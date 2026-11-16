@@ -1706,6 +1706,17 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
     Background events do not change the foreground `status.state`. Events from
     background children, including a delegated `approval_request`, have no order
     relative to the parent turn's events such as `agent_end`.
+12. Connection loss during a request. When a connection reaches end of input
+    (EOF) while one of its requests is still running, the server starts no new
+    request from it, including any request already buffered behind the running
+    one. On unix and tcp this is a half-close: the server does not close the
+    write side, so the reply to the request that is still running and any
+    already-buffered reply are still written. A controller that lost its
+    connection keeps its controller slot until its running request ends; a new
+    controller `hello` then waits up to one handoff deadline (10 s) for that
+    slot and succeeds, instead of being refused at once. A controller slot held
+    by a *live* holder still refuses a second controller `hello` immediately
+    with `-32001`. Old clients are otherwise unchanged.
 
 ## size and pagination rules
 

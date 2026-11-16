@@ -836,3 +836,69 @@ def test_forward_walk_progresses_when_last_group_is_near_limit(
             seen.extend(row["id"] for row in page["messages"])
             offset = page["next_offset"]
         assert seen[-1] == "big", size
+
+
+
+@pytest.mark.parametrize("trailing", ["turn_end", "none"])
+@pytest.mark.parametrize("path", ["index", "projection"])
+@pytest.mark.asyncio
+async def test_real_socket_forward_pages_serve_every_row_once_at_every_split(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str, trailing: str
+) -> None:
+    server = ZetaServer(home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex")
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(str(server.socket_path), limit=2_000_000)
+    try:
+        await request(
+            reader, writer, 1, "hello",
+            {"protocol_version": "1.2", "features": ["served_turn_end"]},
+        )
+        session_id = (await request(
+            reader, writer, 2, "new_session", {"provider": "codex"}
+        ))[-1]["result"]["session"]["session_id"]
+        store = server.runtime.opened.store
+        for number in range(6):
+            store.append_message(with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"message-{number}" + "x" * 100)]),
+                MessageOrigin.USER,
+            ))
+        if trailing == "turn_end":
+            # The trailing open group holds only this row: no message closes it.
+            await store.append_turn_end_async("a" * 32, "completed")
+        if path == "projection":
+            # test-contract: seam the sidecar index defers (stale, closed, or
+            # read-only), so serve pages the full projection, as in production.
+            monkeypatch.setattr(store, "history_index_page", lambda request: None)
+        full = await _history_request(reader, writer, 3, session_id, {"offset": 0})
+        assert full["next_offset"] is None
+        assert len(full["messages"]) == 7 if trailing == "turn_end" else 6
+        # Page fitting reserves the largest request id, so size frames the same way.
+        widest_id = "\x00" * protocol.MAX_REQUEST_ID_BYTES
+        full_size = FrameCodec().response_size(widest_id, full)
+        envelope = FrameCodec().response_size(widest_id, {"messages": [], "next_offset": 0})
+        request_id = 4
+        splits: set[int] = set()
+        # Each limit below still fits two groups, so no group becomes a marker.
+        for limit in range(envelope + (full_size - envelope) // 3, full_size + 16, 2):
+            monkeypatch.setattr(history_projection, "MAX_FRAME_BYTES", limit)
+            pages: list[list[dict[str, object]]] = []
+            offset: int | None = 0
+            while offset is not None and len(pages) <= 20:
+                page = await _history_request(
+                    reader, writer, request_id, session_id, {"offset": offset}
+                )
+                request_id += 1
+                pages.append(page["messages"])
+                offset = page["next_offset"]
+            served = [row for page_rows in pages for row in page_rows]
+            assert served == full["messages"], (
+                f"{path} limit {limit}: pages {[len(rows) for rows in pages]} "
+                f"served {len(served)} of {len(full['messages'])} rows"
+            )
+            assert all(pages), f"{path} limit {limit}: empty page {[len(rows) for rows in pages]}"
+            for page_rows in pages[:-1]:
+                splits.add(served.index(page_rows[-1]) + 1)
+        # One row per group here, so every row position is a group boundary.
+        assert splits == set(range(2, len(full["messages"]))), splits
+    finally:
+        await close_serve(server, writer)

@@ -10151,14 +10151,8 @@ async def test_slash_status_transcript_work_does_not_block_serve(
 
         client = server._client
         assert client is not None
-        request_task = next(
-            task
-            for task in asyncio.all_tasks()
-            if task is not asyncio.current_task()
-            and any(
-                frame.f_locals.get("client") is client for frame in task.get_stack()
-            )
-        )
+        request_task = client._run_task
+        assert request_task is not None
         request_task.cancel()
         # A cancelled /status waits for its started worker before it re-raises,
         # so release the worker before awaiting the cancelled request.
@@ -10269,14 +10263,8 @@ async def test_serve_close_settles_slash_status_read(
             assert await asyncio.to_thread(status_entered.wait, 10)
         client = server._client
         assert client is not None
-        request_task = next(
-            task
-            for task in asyncio.all_tasks()
-            if task is not asyncio.current_task()
-            and any(
-                frame.f_locals.get("client") is client for frame in task.get_stack()
-            )
-        )
+        request_task = client._run_task
+        assert request_task is not None
 
         await await_or_fail(server.close(), what="server close")
         # The workers are still held: only the registry close can end these.

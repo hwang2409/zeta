@@ -120,10 +120,12 @@ async def new_session(self, params: dict[str, Any]) -> dict[str, object]:
                 )
             if bindings is not None:
                 headers, configs = bindings
-                await self.server.runtime.loop.set_mcp_bindings(headers, configs)
+                # assign the control's binding state before the await so a cancel
+                # inside set_mcp_bindings still lets the release clear the loop (F6).
                 self.server.control._active_mcp_bindings = headers
                 self.server.control._mcp_binding_servers = frozenset(headers)
                 self.server.control._mcp_binding_required = bool(headers)
+                await self.server.runtime.loop.set_mcp_bindings(headers, configs)
             elif self.server.runtime.loop is not None:
                 self.server.control._active_mcp_bindings = {}
                 self.server.control._mcp_binding_servers = frozenset()
@@ -201,10 +203,12 @@ async def resume(self, params: dict[str, Any]) -> dict[str, object]:
                 self.server.attach(incoming)
             if bindings is not None:
                 headers, configs = bindings
-                await self.server.runtime.loop.set_mcp_bindings(headers, configs)
+                # assign the control's binding state before the await so a cancel
+                # inside set_mcp_bindings still lets the release clear the loop (F6).
                 self.server.control._active_mcp_bindings = headers
                 self.server.control._mcp_binding_servers = frozenset(headers)
                 self.server.control._mcp_binding_required = bool(headers)
+                await self.server.runtime.loop.set_mcp_bindings(headers, configs)
             elif previous_session_id != session_id:
                 self.server.control._active_mcp_bindings = {}
                 self.server.control._mcp_binding_servers = frozenset()
