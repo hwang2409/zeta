@@ -45,6 +45,7 @@ from ..compaction import (
     SummaryCompletionError as _SummaryCompletionError,
     SummaryInputTooLarge as _SummaryInputTooLarge,
 )
+from ..protocol.tool_batches import interrupted_tool_result, repair_tool_batches
 from ..protocol.types import (
     ASSISTANT_RESPONSE_COMPLETED,
     ASSISTANT_RESPONSE_STATE,
@@ -67,6 +68,37 @@ EMERGENCY_TARGET_RATIO = 0.5
 
 
 BudgetExceeded = RequestBudgetExceeded
+
+
+def _with_interrupted_results(
+    items: list[_ContextItem], entries: Sequence[ConversationEntry]
+) -> list[_ContextItem]:
+    """Repair batches a dead process left open, with this branch's approval facts.
+
+    A call whose durable approval request never got ``allow`` did not run; any
+    other call with no result may have run.
+    """
+    allowed = {
+        entry.data.get("request_id")
+        for entry in entries
+        if entry.type == "approval_resolution" and entry.data.get("decision") == "allow"
+    }
+    requested = {
+        request["request_id"]
+        for entry in entries
+        if entry.type == "message"
+        for request in entry.data.get("approval_requests", ())
+    }
+    return repair_tool_batches(
+        items,
+        lambda item: item.message,
+        lambda call_id: _ContextItem(
+            None,
+            interrupted_tool_result(
+                call_id, not_run=call_id in requested and call_id not in allowed
+            ),
+        ),
+    )
 
 
 class StaleBranchError(RuntimeError):
@@ -1267,7 +1299,7 @@ class ContextAssembler(ContextMarkerMixin):
                         ),
                     )
                 )
-        return items
+        return _with_interrupted_results(items, entries)
 
     @staticmethod
     def _branch_id(entries: Sequence[ConversationEntry]) -> str | None:
