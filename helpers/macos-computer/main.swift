@@ -121,6 +121,22 @@ func frontmostBundleID() -> String {
     return NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
 }
 
+// cua (github.com/trycua/cua, MIT) refuses input while a macOS security/consent prompt owns the
+// input — platform-macos/src/security_prompt.rs (KEYCHAIN_PROMPT_OWNERS). we borrow the idea in a
+// minimal form: if the frontmost app is one of those prompt owners (keychain / admin password /
+// Touch ID panel), refuse input. complements IsSecureEventInputEnabled, which cua lacks.
+let securityPromptBundleIDs: Set<String> = [
+    "com.apple.SecurityAgent",
+    "com.apple.LocalAuthentication.UIAgent",
+]
+
+func securityPromptFrontmost() -> Bool {
+    guard let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier else {
+        return false
+    }
+    return securityPromptBundleIDs.contains(bundleID)
+}
+
 // MARK: - capture
 
 struct Capture {
@@ -146,14 +162,13 @@ func captureDisplay(_ index: Int) throws -> Capture {
                     "display \(index) out of range (have \(displays.count))")
             }
             let display = displays[index]
-            let displayID = display.displayID
-            let bounds = CGDisplayBounds(displayID)
-            let mode = CGDisplayCopyDisplayMode(displayID)
-            let pxWidth = mode?.pixelWidth ?? Int(bounds.width)
-            let pxHeight = mode?.pixelHeight ?? Int(bounds.height)
-            let scale = bounds.width > 0 ? Double(pxWidth) / Double(bounds.width) : 1.0
-
+            let bounds = CGDisplayBounds(display.displayID)  // origin in global points
             let filter = SCContentFilter(display: display, excludingWindows: [])
+            // use ScreenCaptureKit's own point->pixel scale for this display; do not assume 2x.
+            let scale = Double(filter.pointPixelScale)
+            let rect = filter.contentRect
+            let pxWidth = Int((rect.width * CGFloat(scale)).rounded())
+            let pxHeight = Int((rect.height * CGFloat(scale)).rounded())
             let config = SCStreamConfiguration()
             config.width = pxWidth
             config.height = pxHeight
@@ -309,7 +324,7 @@ func pointArg(_ req: [String: Any]) throws -> CGPoint {
 
 func guardInput() throws {
     if screenIsLocked() { throw HelperError.locked }
-    if secureInputEnabled() { throw HelperError.secureInput }
+    if secureInputEnabled() || securityPromptFrontmost() { throw HelperError.secureInput }
 }
 
 func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
