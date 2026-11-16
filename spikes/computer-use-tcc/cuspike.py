@@ -21,7 +21,7 @@ try:
     AXIsProcessTrusted = _AS.AXIsProcessTrusted
     AXIsProcessTrustedWithOptions = _AS.AXIsProcessTrustedWithOptions
     kAXTrustedCheckOptionPrompt = _AS.kAXTrustedCheckOptionPrompt
-except Exception:  # pragma: no cover - fallback if umbrella layout differs
+except (ImportError, AttributeError):  # fallback if umbrella layout differs
     from HIServices import (  # type: ignore
         AXIsProcessTrusted,
         AXIsProcessTrustedWithOptions,
