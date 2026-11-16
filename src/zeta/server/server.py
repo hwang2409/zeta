@@ -32,7 +32,7 @@ from . import (
     login,
 )
 from . import control as control_module
-from .connections import ConnectionRegistry, last_turn_outcome
+from .connections import ConnectionRegistry
 from .control import (
     NotificationPresentation,
     ServeControl,
@@ -596,6 +596,13 @@ class _Client:
                 if not self.handshaken:
                     break
         finally:
+            # a cancel of the connection task (server teardown) must also stop an
+            # in-flight handler; the EOF-loss path already awaited it to done.
+            handler = self._run_task
+            if handler is not None and not handler.done():
+                handler.cancel()
+                with contextlib.suppress(BaseException):
+                    await handler
             self._cancel_pending_read()
             await self.close(graceful=graceful and not self._transport_failed)
 
@@ -911,18 +918,11 @@ class _Client:
                 require_host_binding = "session_host_commands" in self.features
 
                 async def claim() -> bool:
-                    if not await self.server.control.controller_claimed(
+                    return await self.server.control.controller_claimed(
                         reconnect=reconnect,
                         require_host_binding=require_host_binding,
                         deadline=deadline,
-                    ):
-                        return False
-                    await self.server.parking.claim(
-                        "session_park" in self.features,
-                        reconnect=reconnect,
-                        require_host_binding=require_host_binding,
                     )
-                    return True
 
                 # shield the claim so a cancel of the hello does not leave the
                 # approvals lifecycle half-moved; it waits for the bounded claim.
@@ -939,6 +939,11 @@ class _Client:
                         ErrorDescriptor.CONNECTION_CAPACITY,
                         "another client is already connected",
                     )
+                await self.server.parking.claim(
+                    "session_park" in self.features,
+                    reconnect=reconnect,
+                    require_host_binding=require_host_binding,
+                )
                 if reconnect_bindings is not None:
                     await self.server.control.reattach_mcp_bindings(
                         *reconnect_bindings
