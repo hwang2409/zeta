@@ -112,6 +112,7 @@ def trust_project_extensions(host: ExtensionHost) -> None:
     pending = list(host.pending_project)
     host.pending_project.clear()
     for item in pending:
+        host.mark_trusted(item.manifest.name, PROJECT_SCOPE)
         _load_one(host, item.directory, item.manifest, PROJECT_SCOPE)
 
 

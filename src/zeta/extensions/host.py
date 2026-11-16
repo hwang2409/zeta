@@ -16,6 +16,7 @@ skipped. One broken extension never breaks the session or stops the rest.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import re
 import sys
@@ -132,8 +133,10 @@ class ExtensionHost:
         self.pending_project: list[PendingExtension] = []
         self.notices: list[str] = []
         self.warnings: list[str] = []
-        self.statuses: list[ExtensionStatus] = []
+        self.statuses: dict[tuple[str, str], ExtensionStatus] = {}
         self._event_sink: Callable[[StreamEvent], None] | None = None
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+        self.notify_dropped = 0
         self._packages: dict[str, Path] = {}
         self._closed = False
 
@@ -167,41 +170,73 @@ class ExtensionHost:
         if self._closed:
             return
         self._closed = True
+        self._event_sink = None
+        self._event_loop = None
         for package in tuple(self._packages):
             self.remove_package(package)
 
-    def set_event_sink(self, sink: Callable[[StreamEvent], None] | None) -> None:
+    def set_event_sink(
+        self, sink: Callable[[StreamEvent], None] | None,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
         self._event_sink = sink
+        self._event_loop = loop
 
     def notify(self, extension: str, text: str, level: str) -> None:
-        if self._event_sink is not None:
-            self._event_sink(StreamEvent(
-                StreamEventType.AGENT_NOTIFICATION,
-                data={"kind": "extension", "extension": extension, "text": text, "level": level},
-            ))
+        if type(text) is not str or level not in {"info", "warning", "error"}:
+            raise ValueError("invalid extension notification")
+        if len(text) > 2000:
+            text = text[:1997] + "..."
+        event = StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={"kind": "extension", "extension": extension, "text": text, "level": level},
+        )
+
+        def send() -> None:
+            sink = self._event_sink
+            if self._closed or sink is None:
+                self.notify_dropped += 1
+                return
+            try:
+                sink(event)
+            except Exception:  # noqa: BLE001 - extension notices must not break a session
+                self.notify_dropped += 1
+
+        if self._closed or self._event_sink is None or self._event_loop is None:
+            self.notify_dropped += 1
+        else:
+            try:
+                self._event_loop.call_soon_threadsafe(send)
+            except RuntimeError:
+                self.notify_dropped += 1
 
     def add_status(self, manifest: ExtensionManifest, scope: str, *, enabled: bool) -> None:
-        self.statuses.append(ExtensionStatus(
+        self.statuses[(manifest.name, scope)] = ExtensionStatus(
             manifest.name, scope, manifest.version, enabled, scope == USER_SCOPE
-        ))
+        )
 
-    def mark_loaded(self, name: str) -> None:
-        for status in self.statuses:
-            if status.name == name:
-                status.loaded = True
-                status.error = None
+    def mark_loaded(self, name: str, scope: str) -> None:
+        status = self.statuses.get((name, scope))
+        if status is not None:
+            status.loaded = True
+            status.error = None
 
-    def mark_error(self, name: str, error: str) -> None:
-        for status in self.statuses:
-            if status.name == name:
+    def mark_error(self, name: str, error: str, scope: str | None = None) -> None:
+        for status in self.statuses.values():
+            if status.name == name and (scope is None or status.scope == scope):
                 status.error = error
+
+    def mark_trusted(self, name: str, scope: str) -> None:
+        status = self.statuses.get((name, scope))
+        if status is not None:
+            status.trusted = True
 
     def status_rows(self) -> list[dict[str, object]]:
         return [{
             "name": item.name, "scope": item.scope, "version": item.version,
             "enabled": item.enabled, "trusted": item.trusted, "loaded": item.loaded,
             "error": item.error,
-        } for item in self.statuses]
+        } for item in self.statuses.values()]
 
     def commit(self, extension: LoadingExtension) -> None:
         """Register a successfully activated extension's tools."""
@@ -230,7 +265,7 @@ class ExtensionHost:
                     f"extensions · {extension.scope} extension tool '{name}' from "
                     f"{display} shadows {shadow}"
                 )
-        self.mark_loaded(extension.manifest.name)
+        self.mark_loaded(extension.manifest.name, extension.scope)
         self.loaded.append(
             LoadedExtension(
                 name=extension.manifest.name,

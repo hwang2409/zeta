@@ -1,14 +1,11 @@
 """Logical serve turn and approval lifetime."""
-
 from __future__ import annotations
-
 import asyncio
 import functools
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import aclosing, contextmanager
 from typing import TYPE_CHECKING, Any
-
 from ..core.approval import (
     ApprovalPolicy,
     ApprovalRequest,
@@ -59,21 +56,15 @@ from .protocol import (
 )
 from .session_replay.in_flight import InFlightReply
 from .session_replay.rows import RowFacts
-
 if TYPE_CHECKING:
     from ..mcp import MCPServerConfig
     from .runtime import ServerRuntime
     from .server import ZetaServer
-
 USER_MESSAGE_MAX_BYTES = 262_144
 CONTROLLER_HANDOFF_DEADLINE_SECONDS = 10.0
-
 NotificationSender = Callable[..., Awaitable[bool]]
-
-
 class NotificationPresentation:
     """Publish each durable notification at most once per serve session."""
-
     def __init__(self) -> None:
         self._presented: set[tuple[str, str]] = set()
 
@@ -1252,7 +1243,10 @@ class ServeControl:
             await self._start_approval(event, session_id, wire_event)
             return
         if kind is StreamEventType.AGENT_NOTIFICATION and event.data.get("kind") == "extension":
-            await self._notify(wire_event, session_id, data=dict(event.data)); return
+            connections = self.server.connections
+            if connections is not None:
+                await connections.publish_feature_event("extensions", EventDescriptor.EXTENSION_NOTICE, session_id, data=dict(event.data))
+            return
         if kind is StreamEventType.AGENT_NOTIFICATION:
             await self.server.notification_presentations.publish(
                 session_id,

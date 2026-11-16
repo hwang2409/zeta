@@ -358,7 +358,8 @@ class ZetaServer:
             runtime.set_background_event_sink(control._publish_background_event)
             if runtime.extensions is not None:
                 runtime.extensions.set_event_sink(
-                    lambda event: control._publish_background_event(runtime.session_id, event)
+                    lambda event: control._publish_background_event(runtime.session_id, event),
+                    self.connections.loop,
                 )
             runtime.set_memory_notice_sink(control._publish_memory_notice)
             runtime.set_run_work_event_sink(control._publish_run_work_event)
@@ -409,6 +410,11 @@ class ZetaServer:
         self.connections = ConnectionRegistry(
             asyncio.get_running_loop(), lambda: self.control.in_flight
         )
+        if self.runtime.extensions is not None:
+            self.runtime.extensions.set_event_sink(
+                lambda event: self.control._publish_background_event(self.runtime.session_id, event),
+                self.connections.loop,
+            )
         if self.port is None:
             if self._prebound_socket is not None:
                 self._server = await asyncio.start_unix_server(

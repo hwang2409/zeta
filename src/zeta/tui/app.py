@@ -399,7 +399,9 @@ class TUIApp(
             lambda event: app._handle_background_event(event)
         )
         if extensions is not None:
-            extensions.set_event_sink(lambda event: app._handle_background_event(event))
+            extensions.set_event_sink(
+                lambda event: app._handle_background_event(event), asyncio.get_running_loop()
+            )
         self.loop.set_background_wake_callback(lambda: app._schedule_background_wake())
         self.loop.set_mcp_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -1143,6 +1145,11 @@ class TUIApp(
             except (OSError, RuntimeError) as exc: return f"project instructions editor error: {exc} ({path})"
             return (f"project instructions editor error: exited with status {status} ({path})" if status else f"project instructions: {path} (applies to new and resumed sessions)")
         return run()
+    def show_extensions(self) -> None:
+        from .render import render_extensions_list
+
+        self._print(render_extensions_list(self.extensions.status_rows() if self.extensions else []))
+
     def _print_system(self, output: str) -> None:
         self._print_unit(
             Text(

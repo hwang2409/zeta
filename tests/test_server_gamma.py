@@ -345,6 +345,40 @@ async def test_active_resume_rejects_a_session_whose_cwd_was_removed(
 
 
 @pytest.mark.asyncio
+async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
+    extension_dir = tmp_path / "home" / "extensions" / "notice"
+    extension_dir.mkdir(parents=True)
+    (extension_dir / "zeta-extension.toml").write_text(
+        '[extension]\nname = "notice"\nversion = "1"\napi_version = 1\nentry = "ext:activate"\n'
+    )
+    (extension_dir / "ext.py").write_text("def activate(zx): pass\n")
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer)
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        server.runtime.extensions.notify("notice", "hello", "info")
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(reader.read(1), 0.2)
+    finally:
+        await close_serve(server, writer)
+
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["extensions"])
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        server.runtime.extensions.notify("notice", "hello", "info")
+        await asyncio.sleep(0)
+        frames = await _frames_until_event(reader, "extension_notice")
+        assert frames[-1]["params"]["data"] == {
+            "kind": "extension", "extension": "notice", "text": "hello", "level": "info"
+        }
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_hello_echoes_requested_supported_features_only(tmp_path: Path) -> None:
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)

@@ -1554,6 +1554,7 @@ Event fields are:
 | `child_progress` | `event`, `run_id: string`, `sequence: integer`, `revision: integer`, `child: ChildRun` | `session_id`, `stream_id`, `seq` |
 | `child_ended` | `event`, `run_id: string`, `sequence: integer`, `child: ChildRun` | `session_id`, `stream_id`, `seq` |
 | `sub_agent_receipt` | `event`, `data: object` | `session_id` |
+| `extension_notice` (feature `extensions`) | `event`, `data: {kind: "extension", extension: string, text: string, level: "info" | "warning" | "error"}` | `session_id` |
 | `task_exit_notification` | `event`, `data: object` | `session_id` |
 | `project_inbox_notification` | `event`, `data: object` | `session_id` |
 | `project_inbox_health` (protocol 1.2 only) | `event`, `data: object` | `session_id` |
@@ -2207,7 +2208,19 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_restart_reason` | exposes the `server_restarted` abort reason on `approval_end`; a client without this feature still receives the terminal end but never the reason (see "approve and deny") |
 | `session_retention` | enables negotiated live `session_retention` events; durable retention history remains available through `/retention` after reconnect |
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
-| `extensions` | adds read-only `extensions_list` and transient extension notifications |
+| `extensions` | adds read-only `extensions_list` and gated transient `extension_notice` events |
+| `in_flight_replay` | enables replay of events already in flight |
+| `resume_attach` | enables reconnecting to an existing session |
+| `session_park` | enables parking a session |
+| `turn_reconnect` | enables reconnecting to a running turn |
+
+### `extensions_list`
+
+request: `{}`. result: an array of objects with `name`, `scope`, `version`, `enabled`, `trusted`, `loaded`, and `error` (a string or `null`). errors use the standard JSON-RPC invalid-params and method errors.
+
+### `extension_notice`
+
+this event is sent only to clients that negotiated `extensions`. its exact `params.data` is `{\"kind\":\"extension\",\"extension\":string,\"text\":string,\"level\":\"info\"|\"warning\"|\"error\"}`. it is transient: it is not stored and does not create a notification row. text longer than 2000 characters is cut to 1997 characters plus `...`.
 | `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
 | `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
 | `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 are parked or closing (`-32004` with `data.reason: "parked_limit"`), `status` adds `parked_sessions`, and the controller gets `parked_session_changed` events (see "parking a busy session") |

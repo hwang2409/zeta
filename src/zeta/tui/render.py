@@ -538,6 +538,27 @@ STREAM_EVENTS_HANDLED_ELSEWHERE = frozenset({
 STREAM_EVENTS_HIDDEN = frozenset()
 
 
+def render_extensions_list(rows: list[dict[str, object]]) -> RenderableType:
+    from rich.table import Table
+
+    table = Table(title="extensions")
+    for heading in ("name", "scope", "version", "enabled", "trusted", "loaded", "error"):
+        table.add_column(heading)
+    for row in rows:
+        table.add_row(*(str(row.get(key, "")) for key in ("name", "scope", "version", "enabled", "trusted", "loaded", "error")))
+    return table
+
+
+def render_extension_notice(event: StreamEvent) -> RenderableType:
+    text = event.data.get("text")
+    extension = event.data.get("extension", "extension")
+    level = event.data.get("level", "info")
+    if not isinstance(text, str) or not isinstance(extension, str):
+        return Text("extension notification unavailable", style=theme.ERROR)
+    style = theme.ERROR if level == "error" else theme.WARNING if level == "warning" else theme.NOTICE
+    return Text(f"{extension}: {text}", style=style, overflow="ellipsis", no_wrap=True)
+
+
 def render_agent_notification(
     event: StreamEvent,
     identity_index: AgentIdentityIndex | None = None,
@@ -547,13 +568,7 @@ def render_agent_notification(
         return None
     kind = event.data.get("kind", "agent_completion")
     if kind == "extension":
-        text = event.data.get("text")
-        extension = event.data.get("extension", "extension")
-        level = event.data.get("level", "info")
-        if not isinstance(text, str) or not isinstance(extension, str):
-            return Text("extension notification unavailable", style=theme.ERROR)
-        style = theme.ERROR if level == "error" else theme.WARNING if level == "warning" else theme.NOTICE
-        return Text(f"{extension}: {text}", style=style, overflow="ellipsis", no_wrap=True)
+        return render_extension_notice(event)
     if kind == "project_inbox":
         text = event.data.get("text")
         if not isinstance(text, str):
