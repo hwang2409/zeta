@@ -21,6 +21,7 @@ from ..protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
+    StreamEventType,
     TextContent,
     user_message_for_turn,
     with_message_origin,
@@ -343,9 +344,25 @@ class DeliveryRequests:
         await state.opened.store.append_turn_end_async(turn_id, turn_reason)
         self._release_turn(state, owner_task)
 
-    async def fail_finalize(self, session_id: str, state: SessionState) -> None:
-        """End a turn whose finalization raised: drop its steering as failed
-        and release the turn, so no steer stays queued and the next send runs."""
+    async def finalize_or_fail(
+        self,
+        session_id: str,
+        state: SessionState,
+        turn_id: str,
+        outcome: TurnOutcome,
+    ) -> TurnOutcome:
+        """Finalize the turn; if that raises, end it as failed so the client
+        still gets an error, turn_end, and agent_end, and no steer stays queued."""
+        try:
+            await self.finalize_turn(session_id, state, turn_id, outcome)
+            return outcome
+        except Exception as exc:  # a raise here would wedge the session
+            logger.exception(
+                "serve turn finalization failed: session=%s turn=%s",
+                session_id,
+                turn_id,
+            )
+            error = {"code": "server_error", "message": str(exc)}
         try:
             await self._drop_steering(session_id, state, "failed")
         except Exception:  # the turn must still be released
@@ -355,6 +372,13 @@ class DeliveryRequests:
             )
         finally:
             self._release_turn(state, asyncio.current_task())
+        await self._control._notify(
+            event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+            session_id,
+            error=error,
+            data={},
+        )
+        return TurnOutcome.FAILED
 
     def _release_turn(
         self, state: SessionState, owner_task: asyncio.Task[Any] | None
