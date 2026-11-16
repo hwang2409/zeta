@@ -520,7 +520,7 @@ async def status(
 ) -> dict[str, object]:
     controller = controller or self.server.controllers.owned(self)
     runtime = controller.runtime
-    session = session_snapshot(self, controller)
+    session = session_snapshot(self)
     reconnect = "approval_reconnect" in self.features
     if reconnect:
         baseline = await live_status_baseline(self, controller)
