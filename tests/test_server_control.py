@@ -981,3 +981,317 @@ async def test_closed_client_cannot_clear_serve_control_state(tmp_path: Path) ->
     assert server.runtime._memory_notice_sink is not None
     assert server.runtime._background_wake_sink is not None
     assert reference() is None
+
+
+async def _serve_after_first_turn(tmp_path: Path):
+    """A serve session whose first turn has ended, so a wake no longer counts as busy."""
+    from tests.test_server import _ready_extensions
+
+    server = ZetaServer(
+        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
+    )
+    reader, writer, session_id = await _ready_extensions(server)
+    await _request(reader, writer, "first", "send", {"text": "hello"})
+    await read_until(
+        reader,
+        lambda frame: frame.get("params", {}).get("event") == "agent_end",
+        what="first turn agent_end",
+    )
+    return server, reader, writer, session_id
+
+
+def _schedule_wake(server: ZetaServer, session_id: str) -> None:
+    server.runtime.opened.store.append_agent_notification(
+        "child",
+        child_session_path="/tmp/child",
+        description="child",
+        status="completed",
+        text="child done",
+    )
+    sink = server.runtime._background_wake_sink
+    assert sink is not None
+    sink(session_id)
+
+
+def _is_turn_end(session_id: str):
+    return (
+        lambda frame: frame.get("params", {}).get("event") == "turn_end"
+        and frame["params"].get("session_id") == session_id
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("slash_run", {"text": "/model gpt-5.6-sol"}),
+        ("set_settings", {"model": "gpt-5.6-sol", "approval_mode": "deny"}),
+        ("resume", {}),
+    ],
+)
+async def test_state_change_waits_for_wake_in_setup_before_turn_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, params: dict
+) -> None:
+    server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
+    loop = server.runtime.loop
+    in_setup = asyncio.Event()
+    release_setup = asyncio.Event()
+    original_ensure = loop._ensure_mcp_servers
+
+    async def held_ensure() -> None:
+        in_setup.set()
+        await await_or_fail(release_setup.wait(), what="wake setup release")
+        await original_ensure()
+
+    # test-contract: seam MCP startup is the slow step a wake runs before turn_start
+    monkeypatch.setattr(loop, "_ensure_mcp_servers", held_ensure)
+    try:
+        model = server.runtime.model
+        opened = server.runtime.opened
+        _schedule_wake(server, session_id)
+        await await_or_fail(in_setup.wait(), what="wake in setup")
+        assert loop.notification_turn_state == "running"
+
+        reply = (
+            await _request(
+                reader, writer, method, method, {"session_id": session_id, **params}
+            )
+        )[-1]
+        assert reply.get("error", {}).get("code") == -32004, reply
+        assert server.runtime.model == model
+        assert server.runtime.opened is opened
+
+        release_setup.set()
+        await read_until(reader, _is_turn_end(session_id), what="wake turn_end")
+    finally:
+        release_setup.set()
+        await close_serve(server, writer)
+
+
+class _GateSignalingEvent(asyncio.Event):
+    def __init__(self, waiting: asyncio.Event) -> None:
+        super().__init__()
+        self.set()
+        self._waiting = waiting
+
+    async def wait(self) -> bool:
+        if not self.is_set():
+            self._waiting.set()
+        return await asyncio.wait_for(super().wait(), 10)
+
+
+@pytest.mark.asyncio
+async def test_running_slash_command_holds_wake_start_until_it_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.server.slash_commands import ServerSlashSession
+
+    server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
+    loop = server.runtime.loop
+    order: list[str] = []
+    in_command = asyncio.Event()
+    release_command = asyncio.Event()
+    # set when the wake either waits on the start gate or reaches its setup.
+    wake_progressed = asyncio.Event()
+    original_model = ServerSlashSession.slash_model
+    original_ensure = loop._ensure_mcp_servers
+
+    async def held_model(self, args: str) -> str:
+        in_command.set()
+        await await_or_fail(release_command.wait(), what="slash command release")
+        order.append("command done")
+        return await original_model(self, args)
+
+    async def observed_ensure() -> None:
+        order.append("wake setup")
+        wake_progressed.set()
+        await original_ensure()
+
+    monkeypatch.setattr(ServerSlashSession, "slash_model", held_model)
+    # test-contract: seam MCP startup is the first wake step after its start gate
+    monkeypatch.setattr(loop, "_ensure_mcp_servers", observed_ensure)
+    # test-contract: seam signal when the wake waits on the start gate; absent on old code
+    monkeypatch.setattr(
+        server.control,
+        "_no_state_change",
+        _GateSignalingEvent(wake_progressed),
+        raising=False,
+    )
+    try:
+        await send(
+            reader,
+            writer,
+            "model",
+            "slash_run",
+            {"session_id": session_id, "text": "/model gpt-5.6-sol"},
+        )
+        await await_or_fail(in_command.wait(), what="slash command running")
+        _schedule_wake(server, session_id)
+        await await_or_fail(wake_progressed.wait(), what="wake gated or in setup")
+        release_command.set()
+        frames = await read_until(
+            reader, _is_turn_end(session_id), what="wake turn_end"
+        )
+        assert order == ["command done", "wake setup"]
+        reply = next(frame for frame in frames if frame.get("id") == "model")
+        assert reply["result"]["text"] == "model: gpt-5.6-sol", reply
+    finally:
+        release_command.set()
+        await close_serve(server, writer)
+
+
+class _SecondHoldOnRelease(asyncio.Event):
+    """The start gate; when the first change releases it, a second takes the hold in the same tick."""
+
+    def __init__(self, control: Any, second_holds: list[str]) -> None:
+        super().__init__()
+        super().set()
+        self._control = control
+        self._second_holds = second_holds
+        self.second_hold: Any = None
+
+    def set(self) -> None:
+        super().set()
+        if self.second_hold is None:
+            self.second_hold = self._control.hold_wake_start()
+            self.second_hold.__enter__()
+            self._second_holds.append("second change holds")
+
+    def release_second(self) -> None:
+        self.second_hold.__exit__(None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_wake_waits_for_change_that_takes_hold_as_first_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.server.slash_commands import ServerSlashSession
+
+    server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
+    loop = server.runtime.loop
+    order: list[str] = []
+    in_command = asyncio.Event()
+    release_command = asyncio.Event()
+    original_model = ServerSlashSession.slash_model
+    original_ensure = loop._ensure_mcp_servers
+
+    async def held_model(self, args: str) -> str:
+        in_command.set()
+        await await_or_fail(release_command.wait(), what="slash command release")
+        return await original_model(self, args)
+
+    async def observed_ensure() -> None:
+        order.append("wake setup")
+        await original_ensure()
+
+    gate = _SecondHoldOnRelease(server.control, order)
+    monkeypatch.setattr(ServerSlashSession, "slash_model", held_model)
+    # test-contract: seam MCP startup is the first wake step after its start gate
+    monkeypatch.setattr(loop, "_ensure_mcp_servers", observed_ensure)
+    # test-contract: seam a second state change takes the hold in the tick the first releases it
+    monkeypatch.setattr(server.control, "_no_state_change", gate)
+    try:
+        reply = None
+        await send(
+            reader,
+            writer,
+            "model",
+            "slash_run",
+            {"session_id": session_id, "text": "/model gpt-5.6-sol"},
+        )
+        await await_or_fail(in_command.wait(), what="slash command running")
+        _schedule_wake(server, session_id)
+        release_command.set()
+        frames = await read_until(
+            reader, lambda frame: frame.get("id") == "model", what="model reply"
+        )
+        reply = frames[-1]
+        # let the woken wake run; it must still wait for the second change.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert order == ["second change holds"]
+        gate.release_second()
+        await read_until(reader, _is_turn_end(session_id), what="wake turn_end")
+        assert order == ["second change holds", "wake setup"]
+        assert reply["result"]["text"] == "model: gpt-5.6-sol", reply
+    finally:
+        release_command.set()
+        if gate.second_hold is not None and server.control._state_changes:
+            gate.release_second()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_wake_held_across_session_change_does_not_run_on_old_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
+    started: list[str] = []
+    original_run = server.turn_contexts.run_notification_turn
+
+    async def observed_run(woken_session_id: str, *args: Any, **kwargs: Any):
+        started.append(woken_session_id)
+        return await original_run(woken_session_id, *args, **kwargs)
+
+    # test-contract: seam the notification turn body starts only after the start gate
+    monkeypatch.setattr(server.turn_contexts, "run_notification_turn", observed_run)
+    hold = server.control.hold_wake_start()
+    hold.__enter__()
+    held = True
+    try:
+        _schedule_wake(server, session_id)
+        wake = server.control._notification_task
+        assert wake is not None
+        # a session change runs while the wake waits at the start gate.
+        reply = (await _request(reader, writer, "new", "new_session", {}))[-1]
+        assert reply["result"]["session"]["session_id"] != session_id, reply
+        hold.__exit__(None, None, None)
+        held = False
+        await await_or_fail(asyncio.gather(wake, return_exceptions=True), what="wake end")
+        assert session_id not in started
+    finally:
+        if held:
+            hold.__exit__(None, None, None)
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_abort_with_child_approval_cancels_wake_held_at_start_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
+    control = server.control
+    in_abort = asyncio.Event()
+    original_abort = control.abort
+
+    async def observed_abort(*args: Any, **kwargs: Any):
+        in_abort.set()
+        return await original_abort(*args, **kwargs)
+
+    # test-contract: seam an open child approval (string key) makes abort wait, not cancel
+    monkeypatch.setattr(control._approvals, "active_keys", lambda: ("child-approval",))
+    # test-contract: seam signal once dispatch holds the start gate for abort
+    monkeypatch.setattr(control, "abort", observed_abort)
+    hold = control.hold_wake_start()
+    hold.__enter__()
+    held = True
+    try:
+        _schedule_wake(server, session_id)
+        wake = control._notification_task
+        assert wake is not None
+        await send(reader, writer, "abort", "abort", {})
+        await await_or_fail(in_abort.wait(), what="abort holds the gate")
+        hold.__exit__(None, None, None)
+        held = False
+        # the abort's own hold keeps the wake at the gate; the abort must not wait for it.
+        reply = (
+            await read_until(
+                reader, lambda frame: frame.get("id") == "abort", what="abort reply"
+            )
+        )[-1]
+        assert reply.get("result") == {"aborted": True}, reply
+        assert wake.cancelled()
+    finally:
+        if held:
+            hold.__exit__(None, None, None)
+        await close_serve(server, writer)

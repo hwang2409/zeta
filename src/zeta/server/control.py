@@ -132,6 +132,12 @@ class ServeControl:
         self._turn_handoff_task: asyncio.Task[None] | None = None
         self._turn_end_published = False
         self._notification_turn_started = False
+        # a wake past this gate may be in setup before its turn_start; state
+        # changes then count it as busy, and a running state change holds the gate.
+        self._wake_admitted = False
+        self._state_changes = 0
+        self._no_state_change = asyncio.Event()
+        self._no_state_change.set()
         self._session_swap_active = False
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
@@ -261,15 +267,37 @@ class ServeControl:
             )
         )
 
+    def state_change_busy(self) -> bool:
+        """Report a turn a state-changing request must wait for."""
+        task = self._turn_task
+        return self.turn_busy() or (
+            self._wake_admitted
+            and task is not None
+            and task is self._notification_task
+            and not task.done()
+        )
+
+    @contextmanager
+    def hold_wake_start(self) -> Iterator[None]:
+        """Keep a scheduled wake from starting until this state change ends."""
+        self._state_changes += 1
+        self._no_state_change.clear()
+        try:
+            yield
+        finally:
+            self._state_changes -= 1
+            if not self._state_changes:
+                self._no_state_change.set()
+
     async def require_idle(self) -> None:
-        if self.turn_busy():
+        if self.state_change_busy():
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
             )
 
     @contextmanager
     def reserve_session_swap(self) -> Iterator[None]:
-        if self.turn_busy() or (
+        if self.state_change_busy() or (
             self._turn_handoff_task is not None
             and not self._turn_handoff_task.done()
         ):
@@ -409,7 +437,7 @@ class ServeControl:
         """Re-bind the active session's released MCP headers for a returning client."""
         loop = self.server.runtime.loop
         assert loop is not None
-        await loop.set_mcp_bindings(headers, configs)
+        await loop.rebind_mcp(headers, configs)
         self._end_grace_deadline()
         await loop._ensure_mcp_servers()
         self._active_mcp_bindings = headers
@@ -731,9 +759,12 @@ class ServeControl:
                 self._terminate_pending_approvals, reason="turn_canceled"
             ),
             before_cancel=mark_canceled,
+            # a wake still at the start gate has nothing to keep; cancel it, as
+            # waiting for it would hold this request's gate forever.
             cancel_task=not any(
                 isinstance(key, str) for key in self._approvals.active_keys()
-            ),
+            )
+            or (turn_task is self._notification_task and not self._wake_admitted),
         )
         if aborted:
             await self._notify(
@@ -897,6 +928,12 @@ class ServeControl:
                     state.turn_started()
 
         try:
+            # a second change can take the hold before this wake resumes
+            while self._state_changes:
+                await self._no_state_change.wait()
+            if self.server.runtime.loop is not loop:
+                return  # a session change ran while this wake waited
+            self._wake_admitted = True
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
                 session_id,
                 loop,
@@ -929,6 +966,7 @@ class ServeControl:
             ):
                 self._schedule_background_wake(session_id)
             self._notification_turn_started = False
+            self._wake_admitted = False
             if started:
                 self._close_deferred_replay(session_id)
                 await self.deliveries.finalize_turn(

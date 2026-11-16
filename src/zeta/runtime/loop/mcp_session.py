@@ -71,6 +71,8 @@ class MCPSession:
             if self._mcp_mount_task is None:
                 self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
             await asyncio.shield(self._mcp_mount_task)
+        if self._mcp_rebind is not None:
+            await asyncio.shield(self._mcp_rebind)
         await self._wait_for_pending_mcp_refreshes()
 
     async def _wait_for_pending_mcp_refreshes(
@@ -124,6 +126,25 @@ class MCPSession:
         self._mcp_mount = mount
         self._mcp_mount_attempted = True
         mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
+
+    async def rebind_mcp(
+        self,
+        bindings: dict[str, dict[str, str]],
+        configs: dict[str, MCPServerConfig],
+    ) -> None:
+        """Re-bind released headers for a returning client. Unlike
+        ``set_mcp_bindings`` it lets a running first mount finish, and a turn
+        in MCP setup waits for it, so its first request has the bound tools."""
+        done = asyncio.get_running_loop().create_future()
+        self._mcp_rebind = done
+        try:
+            if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
+                await asyncio.wait({self._mcp_mount_task})
+            await self.set_mcp_bindings(bindings, configs)
+        finally:
+            done.set_result(None)
+            if self._mcp_rebind is done:
+                self._mcp_rebind = None
 
     async def set_mcp_bindings(
         self,
