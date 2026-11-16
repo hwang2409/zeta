@@ -205,9 +205,10 @@ async def dispatch_tool_calls(
                             update_task,
                             return_exceptions=True,
                         )
-                    for task in done:
-                        if task is update_task:
-                            continue
+                    finished: list[tuple[ToolCall, ToolResult]] = []
+                    for task in sorted(
+                        done & parallel_tasks.keys(), key=lambda t: parallel_tasks[t][0]
+                    ):
                         index, tool_call = parallel_tasks.pop(task)
                         try:
                             task_result = task.result()
@@ -219,25 +220,26 @@ async def dispatch_tool_calls(
                                 str(exc),
                                 is_error=True,
                             )
-                        parallel_results[index] = await _prepare_tool_result(
+                        result = await _prepare_tool_result(
                             tool_call,
                             validate_result(task_result, tool_call.id),
                         )
+                        # durable as each call ends, so a crash keeps every
+                        # finished result; context assembly restores call order
+                        result = loop._finalize_tool_results([tool_call], [result])[0]
+                        completed_tool_indexes.add(index)
+                        finished.append((tool_call, result))
+                    if finished:
+                        while not stream_updates.empty():
+                            yield stream_updates.get_nowait()
+                        for tool_call, result in finished:
+                            yield StreamEvent(
+                                StreamEventType.TOOL_EXECUTION_END,
+                                tool_call=tool_call,
+                                tool_result=result,
+                            )
                 while not stream_updates.empty():
                     yield stream_updates.get_nowait()
-                batch_end = call_index + len(parallel_calls)
-                results = loop._finalize_tool_results(
-                    parallel_calls,
-                    parallel_results[call_index:batch_end],
-                )
-                parallel_results[call_index:batch_end] = [None] * len(parallel_calls)
-                completed_tool_indexes.update(range(call_index, batch_end))
-                for tool_call, result in zip(parallel_calls, results, strict=True):
-                    yield StreamEvent(
-                        StreamEventType.TOOL_EXECUTION_END,
-                        tool_call=tool_call,
-                        tool_result=result,
-                    )
                 call_index += len(parallel_calls)
                 continue
 
