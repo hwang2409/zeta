@@ -78,7 +78,10 @@ class ProjectLockingMixin:
         return lock_fd
 
     @staticmethod
-    def _acquire_lock(lock_fd: int, mode: int) -> None:
+    def _acquire_lock(lock_fd: int, mode: int, *, wait: bool = False) -> None:
+        if wait:
+            fcntl.flock(lock_fd, mode)
+            return
         deadline = time.monotonic() + _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS
         while True:
             try:
@@ -316,7 +319,7 @@ class ProjectLockingMixin:
                     assert lock_fd is not None
                     try:
                         os.fchmod(lock_fd, 0o600)
-                        self._acquire_lock(lock_fd, fcntl.LOCK_EX)
+                        self._acquire_lock(lock_fd, fcntl.LOCK_EX, wait=True)
                         yield root_fd
                         return
                     finally:

@@ -772,7 +772,9 @@ def test_project_registry_serializes_concurrent_creates_and_rejects_hardlinks(
             second_lock_attempted.set()
         real_acquire_lock(lock_fd, mode, **kwargs)
 
+    # test-contract: seam force concurrent publication and lock contention
     monkeypatch.setattr(registry, "_publish", blocked_publish)
+    # test-contract: seam observe the second create's lock acquisition
     monkeypatch.setattr(registry, "_acquire_lock", observe_lock)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(registry.create_project, "project-0", "scope")
@@ -780,6 +782,7 @@ def test_project_registry_serializes_concurrent_creates_and_rejects_hardlinks(
         second = pool.submit(registry.create_project, "project-1", "scope")
         assert second_lock_attempted.wait(10), "second project create did not contend"
         assert not release_publish.wait(1.1), "project create released too early"
+        assert not second.done(), "project create did not wait for the holder"
         release_publish.set()
         projects = [first.result(), second.result()]
     with ThreadPoolExecutor(max_workers=4) as pool:
