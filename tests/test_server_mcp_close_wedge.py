@@ -131,6 +131,16 @@ async def test_resume_rebind_replies_though_bound_close_wedges(
         assert "result" in resume[-1], resume[-1]
         assert not close_gate.is_set()
 
+        # the wedge can outlive resume: the old client's background close must
+        # not pin the actor loop, so the next request still replies (RCA
+        # sample 2, session_settings after a successful re-bind).
+        settings_reply = await await_or_fail(
+            _request(reader, writer, 5, "session_settings", {"session_id": session_id}),
+            what="session_settings reply after the re-bind while the close is wedged",
+        )
+        assert "result" in settings_reply[-1], settings_reply[-1]
+        assert not close_gate.is_set()
+
         # A disconnects; a fresh controller must attach, not get -32001.
         writer.close()
         await writer.wait_closed()
