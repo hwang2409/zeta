@@ -995,6 +995,15 @@ def test_static_gate_rejects_committed_bypass_mutations(source: str) -> None:
 
 STRUCTURED_ERROR_FIXTURES = (
     (
+        ErrorDescriptor.SESSION_CONTROLLED,
+        "the requested session is controlled by another client; the connection stays open",
+        {
+            "session_id": "s1",
+            "holder": {"client_version": "1.4", "connected_for_ms": 12000},
+        },
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32014,"message":"the requested session is controlled by another client; the connection stays open","data":{"code":"session_controlled","session_id":"s1","holder":{"client_version":"1.4","connected_for_ms":12000}}}}\n',
+    ),
+    (
         ErrorDescriptor.STALE_EVENT_SEQUENCE,
         "replay continuity was invalidated",
         None,

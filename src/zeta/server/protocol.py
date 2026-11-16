@@ -33,6 +33,11 @@ class ErrorDescriptor(Enum):
         None,
         "requested controller or observer connection role is at capacity",
     )
+    SESSION_CONTROLLED = (
+        -32014,
+        "session_controlled",
+        "the requested session is controlled by another client; the connection stays open",
+    )
     PROTOCOL_MISMATCH = (
         -32002,
         None,
@@ -286,6 +291,9 @@ FEATURES = (
     "in_flight_replay",
     "session_park",
 )
+
+# Dormant until multi-controller admission is complete in a later slice.
+DORMANT_FEATURES = ("multi_controller",)
 
 
 class Access(StrEnum):

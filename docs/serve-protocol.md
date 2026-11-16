@@ -118,6 +118,39 @@ receives no echo uses no feature. A `features` value that is not an array of
 strings returns `-32602` and closes the connection. A 1.0 negotiation ignores
 `features`.
 
+### `multi_controller` (dormant)
+
+`multi_controller` is the negotiated capability for the later multi-controller
+serve mode. it is documented here so clients can prepare for that mode, but this
+slice does not advertise it in production and does not change admission behavior.
+a private in-process test server may echo the capability while retaining the
+current single-controller rules.
+
+When enabled in a later slice, controller mode is exclusive: a serve process is
+in either legacy mode (one controller) or negotiated multi-controller mode; the
+two modes cannot mix. each negotiated controller controls at most one session,
+and each session has at most one controller. a second controller for an attached
+session receives `session_controlled` (`-32014`) with the socket left open.
+the bounded diagnostic `holder` may contain only safe client version and
+connection duration fields; it never contains credentials, addresses, cwd, or
+bindings.
+
+Reconnect must name the exact session being reclaimed and pass its binding and
+approval checks. an unattached negotiated connection does not infer reconnect
+from another session's grace record. a reconnect failure leaves the existing
+record in grace for the current reconnect rules.
+
+The later mode starts with limits of four negotiated controllers, eight
+observers per session, 32 physical connections, and eight resident session
+records (including parked, closing, and reconnect-grace records). the existing
+256-frame / 4 MiB per-connection output bounds remain in force. these are fixed
+protocol limits, not settings.
+
+The compatibility trace for this capability covers legacy hello, resume, park,
+refusal, reconnect, and close on both Unix and WebSocket transports. until the
+capability is activated, legacy traces remain unchanged: a controller at
+capacity receives `-32001` and the connection closes.
+
 `model_catalog`, `session_settings`, `set_settings`, and `send_images` are
 request methods listed in hello `capabilities.requests`, not feature names in
 `capabilities.features`; clients detect them there.
@@ -1396,6 +1429,7 @@ Error descriptors are:
 | `invalid_params` | `-32602` | none | params have the wrong shape, value, or negotiated capability |
 | `internal_error` | `-32000` | none | unexpected server or storage failure |
 | `connection_capacity` | `-32001` | none | requested controller or observer connection role is at capacity |
+| `session_controlled` | `-32014` | `session_controlled` | the requested session is controlled by another client; the connection stays open |
 | `protocol_mismatch` | `-32002` | none | handshake is missing or the protocol version does not match |
 | `no_active_session` | `-32003` | none | no active session, or the active session requires a host binding |
 | `operation_busy` | `-32004` | none | operation is blocked by active turn, tool, or background-agent work |
