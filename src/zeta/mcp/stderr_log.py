@@ -28,10 +28,33 @@ class _FileLockTimeout(TimeoutError):
     pass
 
 
+def _loss_marker(dropped_bytes: int) -> bytes:
+    return f"[zeta: dropped {dropped_bytes} bytes of stderr]\n".encode()
+
+
+def _fit_stderr_data(data: bytes, available: int) -> bytes:
+    if len(data) <= available:
+        return data
+    candidate = data[: max(available, 0)]
+    newline = candidate.rfind(b"\n")
+    if newline >= 0:
+        return candidate[: newline + 1]
+    while candidate:
+        try:
+            candidate.decode("utf-8")
+        except UnicodeDecodeError:
+            candidate = candidate[:-1]
+        else:
+            break
+    return candidate
+
+
 class RotatingStderrLog:
     """Drain one stderr stream into securely opened, process-safe log files."""
 
     def __init__(self, path: Path, directory_fd: int, lock_fd: int) -> None:
+        if MCP_STDERR_LOG_FILE_BYTES < len(_loss_marker(1)):
+            raise ValueError("MCP stderr log cap is smaller than its loss marker")
         self.path = path
         self._directory_fd = directory_fd
         self._lock_fd = lock_fd
@@ -82,10 +105,14 @@ class RotatingStderrLog:
         async def append(chunk: bytes) -> bool:
             nonlocal dropped_bytes, drop_episode
             marker_bytes = dropped_bytes
-            if not await asyncio.to_thread(self._append, chunk, marker_bytes):
+            written = await asyncio.to_thread(self._append, chunk, marker_bytes)
+            if written is None:
                 return False
             dropped_bytes -= marker_bytes
-            if dropped_bytes == 0:
+            omitted = len(chunk) - written
+            if omitted:
+                record_drop(omitted)
+            elif dropped_bytes == 0:
                 drop_episode = False
             return True
 
@@ -136,31 +163,26 @@ class RotatingStderrLog:
         if directory_fd >= 0 or lock_fd >= 0:
             await asyncio.to_thread(_close_fds, directory_fd, lock_fd)
 
-    def _append(self, data: bytes, dropped_bytes: int = 0) -> bool:
+    def _append(self, data: bytes, dropped_bytes: int = 0) -> int | None:
         try:
             with self._locked():
-                marker = (
-                    f"[zeta: dropped {dropped_bytes} bytes of stderr]\n".encode()
-                    if dropped_bytes
-                    else b""
-                )
-                payload = marker + data
+                marker = _loss_marker(dropped_bytes) if dropped_bytes else b""
                 fd = self._open_log(0, create=True)
                 try:
-                    if os.fstat(fd).st_size + len(payload) > MCP_STDERR_LOG_FILE_BYTES:
+                    if os.fstat(fd).st_size + len(marker) > MCP_STDERR_LOG_FILE_BYTES:
                         os.close(fd)
                         fd = -1
                         self._rotate()
                         fd = self._open_log(0, create=True)
                     available = MCP_STDERR_LOG_FILE_BYTES - os.fstat(fd).st_size
-                    if available > 0:
-                        write_all(fd, payload[:available])
+                    data_to_write = _fit_stderr_data(data, available - len(marker))
+                    write_all(fd, marker + data_to_write)
                 finally:
                     if fd >= 0:
                         os.close(fd)
         except _FileLockTimeout:
-            return False
-        return True
+            return None
+        return len(data_to_write)
 
     def _normalize_existing(self) -> None:
         for index in range(MCP_STDERR_LOG_FILE_COUNT):
