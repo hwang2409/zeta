@@ -22,6 +22,7 @@ def test_disabled_facade_does_not_import_opentelemetry() -> None:
 
 
 def test_hostile_environment_does_not_disable_private_configuration(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    pytest.importorskip("opentelemetry")
     from opentelemetry.exporter.otlp.proto.http import trace_exporter
     from opentelemetry.sdk.trace.export import SpanExportResult
 
