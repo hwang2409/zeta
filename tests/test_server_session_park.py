@@ -75,11 +75,12 @@ async def _open(server: ZetaServer, features: list[str]) -> Client:
 
 
 async def _until(predicate: Callable[[], bool], what: str) -> None:
-    async def wait() -> None:
-        while not predicate():
-            await asyncio.sleep(0)
-
-    await await_or_fail(wait(), what=what)
+    try:
+        async with asyncio.timeout(10):
+            while not predicate():
+                await asyncio.sleep(0)
+    except TimeoutError:
+        raise AssertionError(f"timed out waiting for {what}") from None
 
 
 async def _closed(server: ZetaServer, session_id: str) -> None:
