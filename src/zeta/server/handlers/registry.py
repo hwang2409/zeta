@@ -613,6 +613,7 @@ async def dispatch(
         else None
     )
     if policy is Resolve.OWNED_FIRST:
+        # legacy order: a mutation's health error precedes its version/feature error
         controller.control._reject_if_unhealthy()  # type: ignore[union-attr]
         _require_negotiated(client, descriptor)
     if descriptor.access is Access.DELIVERY:
