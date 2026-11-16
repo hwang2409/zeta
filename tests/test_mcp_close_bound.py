@@ -166,6 +166,7 @@ class _RefreshBlockingClient(_LifecycleClient):
         self.refresh_started.set()
         while not self.gate.is_set():
             try:
+                # test-contract: durability models a refresh that ignores cancellation
                 await self.gate.wait()
             except asyncio.CancelledError:
                 task = asyncio.current_task()
@@ -199,6 +200,7 @@ async def test_repeated_rebinds_keep_abandoned_closes_bounded(
         created.append(task)
         return task
 
+    # test-contract: seam record each scheduled close so the test can await them
     monkeypatch.setattr(MCPServerActor, "_schedule_close", record_schedule)
 
     actor = MCPServerActor(
