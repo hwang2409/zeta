@@ -212,6 +212,7 @@ class ServeControl:
                 allow_assistant_reset=allow_assistant_reset,
             )
         )
+        self._turn_task.add_done_callback(self._turn_done)
         connections = self.server.connections
         session_id = self.runtime.session_id
         if connections is not None and session_id is not None:
@@ -219,6 +220,39 @@ class ServeControl:
 
     def unhealthy(self) -> bool:
         return self._approvals.state.health is not None
+
+    @property
+    def attached(self) -> bool:
+        """This pair is the client's session; a parked pair sends no frame."""
+        return self.server.control is self
+
+    def holds_work(self) -> bool:
+        """Closing this pair now would cut work: a turn, a wake, an approval, a
+        background child or task, or a task exit not yet delivered."""
+        loop = self.runtime.loop
+        if loop is None:
+            return False
+        return (
+            any(
+                task is not None and not task.done()
+                for task in (self._turn_task, self._turn_handoff_task)
+            )
+            or loop.notification_turn_state != "idle"
+            or self.has_pending_approvals()
+            or loop.has_running_work
+            or any(
+                record.receipt_pending
+                for record in loop.tool_registry.background_tasks.records
+            )
+        )
+
+    def _turn_done(self, _task: asyncio.Task[None]) -> None:
+        self._maybe_idle()
+
+    def _maybe_idle(self) -> None:
+        """Ask the server to close this pair once it is parked and idle; loop thread only."""
+        if self in self.server._parked.values():
+            asyncio.get_running_loop().call_soon(self.server._close_if_idle, self)
 
     def _reject_if_unhealthy(self) -> None:
         self._approvals.reject_if_unhealthy()
@@ -642,7 +676,7 @@ class ServeControl:
         """
         self.in_flight.end_run()
         connections = self.server.connections
-        if connections is not None and session_id is not None:
+        if connections is not None and session_id is not None and self.attached:
             connections.release_deferred_replay(session_id, close=True)
 
     async def _run_blocking(self, job: Callable[[], object]) -> object:
@@ -692,6 +726,7 @@ class ServeControl:
             self._turn_task = asyncio.create_task(
                 self._resume_tool(core_key, host_commands, turn_id=uuid.uuid4().hex)
             )
+            self._turn_task.add_done_callback(self._turn_done)
         return result
 
     async def _publish_session_grant(self, tool: str) -> None:
@@ -704,7 +739,7 @@ class ServeControl:
     async def publish_session_grant_change(self, change: SessionGrantChange) -> None:
         connections = self.server.connections
         session_id = self.runtime.session_id
-        if connections is None or session_id is None:
+        if connections is None or session_id is None or not self.attached:
             return
         await connections.publish_feature_event(
             FEATURE, EVENT, session_id, data=event_data(change, session_id)
@@ -893,6 +928,7 @@ class ServeControl:
                 session_id, host_commands, turn_id=uuid.uuid4().hex
             )
         )
+        self._turn_task.add_done_callback(self._turn_done)
 
     async def _run_notification_turn(
         self,
@@ -1263,6 +1299,7 @@ class ServeControl:
 
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
         """Schedule child events from the loop's synchronous sink."""
+        self._maybe_idle()
         if not self.closing:
             asyncio.create_task(
                 self._event(event, session_id=session_id, background=True)
@@ -1273,6 +1310,8 @@ class ServeControl:
         if connections is None:
             return
         def publish() -> None:
+            # the sink may run on a worker thread; check idleness on the loop
+            self._maybe_idle()
             controller = connections.controller_metadata()
             if not self.closing and controller is not None and "run_work" in controller.features:
                 if event is EventDescriptor.BACKGROUND_TASK_UPDATED:
@@ -1305,7 +1344,7 @@ class ServeControl:
         self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> object:
         connections = getattr(self.server, "connections", None)
-        if connections is None:
+        if connections is None or not self.attached:
             from .connections import Admission
 
             return Admission("no_controller")
@@ -1319,7 +1358,7 @@ class ServeControl:
         if session_id is None and self.runtime.opened is not None:
             session_id = self.runtime.session_id
         connections = self.server.connections
-        if connections is None:
+        if connections is None or not self.attached:
             return False
         return await connections.publish_controller(event, session_id, **fields)
 

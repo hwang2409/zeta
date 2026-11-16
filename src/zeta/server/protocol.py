@@ -283,6 +283,7 @@ FEATURES = (
     "resume_attach",
     "turn_reconnect",
     "in_flight_replay",
+    "session_park",
 )
 
 
