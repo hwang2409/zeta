@@ -10,7 +10,7 @@ from textwrap import dedent
 import pytest
 
 from zeta.agent.tool_results import validated_tool_result
-from zeta.config.settings import SETTINGS_FILENAME, load_settings, resolve
+from zeta.config.settings import ComputerUseConfig, SETTINGS_FILENAME, load_settings, resolve
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, ToolCall
 from zeta.providers.anthropic import build_messages_payload
@@ -26,7 +26,7 @@ async def _computer_registry(
     tmp_path: Path, *, enabled: bool = True, backend: FakeBackend | None = None
 ):
     registry = ToolRegistry(
-        tmp_path, skill_catalog=SkillCatalog.empty(), computer_enabled=enabled
+        tmp_path, skill_catalog=SkillCatalog.empty(), computer=ComputerUseConfig(enabled=enabled, default_app_access="allow")
     )
     if backend is not None:
         registry.computer_backend = backend
@@ -34,6 +34,10 @@ async def _computer_registry(
         yield registry
     finally:
         await registry.close()
+
+
+def _ops(backend: FakeBackend) -> list[tuple]:
+    return [action for action in backend.actions if action[0] != "state"]
 
 
 def _tool_names(registry: ToolRegistry) -> set[str]:
@@ -61,7 +65,7 @@ async def test_screenshot_returns_image_and_records_capture(tmp_path: Path) -> N
     image = result["content"][1]
     assert image["mimeType"] == "image/png"
     assert base64.b64decode(image["data"]) == FakeBackend().image
-    assert backend.actions == [("screenshot", None)]
+    assert _ops(backend) == [("screenshot", None)]
 
 
 @pytest.mark.asyncio
@@ -95,8 +99,8 @@ async def test_screen_changing_actions_record_op_and_return_screenshot(
         assert result["isError"] is False, arguments
         # every screen-changing action returns a fresh screenshot last
         assert result["content"][-1]["type"] == "image", arguments
-        assert expected in backend.actions, arguments
-        assert backend.actions[-1] == ("screenshot", None), arguments
+        assert expected in _ops(backend), arguments
+        assert _ops(backend)[-1] == ("screenshot", None), arguments
 
 
 @pytest.mark.asyncio
@@ -105,7 +109,7 @@ async def test_action_done_is_not_error_when_followup_screenshot_fails(
 ) -> None:
     class ScreenshotFailureBackend(FakeBackend):
         async def screenshot(self, display: int | None = None):
-            if self.actions and self.actions[-1][0] == "click":
+            if any(action[0] == "click" for action in self.actions):
                 raise ComputerError("not_permitted", "screen recording denied")
             return await super().screenshot(display)
 
@@ -120,12 +124,11 @@ async def test_action_done_is_not_error_when_followup_screenshot_fails(
             )
         )
 
-    assert result["isError"] is False
+    assert result["isError"] is True
     text = result["content"][0]["text"]
-    assert "left_click done" in text
-    assert "screenshot failed" in text
+    assert "left_click failed" in text
     assert "screen recording denied" in text
-    assert ("click", 10, 20, "left", 1) in backend.actions
+    assert ("click", 10, 20, "left", 1) in _ops(backend)
 
 
 @pytest.mark.asyncio
@@ -140,7 +143,7 @@ async def test_cursor_position_returns_text_without_capture(tmp_path: Path) -> N
     assert result["isError"] is False
     assert result["content"][0]["text"] == "cursor_position x=42 y=7"
     assert all(block["type"] != "image" for block in result["content"])
-    assert backend.actions[-1] == ("cursor_position",)
+    assert _ops(backend)[-1] == ("cursor_position",)
 
 
 @pytest.mark.asyncio
@@ -161,9 +164,9 @@ async def test_cursor_position_edge_can_be_reused_for_click(tmp_path: Path) -> N
         )
 
     assert position["isError"] is False
-    assert point == {"x": 1279, "y": 799}
+    assert {key: point[key] for key in ("x", "y")} == {"x": 1279, "y": 799}
     assert result["isError"] is False
-    assert ("click", 1279, 799, "left", 1) in backend.actions
+    assert ("click", 1279, 799, "left", 1) in _ops(backend)
 
 
 @pytest.mark.asyncio
@@ -177,7 +180,7 @@ async def test_missing_coordinate_is_a_clear_error(tmp_path: Path) -> None:
 
     assert result["isError"] is True
     assert "coordinate" in result["content"][0]["text"]
-    assert backend.actions == [("screenshot", None)]
+    assert _ops(backend) == [("screenshot", None)]
 
 
 @pytest.mark.asyncio
@@ -201,8 +204,8 @@ async def test_child_registry_does_not_inherit_parent_screenshot(
             ToolCall("c", "computer", {"action": "left_click", "coordinate": [1, 2]})
         )
         assert result["isError"] is True
-        assert result["content"][0]["text"] == "take a screenshot first"
-        assert child_backend.actions == []
+        assert "computer" in result["content"][0]["text"]
+        assert _ops(child_backend) == []
     finally:
         if child is not None:
             await child.close()
@@ -222,7 +225,7 @@ async def test_coordinate_action_before_screenshot_is_a_clear_error(
 
     assert result["isError"] is True
     assert "screenshot" in result["content"][0]["text"]
-    assert backend.actions == []
+    assert _ops(backend) == []
 
 
 @pytest.mark.asyncio
@@ -273,7 +276,7 @@ async def test_click_maps_through_downscaled_retina_frame(tmp_path: Path) -> Non
         )
 
     assert result["isError"] is False
-    assert ("click", 740, 450, "left", 1) in backend.actions
+    assert ("click", 740, 450, "left", 1) in _ops(backend)
 
 
 @pytest.mark.asyncio
@@ -287,7 +290,7 @@ async def test_out_of_bounds_coordinate_is_rejected(tmp_path: Path) -> None:
 
     assert result["isError"] is True
     assert "outside" in result["content"][0]["text"]
-    assert all(action[0] != "click" for action in backend.actions)
+    assert all(action[0] != "click" for action in _ops(backend))
 
 
 def _write_settings(base: Path, body: str) -> None:

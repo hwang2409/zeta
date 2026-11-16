@@ -48,7 +48,7 @@ from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from ..agent.budget import DEFAULT_MAX_AGENT_DEPTH, HARD_MAX_AGENT_DEPTH
 from ..core.approval import parse_approval_rule
@@ -108,7 +108,8 @@ _PROJECT_SAFE_KEYS = frozenset(
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _INBOX_KEYS = frozenset({"enabled"})
-_COMPUTER_KEYS = frozenset({"enabled"})
+_COMPUTER_KEYS = frozenset({"enabled", "persist_screenshots", "indicator", "kill_switch", "default_app_access", "macos"})
+_COMPUTER_MACOS_KEYS = frozenset({"bundle_ids"})
 _ANTHROPIC_KEYS = frozenset({"oauth_compat"})
 _COMMAND_KEYS = frozenset({"command_niceness"})
 _AGENTS_KEYS = frozenset({"explicit_finish", "max_depth"})
@@ -116,8 +117,24 @@ _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True)
+class ComputerUseConfig:
+    enabled: bool = False
+    persist_screenshots: bool = False
+    indicator: bool = True
+    kill_switch: bool = True
+    default_app_access: Literal["allow", "deny"] = "deny"
+    bundle_ids: Mapping[str, Literal["allow", "deny"]] = field(
+        default_factory=lambda: _EMPTY_MAPPING
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     """Validated settings from the merged global+project files."""
+
+    @property
+    def computer_enabled(self) -> bool:
+        return self.computer.enabled
 
     provider: str | None = None
     model: str | None = None
@@ -134,7 +151,7 @@ class Settings:
     ollama_base_url: str | None = None
     auto_project: bool | None = None
     inbox_enabled: bool | None = None
-    computer_enabled: bool | None = None
+    computer: ComputerUseConfig = field(default_factory=ComputerUseConfig)
     anthropic_oauth_compat: bool | None = None
     agents_explicit_finish: bool | None = None
     agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
@@ -158,6 +175,10 @@ class Settings:
 class ResolvedConfig:
     """CLI-vs-settings-vs-default resolution for one session."""
 
+    @property
+    def computer_enabled(self) -> bool:
+        return self.computer.enabled
+
     provider: str
     model: str | None
     yolo: bool
@@ -172,7 +193,7 @@ class ResolvedConfig:
     workspace_snapshot_cap: int | None = None
     auto_project: bool = True
     inbox_enabled: bool = True
-    computer_enabled: bool = False
+    computer: ComputerUseConfig = field(default_factory=ComputerUseConfig)
     agents_explicit_finish: bool = False
     agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
     tool_allow: tuple[str, ...] | None = None
@@ -333,7 +354,7 @@ def resolve(
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
         auto_project=settings.auto_project is not False,
         inbox_enabled=settings.inbox_enabled is not False,
-        computer_enabled=settings.computer_enabled is True,
+        computer=settings.computer,
         agents_explicit_finish=settings.agents_explicit_finish is True,
         agents_max_depth=settings.agents_max_depth,
         tool_allow=settings.tool_allow if cli_allow is None else cli_allow,
@@ -635,7 +656,7 @@ def _validate(
         ollama_base_url=ollama_base_url,
         auto_project=auto_project,
         inbox_enabled=inbox_enabled,
-        computer_enabled=computer_enabled,
+        computer=computer_enabled,
         anthropic_oauth_compat=anthropic_oauth_compat,
         agents_explicit_finish=agents_explicit_finish,
         agents_max_depth=agents_max_depth,
@@ -672,16 +693,54 @@ def _validated_inbox(
 
 def _validated_computer(
     data: Mapping[str, Any], notices: list[str]
-) -> bool | None:
+) -> ComputerUseConfig:
     if "computer" not in data:
-        return None
+        return ComputerUseConfig()
     table = data["computer"]
     if not isinstance(table, Mapping):
         notices.append("settings · ignored key 'computer': expected table")
-        return None
+        return ComputerUseConfig()
     for key in table.keys() - _COMPUTER_KEYS:
         notices.append(f"settings · ignored unknown key 'computer.{key}'")
-    return _validated_bool(table, "enabled", notices)
+    enabled = _validated_bool(table, "enabled", notices) is True
+    persist = _validated_bool(table, "persist_screenshots", notices) is True
+    indicator = _validated_bool(table, "indicator", notices)
+    if indicator is False:
+        notices.append("settings · computer.indicator=false is not supported; using true")
+    kill_switch = _validated_bool(table, "kill_switch", notices)
+    if kill_switch is False:
+        notices.append("settings · computer.kill_switch=false is not supported; using true")
+    default = table.get("default_app_access", "deny")
+    if default not in {"allow", "deny"}:
+        notices.append("settings · ignored computer.default_app_access: expected 'allow' or 'deny'")
+        default = "deny"
+    elif default == "allow":
+        notices.append("settings · computer.default_app_access=allow is not supported; using deny")
+        default = "deny"
+    macos = table.get("macos", {})
+    bundles: dict[str, Literal["allow", "deny"]] = {}
+    if not isinstance(macos, Mapping):
+        notices.append("settings · ignored key 'computer.macos': expected table")
+    else:
+        for key in macos.keys() - _COMPUTER_MACOS_KEYS:
+            notices.append(f"settings · ignored unknown key 'computer.macos.{key}'")
+        raw = macos.get("bundle_ids", {})
+        if not isinstance(raw, Mapping):
+            notices.append("settings · ignored key 'computer.macos.bundle_ids': expected table")
+        else:
+            for bundle, access in raw.items():
+                if not isinstance(bundle, str) or not bundle or not isinstance(access, str) or access not in {"allow", "deny"}:
+                    notices.append(f"settings · ignored invalid computer bundle rule {bundle!r}")
+                else:
+                    bundles[bundle] = cast(Literal["allow", "deny"], access)
+    return ComputerUseConfig(
+        enabled=enabled,
+        persist_screenshots=persist,
+        indicator=True,
+        kill_switch=True,
+        default_app_access=cast(Literal["allow", "deny"], default),
+        bundle_ids=MappingProxyType(bundles),
+    )
 
 
 def _validated_anthropic(

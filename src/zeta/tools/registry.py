@@ -224,6 +224,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         project_id: str | None = None,
         project_registry: Any = None,
         inbox_enabled: bool = True,
+        computer: Any = None,
         computer_enabled: bool = False,
         tool_allow: Sequence[str] | None = None,
         tool_deny: Sequence[str] = (),
@@ -263,7 +264,11 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         self.project_registry_state: ProjectRegistryState | None = None
         self.inbox_enabled = inbox_enabled
         self.inbox_target_ids: frozenset[str] | None = None
-        self.computer_enabled = computer_enabled
+        if computer is None:
+            from ..config.settings import ComputerUseConfig
+            computer = ComputerUseConfig(enabled=computer_enabled, default_app_access="allow")
+        self.computer_config = computer
+        self.computer_enabled = self.computer_config.enabled
         # The one OS seam for the computer tool; set by composition when a real
         # backend exists, or by tests injecting a FakeBackend. None means the
         # enabled tool reports that no backend is available on this machine.
