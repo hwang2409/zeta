@@ -52,9 +52,10 @@ class StatusCell:
 
 
 class _Exporter:
-    def __init__(self, delegate: object, cell: StatusCell) -> None:
+    def __init__(self, delegate: object, cell: StatusCell, session: object) -> None:
         self._delegate = delegate
         self._cell = cell
+        self._session = session
 
     def export(self, spans: object) -> object:
         from opentelemetry.sdk.trace.export import SpanExportResult
@@ -72,6 +73,7 @@ class _Exporter:
 
     def shutdown(self) -> None:
         self._delegate.shutdown()
+        self._session.close()
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         return self._delegate.force_flush(timeout_millis)
@@ -172,7 +174,7 @@ def configure(endpoint: str) -> _Runtime:
     session.trust_env = False
     cell = StatusCell()
     delegate = OTLPSpanExporter(endpoint=endpoint, headers={}, timeout=5, session=session)
-    exporter = _Exporter(delegate, cell)
+    exporter = _Exporter(delegate, cell, session)
     limits = SpanLimits(
         max_attributes=128,
         max_events=128,

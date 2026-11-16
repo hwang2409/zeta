@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import http.server
+import logging
 import os
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
 
-telemetry = pytest.importorskip("zeta.telemetry")
+from zeta import telemetry
 
 
 def test_disabled_facade_does_not_import_opentelemetry() -> None:
@@ -21,8 +24,7 @@ def test_disabled_facade_does_not_import_opentelemetry() -> None:
     assert result.returncode == 0
 
 
-def test_hostile_environment_does_not_disable_private_configuration(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    pytest.importorskip("opentelemetry")
+def test_hostile_environment_does_not_disable_private_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
     from opentelemetry.exporter.otlp.proto.http import trace_exporter
     from opentelemetry.sdk.trace.export import SpanExportResult
 
@@ -57,10 +59,76 @@ def test_hostile_environment_does_not_disable_private_configuration(monkeypatch:
     assert set(carrier) <= {"traceparent", "tracestate"}
 
 
+def test_transport_ignores_proxy_and_redirects() -> None:
+    received = threading.Event()
+
+    class RedirectHandler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.set()
+            self.send_response(302)
+            self.send_header("Location", "http://127.0.0.2:4318/v1/traces")
+            self.end_headers()
+
+        def log_message(self, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    try:
+        os.environ["HTTP_PROXY"] = "http://127.0.0.2:1"
+        os.environ["HTTPS_PROXY"] = "http://127.0.0.2:1"
+        endpoint = f"http://127.0.0.1:{server.server_port}/v1/traces"
+        instance = telemetry.Telemetry.configure(endpoint)
+        with instance.turn_span():
+            pass
+        instance.shutdown()
+        assert received.wait(5)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(5)
+        os.environ.pop("HTTP_PROXY", None)
+        os.environ.pop("HTTPS_PROXY", None)
+
+
 def test_sdk_disabled_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OTEL_SDK_DISABLED", " true ")
     with pytest.raises(telemetry.TelemetryError, match="OTEL_SDK_DISABLED cannot disable"):
         telemetry.Telemetry.configure("http://127.0.0.1:4318/v1/traces")
+
+
+def test_shutdown_is_synchronous_and_export_failure_is_not_logged(monkeypatch: pytest.MonkeyPatch) -> None:
+    from opentelemetry.exporter.otlp.proto.http import trace_exporter
+    from opentelemetry.sdk.trace.export import SpanExportResult
+
+    stopped = threading.Event()
+
+    class FailingExporter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def export(self, _spans):
+            return SpanExportResult.FAILURE
+
+        def shutdown(self):
+            stopped.set()
+
+    monkeypatch.setattr(trace_exporter, "OTLPSpanExporter", FailingExporter)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    app_logger = logging.getLogger("zeta.telemetry.test")
+    app_logger.addHandler(handler)
+    try:
+        instance = telemetry.Telemetry.configure("http://127.0.0.1:4318/v1/traces")
+        with instance.turn_span():
+            pass
+        instance.shutdown()
+        assert stopped.is_set()
+        assert not records
+    finally:
+        app_logger.removeHandler(handler)
 
 
 def test_loopback_and_one_slot() -> None:
