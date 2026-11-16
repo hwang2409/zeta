@@ -21,7 +21,7 @@ from prompt_toolkit.layout.containers import (
     Window,
     to_container,
 )
-from prompt_toolkit.layout.controls import FormattedTextControl, UIControl
+from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.menus import CompletionsMenu, MultiColumnCompletionsMenu
 from prompt_toolkit.layout.mouse_handlers import MouseHandler, MouseHandlers
 from prompt_toolkit.layout.screen import Char, Screen, WritePosition
@@ -35,6 +35,7 @@ from ..core.session import _preview_text
 from ..core.slash import context_window
 from . import theme
 from .agent_card import AgentNavigation
+from .cards.picker_card import PickerCardControl
 from .composer import status_formatted_text, vim_state_label
 from .render import format_status
 from .todo import TODO_PAD_BOTTOM, VISIBLE_ROWS, TodoWidget
@@ -581,7 +582,7 @@ def full_screen_content(
     queued_messages: Callable[[], Sequence[str]] = tuple,
     decisions_answer_window: AnyContainer | None = None,
     overlay_field_windows: Sequence[AnyContainer] = (),
-    picker_card: UIControl | None = None,
+    picker_card: PickerCardControl | None = None,
 ) -> FloatContainer:
     """Transcript over composer chrome, with the command menu floating above it."""
 
@@ -653,7 +654,7 @@ def full_screen_content(
             VSplit(
                 [
                     Window(width=CONTENT_MARGIN, char=" "),
-                    Window(picker_card, dont_extend_height=True),
+                    Window(picker_card, height=picker_card.height, dont_extend_height=True),
                     Window(width=CONTENT_MARGIN, char=" "),
                 ]
             )

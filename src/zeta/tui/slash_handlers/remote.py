@@ -23,7 +23,7 @@ from ...remote.discovery import (
 )
 from ...remote.wire import RemoteWireError
 from .. import theme
-from ..cards.picker_card import SELECTED_MARKER
+from ..cards.picker_card import HINT_MARKER, SELECTED_MARKER
 from ..checkpoints import render_replayed_message
 from ..transcript import TranscriptPresenter, TranscriptWidget
 from ..user import displayed_user_text, user_message
@@ -46,7 +46,7 @@ class RemotePicker:
         for index, row in enumerate(self.rows):
             marker = SELECTED_MARKER if index == self.index else "  "
             lines.append(Text(f"{marker}{row.host} · {row.name or row.session_id[:8]} · {row.state or 'unknown'}"))
-        lines.append(Text("↑/↓ move · enter select · esc cancel", style=theme.AFFORDANCE))
+        lines.append(Text(f"{HINT_MARKER} move · enter select · esc cancel", style=theme.AFFORDANCE))
         return Panel(
             Group(*lines),
             border_style=theme.ACCENT,

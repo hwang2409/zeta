@@ -17,10 +17,10 @@ from rich.text import Text
 
 from ...core.slash import context_window
 from .. import theme
-from ..cards.picker_card import SELECTED_MARKER
+from ..cards.picker_card import HINT_MARKER, SELECTED_MARKER
 
 MAX_VISIBLE_ROWS = 12
-HINT = "↑/↓ move · enter select · esc cancel · or /model <name>"
+HINT = f"{HINT_MARKER} move · enter select · esc cancel · or /model <name>"
 
 
 def _format_window(tokens: int) -> str:

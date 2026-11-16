@@ -13,6 +13,7 @@ from io import StringIO
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.formatted_text.utils import split_lines
+from prompt_toolkit.layout import Dimension
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from rich.console import Console, RenderableType
 
@@ -20,7 +21,9 @@ from ..theme import RICH_THEME
 
 # The highlighted row of every picker starts with this marker.
 SELECTED_MARKER = "❯ "
-# Kept rows at each end of a cropped card: border and header, hint and border.
+# Every picker's key hint, its last row, starts with this marker.
+HINT_MARKER = "↑/↓"
+# Kept rows at the top of a cropped card: border and header.
 _EDGE_ROWS = 2
 
 FragmentLine = list[tuple[str, str]]
@@ -34,31 +37,44 @@ def card_height_cap(terminal_rows: int) -> int:
 
 
 def crop_card(lines: list[FragmentLine], cap: int) -> list[FragmentLine]:
-    """Keep both card edges and the rows around the highlighted one."""
+    """Keep both card edges and the rows around the highlighted one.
+
+    The bottom edge is the key hint, however many lines it wraps to, and the
+    border under it.
+    """
 
     if len(lines) <= cap:
         return lines
-    body = lines[_EDGE_ROWS:-_EDGE_ROWS]
+    bottom = _bottom_edge_rows(lines)
+    body = lines[_EDGE_ROWS:-bottom]
     # A screen too short for the elision lines keeps the selected row instead.
-    room = max(1, cap - _EDGE_ROWS * 2)
+    room = max(1, cap - _EDGE_ROWS - bottom)
     selected = next(
-        (
-            index
-            for index, line in enumerate(body)
-            if SELECTED_MARKER in "".join(text for _style, text in line)
-        ),
+        (index for index, line in enumerate(body) if SELECTED_MARKER in _text(line)),
         0,
     )
     start = max(0, min(selected - room // 2, len(body) - room))
     shown = body[start : start + room]
-    if room < 3:
-        return [*lines[:_EDGE_ROWS], *shown, *lines[-_EDGE_ROWS:]]
-    # The first and last shown rows say how many rows the crop hides.
-    if start:
-        shown[0] = _elision(shown[0], f"… {start + 1} more above")
-    if start + room < len(body):
-        shown[-1] = _elision(shown[-1], f"… {len(body) - start - room + 1} more below")
-    return [*lines[:_EDGE_ROWS], *shown, *lines[-_EDGE_ROWS:]]
+    if room >= 3:
+        # The first and last shown rows say how many rows the crop hides.
+        if start:
+            shown[0] = _elision(shown[0], f"… {start + 1} more above")
+        if start + room < len(body):
+            shown[-1] = _elision(shown[-1], f"… {len(body) - start - room + 1} more below")
+    return [*lines[:_EDGE_ROWS], *shown, *lines[-bottom:]]
+
+
+def _bottom_edge_rows(lines: list[FragmentLine]) -> int:
+    """Rows from the key hint's first line to the bottom border."""
+
+    for index in range(len(lines) - 1, _EDGE_ROWS - 1, -1):
+        if _text(lines[index]).strip("│ ").startswith(HINT_MARKER):
+            return len(lines) - index
+    return 2
+
+
+def _text(line: FragmentLine) -> str:
+    return "".join(text for _style, text in line)
 
 
 def _elision(line: FragmentLine, text: str) -> FragmentLine:
@@ -81,10 +97,24 @@ class PickerCardControl(UIControl):
 
     def __init__(self, card: Callable[[], RenderableType | None]) -> None:
         self._card = card
+        self._width: int | None = None
+
+    def height(self) -> Dimension:
+        """The card's rows, up to half the screen, as the window's minimum.
+
+        A split hands out rows one at a time in turn up to each child's
+        preferred height, so with only a preferred height the card would share
+        rows with the transcript and lose its selected row and its hint.
+        """
+
+        size = get_app().output.get_size()
+        lines = self.lines(self._width or size.columns, size.rows)
+        return Dimension(min=min(len(lines), size.rows // 2))
 
     def lines(self, width: int, height: int) -> list[FragmentLine]:
         """The card cropped to half the terminal and to ``height``, the window's room."""
 
+        self._width = width
         renderable = self._card()
         if renderable is None:
             return []
@@ -117,4 +147,4 @@ class PickerCardControl(UIControl):
         return False
 
 
-__all__ = ["SELECTED_MARKER", "PickerCardControl", "card_height_cap", "crop_card"]
+__all__ = ["HINT_MARKER", "SELECTED_MARKER", "PickerCardControl", "card_height_cap", "crop_card"]

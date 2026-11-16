@@ -11,10 +11,10 @@ from rich.text import Text
 from ...accounts import AccountId
 from ...accounts.usage import UsageState, format_usage_lines
 from .. import theme
-from ..cards.picker_card import SELECTED_MARKER
+from ..cards.picker_card import HINT_MARKER, SELECTED_MARKER
 
-HINT = "↑/↓ · enter · l login · x logout · r refresh · d default · n rename · esc"
-VIEW_ONLY_HINT = "↑/↓ · r refresh · esc"
+HINT = f"{HINT_MARKER} · enter · l login · x logout · r refresh · d default · n rename · esc"
+VIEW_ONLY_HINT = f"{HINT_MARKER} · r refresh · esc"
 
 
 @dataclass

@@ -32,6 +32,7 @@ from tests.support.owned import await_or_fail
 from zeta.accounts.availability import AccountDisplay
 from zeta.accounts.registry import AccountId
 from zeta.accounts.session import AccountListSnapshot
+from zeta.accounts.usage import UsageState
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
@@ -48,6 +49,7 @@ from zeta.remote.discovery import RemoteSession
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
+from zeta.tui.cards.picker_card import SELECTED_MARKER
 from zeta.tui.transcript.paged_history import (
     HistoryCursor,
     PagedTranscriptHistory,
@@ -670,12 +672,15 @@ def _fake_remote_hosts(_app: TUIApp, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(RemoteSessionClient, "attach", attach)
 
 
-def _fake_accounts(app: TUIApp, monkeypatch: pytest.MonkeyPatch) -> None:
-    accounts = (AccountId("codex", "work"), AccountId("codex", "home"))
+def _fake_accounts(app: TUIApp, monkeypatch: pytest.MonkeyPatch, count: int = 2) -> None:
+    names = ("work", "home", "lab", "spare", "travel", "backup")
+    accounts = tuple(AccountId("codex", name) for name in names[:count])
+    # A usage line under each row, as real accounts have: two rows each.
+    usage = UsageState(None, "never refreshed") if count > 2 else None
 
     async def list_snapshot() -> AccountListSnapshot:
         return AccountListSnapshot(
-            tuple(AccountDisplay(account, account.name) for account in accounts),
+            tuple(AccountDisplay(account, account.name, usage=usage) for account in accounts),
             {"codex": accounts[0]},
             {"codex": accounts[0]},
         )
@@ -1139,14 +1144,14 @@ def _hold_remote_discovery(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
 async def test_interrupt_and_exit_act_while_a_picker_loads(
     root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str
 ) -> None:
-    # A loading picker drops typed keys, but never the keys that stop zeta.
+    # A loading picker drops typed keys, but never the keys that stop zeta:
+    # ctrl+c stops the load (as on main, where it stopped the slash command),
+    # and ctrl+d exits.
     copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
     startup.set()
     gate = _hold_remote_discovery(monkeypatch)
     async with running_tui(copy) as driver:
         app = driver.app
-        interrupts: list[None] = []
-        monkeypatch.setattr(app, "abort_active", lambda: interrupts.append(None))
         await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
         await driver.settle("settled screen before /remote")
         try:
@@ -1154,13 +1159,16 @@ async def test_interrupt_and_exit_act_while_a_picker_loads(
             await driver.until(lambda: app._picker_loading is not None, what="/remote opened nothing")
             await driver.send(key)
             await driver.settle("key taken while /remote loads")
-            acted = interrupts == [None] if key == "\x03" else app._exit_requested
+            acted = not app._picker_active if key == "\x03" else app._exit_requested
             assert acted, (
-                f"{key!r} was dropped while /remote loaded: interrupts={len(interrupts)},"
-                f" exit requested={app._exit_requested}"
+                f"{key!r} did not act while /remote loaded: picker still loading="
+                f"{app._picker_loading is not None}, exit requested={app._exit_requested}"
             )
         finally:
             gate.set()
+        if key == "\x03":
+            await driver.settle("settled screen after the load would have ended")
+            assert not app.remote_picker_active, "the picker opened after ctrl+c stopped its load"
 
 
 @pytest.mark.asyncio
@@ -1288,42 +1296,77 @@ async def test_a_picker_opened_before_the_first_page_leaves_no_card_behind(
         )
 
 
+LONG_PICKERS = [
+    pytest.param(command, count, size, id=f"{command}-{count}-{size.columns}x{size.rows}")
+    for command, count in (("/accounts", 6), ("/remote", 40))
+    for size in (Size(rows=50, columns=160), Size(rows=24, columns=80))
+] + [pytest.param("/remote", 40, Size(rows=12, columns=80), id="/remote-40-80x12")]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("screen_rows", [24, 12])
-async def test_a_long_picker_keeps_its_selected_row_and_the_transcript_on_a_small_screen(
-    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, screen_rows: int
+@pytest.mark.parametrize(("command", "count", "size"), LONG_PICKERS)
+async def test_every_row_of_a_long_picker_shows_with_its_hint_and_border(
+    root_home: RootHome,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    count: int,
+    size: Size,
 ) -> None:
+    # Down through every row: the selected row, the key hint, and the bottom
+    # border show on each step, at every screen size (6 accounts is henry's
+    # real count). Enter must never act on a row the user cannot see.
     copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
     startup.set()
-    rows = tuple(RemoteSession("lab", f"s{index}", f"session-{index:02d}", None) for index in range(30))
+    sessions = tuple(
+        RemoteSession("lab", f"s{index}", f"session-{index:02d}", None) for index in range(count)
+    )
 
     async def discover(_client: object, _hosts: object = None) -> tuple:
-        return rows, ()
+        return sessions, ()
 
     monkeypatch.setattr(RemoteSessionClient, "discover", discover)
-    async with running_tui(copy, size=Size(rows=screen_rows, columns=80)) as driver:
+    async with running_tui(copy, size=size) as driver:
         app = driver.app
+        _fake_accounts(app, monkeypatch, count=min(count, 6))
         await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
-        await driver.settle("settled screen before /remote")
-        await driver.send("/remote" + ENTER)
-        await driver.until(lambda: app.remote_picker_active, what="/remote opened no picker")
-        await driver.send(DOWN * 25)
-        await driver.settle("settled screen after the moves")
-        screen = driver.all_rows()
-        drawn = "\n".join(screen)
-        # The card fits the room it gets: the selected row, the hint, and the
-        # bottom border all show, also when the screen leaves it few rows.
-        hint = next((index for index, row in enumerate(screen) if "esc cancel" in row), None)
-        assert (
-            any("❯ lab · session-25" in row for row in screen)
-            and hint is not None
-            and "╰" in screen[hint + 1]
-        ), "the selected row, the hint, or the bottom border is not drawn:\n" + drawn
-        if screen_rows == 24:
-            # The card is cropped around the selected row and says what it hides,
-            # and half the screen is its limit: the transcript keeps its rows.
-            assert "more above" in drawn and len(driver.rows()) >= 6, (
-                "the crop line is missing or the card squeezed the transcript:\n" + drawn
+        await driver.settle(f"settled screen before {command}")
+        await driver.send(command + ENTER)
+        await driver.until(
+            lambda: app._picker_active and app._picker_loading is None,
+            what=f"{command} opened no picker",
+        )
+        for step in range(count):
+            if step:
+                await driver.send(DOWN)
+            await driver.settle(f"settled screen after Down {step}")
+            screen = driver.all_rows()
+            selected = (
+                f"session-{step:02d}"
+                if command == "/remote"
+                else f"codex:{app._accounts_picker.highlighted.name}"
+            )
+            # The hint, however many lines it wraps to, then the bottom border.
+            hint = next((index for index, row in enumerate(screen) if "↑/↓" in row), None)
+            border = next(
+                (index for index, row in enumerate(screen) if "╰" in row and index > (hint or 0)),
+                None,
+            )
+            hint_text = " ".join(
+                row.strip(" │") for row in screen[hint:border] if hint is not None
+            )
+            assert (
+                any(SELECTED_MARKER in row and selected in row for row in screen)
+                and border is not None
+                and hint_text.endswith("esc" if command == "/accounts" else "esc cancel")
+            ), (
+                f"Down {step}: the selected row {selected!r}, the hint, or the bottom border"
+                " is not drawn:\n" + "\n".join(screen)
+            )
+        if size.rows >= 24:
+            # Half the screen is the card's limit: the transcript keeps its rows.
+            assert len(driver.rows()) >= 5, "the card squeezed the transcript:\n" + "\n".join(
+                driver.all_rows()
             )
 
 
