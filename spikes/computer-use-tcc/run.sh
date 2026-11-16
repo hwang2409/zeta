@@ -30,18 +30,29 @@ AGENT_ACTIVE=0
 AGENT_DRY_RUN=0
 
 agent_cleanup() {
-  if [ "$AGENT_ACTIVE" -eq 1 ]; then
-    if [ "$AGENT_DRY_RUN" -eq 1 ]; then
-      printf 'dry-run: launchctl bootout gui/%s/%s\n' "$UID" "$AGENT_LABEL"
+  local dir="$AGENT_DIR" active="$AGENT_ACTIVE" dry_run="$AGENT_DRY_RUN"
+  if [ "$active" -eq 1 ] && [ "$dry_run" -eq 0 ]; then
+    launchctl bootout "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$dir" ]; then
+    if [ "$dry_run" -eq 1 ]; then
+      rm -rf "$dir"
+      printf 'dry-run: rm -rf %s\n' "$dir"
     else
-      launchctl bootout "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1 || true
+      rm -rf "$dir"
     fi
   fi
-  if [ -n "$AGENT_DIR" ]; then
-    if [ "$AGENT_DRY_RUN" -eq 1 ]; then printf 'dry-run: rm -rf %s\n' "$AGENT_DIR"; else rm -rf "$AGENT_DIR"; fi
+  if [ "$active" -eq 1 ] && [ "$dry_run" -eq 1 ]; then
+    printf 'dry-run: launchctl bootout gui/%s/%s\n' "$UID" "$AGENT_LABEL"
   fi
   AGENT_ACTIVE=0
   AGENT_DIR=""
+}
+
+agent_finish() {
+  local rc="$1"
+  agent_cleanup
+  return "$rc"
 }
 
 agent_signal() {
@@ -193,9 +204,28 @@ EOF
   if actual="$(classify_rebuild_result "true true" old new 1)"; then status=0; else status=$?; fi
   printf '%-18s %-12s status=%s\n' build-failure "$actual" "$status"
   [ "$actual" = INCONCLUSIVE ] && [ "$status" -eq 2 ] || return 1
-  AGENT_DIR="${TMPDIR:-/tmp}/com.henry.zeta.cuspike-selftest"
-  AGENT_ACTIVE=1; AGENT_DRY_RUN=1
-  agent_cleanup
+  local path mode output status_line
+  for path in agent agent-rebuild; do
+    for mode in success failure timeout; do
+      output="${TMPDIR:-/tmp}/com.henry.zeta.cuspike-selftest-output.$$"
+      AGENT_DRY_RUN=1 AGENT_DRY_RUN_MODE="$mode"
+      if [ "$path" = agent ]; then
+        if cmd_agent check >"$output" 2>&1; then status_line=0; else status_line=$?; fi
+      else
+        if cmd_agent_rebuild adhoc >"$output" 2>&1; then status_line=0; else status_line=$?; fi
+      fi
+      awk '
+        /dry-run: rm -rf / { removed = NR }
+        /dry-run: launchctl bootout / { booted = NR }
+        END { exit !(removed && booted && booted > removed) }
+      ' "$output" || return 1
+      [ -z "$AGENT_DIR" ] || return 1
+      if find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'com.henry.zeta.cuspike.*' -print -quit 2>/dev/null | grep -q .; then return 1; fi
+      printf '%-18s %-12s status=%s cleanup=ok\n' "$path" "$mode" "$status_line"
+      rm -f "$output"
+    done
+  done
+  AGENT_DRY_RUN=0
 }
 
 cmd_check() {
@@ -329,7 +359,7 @@ EOF
 
 cmd_agent() {
   local command="${1:-}"; [ -n "$command" ] || { echo "usage: $0 agent <check|capture|grant>"; return 2; }
-  need_bin || return 1
+  if [ "$AGENT_DRY_RUN" -eq 0 ]; then need_bin || return 1; fi
   case "$command" in check) command=preflight ;; grant) command=request ;; capture) command=preflight ;; *) echo "unknown agent command: $command"; return 2 ;; esac
   AGENT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/com.henry.zeta.cuspike.XXXXXX")" || return 1
   chmod 700 "$AGENT_DIR"
@@ -353,33 +383,51 @@ EOF
 </dict></plist>
 EOF
   AGENT_ACTIVE=1
-  launchctl bootstrap "gui/$UID" "$plist" || return 1
+  if [ "$AGENT_DRY_RUN" -eq 1 ]; then
+    case "${AGENT_DRY_RUN_MODE:-success}" in
+      success) printf 'screen_recording=true accessibility=true\n' >"$AGENT_DIR/stdout"; printf '0\n' >"$AGENT_DIR/done" ;;
+      failure) printf 'helper failed\n' >"$AGENT_DIR/stderr"; printf '7\n' >"$AGENT_DIR/done" ;;
+      timeout) : ;;
+    esac
+  else
+    launchctl bootstrap "gui/$UID" "$plist" || { agent_finish 1; return $?; }
+  fi
   local status=124 done_code
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    if [ -s "$AGENT_DIR/done" ]; then status=0; break; fi
-    sleep 1
-  done
+  if [ "$AGENT_DRY_RUN" -eq 1 ]; then
+    [ -s "$AGENT_DIR/done" ] && status=0
+  else
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if [ -s "$AGENT_DIR/done" ]; then status=0; break; fi
+      sleep 1
+    done
+  fi
   if [ "$status" -eq 0 ]; then
     done_code="$(cat "$AGENT_DIR/done")"
     case "$done_code" in 0|[1-9]|[1-9][0-9]) status="$done_code" ;; *) status=125 ;; esac
   fi
-  launchctl bootout "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1 || true
-  AGENT_ACTIVE=0
   cat "$AGENT_DIR/stdout" "$AGENT_DIR/stderr" 2>/dev/null | tee -a "$RESULTS"
-  return "$status"
+  agent_finish "$status"
+  return "$?"
 }
 
 cmd_agent_rebuild() {
   local mode="${1:-adhoc}"; case "$mode" in adhoc|cert) ;; *) echo "usage: $0 agent-rebuild <adhoc|cert>"; return 2 ;; esac
-  need_bin || return 1
-  local before; before="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
-  local build_rc=0; cmd_build "$mode" >/dev/null || build_rc=$?
-  local after; after="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
+  if [ "$AGENT_DRY_RUN" -eq 0 ]; then need_bin || return 1; fi
+  local before="old" after="new" build_rc=0
+  if [ "$AGENT_DRY_RUN" -eq 0 ]; then
+    before="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
+    cmd_build "$mode" >/dev/null || build_rc=$?
+    after="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
+  fi
   log "## agent-rebuild @ $(ts) mode=$mode"
   log "cdhash before=$before after=$after"
   local out values outcome outcome_rc
-  out="$(cmd_agent check 2>&1)"
-  values="$(_preflight_values "$out")"
+  out="${TMPDIR:-/tmp}/com.henry.zeta.cuspike-rebuild-output.$$"
+  : >"$out"
+  cmd_agent check >"$out" 2>&1 || true
+  values="$(_preflight_values "$(cat "$out")")"
+  cat "$out"
+  rm -f "$out"
   if outcome="$(classify_rebuild_result "$values" "$before" "$after" "$build_rc")"; then outcome_rc=0; else outcome_rc=$?; fi
   log "[$([ "$outcome" = SURVIVED ] && echo PASS || echo "$outcome")] grant $outcome after agent rebuild (mode=$mode): ${values:-malformed}"
   return "$outcome_rc"
