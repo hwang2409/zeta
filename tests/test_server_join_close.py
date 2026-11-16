@@ -214,8 +214,18 @@ async def test_output_writer_failure_closes_connection_and_releases_slot(
         if held:
             raise RuntimeError("injected output writer failure")
 
+    queued = asyncio.Event()
+    enqueue = connections._enqueue
+
+    def watch_enqueue(target: Any, frame: Any, **kwargs: Any) -> None:
+        enqueue(target, frame, **kwargs)
+        if b'"id":4' in frame.payload:
+            queued.set()
+
     # test-contract: seam an unexpected bug inside the output writer task
     monkeypatch.setattr(connections, "_end_frame_write", broken)
+    # test-contract: seam observe the status reply entering the output queue
+    monkeypatch.setattr(connections, "_enqueue", watch_enqueue)
     async with _closing(server, client, resume):
         # a live event: the writer sends it with no caller waiting on it
         connections._publish_observer(
@@ -224,12 +234,9 @@ async def test_output_writer_failure_closes_connection_and_releases_slot(
         await await_or_fail(entered.wait(), what="held frame write started")
         # the request loop's reply waits in the queue behind the held frame
         await client.send(4, "status", {})
-        await await_or_fail(_until(lambda: bool(output.queue)), what="status reply queued")
+        await await_or_fail(queued.wait(), what="status reply queued")
+        assert output.current_frame is not None and HELD_EVENT in output.current_frame.payload
         resume.set()
         await _assert_released_and_reusable(server, transport, output, released)
         assert len(_writer_failures(caplog)) == 1
 
-
-async def _until(condition: Any) -> None:
-    while not condition():
-        await asyncio.sleep(0)
