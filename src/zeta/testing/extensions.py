@@ -16,6 +16,7 @@ called, mirroring the real trust boundary.
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
 import uuid
@@ -63,7 +64,7 @@ class ExtensionKit:
 
     async def aclose(self) -> None:
         await self.registry.close()
-        shutil.rmtree(self._root, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, self._root, ignore_errors=True)
 
 
 def load_extension(
