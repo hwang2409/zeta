@@ -843,7 +843,7 @@ class TUIApp(
                 self._scan_prompt_history(query), self._finder_accept_when_ready
             )
         transcript = self._viewed_transcript()
-        if not query or self._active_finder is not transcript:
+        if self._active_finder is not transcript:
             return
         owner.start_search(
             query,
@@ -851,9 +851,20 @@ class TUIApp(
             lambda target, value: self._publish_history_search_target(
                 transcript, target, value
             ),
+            lambda: self._return_finder_to_its_view(transcript, query),
         )
-        if owner.search_task is not None:
-            owner.search_task.add_done_callback(self._history_search_ended)
+        owner.search_task.add_done_callback(self._history_search_ended)
+
+    async def _return_finder_to_its_view(
+        self, transcript: TranscriptWidget, query: str
+    ) -> None:
+        # Pages an earlier query's search revealed do not belong to this query:
+        # rank it over the view the finder opened on, as a burst of keys would.
+        saved = getattr(self, "_finder_return", None)
+        if saved is None or saved[2] == self._resident_page_keys():
+            return
+        await self._return_to_view(saved[0], saved[1])
+        self._publish_history_search_target(transcript, None, query)
 
     def _navigate_history_search(self, delta: int) -> bool:
         transcript = self._viewed_transcript()

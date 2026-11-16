@@ -1157,3 +1157,45 @@ async def test_ctrl_f_after_an_accepted_match_opens_a_new_search(
         assert composer and not any(OLD_WORDS[3] in row for row in composer), (
             f"the second query went into the composer: {composer}"
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_key", ["a", BACKSPACE], ids=["miss", "cleared"])
+async def test_finder_typed_one_key_per_frame_searches_the_view_it_opened_on(
+    root_home: RootHome, last_key: str
+) -> None:
+    # "q" alone matches only turn 3's quokka, far behind the tail, so its search
+    # replaces the pages. The next key must not leave the finder ranking those
+    # pages: "qa" fuzzy-matches quokka but no text holds "qa", and a burst of the
+    # same keys finds nothing.
+    async with running_tui(root_home) as driver:
+        await driver.settle("settled tail before the finder")
+        pager = driver.app._agent_navigation.transcript_control.history_pager
+        tail_pages, tail = _resident(pager), driver.rows()
+        await driver.send(CTRL_F)
+        await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
+        await driver.send("q")
+        await driver.until(
+            lambda: _prompt(3) in driver.screen() and driver.idle(),
+            what="the search for 'q' did not reveal turn 3",
+        )
+        await driver.settle("settled on 'q'")
+        await driver.send(last_key)
+        await driver.settle(f"settled after {last_key!r}")
+        await driver.send(ENTER)
+        await driver.settle("settled after Enter")
+        if last_key == "a":
+            assert driver.finder_drawn(), (
+                "Enter on 'qa' accepted a row that only the search for 'q' brought in;"
+                f" screen:\n{driver.screen()}"
+            )
+            await _close_finder_with_escape(driver)
+            await driver.settle("settled after Esc")
+            assert driver.rows() == tail, f"Esc did not restore the tail:\n{driver.screen()}"
+        else:
+            # An empty query lists the newest rows of the view the finder opened on.
+            assert not driver.finder_drawn() and _answer(TURNS - 1) in driver.screen(), (
+                "Enter on the cleared query jumped into pages the search for 'q'"
+                f" revealed; screen:\n{driver.screen()}"
+            )
+        assert _resident(pager) == tail_pages, "the pages 'q' revealed are still resident"
