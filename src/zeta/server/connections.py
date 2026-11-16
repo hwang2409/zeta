@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -40,6 +41,8 @@ from .session_replay.children import ChildRunProjection
 from .session_replay.in_flight import InFlightReply
 from .session_replay.output import ReplayOutput, _OutputFrame
 from .session_replay.rows import RowFacts
+
+logger = logging.getLogger(__name__)
 
 CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
 
@@ -670,19 +673,45 @@ class ConnectionRegistry(ReplayOutput):
     async def _output_writer(self, state: _Connection) -> None:
         output = state.output
         assert output is not None
+        item: _OutputFrame | None = None
         try:
             while True:
                 await output.wake.wait()
                 while output.queue:
-                    await self._write_output_frame(
-                        state, output, output.queue.popleft()
-                    )
+                    item = output.queue.popleft()
+                    await self._write_output_frame(state, output, item)
+                    item = None
                 output.drained.set()
                 output.wake.clear()
                 if await self._complete_output_phase(state, output):
                     return
         except asyncio.CancelledError:
             return
+        except Exception:
+            # a dead writer strands every caller and the controller slot: fail closed
+            logger.exception(
+                "serve output writer failed; closing the connection (role=%s phase=%s)",
+                state.role,
+                output.phase,
+            )
+            self._fail_dead_writer(state, output, item)
+
+    def _fail_dead_writer(
+        self, state: _Connection, output: _OutputState, item: _OutputFrame | None
+    ) -> None:
+        # the run loop then reads EOF and releases the connection and its role
+        state.connection.writer.close()
+        # fail every waiter before any accounting step, which could raise again
+        for frame in (item, *output.queue):
+            if frame is not None:
+                self._finish_future(frame.future, False)
+        self._finish_future(output.ready, False)
+        if output.current_frame is not None:
+            # the writer failed before this frame left it: it is still charged
+            self._end_frame_write(output, output.current_frame)
+        output.current_write = None
+        # queued frames still hold their replay budget; release it with them
+        self._clear_output(output)
 
     async def _write_output_frame(
         self, state: _Connection, output: _OutputState, item: _OutputFrame
@@ -694,7 +723,7 @@ class ConnectionRegistry(ReplayOutput):
             )
             result, _ = await output.current_write
         except asyncio.CancelledError:
-            self._finish_frame_accounting(output, item)
+            self._end_frame_write(output, item)
             self._fail_replay_frame(state, item)
             if not output.released:
                 self._finish_future(item.future, False)
@@ -707,16 +736,13 @@ class ConnectionRegistry(ReplayOutput):
                 self._reset_flush(output, False)
             return
         except Exception as exc:  # noqa: BLE001 - preserve write failure for its caller
-            self._finish_frame_accounting(output, item)
+            self._end_frame_write(output, item)
             self._fail_replay_frame(state, item)
             self._finish_future(item.future, error=exc)
             if output.phase == "flushing":
                 self._reset_flush(output, error=exc)
             return
-        finally:
-            output.current_frame = None
-            output.current_write = None
-        self._finish_frame_accounting(output, item)
+        self._end_frame_write(output, item)
         self._finish_future(item.future, result)
         if not result:
             self._fail_replay_frame(state, item)
@@ -861,6 +887,12 @@ class ConnectionRegistry(ReplayOutput):
     def _charge(output: _OutputState, item: _OutputFrame) -> None:
         output.retained_bytes += len(item.payload)
         output.retained_frames += 1
+
+    def _end_frame_write(self, output: _OutputState, item: _OutputFrame) -> None:
+        """The frame left the writer: it is no longer in flight, then uncharge it."""
+        output.current_frame = None
+        output.current_write = None
+        self._finish_frame_accounting(output, item)
 
     def _finish_frame_accounting(
         self, output: _OutputState, item: _OutputFrame
