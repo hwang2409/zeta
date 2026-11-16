@@ -20,6 +20,7 @@ from .history_projection import (
     _history_group,
     _history_group_fits,
     _publish_cache,
+    forward_next_offset,
     history_projection,
     history_projection_from_groups,
 )
@@ -197,7 +198,7 @@ def _fit_history_groups(
             cache_sizes.append(forward_size)
             groups.append(group)
             sizes.append(size)
-        cursor = index if backward else min(index + 1, end)
+        cursor = index if backward else index + 1
         raw_group = projection.entry_groups[index]
         reserve = child_run_lifecycle.baseline_reserve(groups[index]) if backward and child_runs else 0
         while True:
@@ -209,7 +210,6 @@ def _fit_history_groups(
                 body_size=body_size + reserve,
                 rows=rows,
                 cursor=cursor,
-                end=end,
                 backward=backward,
                 validator=validator,
                 raw_group=raw_group,
@@ -268,10 +268,11 @@ def _forward_page_history(
         backward=False,
         child_runs=child_runs,
     )
-    next_offset = min(selected[-1] + 1, entry_count) if selected else offset
     return {
         "messages": rows,
-        "next_offset": next_offset if next_offset < entry_count else None,
+        "next_offset": forward_next_offset(
+            projection, selected[-1] + 1 if selected else offset
+        ),
     }, expanded
 
 
@@ -682,6 +683,12 @@ def _forward_history_request(
     local_next = result["next_offset"]
     consumed = len(page.groups) if local_next is None else local_next
     next_offset = page.start + consumed
+    if (
+        next_offset == page.total
+        and consumed < len(page.groups)
+        and not projection.entry_groups[consumed]
+    ):
+        next_offset += 1  # only the empty trailing open group is left
     result["next_offset"] = next_offset if next_offset <= page.total else None
     return result
 
