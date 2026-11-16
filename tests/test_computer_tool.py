@@ -88,6 +88,7 @@ async def test_screen_changing_actions_record_op_and_return_screenshot(
     for arguments, expected in cases:
         backend = FakeBackend()
         async with _computer_registry(tmp_path, backend=backend) as registry:
+            await registry.execute(ToolCall("s", "computer", {"action": "screenshot"}))
             result = await registry.execute(ToolCall("c", "computer", arguments))
         assert result["isError"] is False, arguments
         # every screen-changing action returns a fresh screenshot last
@@ -100,6 +101,7 @@ async def test_screen_changing_actions_record_op_and_return_screenshot(
 async def test_cursor_position_returns_text_without_capture(tmp_path: Path) -> None:
     backend = FakeBackend(cursor=(42, 7))
     async with _computer_registry(tmp_path, backend=backend) as registry:
+        await registry.execute(ToolCall("s", "computer", {"action": "screenshot"}))
         result = await registry.execute(
             ToolCall("c", "computer", {"action": "cursor_position"})
         )
@@ -107,19 +109,35 @@ async def test_cursor_position_returns_text_without_capture(tmp_path: Path) -> N
     assert result["isError"] is False
     assert result["content"][0]["text"] == "cursor_position x=42 y=7"
     assert all(block["type"] != "image" for block in result["content"])
-    assert backend.actions == [("cursor_position",)]
+    assert backend.actions[-1] == ("cursor_position",)
 
 
 @pytest.mark.asyncio
 async def test_missing_coordinate_is_a_clear_error(tmp_path: Path) -> None:
     backend = FakeBackend()
     async with _computer_registry(tmp_path, backend=backend) as registry:
+        await registry.execute(ToolCall("s", "computer", {"action": "screenshot"}))
         result = await registry.execute(
             ToolCall("c", "computer", {"action": "left_click"})
         )
 
     assert result["isError"] is True
     assert "coordinate" in result["content"][0]["text"]
+    assert backend.actions == [("screenshot", None)]
+
+
+@pytest.mark.asyncio
+async def test_coordinate_action_before_screenshot_is_a_clear_error(
+    tmp_path: Path,
+) -> None:
+    backend = FakeBackend()
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        result = await registry.execute(
+            ToolCall("c", "computer", {"action": "left_click", "coordinate": [1, 2]})
+        )
+
+    assert result["isError"] is True
+    assert "screenshot" in result["content"][0]["text"]
     assert backend.actions == []
 
 
@@ -155,6 +173,37 @@ async def test_screenshot_reaches_provider_payloads_as_image(tmp_path: Path) -> 
     codex_image = codex["input"][1]["content"][0]
     assert codex_image["type"] == "input_image"
     assert codex_image["image_url"].startswith("data:image/png;base64,")
+
+
+@pytest.mark.asyncio
+async def test_click_maps_through_downscaled_retina_frame(tmp_path: Path) -> None:
+    # A 2x retina display downscaled to the WXGA box; the physical/image ratio
+    # (2.0) and the point scale (2.0) cancel, so model coords land at origin+xy.
+    backend = FakeBackend(width=2560, height=1600, scale=2.0, origin_x=100, origin_y=50)
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        await registry.execute(ToolCall("s", "computer", {"action": "screenshot"}))
+        geometry = registry.computer_geometry
+        assert (geometry.image_width, geometry.image_height) == (1280, 800)
+        result = await registry.execute(
+            ToolCall("c", "computer", {"action": "left_click", "coordinate": [640, 400]})
+        )
+
+    assert result["isError"] is False
+    assert ("click", 740, 450, "left", 1) in backend.actions
+
+
+@pytest.mark.asyncio
+async def test_out_of_bounds_coordinate_is_rejected(tmp_path: Path) -> None:
+    backend = FakeBackend(width=1280, height=800)
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        await registry.execute(ToolCall("s", "computer", {"action": "screenshot"}))
+        result = await registry.execute(
+            ToolCall("c", "computer", {"action": "left_click", "coordinate": [2000, 10]})
+        )
+
+    assert result["isError"] is True
+    assert "outside" in result["content"][0]["text"]
+    assert all(action[0] != "click" for action in backend.actions)
 
 
 def _write_settings(base: Path, body: str) -> None:
