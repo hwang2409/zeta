@@ -83,9 +83,10 @@ async def abort(client, request_id, params):
 
 async def status(client, request_id, params):
     owned = client.server.controllers.owned(client)
-    selected = client.server.controllers.selected(client, owned.runtime.session_id)
-    runtime = selected.runtime
+    runtime = owned.runtime
     session_id = runtime.session_id if runtime.opened is not None else None
+    if session_id is not None:
+        runtime = client.server.controllers.selected(client, session_id).runtime
     if client.role == "observer":
         fallback_config = (
             await client.connections.run_blocking(lambda: runtime._config(None, None))
