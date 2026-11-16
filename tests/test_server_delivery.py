@@ -231,7 +231,8 @@ async def test_delivery_id_cancel_before_append_commits_does_nothing(
 
     async def append(*args: Any, **kwargs: Any):
         append_started.set()
-        await asyncio.Event().wait()
+        # held until the test cancels the request; wait_for cancels the inner wait too
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         return await original_append(*args, **kwargs)
 
     store.append_client_delivery_async = append
@@ -260,10 +261,10 @@ async def test_delivery_id_cancel_before_append_commits_does_nothing(
     task = asyncio.create_task(
         getattr(requests, method)({"text": "hello", "delivery_id": "cancel-2"}, frozenset({"delivery_id"}))
     )
-    await append_started.wait()
+    await await_or_fail(append_started.wait(), what="append start")
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="canceled delivery request")
     assert store.client_delivery("cancel-2") is None
     assert effects == []
     store.close()
