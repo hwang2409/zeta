@@ -146,7 +146,8 @@ class ControllerMetadata:
 
 @dataclass
 class _OutputState:
-    phase: Literal["claimed_buffering", "flushing", "ready", "overflowing"] = (
+    # closed: the writer died; nothing may enter the queue again
+    phase: Literal["claimed_buffering", "flushing", "ready", "overflowing", "closed"] = (
         "claimed_buffering"
     )
     queue: deque[_OutputFrame] = field(default_factory=deque)
@@ -644,6 +645,7 @@ class ConnectionRegistry(ReplayOutput):
     ) -> None:
         # the run loop then reads EOF and releases the connection and its role
         state.connection.writer.close()
+        output.phase = "closed"
         # fail every waiter before any accounting step, which could raise again
         for frame in (item, *output.queue):
             if frame is not None:
@@ -746,7 +748,7 @@ class ConnectionRegistry(ReplayOutput):
     def _admit(self, state: _Connection, frame: _Frame) -> bool:
         output = state.output
         assert output is not None
-        if output.overflowed:
+        if output.overflowed or output.phase == "closed":
             return False
         if self._fits(output, len(frame)):
             return True
