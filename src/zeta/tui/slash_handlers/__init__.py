@@ -11,6 +11,7 @@ import functools
 import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from prompt_toolkit.enums import EditingMode
 from rich.console import RenderableType
@@ -166,11 +167,17 @@ class SlashHandlerMixin:
                 viewed_health.summary if viewed_health is not None else None
             ),
             transcript_session_id=viewed_path.name,
-            otel_status=(
-                "off" if getattr(self, "telemetry", None) is None
-                else self.telemetry.status().state
-            ),
+            otel_status=self._otel_status(),
         )
+
+    def _otel_status(self) -> str:
+        # TUI-only text: the endpoint stays local and never reaches serve.
+        status = self.telemetry.status()
+        if status.state == "healthy" and self._otel_endpoint is not None:
+            return f"healthy ({urlsplit(self._otel_endpoint).netloc})"
+        if status.reason is not None:
+            return f"{status.state} ({status.reason.replace('_', ' ')})"
+        return status.state
 
     def model_choices(self) -> tuple[str, ...]:
         """Models the picker and the composer completer offer for this provider."""

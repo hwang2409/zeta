@@ -6,7 +6,6 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
-from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +34,6 @@ from ..providers.completion import CompletionRetryBudget
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from ..storage_format import open_writer
-from ..telemetry import Telemetry
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from .loop import AgentLoop
@@ -78,7 +76,6 @@ class RuntimeComposition:
     budget_pinned: bool
     memory_reconciler: AutoMemoryReconciler | None = None
     project_registry_busy: bool = False
-    telemetry: Telemetry = dataclass_field(default_factory=Telemetry.disabled)
 
 
 def compose_runtime(
@@ -107,7 +104,6 @@ def compose_runtime(
     """Build one session, policy, loop, and tool registry for any frontend."""
 
     with ExitStack() as cleanup:
-        telemetry = Telemetry.configure(config)
         resuming = opened is not None
         invocation_policy = ToolPolicy.create(
             config.tool_allow,
@@ -467,7 +463,6 @@ def compose_runtime(
             external_tools=external_tools,
             budget_pinned=budget_pinned,
             memory_reconciler=memory_reconciler,
-            telemetry=telemetry,
             project_registry_busy=(
                 project_discovery.registry_busy
                 if project_discovery is not None

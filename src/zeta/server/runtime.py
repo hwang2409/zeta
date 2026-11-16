@@ -51,7 +51,6 @@ from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_session_agents
-from ..telemetry import Telemetry
 from ..tools._shared.background_task_types import BackgroundTaskNotice
 from ..tools._shared.run_work import background_task_row
 from .protocol import EventDescriptor
@@ -143,7 +142,6 @@ class SessionState:
     project_dir: Path
     repo_root: Path
     project_registry_busy: bool = False
-    telemetry: Telemetry = field(default_factory=Telemetry.disabled)
     usage: dict[str, Any] = field(default_factory=dict)
     usage_tracker: UsageTracker = field(init=False)
     status: str = "idle"
@@ -162,7 +160,6 @@ class SessionState:
             project_dir=composition.project_dir,
             repo_root=composition.repo_root,
             project_registry_busy=composition.project_registry_busy,
-            telemetry=composition.telemetry,
         )
 
     @property
@@ -699,8 +696,6 @@ class ServerRuntime:
 
     async def close(self) -> None:
         state = self._state
-        if state is not None:
-            await asyncio.to_thread(state.telemetry.shutdown)
         if state is not None:
             await self._close_active_state(state)
         await self._wait_for_setup_reapers()

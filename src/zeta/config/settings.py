@@ -219,6 +219,10 @@ def load_settings(
     project_data = (
         _parse(project_path, notices) if project_path != global_path else {}
     )
+    if "otel" in project_data:
+        # [otel] picks a local collector for the whole process; a repository must not.
+        where = _display_path(project_path) if project_path is not None else "project settings"
+        raise SettingsError(f"[otel] is global-only; remove it from {where}")
     project_data = _strip_unsafe_project_keys(project_data, project_path, warnings)
     global_allow, global_deny = _validate_policy_layer(global_data, global_path)
     project_allow, project_deny = _validate_policy_layer(project_data, project_path)
@@ -612,10 +616,13 @@ def _validate(
         raise SettingsError("invalid otel settings")
     otel_endpoint = otel.get("endpoint")
     if otel_endpoint is not None:
-        if not isinstance(otel_endpoint, str):
-            raise SettingsError("otel.endpoint must be an http(s) URL with a literal loopback host")
+        from ..telemetry import TelemetryError
         from ..telemetry.runtime import validate_loopback_endpoint
-        validate_loopback_endpoint(otel_endpoint)
+
+        try:
+            validate_loopback_endpoint(otel_endpoint)
+        except TelemetryError as exc:
+            raise SettingsError(str(exc)) from None
     mcp = data.get("mcp", {})
     mcp_limits = _validated_mcp_limits(mcp)
     mcp = cast(Mapping[str, Any], mcp)

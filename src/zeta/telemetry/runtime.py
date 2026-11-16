@@ -97,7 +97,7 @@ def validate_loopback_endpoint(endpoint: str) -> str:
             or parsed.fragment
         ):
             raise ValueError
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         raise TelemetryError("otel.endpoint must be an http(s) URL with a literal loopback host") from None
     return endpoint
 

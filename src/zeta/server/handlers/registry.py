@@ -197,7 +197,9 @@ async def session_settings(client, request_id, params):
     if client.role == "observer":
         return await client.connections.read_settings(client, params)
     validation.active(client.server.runtime, params)
-    return settings.settings(client.server.runtime, include_plan_mode=True, include_telemetry="otel" in client.features)
+    return settings.settings(
+        client.server.runtime, include_plan_mode=True, telemetry=settings.telemetry(client)
+    )
 
 
 async def set_settings(client, request_id, params):
@@ -206,7 +208,7 @@ async def set_settings(client, request_id, params):
     mode = validation.required_string(params, "approval_mode")
     model_selection.validate(model, mode)
     await model_selection.apply_rpc(runtime, model, mode)
-    return settings.settings(runtime, include_telemetry="otel" in client.features)
+    return settings.settings(runtime, telemetry=settings.telemetry(client))
 
 
 async def set_compaction(client, request_id, params):

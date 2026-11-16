@@ -56,9 +56,6 @@ class RuntimeCloseMixin:
                     first_error = exc
 
         try:
-            telemetry = getattr(self, "telemetry", None)
-            if telemetry is not None:
-                await attempt_async(lambda: asyncio.to_thread(telemetry.shutdown))
             attempt(self._cancel_background_invalidation)
             await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)
@@ -141,6 +138,8 @@ class RuntimeCloseMixin:
             self._draft_session = None
             self._session = None
             self._closed = True
+            # last, so every close step above can still export; off the loop, idempotent
+            await attempt_async(lambda: asyncio.to_thread(self.telemetry.shutdown))
         restore_closed_history = getattr(self, "_restore_closed_history", None)
         if restore_closed_history is not None:
             attempt(restore_closed_history)
