@@ -38,6 +38,7 @@ from zeta.runtime.composition import RuntimeComposition, compose_runtime
 from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
 from zeta.server.protocol import EventDescriptor, FrameCodec
+from zeta.server.session_replay.in_flight import InFlightReply
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.transcript_search.index import TranscriptIndex
@@ -424,7 +425,7 @@ async def test_serve_memory_event_requires_negotiated_feature() -> None:
             pass
 
     async def _memory_frames(features: frozenset[str]) -> list[dict[str, object]]:
-        registry = ConnectionRegistry(asyncio.get_running_loop())
+        registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
         connection = _Controller()
         registry.register(connection)
         registry.negotiate_role(connection, "controller", "1.2", features)

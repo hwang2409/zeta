@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from ..core.slash import DEFAULT_OLLAMA_TOKEN_BUDGET, context_window
-from ..protocol.tool_batches import without_incomplete_tool_batches
+from ..protocol.tool_batches import complete_tool_batches
 from ..protocol.types import (
     CompletionBackend,
     Message,
@@ -112,7 +112,7 @@ def _content(message: Message) -> str:
 
 
 def _messages(messages: Sequence[Message]) -> list[dict[str, Any]]:
-    messages = provider_messages(without_incomplete_tool_batches(messages))
+    messages = provider_messages(complete_tool_batches(messages))
     result: list[dict[str, Any]] = []
     prior_calls: dict[str, ToolCall] = {}
     for message in messages:

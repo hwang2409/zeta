@@ -13,7 +13,7 @@ from ..media.images import (
     image_dimensions,
     image_signature_matches,
 )
-from ..protocol.tool_batches import without_incomplete_tool_batches
+from ..protocol.tool_batches import complete_tool_batches
 from ..protocol.types import (
     ContentBlock,
     ImageContent,
@@ -181,7 +181,7 @@ def build_messages_payload(
     thinking_budget: int = 8_192,
 ) -> dict[str, Any]:
     _validate_thinking_parameters(max_tokens, thinking_budget)
-    messages = provider_messages(without_incomplete_tool_batches(messages))
+    messages = provider_messages(complete_tool_batches(messages))
     system: list[dict[str, Any]] = []
     wire_messages: list[dict[str, Any]] = []
     system_at_head = True

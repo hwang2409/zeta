@@ -175,10 +175,10 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
 
     loop = type("Loop", (), {"steer": lambda self, message: steer(message)})()
     control = type("Control", (), {})()
-    control.server = type("Server", (), {"runtime": type("Runtime", (), {
+    control.runtime = type("Runtime", (), {
         "loop": loop, "opened": type("Opened", (), {"store": store})(),
         "session_id": "session-1",
-    })()})()
+    })()
     control._model_inputs = type("Inputs", (), {
         "resolve": lambda self, session_id, params, enabled: ResolvedModelInput(
             params["text"], params["text"], MessageOrigin.USER, None
@@ -231,16 +231,17 @@ async def test_delivery_id_cancel_before_append_commits_does_nothing(
 
     async def append(*args: Any, **kwargs: Any):
         append_started.set()
-        await asyncio.Event().wait()
+        # held until the test cancels the request; wait_for cancels the inner wait too
+        await asyncio.wait_for(asyncio.Event().wait(), 10)
         return await original_append(*args, **kwargs)
 
     store.append_client_delivery_async = append
     loop = type("Loop", (), {"steer": lambda self, message: None})()
     control = type("Control", (), {})()
-    control.server = type("Server", (), {"runtime": type("Runtime", (), {
+    control.runtime = type("Runtime", (), {
         "loop": loop, "opened": type("Opened", (), {"store": store})(),
         "session_id": "session-1",
-    })()})()
+    })()
     control._model_inputs = type("Inputs", (), {
         "resolve": lambda self, session_id, params, enabled: ResolvedModelInput(
             params["text"], params["text"], MessageOrigin.USER, None
@@ -260,10 +261,10 @@ async def test_delivery_id_cancel_before_append_commits_does_nothing(
     task = asyncio.create_task(
         getattr(requests, method)({"text": "hello", "delivery_id": "cancel-2"}, frozenset({"delivery_id"}))
     )
-    await append_started.wait()
+    await await_or_fail(append_started.wait(), what="append start")
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="canceled delivery request")
     assert store.client_delivery("cancel-2") is None
     assert effects == []
     store.close()
@@ -1563,12 +1564,10 @@ class _Control:
         self.echo_stalls = False
         self.release_echo = asyncio.Event()
         self.loop = SimpleNamespace(steer=self._steer)
-        self.server = SimpleNamespace(
-            runtime=SimpleNamespace(
-                loop=self.loop,
-                opened=SimpleNamespace(store=self.store),
-                session_id="session",
-            )
+        self.runtime = SimpleNamespace(
+            loop=self.loop,
+            opened=SimpleNamespace(store=self.store),
+            session_id="session",
         )
         self._model_inputs = SimpleNamespace(
             resolve=lambda *args, **kwargs: SimpleNamespace(

@@ -238,7 +238,7 @@ class ReplayOutput:
         """
         state = self._connections[connection]
         stream_id = self.replay.pending_stream_id(connection)
-        for event, fields in self.in_flight.frames(scope.value):
+        for event, fields in self.in_flight().frames(scope.value):
             shaped = self._fields_for_connection(state, event, fields)
             # the largest seq bounds the frame size the stream sends
             frame = connection.codec.notification(
@@ -428,7 +428,7 @@ class ReplayOutput:
             prepared.seq is None
             and scope.kind == "top"
             and "in_flight_replay" in state.features
-            and self.in_flight.owns(event, fields)
+            and self.in_flight().owns(event, fields)
         ):
             # the join's in-flight frames carry it, so holding it only costs room
             return True

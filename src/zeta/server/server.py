@@ -227,7 +227,7 @@ class ZetaServer:
         self.port = port
         self.approval_reconnect_grace = approval_reconnect_grace
         self._borrowed = runtime is not None
-        self.runtime = runtime or ServerRuntime(
+        runtime = runtime or ServerRuntime(
             self.home,
             cwd=cwd,
             provider=provider,
@@ -274,7 +274,7 @@ class ZetaServer:
         self._retention_owner = (
             make_retention_owner(
                 self.home,
-                self.runtime.manager._storage_lease,
+                runtime.manager._storage_lease,
                 lambda: (
                     0
                     if self.runtime.opened is None
@@ -285,7 +285,7 @@ class ZetaServer:
             if (
                 not self._borrowed
                 and feature_enabled(
-                    self.runtime.manager._storage_lease.observed_epoch,
+                    runtime.manager._storage_lease.observed_epoch,
                     StorageFeature.SESSION_RETENTION_ACTIVATION,
                 )
             )
@@ -299,13 +299,22 @@ class ZetaServer:
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.foreground_event_publisher = foreground_event_publisher or ForegroundEventPublisher()
-        self.control = ServeControl(self, self.foreground_event_publisher)
+        self.control = ServeControl(self, runtime, self.foreground_event_publisher)
+        self._bind_pair(self.control)
+
+    @property
+    def runtime(self) -> ServerRuntime:
+        return self.control.runtime
+
+    def _bind_pair(self, control: ServeControl) -> None:
+        """Point the runtime's sinks at its control; a borrowed runtime keeps its owner's."""
         if not self._borrowed:
-            self.runtime.set_approval_control_binder(self.control.bind_policy)
-            self.runtime.set_background_event_sink(self.control._publish_background_event)
-            self.runtime.set_memory_notice_sink(self.control._publish_memory_notice)
-            self.runtime.set_run_work_event_sink(self.control._publish_run_work_event)
-            self.runtime.set_background_wake_sink(self.control._schedule_background_wake)
+            runtime = control.runtime
+            runtime.set_approval_control_binder(control.bind_policy)
+            runtime.set_background_event_sink(control._publish_background_event)
+            runtime.set_memory_notice_sink(control._publish_memory_notice)
+            runtime.set_run_work_event_sink(control._publish_run_work_event)
+            runtime.set_background_wake_sink(control._schedule_background_wake)
 
     async def _publish_foreground_events(self) -> None:
         assert self._foreground_subscription is not None
@@ -346,7 +355,9 @@ class ZetaServer:
         if not self._borrowed:
             await self.runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
-        self.connections = ConnectionRegistry(asyncio.get_running_loop())
+        self.connections = ConnectionRegistry(
+            asyncio.get_running_loop(), lambda: self.control.in_flight
+        )
         if self.port is None:
             if self._prebound_socket is not None:
                 self._server = await asyncio.start_unix_server(
@@ -471,7 +482,9 @@ class _Client:
         self.reader = reader
         self.writer = writer
         if server.connections is None:
-            server.connections = ConnectionRegistry(asyncio.get_running_loop())
+            server.connections = ConnectionRegistry(
+                asyncio.get_running_loop(), lambda: server.control.in_flight
+            )
             server.connections.register(self)
         self.connections = server.connections
         self.logins = login.Logins(server.home)

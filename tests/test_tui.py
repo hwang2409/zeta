@@ -11823,14 +11823,25 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
+    app._active_session = app._make_session()
+    app._present_pending_approvals()
+    assert len(app._approval_units) == 1
 
     app._submit_input("approve the plan")
-    # test-contract: latency ui task startup is the product readiness contract
-    await asyncio.sleep(0.05)
-    if app._active_task is not None:
-        await asyncio.wait_for(app._active_task, 10)
+    # The pipeline consumer starts the turn task on its next loop step.
+    await asyncio.sleep(0)
+    assert app._active_task is not None
+    await await_or_fail(app._active_task, what="prompt turn")
 
-    assert [request.key for request in app.pending_approvals] == [call.id]
+    # The words reach the model as a prompt. The new turn closes the open
+    # request of the turn that is over, as an abort, never as an approval.
+    assert store.approval_state_now(call.id) == (call, "abort")
+    assert app.pending_approvals == ()
+    assert app._approval_units == {}
+    assert (
+        "system · approval for pending-call closed: its turn ended before an answer"
+        in [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    )
     assert [
         block.text
         for message in branch_messages(store)
