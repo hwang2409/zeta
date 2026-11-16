@@ -43,6 +43,7 @@ from .manifest import (
     ExtensionManifestError,
     parse_manifest,
 )
+from .trust import is_trusted
 
 EXTENSIONS_DIRNAME = "extensions"
 
@@ -83,8 +84,16 @@ def apply_extensions(
             manifest = _manifest_or_notice(host, directory, PROJECT_SCOPE)
             if manifest is None or _skip(host, manifest, directory, disabled_set):
                 continue
-            host.pending_project.append(PendingExtension(manifest, directory))
-            pending_names.append(manifest.name)
+            try:
+                trusted = is_trusted(host.home, PROJECT_SCOPE, manifest.name, directory)
+            except Exception as exc:  # noqa: BLE001 - trust failure fails open
+                host.notices.append(f"extensions · invalid trust store: {_short(exc)}")
+                trusted = False
+            if trusted:
+                _load_one(host, directory, manifest, PROJECT_SCOPE)
+            else:
+                host.pending_project.append(PendingExtension(manifest, directory))
+                pending_names.append(manifest.name)
         if pending_names:
             host.warnings.append(
                 "extensions · untrusted project extensions present: "

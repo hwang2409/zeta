@@ -20,6 +20,15 @@ from .manifest import (
     ExtensionManifestError,
     parse_manifest,
 )
+from .trust import (
+    ExtensionTrustError,
+    fingerprint,
+    install,
+    is_trusted,
+    remove,
+    set_trusted,
+    update,
+)
 
 __all__ = [
     "EXTENSION_API_VERSION",
@@ -28,9 +37,16 @@ __all__ = [
     "ExtensionHost",
     "ExtensionManifest",
     "ExtensionManifestError",
+    "ExtensionTrustError",
     "LoadedExtension",
     "PendingExtension",
     "apply_extensions",
+    "fingerprint",
+    "install",
+    "is_trusted",
     "parse_manifest",
+    "remove",
+    "set_trusted",
     "trust_project_extensions",
+    "update",
 ]
