@@ -68,7 +68,7 @@ class ScriptedBackend:
         yield StreamEvent(StreamEventType.MESSAGE_START, data=dict(self.start))
         if step == "stall":
             self.stalled.set()
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="the test to cancel the stalled provider call")
         if isinstance(step, BaseException):
             raise step
         if isinstance(step, ErrorInfo):
@@ -273,6 +273,7 @@ def test_disabled_turn_creates_no_span(tmp_path, monkeypatch) -> None:
     def no_span(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("disabled telemetry reached span construction")
 
+    # test-contract: seam the disabled facade must never reach span construction
     monkeypatch.setattr(Telemetry, "_span", no_span)
     events = asyncio.run(_run(_loop(tmp_path, ScriptedBackend("claude", "claude-opus-5-5", ["tool", "reply"]), Telemetry.disabled())))
     assert [event.type for event in events].count(StreamEventType.TURN_END) == 2
