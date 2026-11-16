@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -148,6 +149,35 @@ async def test_api_version_mismatch_refused_with_notice(tmp_path: Path) -> None:
         assert "ext_echo" not in registry.registered_names
         assert host.loaded == []
         assert any("upgrade zeta" in notice for notice in host.notices)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_names_keep_status_scoped(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write_extension(home / "extensions", "same")
+    _write_extension(project / ".zeta" / "extensions", "same", source="def activate(zx): raise RuntimeError('broken')\n")
+    async with _open_registry(tmp_path) as registry:
+        host = apply_extensions(registry, home=home, project_dir=project, builtin_names=registry.registered_names)
+        trust_project_extensions(host)
+        rows = {(row["name"], row["scope"]): row for row in host.status_rows()}
+        assert rows[("same", "user")]["loaded"] is True
+        assert rows[("same", "user")]["error"] is None
+        assert rows[("same", "project")]["loaded"] is False
+        assert "activate raised" in rows[("same", "project")]["error"]
+
+
+@pytest.mark.asyncio
+async def test_notify_from_foreign_thread_after_loop_binding(tmp_path: Path) -> None:
+    async with _open_registry(tmp_path) as registry:
+        host = apply_extensions(registry, home=tmp_path / "home", project_dir=None, builtin_names=registry.registered_names)
+        events = []
+        host.set_event_sink(events.append, asyncio.get_running_loop())
+        thread = threading.Thread(target=host.notify, args=("thread-ext", "hello", "info"))
+        thread.start()
+        await asyncio.to_thread(thread.join)
+        await asyncio.sleep(0)
+        assert events[0].data["text"] == "hello"
 
 
 @pytest.mark.asyncio
