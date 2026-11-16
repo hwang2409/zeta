@@ -188,6 +188,7 @@ async def connect_replay(server: ZetaServer, transport: Transport) -> ReplayClie
         (
             f"GET /?{query} HTTP/1.1\r\n"
             f"Host: 127.0.0.1:{server._websocket.port}\r\n"
+            "User-Agent: zeta-replay-test\r\n"
             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         ).encode("ascii")

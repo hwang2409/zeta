@@ -1,17 +1,31 @@
-"""Diagnostics for a wedged serve controller slot.
+"""Diagnostics for a contended serve controller slot.
 
-When a controller ``hello`` is refused with -32001 while the holder's
+Every controller ``hello`` refused with -32001 because another connection
+already holds the slot writes one bounded stderr line that names both the
+holder and the refused connection: transport, peer pid (unix) or remote
+address (tcp/websocket) with the websocket User-Agent, the hello client
+version, connection age, time since the last received frame, the running
+request (or ``idle``), and whether the peer has closed. When the holder's
 connection is already gone (EOF / transport lost) but its request task still
-runs, :func:`log_stuck_holder` writes one bounded record to stderr naming the
-holder's running request and the await chain its run task is stuck on. This is
-diagnostic only; it changes no refusal behavior.
+runs, the same line also carries the stuck request and the await chain its run
+task is suspended on. This is diagnostic only; it changes no refusal behavior.
+
+The line never carries tokens or secrets: only the User-Agent and remote
+address, the hello client version, and the running method and id.
+
+:func:`log_stuck_holder` reuses the same bounded, escaped dump for the hold
+path, which logs a lost holder whose request did not end after cancel.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import socket
+import struct
+import sys
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -23,6 +37,66 @@ logger = logging.getLogger("zeta.server.diagnostics")
 # Bound the dump so repeated wedges cannot flood stderr.
 _MAX_CHAIN_FRAMES = 40
 _MAX_FRAME_CHARS = 200
+_MAX_UA_CHARS = 80
+_MAX_CLIENT_CHARS = 40
+
+
+@dataclass(frozen=True, slots=True)
+class PeerIdentity:
+    """Peer facts captured once at accept; never fail if the OS withholds one."""
+
+    transport: str  # "unix" | "tcp" | "websocket"
+    pid: int | None = None
+    remote: str | None = None
+    user_agent: str | None = None
+
+
+def _peer_pid(sock: socket.socket) -> int | None:
+    """The connecting peer's pid for a unix socket, or None if unavailable."""
+    try:
+        if sys.platform == "darwin":
+            # macOS LOCAL_PEERPID on SOL_LOCAL returns the peer pid as an int.
+            return sock.getsockopt(0, 0x002)
+        if sys.platform.startswith("linux"):
+            creds = sock.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            )
+            pid, _uid, _gid = struct.unpack("3i", creds)
+            return pid
+    except OSError:
+        return None
+    return None
+
+
+def capture_peer_identity(reader: object, writer: object) -> PeerIdentity:
+    """Capture the peer's transport and address at accept, best effort."""
+    if hasattr(reader, "remote_address") and hasattr(reader, "user_agent"):
+        return PeerIdentity(
+            "websocket",
+            remote=getattr(reader, "remote_address", None),
+            user_agent=getattr(reader, "user_agent", None),
+        )
+    sock = writer.get_extra_info("socket") if hasattr(writer, "get_extra_info") else None
+    if sock is not None and sock.family == socket.AF_UNIX:
+        return PeerIdentity("unix", pid=_peer_pid(sock))
+    peer = writer.get_extra_info("peername") if hasattr(writer, "get_extra_info") else None
+    remote = f"{peer[0]}:{peer[1]}" if isinstance(peer, tuple) and len(peer) >= 2 else None
+    return PeerIdentity("tcp", remote=remote)
+
+
+def _clip(value: str, limit: int) -> str:
+    """Escape control characters, then bound to ``limit`` chars.
+
+    Client-controlled text (User-Agent, client version, request method) must not
+    forge log lines, so escape every non-printable character -- newlines, CR,
+    tab, other C0/C1 controls, and the unicode line separators U+2028/U+2029 --
+    before formatting. Clip after escaping so the bound holds on the output.
+    """
+    escaped = "".join(
+        c if c.isprintable() else c.encode("unicode_escape").decode("ascii")
+        for c in value
+    )
+    return escaped if len(escaped) <= limit else escaped[: limit - 1] + "\u2026"
 
 
 def _await_chain(task: asyncio.Task[object] | None) -> list[str]:
@@ -74,8 +148,32 @@ def _output_summary(output: _OutputState | None) -> str:
     )
 
 
-def log_stuck_holder(holder: _Client, output: _OutputState | None, *, reason: str) -> None:
-    """Write one warning naming the lost holder's running request and await chain."""
+def _identity(client: _Client, now: float) -> str:
+    """One bounded, secret-free field list describing a connection."""
+    peer = client._peer
+    parts = [peer.transport]
+    if peer.pid is not None:
+        parts.append(f"pid={peer.pid}")
+    if peer.remote is not None:
+        parts.append(f"remote={_clip(peer.remote, _MAX_UA_CHARS)}")
+    if peer.user_agent:
+        parts.append(f'ua="{_clip(peer.user_agent, _MAX_UA_CHARS)}"')
+    client_version = client._client_version
+    parts.append(f"client={_clip(client_version, _MAX_CLIENT_CHARS) if client_version else '?'}")
+    parts.append(f"age={now - client._connected_at:.1f}s")
+    parts.append(f"last_frame={now - client._last_frame_at:.1f}s")
+    request = client._request
+    parts.append(
+        f"req={_clip(request[0], _MAX_CLIENT_CHARS)}/{request[1]!r}"
+        if request is not None
+        else "req=idle"
+    )
+    parts.append(f"peer_closed={'yes' if client.peer_closed() else 'no'}")
+    return " ".join(parts)
+
+
+def _lost_holder_dump(holder: _Client, output: _OutputState | None) -> str:
+    """The stuck request and await chain when the holder's connection is gone."""
     request = holder._request
     if request is None:
         method, request_id, age = "<none>", None, 0.0
@@ -83,12 +181,41 @@ def log_stuck_holder(holder: _Client, output: _OutputState | None, *, reason: st
         method, request_id, started = request
         age = time.monotonic() - started
     chain = _await_chain(holder._run_task)
-    logger.warning(
-        "serve: %s; holder request method=%s id=%r age=%.1fs; %s; await chain: %s",
-        reason,
-        method,
-        request_id,
-        age,
-        _output_summary(output),
-        " <- ".join(chain) if chain else "<empty>",
+    return (
+        f"holder request method={method} id={request_id!r} age={age:.1f}s; "
+        f"{_output_summary(output)}; await chain: "
+        f"{' <- '.join(chain) if chain else '<empty>'}"
     )
+
+
+def log_stuck_holder(holder: _Client, output: _OutputState | None, *, reason: str) -> None:
+    """Write one bounded record naming a lost holder's stuck request.
+
+    The hold path (``_await_handler_held``) calls this at each cancel-bound
+    interval so a holder whose request swallows its cancel stays visible. It
+    reuses the same bounded, escaped dump the refusal log appends.
+    """
+    logger.warning("serve: %s; %s", reason, _lost_holder_dump(holder, output))
+
+
+def log_controller_refusal(
+    holder: _Client,
+    output: _OutputState | None,
+    refused: _Client,
+    *,
+    suppressed: int,
+) -> None:
+    """Write one bounded warning naming the holder and the refused connection.
+
+    When the holder's connection is already closed while its request still
+    runs, append the stuck request and its await chain.
+    """
+    now = time.monotonic()
+    line = (
+        f"serve: controller hello refused -32001 (another connection holds the slot); "
+        f"holder[{_identity(holder, now)}]; refused[{_identity(refused, now)}]; "
+        f"suppressed={suppressed}"
+    )
+    if holder.peer_closed() and holder._request is not None:
+        line = f"{line}; {_lost_holder_dump(holder, output)}"
+    logger.warning("%s", line)
