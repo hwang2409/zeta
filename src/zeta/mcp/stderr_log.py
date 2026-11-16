@@ -20,6 +20,7 @@ _READ_BYTES = 64 * 1024
 _WRITE_QUEUE_BYTES = 8 * 1024 * 1024
 _LOCK_TIMEOUT_SECONDS = 1.0
 _LOCK_RETRY_SECONDS = 0.01
+_MAX_MARKER_DROPPED_BYTES = 10**20 - 1
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +39,16 @@ def _fit_stderr_data(data: bytes, available: int) -> bytes:
     candidate = data[: max(available, 0)]
     newline = candidate.rfind(b"\n")
     if newline >= 0:
-        return candidate[: newline + 1]
+        candidate = candidate[: newline + 1]
+    else:
+        if available <= 0:
+            return b""
+        candidate = candidate[: available - 1] + b"\n"
     while candidate:
         try:
             candidate.decode("utf-8")
         except UnicodeDecodeError:
-            candidate = candidate[:-1]
+            candidate = candidate[:-2] + candidate[-1:]
         else:
             break
     return candidate
@@ -53,7 +58,7 @@ class RotatingStderrLog:
     """Drain one stderr stream into securely opened, process-safe log files."""
 
     def __init__(self, path: Path, directory_fd: int, lock_fd: int) -> None:
-        if MCP_STDERR_LOG_FILE_BYTES < len(_loss_marker(1)):
+        if MCP_STDERR_LOG_FILE_BYTES < len(_loss_marker(_MAX_MARKER_DROPPED_BYTES)):
             raise ValueError("MCP stderr log cap is smaller than its loss marker")
         self.path = path
         self._directory_fd = directory_fd
@@ -177,12 +182,19 @@ class RotatingStderrLog:
                     available = MCP_STDERR_LOG_FILE_BYTES - os.fstat(fd).st_size
                     data_to_write = _fit_stderr_data(data, available - len(marker))
                     write_all(fd, marker + data_to_write)
+                    written = len(data_to_write)
+                    if (
+                        written
+                        and data_to_write.endswith(b"\n")
+                        and not data[:written].endswith(b"\n")
+                    ):
+                        written -= 1
                 finally:
                     if fd >= 0:
                         os.close(fd)
         except _FileLockTimeout:
             return None
-        return len(data_to_write)
+        return written
 
     def _normalize_existing(self) -> None:
         for index in range(MCP_STDERR_LOG_FILE_COUNT):
