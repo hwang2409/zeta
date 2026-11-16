@@ -1,11 +1,14 @@
 """Logical serve turn and approval lifetime."""
+
 from __future__ import annotations
+
 import asyncio
 import functools
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import aclosing, contextmanager
 from typing import TYPE_CHECKING, Any
+
 from ..core.approval import (
     ApprovalPolicy,
     ApprovalRequest,
@@ -56,6 +59,7 @@ from .protocol import (
 )
 from .session_replay.in_flight import InFlightReply
 from .session_replay.rows import RowFacts
+
 if TYPE_CHECKING:
     from ..mcp import MCPServerConfig
     from .runtime import ServerRuntime
@@ -1029,7 +1033,6 @@ class ServeControl:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
         if outcome is TurnOutcome.COMPLETED:
             await self.deliveries.continue_after_turn(session_id, state)
-
     async def _attach_pending_notifications(self) -> None:
         runtime = self.runtime
         loop = runtime.loop
@@ -1037,7 +1040,6 @@ class ServeControl:
             return
         if loop.notification_system_message() is not None:
             self._schedule_background_wake(runtime.session_id)
-
     async def _resume_tool(
         self,
         request_id: str,
@@ -1052,7 +1054,6 @@ class ServeControl:
         session_id = state.session_id
         event_tasks: list[asyncio.Task[None]] = []
         agent_end: StreamEvent | None = None
-
         def emit(event: StreamEvent) -> None:
             nonlocal agent_end
             if event.type is StreamEventType.AGENT_END:
@@ -1063,7 +1064,6 @@ class ServeControl:
                         self._event(event, session_id=session_id, turn_id=turn_id)
                     )
                 )
-
         outcome = TurnOutcome.COMPLETED
         try:
             await loop.resume_pending_tool(
