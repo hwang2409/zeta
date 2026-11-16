@@ -599,6 +599,9 @@ def full_screen_content(
             return False
         output_size = get_app().output.get_size()
         required_rows = agent_navigation.list_height + 4
+        if picker_card is not None:
+            # An open picker owns the keys: the list gives way to its rows.
+            required_rows += picker_card.min_rows()
         if todo_widget.visible:
             todo_height = todo_panel.preferred_height(
                 output_size.columns, output_size.rows
@@ -648,17 +651,29 @@ def full_screen_content(
         Condition(lambda: bool(viewed_queue().messages or viewed_queue().main_waiting)),
     )
     bottom_rows = [spacer, todo_panel, queued_rows]
+    picker_row: AnyContainer | None = None
     if picker_card is not None:
-        # Above the composer, where the picker's keys act.
-        bottom_rows.append(
-            VSplit(
-                [
-                    Window(width=CONTENT_MARGIN, char=" "),
-                    Window(picker_card, height=picker_card.height, dont_extend_height=True),
-                    Window(width=CONTENT_MARGIN, char=" "),
-                ]
+
+        def picker_height(card: PickerCardControl = picker_card) -> Dimension:
+            # The card's minimum fits in the rows the other rows' minimums
+            # leave: a sum over the screen draws "Window too small" instead.
+            size = get_app().output.get_size()
+            others = sum(
+                row.preferred_height(size.columns, size.rows).min
+                for row in [*content_rows, *bottom_rows]
+                if row is not bottom and row is not picker_row
             )
+            return Dimension(min=max(0, min(card.min_rows(), size.rows - others)))
+
+        # Above the composer, where the picker's keys act.
+        picker_row = VSplit(
+            [
+                Window(width=CONTENT_MARGIN, char=" "),
+                Window(picker_card, height=picker_height, dont_extend_height=True),
+                Window(width=CONTENT_MARGIN, char=" "),
+            ]
         )
+        bottom_rows.append(picker_row)
     bottom_rows.extend(padded_composer_rows)
     if list_panel is not None:
         bottom_rows.append(list_panel)

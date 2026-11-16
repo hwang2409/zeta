@@ -13,7 +13,6 @@ from io import StringIO
 from prompt_toolkit.application.current import get_app
 from prompt_toolkit.formatted_text import ANSI, to_formatted_text
 from prompt_toolkit.formatted_text.utils import split_lines
-from prompt_toolkit.layout import Dimension
 from prompt_toolkit.layout.controls import UIContent, UIControl
 from rich.console import Console, RenderableType
 
@@ -98,23 +97,36 @@ class PickerCardControl(UIControl):
     def __init__(self, card: Callable[[], RenderableType | None]) -> None:
         self._card = card
         self._width: int | None = None
+        # One rich render per paint: (render counter, width) -> uncropped lines.
+        self._rendered: tuple[tuple[int, int], list[FragmentLine]] | None = None
 
-    def height(self) -> Dimension:
-        """The card's rows, up to half the screen, as the window's minimum.
+    def min_rows(self) -> int:
+        """The rows the card asks for as its minimum: all of it, up to half the screen.
 
         A split hands out rows one at a time in turn up to each child's
         preferred height, so with only a preferred height the card would share
-        rows with the transcript and lose its selected row and its hint.
+        rows with the transcript and lose its selected row and its hint. The
+        layout caps this at the rows the other rows leave.
         """
 
         size = get_app().output.get_size()
-        lines = self.lines(self._width or size.columns, size.rows)
-        return Dimension(min=min(len(lines), size.rows // 2))
+        return min(len(self.lines(self._width or size.columns, size.rows)), size.rows // 2)
 
     def lines(self, width: int, height: int) -> list[FragmentLine]:
         """The card cropped to half the terminal and to ``height``, the window's room."""
 
         self._width = width
+        app = get_app()
+        key = (app.render_counter, width)
+        if self._rendered is None or self._rendered[0] != key:
+            self._rendered = (key, self._render(width))
+        lines = self._rendered[1]
+        if not lines:
+            return []
+        cap = min(card_height_cap(app.output.get_size().rows), height)
+        return crop_card(lines, cap)
+
+    def _render(self, width: int) -> list[FragmentLine]:
         renderable = self._card()
         if renderable is None:
             return []
@@ -126,9 +138,7 @@ class PickerCardControl(UIControl):
             width=max(1, width),
             theme=RICH_THEME,
         ).print(renderable)
-        lines = list(split_lines(to_formatted_text(ANSI(output.getvalue().rstrip("\n")))))
-        cap = min(card_height_cap(get_app().output.get_size().rows), height)
-        return crop_card(lines, cap)
+        return list(split_lines(to_formatted_text(ANSI(output.getvalue().rstrip("\n")))))
 
     def preferred_height(
         self,

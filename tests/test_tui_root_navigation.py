@@ -1296,15 +1296,30 @@ async def test_a_picker_opened_before_the_first_page_leaves_no_card_behind(
         )
 
 
-LONG_PICKERS = [
-    pytest.param(command, count, size, id=f"{command}-{count}-{size.columns}x{size.rows}")
-    for command, count in (("/accounts", 6), ("/remote", 40))
-    for size in (Size(rows=50, columns=160), Size(rows=24, columns=80))
-] + [pytest.param("/remote", 40, Size(rows=12, columns=80), id="/remote-40-80x12")]
+LONG_PICKERS = (
+    [
+        pytest.param(command, count, size, 0, id=f"{command}-{count}-{size.columns}x{size.rows}")
+        for command, count in (("/accounts", 6), ("/remote", 40))
+        for size in (Size(rows=50, columns=160), Size(rows=24, columns=80))
+    ]
+    + [pytest.param("/remote", 40, Size(rows=12, columns=80), 0, id="/remote-40-80x12")]
+    + [
+        # Six children fill the agent list's 6 rows (a page of 5 and its pager).
+        pytest.param(
+            command,
+            count,
+            Size(rows=rows, columns=80),
+            6,
+            id=f"{command}-{count}-80x{rows}-agent-list",
+        )
+        for command, count in (("/accounts", 6), ("/remote", 40))
+        for rows in (12, 16)
+    ]
+)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("command", "count", "size"), LONG_PICKERS)
+@pytest.mark.parametrize(("command", "count", "size", "children"), LONG_PICKERS)
 async def test_every_row_of_a_long_picker_shows_with_its_hint_and_border(
     root_home: RootHome,
     tmp_path: Path,
@@ -1312,11 +1327,14 @@ async def test_every_row_of_a_long_picker_shows_with_its_hint_and_border(
     command: str,
     count: int,
     size: Size,
+    children: int,
 ) -> None:
     # Down through every row: the selected row, the key hint, and the bottom
     # border show on each step, at every screen size (6 accounts is henry's
-    # real count). Enter must never act on a row the user cannot see.
+    # real count), with and without the agent list. Enter must never act on a
+    # row the user cannot see.
     copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    _add_running_children(copy, children)
     startup.set()
     sessions = tuple(
         RemoteSession("lab", f"s{index}", f"session-{index:02d}", None) for index in range(count)
@@ -1330,6 +1348,11 @@ async def test_every_row_of_a_long_picker_shows_with_its_hint_and_border(
         app = driver.app
         _fake_accounts(app, monkeypatch, count=min(count, 6))
         await driver.until(lambda: not app._startup_replay_active, what="startup did not finish")
+        await driver.until(
+            # The list's rows: the root, then each child.
+            lambda: len(app._agent_navigation.entries) == (children and children + 1),
+            what=f"the agent list did not show {children} children",
+        )
         await driver.settle(f"settled screen before {command}")
         await driver.send(command + ENTER)
         await driver.until(
@@ -2072,16 +2095,27 @@ async def _home_with_a_child(root_home: RootHome, tmp_path: Path) -> RootHome:
     home = tmp_path / "home"
     await asyncio.to_thread(shutil.copytree, root_home.home, home)
     copy = RootHome(home, home / root_home.root.relative_to(root_home.home), root_home.session_id)
-    child = copy.root / copy.session_id / "agents" / "1"
-    child.mkdir(parents=True)
-    log = (copy.root / copy.session_id / "conversation.jsonl").read_text().splitlines()
-    header = json.loads(log[0])
-    header["data"]["session_id"] = "1"
-    (child / "conversation.jsonl").write_text("\n".join([json.dumps(header), *log[1:]]) + "\n")
-    (child / "agent_lifecycle.json").write_text(
-        json.dumps({"agent_type": "worker", "description": "child", "depth": 1, "state": "running"})
-    )
+    _add_running_children(copy, 1)
     return copy
+
+
+def _add_running_children(home: RootHome, count: int) -> None:
+    """Give the root session ``count`` running children with its own history."""
+
+    log = (home.root / home.session_id / "conversation.jsonl").read_text().splitlines()
+    for number in range(1, count + 1):
+        child = home.root / home.session_id / "agents" / str(number)
+        child.mkdir(parents=True)
+        header = json.loads(log[0])
+        header["data"]["session_id"] = str(number)
+        (child / "conversation.jsonl").write_text(
+            "\n".join([json.dumps(header), *log[1:]]) + "\n"
+        )
+        (child / "agent_lifecycle.json").write_text(
+            json.dumps(
+                {"agent_type": "worker", "description": "child", "depth": 1, "state": "running"}
+            )
+        )
 
 
 async def _enter_the_child(driver: Driver) -> None:
