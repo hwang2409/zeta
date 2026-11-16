@@ -5,52 +5,60 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+import re
 import threading
 from collections import deque
 from collections.abc import Mapping
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
+from zeta.models.catalog import PROVIDER_MODELS
+
 from . import SpanHandle, TelemetryError, TelemetryStatus
 from .attributes import RESERVED_CONTENT_ATTRIBUTES
 
-_RESERVED_PREFIXES = tuple(RESERVED_CONTENT_ATTRIBUTES)
 _OPERATION_ATTRIBUTE_KEYS = {
     "agent": frozenset({"gen_ai.operation.name", "zeta.agent.name", "gen_ai.conversation.id", "gen_ai.request.model", "zeta.agent.depth", "zeta.background"}),
     "turn": frozenset({"gen_ai.conversation.id", "zeta.turn.number", "zeta.notification", "zeta.tool.count"}),
     "inference": frozenset({"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.conversation.id", "zeta.stream"}),
     "tool": frozenset({"gen_ai.operation.name", "zeta.tool.name", "zeta.tool.type", "zeta.tool.call.id", "zeta.agent.name", "gen_ai.conversation.id"}),
     "context": frozenset({"zeta.emergency", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count"}),
-    "serve": frozenset({"rpc.system", "rpc.method"}),
 }
-_ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {
-    "error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens",
-    "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size",
-})
-_IDENTIFIER = __import__("re").compile(r"[A-Za-z0-9_.:/-]{1,128}\Z")
-_MODEL = __import__("re").compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
+_EVENT_ATTRIBUTE_KEYS = {"gen_ai.client.retry": frozenset({"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after"}), "zeta.approval.requested": frozenset({"decision", "scope"}), "zeta.approval.resolved": frozenset({"decision", "scope", "duration"})}
+_ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size"})
 _PROVIDERS = frozenset({"claude", "codex", "ollama"})
+_OPERATION_NAMES = frozenset({"invoke_agent", "chat", "execute_tool"})
+_TOOL_TYPES = frozenset({"function", "computer", "mcp", "agent"})
+_FINISH_REASONS = frozenset({"stop", "length", "tool_use", "end_turn", "max_tokens", "content_filter", "error"})
+_RETRY_REASONS = frozenset({"rate_limit", "server_error", "timeout", "connection", "unknown"})
+_APPROVAL_DECISIONS = frozenset({"allow", "deny", "always_allow", "always_deny", "cancel", "reject"})
+_APPROVAL_SCOPES = frozenset({"tool", "session", "turn", "command", "filesystem"})
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_TOOL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:__[A-Za-z0-9][A-Za-z0-9_-]{0,127})?\Z")
+_CALL_ID = re.compile(r"(?=.{1,128}\Z)(?:toolu_[A-Za-z0-9_-]+|call_[A-Za-z0-9_-]+|fc_[A-Za-z0-9_-]+|ollama-[0-9a-f-]+|inline-[0-9a-f-]+)\Z")
+_MODEL = re.compile(r"(?:hf\.co/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?::[A-Za-z0-9_.-]+)?|[A-Za-z0-9][A-Za-z0-9_.-]*:[A-Za-z0-9_.-]+)\Z")
+_PYTHON_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z")
+_MODEL_IDS = frozenset().union(*PROVIDER_MODELS.values())
 
+def _valid(value: object, rule: object) -> object:
+    if not isinstance(value, str) or any(name in value for name in RESERVED_CONTENT_ATTRIBUTES): return "_invalid"
+    if isinstance(rule, frozenset): return value if value in rule else "_invalid"
+    return value if rule.fullmatch(value) else "_invalid"
 
-def _safe_string(value: str, field: str | None = None) -> str:
-    valid = _MODEL if field in {"gen_ai.request.model", "gen_ai.response.model"} else _IDENTIFIER
-    if field == "gen_ai.provider.name" and value not in _PROVIDERS:
-        return "_invalid"
-    if value.startswith(("sk-", "ghp_", "Bearer ")) or not valid.fullmatch(value) or any(name in value for name in _RESERVED_PREFIXES):
-        return "_invalid"
+def _field_value(key: str, value: object) -> object:
+    if key in {"gen_ai.request.model", "gen_ai.response.model"}:
+        return value if isinstance(value, str) and not any(name in value for name in RESERVED_CONTENT_ATTRIBUTES) and (value in _MODEL_IDS or _MODEL.fullmatch(value)) else "_invalid"
+    rules = {"gen_ai.operation.name": _OPERATION_NAMES, "gen_ai.provider.name": _PROVIDERS, "gen_ai.conversation.id": _SESSION_ID, "zeta.agent.name": _IDENTIFIER, "zeta.tool.name": _TOOL_NAME, "zeta.tool.type": _TOOL_TYPES, "zeta.tool.call.id": _CALL_ID, "gen_ai.response.finish_reasons": _FINISH_REASONS, "gen_ai.retry.reason": _RETRY_REASONS, "decision": _APPROVAL_DECISIONS, "scope": _APPROVAL_SCOPES, "error.type": _PYTHON_NAME}
+    rule = rules.get(key)
+    if rule is not None: return _valid(value, rule)
+    ints = {"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.agent.depth", "zeta.turn.number", "zeta.tool.count", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count", "gen_ai.retry.attempt", "gen_ai.retry.delay", "duration"}
+    if key in ints: return value if type(value) is int and value >= 0 else 0
+    if key in {"zeta.background", "zeta.notification", "zeta.stream", "zeta.emergency", "gen_ai.retry.after"}: return value if type(value) is bool else False
     return value
 
-
 def _safe_attributes(attributes: Mapping[str, object] | None, allowed_keys: frozenset[str]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in (attributes or {}).items():
-        if key not in allowed_keys or key not in _ALLOWED_ATTRIBUTE_KEYS:
-            continue
-        if isinstance(value, str):
-            result[key] = _safe_string(value, key)
-        elif isinstance(value, (int, bool)):
-            result[key] = value
-    return result
+    return {key: _field_value(key, value) if isinstance(value, (str, int, bool)) else "_invalid" for key, value in (attributes or {}).items() if key in allowed_keys and key in _ALLOWED_ATTRIBUTE_KEYS}
 
 
 # This is the single owner of the loopback endpoint policy.
@@ -109,9 +117,9 @@ class _SpanHandle(SpanHandle):
         return False
 
     def _set(self, name: str, value: object) -> None:
-        if isinstance(value, str):
-            value = _safe_string(value, name)
-        self._span.set_attribute(name, value)
+        if name not in _ALLOWED_ATTRIBUTE_KEYS:
+            return
+        self._span.set_attribute(name, _field_value(name, value))
 
     def set_usage(self, *, input_tokens: int, output_tokens: int, total_tokens: int) -> None:
         self._set("gen_ai.usage.input_tokens", input_tokens)
@@ -127,20 +135,20 @@ class _SpanHandle(SpanHandle):
         self._set("zeta.tool.call.result.size", result_bytes)
 
     def retry(self, *, attempt: int, reason: str, delay: int, after: bool) -> None:
-        self._span.add_event("gen_ai.client.retry", attributes={
-            "gen_ai.retry.attempt": attempt, "gen_ai.retry.reason": _safe_string(reason, "gen_ai.retry.reason"),
+        self._span.add_event("gen_ai.client.retry", attributes=_safe_attributes({
+            "gen_ai.retry.attempt": attempt, "gen_ai.retry.reason": reason,
             "gen_ai.retry.delay": delay, "gen_ai.retry.after": after,
-        })
+        }, _EVENT_ATTRIBUTE_KEYS["gen_ai.client.retry"]))
 
     def approval_requested(self, *, decision: str, scope: str) -> None:
-        self._span.add_event("zeta.approval.requested", attributes={"decision": _safe_string(decision), "scope": _safe_string(scope)})
+        self._span.add_event("zeta.approval.requested", attributes=_safe_attributes({"decision": decision, "scope": scope}, _EVENT_ATTRIBUTE_KEYS["zeta.approval.requested"]))
 
     def approval_resolved(self, *, decision: str, scope: str, duration: int) -> None:
-        self._span.add_event("zeta.approval.resolved", attributes={"decision": _safe_string(decision), "scope": _safe_string(scope), "duration": duration})
+        self._span.add_event("zeta.approval.resolved", attributes=_safe_attributes({"decision": decision, "scope": scope, "duration": duration}, _EVENT_ATTRIBUTE_KEYS["zeta.approval.resolved"]))
 
     def fail(self, exc: BaseException | type[BaseException]) -> None:
         error_type = exc.__qualname__ if isinstance(exc, type) else type(exc).__qualname__
-        self._set("error.type", _safe_string(error_type))
+        self._set("error.type", _field_value("error.type", error_type))
         from opentelemetry.trace import Status, StatusCode
 
         self._span.set_status(Status(StatusCode.ERROR))
@@ -208,7 +216,8 @@ class _Runtime:
         span_kind = {"internal": SpanKind.INTERNAL, "client": SpanKind.CLIENT, "server": SpanKind.SERVER}[kind]
         if " " in name:
             prefix, suffix = name.split(" ", 1)
-            name = f"{prefix} {_safe_string(suffix)}"
+            key = "zeta.tool.name" if operation == "tool" else "gen_ai.request.model" if operation == "inference" else "zeta.agent.name"
+            name = f"{prefix} {_field_value(key, suffix)}"
         safe_attributes = _safe_attributes(attributes, _OPERATION_ATTRIBUTE_KEYS[operation])
         return _SpanHandle(self._tracer.start_as_current_span(name, kind=span_kind, attributes=safe_attributes, record_exception=False, set_status_on_exception=False))
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.server
+import itertools
 import logging
 import os
 import subprocess
@@ -219,17 +220,16 @@ def test_facade_table_filters_every_operation_and_handle(monkeypatch: pytest.Mon
     )
     leading = tuple(f"{name}.secret-value" for name in reserved_names)
     embedded = tuple(f"safe.{name}.secret-value" for name in reserved_names)
-    adversarial = ("multi\nline", "madeup-provider", "sk-secret", "ghp_secret", "Bearer secret", "unicode-☃", "x" * 129)
+    adversarial = ("multi\nline", "ignore-previous-instructions", "AKIAIOSFODNN7EXAMPLE", "github_pat_11AA0_exampletoken", "sk-secret", "Bearer x", "unicode-☃", "x" * 129)
     operations = (
         lambda value: instance.agent_span(value, agent_name=value, conversation_id=value, model=value, depth=1, background=True),
         lambda value: instance.turn_span(conversation_id=value, turn_number=1, notification=True, tool_count=1),
         lambda value: instance.inference_span(value, provider=adversarial[1], stream=True, conversation_id=value),
         lambda value: instance.tool_span(value, tool_type=value, call_id=value, agent_name=value, conversation_id=value),
         lambda value: instance.context_span(emergency=True, tokens_before=1, tokens_after=2, marker_count=3),
-        lambda value: instance.serve_span(value),
     )
     try:
-        for operation, value in zip(operations, leading):
+        for operation, value in itertools.product(operations, leading):
             with operation(value) as span:
                 for value in embedded:
                     span.set_response(model=value, finish_reason=value)
@@ -248,7 +248,7 @@ def test_facade_table_filters_every_operation_and_handle(monkeypatch: pytest.Mon
     finally:
         instance.shutdown()
 
-    assert len(exported) == 6
+    assert len(exported) == 26
     from zeta.telemetry.runtime import _ALLOWED_ATTRIBUTE_KEYS
 
     for record in exported:

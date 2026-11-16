@@ -154,9 +154,6 @@ class Telemetry:
             "zeta.tokens.after": tokens_after, "zeta.marker.count": marker_count,
         })
 
-    def serve_span(self, method: str) -> SpanHandle:
-        return self._span("serve " + method, kind="server", operation="serve", attributes={"rpc.system": "jsonrpc", "rpc.method": method})
-
     def _span(self, name: str, *, kind: str = "internal", operation: str, attributes: Mapping[str, object] | None = None) -> SpanHandle:
         if self._implementation is None:
             return SpanHandle()
