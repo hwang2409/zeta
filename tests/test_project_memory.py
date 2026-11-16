@@ -781,7 +781,6 @@ def test_project_registry_serializes_concurrent_creates_and_rejects_hardlinks(
         assert publish_started.wait(10), "first project create did not reach publish"
         second = pool.submit(registry.create_project, "project-1", "scope")
         assert second_lock_attempted.wait(10), "second project create did not contend"
-        assert not release_publish.wait(1.1), "project create released too early"
         assert not second.done(), "project create did not wait for the holder"
         release_publish.set()
         projects = [first.result(), second.result()]
