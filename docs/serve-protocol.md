@@ -527,13 +527,14 @@ delivered. The server keeps that session running in the background ("parked")
 and attaches the requested session. When the attached session holds no work,
 the swap is the same as without the feature.
 
-- A parked session sends no event to the controller while it is parked. Its
+- A parked session sends no event to the controller while it is parked, other
+  than `parked_session_changed` (below). Its
   turn, approvals, children, and background tasks keep running, and its rows
   are written to its own history. Two kinds of frames can still carry a
   `session_id` that is not the attached session: child-run events of a parked
   session's children, and events of the outgoing session while the incoming
   session is still being set up. Clients must ignore events whose
-  `session_id` is not the attached session.
+  `session_id` is not the attached session, except `parked_session_changed`.
 - `resume` of a parked session attaches it again, with the rules of "attaching
   to a live turn" (no reopen). The result has `attached: "live_turn"` when its
   turn is still busy, and no `attached` field when it only held background work
@@ -552,6 +553,15 @@ the swap is the same as without the feature.
   parked and closing sessions. `resume` of a parked session never returns this
   error, because it swaps one session for one.
 - `status.parked_sessions` lists the parked sessions (see `status`).
+- The controller gets one `parked_session_changed` event when a session is
+  parked, each time its `state`, `pending_approvals`, or `last_turn_outcome`
+  changes while it is parked, and when it closes (`state: "closed"`). The
+  event's `session_id` is the parked session; `data` is its
+  `status.parked_sessions` row plus `last_turn_outcome` (`{turn_id, reason}`
+  or `null`, the same object as in `status`). A session whose turn ends sends
+  `state: "idle"` with the turn's outcome, then `state: "closed"` once it holds
+  no work. `resume` of a parked session sends no event. Observers do not get
+  this event.
 - On a controller disconnect, each parked session follows the same rules as
   the attached one (approval grace, `turn_reconnect`). A reclaiming `hello`
   with `session_park` takes over every parked session. A reclaiming `hello`
@@ -1552,6 +1562,7 @@ Event fields are:
 | `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
 | `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
 | `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: string` when a session is open |
+| `parked_session_changed` (feature `session_park`, controller only) | `event`, `session_id: string` (the parked session), `data: {session_id: string, state: "running"|"tool"|"idle"|"closed", pending_approvals: integer, last_turn_outcome: {turn_id: string, reason: string}|null}` | none |
 | `session_retention` (feature `session_retention`) | `event`, `data: {timestamp, mode, days, armed_by_zeta_version, preview_id, cutoff, root_ids, count, descendant_count, bytes, skip_counts, progress_counts, errors, disable_pending}` | `session_id` |
 
 In `session_retention` data, `skip_counts` maps a skip reason to the number of
@@ -2176,7 +2187,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 | `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
 | `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
-| `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 are parked or closing (`-32004` with `data.reason: "parked_limit"`), and `status` adds `parked_sessions` (see "parking a busy session") |
+| `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 are parked or closing (`-32004` with `data.reason: "parked_limit"`), `status` adds `parked_sessions`, and the controller gets `parked_session_changed` events (see "parking a busy session") |
 | `in_flight_replay` | requires `session_replay_seq`; a `session_history_and_subscribe` join during a reply starts its stream with the reply text, thinking, and running-tool output streamed so far, as ordinary `assistant_delta` and `tool_output` events (see "joining during a reply") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
