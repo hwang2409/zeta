@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import owned_app
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.models.catalog import PROVIDER_MODELS
@@ -102,7 +103,7 @@ def test_match_models_is_a_case_insensitive_substring_filter() -> None:
 async def test_model_without_arguments_opens_a_picker_on_the_current_model(
     tmp_path: Path,
 ) -> None:
-    app, output = _app(tmp_path)
+    app, _ = _app(tmp_path)
 
     assert (
         await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
@@ -117,7 +118,7 @@ async def test_model_without_arguments_opens_a_picker_on_the_current_model(
     assert picker.selected == "claude-sonnet-4-6"
     assert picker.query == ""
     assert app.model == "claude-sonnet-4-6"
-    rendered = output.getvalue()
+    rendered = _plain(app._picker_card())
     assert "select a model · claude" in rendered
     assert "❯ claude-sonnet-4-6" in rendered
     assert "current" in rendered
@@ -129,7 +130,7 @@ async def test_model_without_arguments_opens_a_picker_on_the_current_model(
 async def test_model_substring_with_several_matches_narrows_the_picker(
     tmp_path: Path,
 ) -> None:
-    app, output = _app(tmp_path)
+    app, _ = _app(tmp_path)
 
     assert (
         await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
@@ -144,7 +145,7 @@ async def test_model_substring_with_several_matches_narrows_the_picker(
     assert picker.query == "opus"
     assert picker.selected == "claude-opus-4-5"
     assert app.model == "claude-sonnet-4-6"
-    assert 'matching "opus"' in output.getvalue()
+    assert 'matching "opus"' in _plain(app._picker_card())
 
 
 @pytest.mark.asyncio
@@ -237,43 +238,24 @@ async def test_picker_navigation_wraps_and_select_switches_the_model(
 
 
 @pytest.mark.asyncio
-async def test_picker_cancel_removes_the_card_and_its_spacer_in_full_screen(
+async def test_the_picker_card_follows_the_picker_and_never_enters_the_transcript(
     tmp_path: Path,
 ) -> None:
-    app, _ = _app(tmp_path, full_screen=True)
-    app._print_system("hello")
-    before = len(app._transcript._units)
-
-    await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
-        app, "/model"
-    )
-
-    assert len(app._transcript._units) == before + 2
-    assert app._model_picker_unit is app._transcript._units[-1]
-    assert "select a model" in _plain(app._model_picker_unit.value)
-
-    app.model_picker_cancel()
-
-    assert app._model_picker is None
-    assert app._model_picker_unit is None
-    assert len(app._transcript._units) == before
-    app.model_picker_cancel()  # idempotent
-    assert len(app._transcript._units) == before
-
-
-@pytest.mark.asyncio
-async def test_picker_moves_repaint_the_card_in_full_screen(tmp_path: Path) -> None:
     app, _ = _app(tmp_path, provider="codex", model="gpt-5.6-luna", full_screen=True)
-    await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
-        app, "/model"
-    )
-    unit = app._model_picker_unit
-    assert "❯ gpt-5.6-luna" in _plain(unit.value)
+    async with owned_app(app):
+        app._print_system("hello")
+        before = len(app._transcript._units)
+        await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch_async(
+            app, "/model"
+        )
+        assert "❯ gpt-5.6-luna" in _plain(app._picker_card())
 
-    app.model_picker_move(1)
+        app.model_picker_move(1)
+        assert "❯ gpt-5.6-sol" in _plain(app._picker_card())
 
-    assert app._model_picker_unit is unit
-    assert "❯ gpt-5.6-sol" in _plain(unit.value)
+        app.model_picker_cancel()
+        assert app._picker_card() is None
+        assert len(app._transcript._units) == before
 
 
 @pytest.mark.asyncio
