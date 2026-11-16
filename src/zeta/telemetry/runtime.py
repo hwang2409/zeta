@@ -9,42 +9,40 @@ import threading
 from collections import deque
 from collections.abc import Mapping
 from contextlib import contextmanager
-from typing import Self
 from urllib.parse import urlsplit
 
-from . import TelemetryError, TelemetryStatus
+from . import SpanHandle, TelemetryError, TelemetryStatus
 from .attributes import RESERVED_CONTENT_ATTRIBUTES
 
-_ALLOWED_ATTRIBUTES = frozenset(
-    {
-        "gen_ai.operation.name",
-        "gen_ai.provider.name",
-        "gen_ai.request.model",
-        "gen_ai.response.model",
-        "gen_ai.response.finish_reasons",
-        "gen_ai.conversation.id",
-        "zeta.agent.depth",
-        "zeta.background",
-        "zeta.turn.number",
-        "zeta.notification",
-        "zeta.tool.count",
-        "zeta.tool.name",
-        "zeta.tool.type",
-        "zeta.tool.call.id",
-        "zeta.agent.name",
-        "rpc.system",
-        "rpc.method",
-        "error.type",
-        "safe",
-    }
-)
-_ALLOWED_EVENT_ATTRIBUTES = frozenset(
-    {"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after", "safe.event"}
-)
+_RESERVED_PREFIXES = tuple(RESERVED_CONTENT_ATTRIBUTES)
+_ALLOWED_ATTRIBUTE_KEYS = frozenset({
+    "gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.response.model",
+    "gen_ai.response.finish_reasons", "gen_ai.conversation.id", "zeta.agent.depth", "zeta.background",
+    "zeta.turn.number", "zeta.notification", "zeta.tool.count", "zeta.tool.name", "zeta.tool.type",
+    "zeta.tool.call.id", "zeta.agent.name", "zeta.stream", "zeta.emergency", "zeta.tokens.before",
+    "zeta.tokens.after", "zeta.marker.count", "rpc.system", "rpc.method", "error.type",
+    "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "zeta.tool.call.arguments.size",
+    "zeta.tool.call.result.size",
+})
+_IDENTIFIER = __import__("re").compile(r"[A-Za-z0-9_.:/-]{1,128}\Z")
 
 
-def _safe_attributes(attributes: Mapping[str, object] | None, allowed: frozenset[str] = _ALLOWED_ATTRIBUTES) -> dict[str, object]:
-    return {key: value for key, value in (attributes or {}).items() if key in allowed and key not in RESERVED_CONTENT_ATTRIBUTES}
+def _safe_string(value: str) -> str:
+    if not _IDENTIFIER.fullmatch(value) or any(value == name or value.startswith(name) for name in _RESERVED_PREFIXES):
+        return "_invalid"
+    return value
+
+
+def _safe_attributes(attributes: Mapping[str, object] | None) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in (attributes or {}).items():
+        if key not in _ALLOWED_ATTRIBUTE_KEYS or key in RESERVED_CONTENT_ATTRIBUTES:
+            continue
+        if isinstance(value, str):
+            result[key] = _safe_string(value)
+        elif isinstance(value, (int, bool)):
+            result[key] = value
+    return result
 
 
 # This is the single owner of the loopback endpoint policy.
@@ -87,38 +85,57 @@ class StatusCell:
             return self._values.pop() if self._values else None
 
 
-class _SpanHandle:
+class _SpanHandle(SpanHandle):
     def __init__(self, scope: object) -> None:
+        super().__init__(self)
         self._scope = scope
         self._span: object | None = None
 
-    def __enter__(self) -> Self:
+    def enter(self) -> None:
         self._span = self._scope.__enter__()
-        return self
 
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
-        if exc_type is not None:
-            self.set_attribute("error.type", exc_type.__name__)
+    def exit(self, exc_type: object, exc: object, traceback: object) -> bool:
+        if exc_type is not None and isinstance(exc, BaseException):
+            self.fail(exc)
         self._scope.__exit__(None, None, None)
         return False
 
-    def set_attribute(self, name: str, value: object) -> None:
-        if name in _ALLOWED_ATTRIBUTES and name not in RESERVED_CONTENT_ATTRIBUTES:
-            self._span.set_attribute(name, value)
+    def _set(self, name: str, value: object) -> None:
+        if isinstance(value, str):
+            value = _safe_string(value)
+        self._span.set_attribute(name, value)
 
-    def add_event(self, name: str, attributes: Mapping[str, object] | None = None) -> None:
-        safe = _safe_attributes(attributes, _ALLOWED_EVENT_ATTRIBUTES)
-        self._span.add_event(name, attributes=safe)
+    def set_usage(self, *, input_tokens: int, output_tokens: int, total_tokens: int) -> None:
+        self._set("gen_ai.usage.input_tokens", input_tokens)
+        self._set("gen_ai.usage.output_tokens", output_tokens)
+        self._set("gen_ai.usage.total_tokens", total_tokens)
 
-    def record_exception(self, exception: BaseException) -> None:
-        self.set_attribute("error.type", type(exception).__name__)
+    def set_response(self, *, model: str, finish_reason: str) -> None:
+        self._set("gen_ai.response.model", model)
+        self._set("gen_ai.response.finish_reasons", finish_reason)
 
-    def set_error(self, error_type: str | None = None) -> None:
-        if error_type is not None:
-            self.set_attribute("error.type", error_type)
-            from opentelemetry.trace import Status, StatusCode
+    def set_sizes(self, *, argument_bytes: int, result_bytes: int) -> None:
+        self._set("zeta.tool.call.arguments.size", argument_bytes)
+        self._set("zeta.tool.call.result.size", result_bytes)
 
-            self._span.set_status(Status(StatusCode.ERROR))
+    def retry(self, *, attempt: int, reason: str, delay: int, after: bool) -> None:
+        self._span.add_event("gen_ai.client.retry", attributes={
+            "gen_ai.retry.attempt": attempt, "gen_ai.retry.reason": _safe_string(reason),
+            "gen_ai.retry.delay": delay, "gen_ai.retry.after": after,
+        })
+
+    def approval_requested(self, *, decision: str, scope: str) -> None:
+        self._span.add_event("zeta.approval.requested", attributes={"decision": _safe_string(decision), "scope": _safe_string(scope)})
+
+    def approval_resolved(self, *, decision: str, scope: str, duration: int) -> None:
+        self._span.add_event("zeta.approval.resolved", attributes={"decision": _safe_string(decision), "scope": _safe_string(scope), "duration": duration})
+
+    def fail(self, exc: BaseException | type[BaseException]) -> None:
+        error_type = exc.__qualname__ if isinstance(exc, type) else type(exc).__qualname__
+        self._set("error.type", _safe_string(error_type))
+        from opentelemetry.trace import Status, StatusCode
+
+        self._span.set_status(Status(StatusCode.ERROR))
 
 
 class _Exporter:
@@ -144,9 +161,6 @@ class _Exporter:
     def shutdown(self) -> None:
         self._delegate.shutdown()
         self._session.close()
-
-    def force_flush(self, timeout_millis: int = 30000) -> bool:
-        return self._delegate.force_flush(timeout_millis)
 
 
 class _Runtime:
@@ -184,6 +198,9 @@ class _Runtime:
         from opentelemetry.trace import SpanKind
 
         span_kind = {"internal": SpanKind.INTERNAL, "client": SpanKind.CLIENT, "server": SpanKind.SERVER}[kind]
+        if " " in name:
+            prefix, suffix = name.split(" ", 1)
+            name = f"{prefix} {_safe_string(suffix)}"
         safe_attributes = _safe_attributes(attributes)
         return _SpanHandle(self._tracer.start_as_current_span(name, kind=span_kind, attributes=safe_attributes, record_exception=False, set_status_on_exception=False))
 
@@ -211,12 +228,6 @@ class _Runtime:
             yield
         finally:
             context.detach(token)
-
-    def retry(self, **attributes: object) -> None:
-        from opentelemetry import trace
-
-        span = trace.get_current_span()
-        span.add_event("gen_ai.client.retry", attributes=_safe_attributes(attributes, _ALLOWED_EVENT_ATTRIBUTES))
 
 
 def configure(endpoint: str) -> _Runtime:

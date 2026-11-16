@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import Self
 
 
 @dataclass(frozen=True)
@@ -19,30 +19,55 @@ class TelemetryError(RuntimeError):
     """Raised when configured telemetry cannot be constructed safely."""
 
 
-class _DisabledSpan:
+class SpanHandle:
+    """A fixed, metadata-only span interface."""
+
+    def __init__(self, implementation: object | None = None) -> None:
+        self._implementation = implementation
+
     def __enter__(self) -> Self:
+        if self._implementation is not None:
+            self._implementation.enter()
         return self
 
-    def __exit__(self, *_args: object) -> None:
-        return None
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+        if self._implementation is not None:
+            return self._implementation.exit(exc_type, exc, traceback)
+        return False
 
-    def set_attribute(self, _name: str, _value: object) -> None:
-        return None
+    def set_usage(self, *, input_tokens: int, output_tokens: int, total_tokens: int) -> None:
+        if self._implementation is not None:
+            self._implementation.set_usage(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens)
 
-    def add_event(self, _name: str, _attributes: Mapping[str, object] | None = None) -> None:
-        return None
+    def retry(self, *, attempt: int, reason: str, delay: int, after: bool) -> None:
+        if self._implementation is not None:
+            self._implementation.retry(attempt=attempt, reason=reason, delay=delay, after=after)
 
-    def record_exception(self, _exception: BaseException) -> None:
-        return None
+    def approval_requested(self, *, decision: str, scope: str) -> None:
+        if self._implementation is not None:
+            self._implementation.approval_requested(decision=decision, scope=scope)
 
-    def set_error(self, _error_type: str | None = None) -> None:
-        return None
+    def approval_resolved(self, *, decision: str, scope: str, duration: int) -> None:
+        if self._implementation is not None:
+            self._implementation.approval_resolved(decision=decision, scope=scope, duration=duration)
+
+    def set_response(self, *, model: str, finish_reason: str) -> None:
+        if self._implementation is not None:
+            self._implementation.set_response(model=model, finish_reason=finish_reason)
+
+    def set_sizes(self, *, argument_bytes: int, result_bytes: int) -> None:
+        if self._implementation is not None:
+            self._implementation.set_sizes(argument_bytes=argument_bytes, result_bytes=result_bytes)
+
+    def fail(self, exc: BaseException | type[BaseException]) -> None:
+        if self._implementation is not None:
+            self._implementation.fail(exc)
 
 
 class Telemetry:
     """A process-owned, optional telemetry provider."""
 
-    def __init__(self, implementation: Any = None) -> None:
+    def __init__(self, implementation: object | None = None) -> None:
         self._implementation = implementation
 
     @classmethod
@@ -92,32 +117,50 @@ class Telemetry:
         if self._implementation is not None:
             self._implementation.inject(carrier)
 
-    def _span(self, name: str, *, kind: str = "internal", attributes: Mapping[str, object] | None = None) -> Any:
+    def agent_span(
+        self, profile: str, *, agent_name: str, conversation_id: str, model: str, depth: int, background: bool
+    ) -> SpanHandle:
+        return self._span(f"invoke_agent {profile}", attributes={
+            "gen_ai.operation.name": "invoke_agent", "zeta.agent.name": agent_name,
+            "gen_ai.conversation.id": conversation_id, "gen_ai.request.model": model,
+            "zeta.agent.depth": depth, "zeta.background": background,
+        })
+
+    def turn_span(self, *, conversation_id: str, turn_number: int, notification: bool, tool_count: int) -> SpanHandle:
+        return self._span("zeta.turn", attributes={
+            "gen_ai.conversation.id": conversation_id, "zeta.turn.number": turn_number,
+            "zeta.notification": notification, "zeta.tool.count": tool_count,
+        })
+
+    def inference_span(self, model: str, *, provider: str, stream: bool, conversation_id: str) -> SpanHandle:
+        return self._span("chat " + model, kind="client", attributes={
+            "gen_ai.operation.name": "chat", "gen_ai.provider.name": provider,
+            "gen_ai.request.model": model, "gen_ai.conversation.id": conversation_id,
+            "zeta.stream": stream,
+        })
+
+    def tool_span(
+        self, name: str, *, tool_type: str, call_id: str, agent_name: str, conversation_id: str
+    ) -> SpanHandle:
+        return self._span("execute_tool " + name, attributes={
+            "gen_ai.operation.name": "execute_tool", "zeta.tool.name": name,
+            "zeta.tool.type": tool_type, "zeta.tool.call.id": call_id,
+            "zeta.agent.name": agent_name, "gen_ai.conversation.id": conversation_id,
+        })
+
+    def context_span(self, *, emergency: bool, tokens_before: int, tokens_after: int, marker_count: int) -> SpanHandle:
+        return self._span("zeta.context.compact", attributes={
+            "zeta.emergency": emergency, "zeta.tokens.before": tokens_before,
+            "zeta.tokens.after": tokens_after, "zeta.marker.count": marker_count,
+        })
+
+    def serve_span(self, method: str) -> SpanHandle:
+        return self._span("serve " + method, kind="server", attributes={"rpc.system": "jsonrpc", "rpc.method": method})
+
+    def _span(self, name: str, *, kind: str = "internal", attributes: Mapping[str, object] | None = None) -> SpanHandle:
         if self._implementation is None:
-            return _DisabledSpan()
+            return SpanHandle()
         return self._implementation._span(name, kind=kind, attributes=attributes)
 
-    def agent_span(self, profile: str, **attributes: object) -> Any:
-        return self._span(f"invoke_agent {profile}", attributes=attributes)
 
-    def turn_span(self, **attributes: object) -> Any:
-        return self._span("zeta.turn", attributes=attributes)
-
-    def inference_span(self, model: str, **attributes: object) -> Any:
-        return self._span(f"chat {model}", kind="client", attributes=attributes)
-
-    def tool_span(self, name: str, **attributes: object) -> Any:
-        return self._span(f"execute_tool {name}", attributes=attributes)
-
-    def context_span(self, **attributes: object) -> Any:
-        return self._span("zeta.context.compact", attributes=attributes)
-
-    def serve_span(self, method: str, **attributes: object) -> Any:
-        return self._span(f"serve {method}", kind="server", attributes=attributes)
-
-    def retry(self, **attributes: object) -> None:
-        if self._implementation is not None:
-            self._implementation.retry(**attributes)
-
-
-__all__ = ["Telemetry", "TelemetryError", "TelemetryStatus"]
+__all__ = ["SpanHandle", "Telemetry", "TelemetryError", "TelemetryStatus"]

@@ -59,7 +59,7 @@ def test_hostile_environment_does_not_disable_private_configuration(monkeypatch:
         monkeypatch.delenv(name, raising=False)
 
     instance = telemetry.Telemetry.configure(SimpleNamespace(otel_endpoint="http://127.0.0.1:4318/v1/traces"))
-    with instance.turn_span():
+    with instance.turn_span(conversation_id="test", turn_number=1, notification=False, tool_count=0):
         carrier = instance.current_trace_context()
     limits = vars(instance._implementation._provider._span_limits)
     instance.shutdown()
@@ -122,7 +122,7 @@ def test_transport_ignores_proxy_and_does_not_follow_redirects(monkeypatch: pyte
     try:
         endpoint = f"http://127.0.0.1:{server.server_port}/v1/traces"
         instance = telemetry.Telemetry.configure(endpoint)
-        with instance.turn_span():
+        with instance.turn_span(conversation_id="test", turn_number=1, notification=False, tool_count=0):
             pass
         instance.shutdown()
         assert received.wait(5)
@@ -168,7 +168,7 @@ def test_shutdown_is_synchronous_and_export_failure_is_not_logged(monkeypatch: p
     app_logger.addHandler(handler)
     try:
         instance = telemetry.Telemetry.configure("http://127.0.0.1:4318/v1/traces")
-        with instance.turn_span():
+        with instance.turn_span(conversation_id="test", turn_number=1, notification=False, tool_count=0):
             pass
         instance.shutdown()
         instance.shutdown()
@@ -194,7 +194,7 @@ def test_loopback_and_one_slot() -> None:
     assert cell.read() is None
 
 
-def test_facade_drops_content_and_exception_details(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_facade_table_filters_every_operation_and_handle(monkeypatch: pytest.MonkeyPatch) -> None:
     from opentelemetry.exporter.otlp.proto.http import trace_exporter
     from opentelemetry.sdk.trace.export import SpanExportResult
 
@@ -213,31 +213,41 @@ def test_facade_drops_content_and_exception_details(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(trace_exporter, "OTLPSpanExporter", MemoryExporter)
     instance = telemetry.Telemetry.configure("http://127.0.0.1:4318/v1/traces")
+    hostile = "gen_ai.input.messages.secret-value"
+    operations = (
+        lambda: instance.agent_span(hostile, agent_name=hostile, conversation_id=hostile, model=hostile, depth=1, background=True),
+        lambda: instance.turn_span(conversation_id=hostile, turn_number=1, notification=True, tool_count=1),
+        lambda: instance.inference_span(hostile, provider=hostile, stream=True, conversation_id=hostile),
+        lambda: instance.tool_span(hostile, tool_type=hostile, call_id=hostile, agent_name=hostile, conversation_id=hostile),
+        lambda: instance.context_span(emergency=True, tokens_before=1, tokens_after=2, marker_count=3),
+        lambda: instance.serve_span(hostile),
+    )
     try:
-        with instance.tool_span("test", **{name: "secret" for name in (
-            "gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.system_instructions",
-            "gen_ai.tool.call.arguments", "gen_ai.tool.call.result",
-        )}) as span:
-            span.set_attribute("safe", "ok")
-            span.add_event("event", {"gen_ai.input.messages": "secret", "safe.event": "ok"})
-            span.record_exception(ValueError("secret stack and message"))
-            span.set_error("ExplicitError")
-            instance.retry(**{"gen_ai.input.messages": "retry secret", "gen_ai.retry.attempt": 2})
+        for operation in operations:
+            with operation() as span:
+                span.set_usage(input_tokens=1, output_tokens=2, total_tokens=3)
+                span.set_response(model=hostile, finish_reason=hostile)
+                span.set_sizes(argument_bytes=4, result_bytes=5)
+                span.retry(attempt=1, reason=hostile, delay=4, after=True)
+                span.approval_requested(decision=hostile, scope=hostile)
+                span.approval_resolved(decision=hostile, scope=hostile, duration=5)
+                span.fail(ValueError(hostile))
+        try:
+            with instance.tool_span(hostile, tool_type=hostile, call_id=hostile, agent_name=hostile, conversation_id=hostile):
+                raise LookupError(hostile)
+        except LookupError:
+            pass
     finally:
         instance.shutdown()
-    assert len(exported) == 1
-    record = exported[0]
-    assert not any(key in record.attributes for key in (
-        "gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.system_instructions",
-        "gen_ai.tool.call.arguments", "gen_ai.tool.call.result",
-    ))
-    assert record.attributes["safe"] == "ok"
-    assert record.attributes["error.type"] == "ExplicitError"
-    assert all("secret" not in str(event.attributes) for event in record.events)
-    assert any(event.name == "gen_ai.client.retry" for event in record.events)
-    assert all("gen_ai.input.messages" not in event.attributes for event in record.events)
-    assert record.status.description is None
 
+    assert len(exported) == 7
+    for record in exported:
+        assert all(hostile not in str(record.attributes).lower() for _ in [0])
+        assert all(hostile not in str(event.attributes).lower() for event in record.events)
+        assert record.status.description is None
+        assert not any(event.name == "exception" or "exception" in event.name for event in record.events)
+        assert record.attributes.get("error.type") == "ValueError" or record.attributes.get("error.type") == "LookupError"
+        assert all("gen_ai.input.messages" not in name for name in (record.name, *(event.name for event in record.events)))
 
 def test_batch_queue_and_shared_logger_are_owned(monkeypatch: pytest.MonkeyPatch) -> None:
     from opentelemetry.exporter.otlp.proto.http import trace_exporter
