@@ -45,7 +45,7 @@ from ..compaction import (
     SummaryCompletionError as _SummaryCompletionError,
     SummaryInputTooLarge as _SummaryInputTooLarge,
 )
-from ..protocol.tool_batches import interrupted_tool_result
+from ..protocol.tool_batches import interrupted_tool_result, repair_tool_batches
 from ..protocol.types import (
     ASSISTANT_RESPONSE_COMPLETED,
     ASSISTANT_RESPONSE_STATE,
@@ -73,11 +73,10 @@ BudgetExceeded = RequestBudgetExceeded
 def _with_interrupted_results(
     items: list[_ContextItem], entries: Sequence[ConversationEntry]
 ) -> list[_ContextItem]:
-    """Give each call of a batch that a dead process left open a stand-in result.
+    """Repair batches a dead process left open, with this branch's approval facts.
 
-    A batch is open when a later item follows before all its results exist.
-    A call whose durable approval request never got ``allow`` did not run;
-    any other call may have run.
+    A call whose durable approval request never got ``allow`` did not run; any
+    other call with no result may have run.
     """
     allowed = {
         entry.data.get("request_id")
@@ -90,41 +89,16 @@ def _with_interrupted_results(
         if entry.type == "message"
         for request in entry.data.get("approval_requests", ())
     }
-    result: list[_ContextItem] = []
-    index = 0
-    while index < len(items):
-        item = items[index]
-        result.append(item)
-        index += 1
-        # A failed provider reply's calls never ran; the payload drops them.
-        if (
-            item.message.role is not MessageRole.ASSISTANT
-            or item.message.metadata.get(FAILED_TURN_MARKER)
-        ):
-            continue
-        call_ids = [
-            block.tool_call.id
-            for block in item.message.content
-            if isinstance(block, ToolUseContent)
-        ]
-        answered: set[str] = set()
-        while index < len(items) and items[index].message.tool_result is not None:
-            answered.add(items[index].message.tool_result.tool_call_id)
-            result.append(items[index])
-            index += 1
-        if index == len(items) or len(set(call_ids)) != len(call_ids):
-            continue
-        result.extend(
-            _ContextItem(
-                None,
-                interrupted_tool_result(
-                    call_id, not_run=call_id in requested and call_id not in allowed
-                ),
-            )
-            for call_id in call_ids
-            if call_id not in answered
-        )
-    return result
+    return repair_tool_batches(
+        items,
+        lambda item: item.message,
+        lambda call_id: _ContextItem(
+            None,
+            interrupted_tool_result(
+                call_id, not_run=call_id in requested and call_id not in allowed
+            ),
+        ),
+    )
 
 
 class StaleBranchError(RuntimeError):

@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from tests.support.owned import await_or_fail
-from zeta.core.approval import ApprovalPolicy
+from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,
@@ -27,8 +27,10 @@ from zeta.protocol.types import (
     ToolSchema,
     ToolUseContent,
 )
+from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
 from zeta.providers.completion import owned_completion
+from zeta.providers.ollama import _messages as ollama_messages
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
@@ -49,6 +51,8 @@ class AddTaskModel(CompletionBackend):
     def __init__(self, name: str) -> None:
         self.name = name
         self.requests: list[list[dict[str, Any]]] = []
+        self.anthropic: list[list[dict[str, Any]]] = []
+        self.ollama: list[list[dict[str, Any]]] = []
         self.turn = 0
 
     @owned_completion
@@ -57,6 +61,12 @@ class AddTaskModel(CompletionBackend):
     ) -> AsyncIterator[StreamEvent]:
         items = build_responses_payload(messages, tool_schemas, model="gpt-5")["input"]
         self.requests.append(items)
+        self.anthropic.append(
+            build_messages_payload(
+                messages, tool_schemas, model="claude-sonnet-4-5", max_tokens=10_000
+            )["messages"]
+        )
+        self.ollama.append(ollama_messages(messages))
         titles = {
             item["call_id"]: json.loads(item["arguments"])["title"]
             for item in items
@@ -220,3 +230,82 @@ async def test_continue_after_a_dead_batch_does_not_repeat_completed_calls(
 async def _drain(events: AsyncIterator[StreamEvent]) -> None:
     async for _event in events:
         pass
+
+
+@pytest.mark.asyncio
+async def test_live_batch_with_a_late_approval_anchor_stays_one_paired_batch(
+    tmp_path: Path,
+) -> None:
+    """A stricter policy mid-batch stores an approval anchor inside the batch.
+
+    The anchor repeats a call of the batch; it must not split the batch or
+    send that call twice, on any provider.
+    """
+
+    store = ConversationStore(tmp_path, session_id="session")
+    policy = ApprovalPolicy(default="allow", store=store)
+    ran: list[str] = []
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+
+    def add_task(arguments: dict[str, str]) -> str:
+        ran.append(arguments["title"])
+        policy.default = ApprovalDecision.ASK
+        return f"added {arguments['title']}"
+
+    registry.register("add_task", add_task)
+    model = AddTaskModel("live")
+    loop = AgentLoop(
+        model,
+        store,
+        registry=registry,
+        approval_policy=policy,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        async with aclosing(
+            loop.run_turn("add Alpha, Beta, Gamma", origin=MessageOrigin.USER)
+        ) as events:
+
+            async def answer() -> None:
+                async for event in events:
+                    if event.type is StreamEventType.TOOL_APPROVAL_START:
+                        assert event.tool_call is not None
+                        assert policy.approve(event.tool_call.id)
+
+            await await_or_fail(answer(), what="live turn")
+
+        assert ran == list(TITLES)
+        ids = [f"live-0-{title}" for title in TITLES]
+        after_batch = model.requests[1]
+        assert [
+            (item["type"], item["call_id"], item.get("output"))
+            for item in after_batch
+            if item.get("call_id", "").startswith("live-")
+        ] == [
+            *(("function_call", call_id, None) for call_id in ids),
+            *(
+                ("function_call_output", call_id, f"added {title}")
+                for call_id, title in zip(ids, TITLES, strict=True)
+            ),
+        ]
+        uses = [
+            block["id"]
+            for message in model.anthropic[1]
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
+        results = [
+            block["tool_use_id"]
+            for message in model.anthropic[1]
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+        ]
+        assert uses == ids
+        assert results == ids
+        assert len(model.ollama) == 2
+    finally:
+        await loop.close()
+        await registry.close()
+        store.close()
