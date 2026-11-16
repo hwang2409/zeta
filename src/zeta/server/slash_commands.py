@@ -587,7 +587,9 @@ def build_registry(runtime: ServerRuntime) -> SlashCommandRegistry:
         skill_catalog=catalog,
         project_registry_state=runtime.manager.project_registry_state,
         surface=SlashSurface.SERVE,
-        extensions=runtime.state.extensions if runtime.state is not None else None,
+        extensions=(
+            getattr(getattr(runtime, "state", None), "extensions", None)
+        ),
     )
 
 
