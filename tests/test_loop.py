@@ -514,6 +514,11 @@ class ParallelChildFailureBackend(CompletionBackend):
             )
             return
         if any(message.tool_result is not None for message in messages):
+            self.model_result_ids = [
+                message.tool_result.tool_call_id
+                for message in messages
+                if message.tool_result is not None
+            ]
             yield StreamEvent(
                 StreamEventType.MESSAGE_END,
                 message=Message(
@@ -3209,32 +3214,48 @@ async def test_child_setup_failure_does_not_cancel_parallel_sibling(
     tmp_path: Path,
 ) -> None:
     store = ConversationStore(tmp_path)
-    loop = AgentLoop(ParallelChildFailureBackend(), store, skill_catalog=SkillCatalog.empty())
+    backend = ParallelChildFailureBackend()
+    loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
     original_ensure = AgentLoop._ensure_mcp_servers
     child_ids: list[str] = []
+    sibling_ended = asyncio.Event()
 
     async def fail_first_child(self: AgentLoop) -> None:
         child_ids.append(self.store.session_id)
         if self.store.session_id == "1":
+            # fail only after the sibling ends: a sibling still running must survive
+            await asyncio.wait_for(sibling_ended.wait(), 10)
             raise httpx.ConnectError(
                 "child setup disconnected",
                 request=httpx.Request("GET", "https://test.invalid"),
             )
         await original_ensure(self)
 
+    async def run() -> None:
+        async for event in loop.run_turn("delegate", origin=MessageOrigin.USER):
+            if (
+                event.type is StreamEventType.TOOL_EXECUTION_END
+                and event.tool_call is not None
+                and event.tool_call.id == "child-lives"
+            ):
+                sibling_ended.set()
+
     with patch.object(AgentLoop, "_ensure_mcp_servers", fail_first_child):
-        await collect(loop.run_turn("delegate", origin=MessageOrigin.USER))
+        await asyncio.wait_for(run(), 10)
 
     assert "1" in child_ids
-    results = [
-        message.tool_result
+    # rows are stored in finish order; context assembly restores call order
+    results = {
+        message.tool_result.tool_call_id: message.tool_result
         for message in branch_messages(store)
         if message.tool_result is not None
-    ]
-    assert results[0] is not None and results[0].is_error
-    assert "child setup disconnected" in results[0].content
-    assert results[1] is not None and results[1].content.startswith("sibling complete")
-    child_path = Path(results[0].structured_content["child_session_path"])
+    }
+    assert results["child-dies"].is_error
+    assert "child setup disconnected" in results["child-dies"].content
+    assert results["child-lives"].content.startswith("sibling complete")
+    assert list(results) == ["child-lives", "child-dies"]
+    assert backend.model_result_ids == ["child-dies", "child-lives"]
+    child_path = Path(results["child-dies"].structured_content["child_session_path"])
     child_store = ConversationStore(child_path.parent, session_id=child_path.name)
     assert child_store.turn_in_flight() is False
 
