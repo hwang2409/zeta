@@ -176,6 +176,7 @@ async def test_parked_approval_is_read_from_join_after_resume(tmp_path: Path) ->
     call = ToolUseContent(ToolCall("w-1", "write", {"path": str(target), "content": "x"}))
     backend = GatedBackend([
         ([TextContent("writing"), HOLD], [TextContent("writing"), call]),
+        ([TextContent("beta")], [TextContent("beta")]),
         ([TextContent("written")], [TextContent("written")]),
     ])
     server = _server(tmp_path, backend)
@@ -185,12 +186,16 @@ async def test_parked_approval_is_read_from_join_after_resume(tmp_path: Path) ->
         a = await client.new(mode="ask")
         await client.call("send", {"text": "write"})
         await await_or_fail(backend.held[0].wait(), what="A mid-reply")
-        await client.new()
+        b = await client.new()
         parked = server._parked[a]
 
         backend.gates[0].set()
         await _until(parked.has_pending_approvals, "parked approval")
-        seen = await client.frames("status")
+        # B's turn start closes stale approvals of B's own store only (#1357)
+        seen = await client.frames("send", {"text": "go"})
+        seen += await frames_until_event(client.reader, "agent_end")
+        assert seen[-1]["params"]["session_id"] == b
+        seen += await client.frames("status")
         status = seen[-1]["result"]
         assert [(row["session_id"], row["pending_approvals"])
                 for row in status["parked_sessions"]] == [(a, 1)]
