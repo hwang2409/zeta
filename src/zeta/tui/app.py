@@ -851,9 +851,7 @@ class TUIApp(
             ),
         )
         if owner.search_task is not None:
-            owner.search_task.add_done_callback(
-                lambda _task: self._finder_accept_when_ready()
-            )
+            owner.search_task.add_done_callback(self._history_search_ended)
 
     def _navigate_history_search(self, delta: int) -> bool:
         transcript = self._viewed_transcript()
@@ -864,13 +862,21 @@ class TUIApp(
                 if delta > 0
                 else transcript.previous_search_match()
             )
-        return owner.navigate_search(
+        if not owner.navigate_search(
             delta,
             transcript,
             lambda target, query: self._publish_history_search_target(
                 transcript, target, query
             ),
-        )
+        ):
+            return False
+        owner.search_task.add_done_callback(self._history_search_ended)
+        return True
+
+    def _history_search_ended(self, _task: asyncio.Task[None]) -> None:
+        # The finder reads "searching…" until this task ends; redraw without a key.
+        self._invalidate_prompt()
+        self._finder_accept_when_ready()
 
     def _finder_loading(self) -> bool:
         navigation = getattr(self, "_agent_navigation", None)
