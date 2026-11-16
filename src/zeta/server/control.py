@@ -437,9 +437,7 @@ class ServeControl:
         """Re-bind the active session's released MCP headers for a returning client."""
         loop = self.server.runtime.loop
         assert loop is not None
-        # set_mcp_bindings cancels a running mount, which would kill a wake waiting on it
-        await loop.finish_mcp_mount()
-        await loop.set_mcp_bindings(headers, configs)
+        await loop.rebind_mcp(headers, configs)
         self._end_grace_deadline()
         await loop._ensure_mcp_servers()
         self._active_mcp_bindings = headers
