@@ -236,8 +236,11 @@ def subscribe_tui_update_notice(app: Any) -> None:
             return
         app._invalidate_prompt()
         observer_host = app.observer_host
-        if observer_host is not None:
-            await observer_host.publish_update(old_revision, new_revision)
+        if observer_host is None:
+            return
+        # Do not keep the app alive while an unrelated observer may wait.
+        del app
+        await observer_host.publish_update(old_revision, new_revision)
 
     app._update_notice_callback = handle_update
     process_update_monitor(package_file).subscribe(handle_update)

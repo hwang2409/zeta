@@ -306,9 +306,23 @@ class Driver:
             await asyncio.sleep(0.01)
         await self.until(self.idle, what=what)
 
+    def keys_pending(self) -> bool:
+        """True while prompt_toolkit holds typed bytes for its flush timer.
+
+        A lone Esc byte may start an escape sequence, so prompt_toolkit keeps it
+        until ``auto_flush_input`` runs ``ttimeoutlen`` later; only then is the
+        key handled.
+        """
+
+        return any(
+            not task.done() and task.get_coro().__name__ == "auto_flush_input"
+            for task in self.session.app._background_tasks
+        )
+
     def idle(self) -> bool:
         return (
-            not self.session.app.invalidated
+            not self.keys_pending()
+            and not self.session.app.invalidated
             and not self.app._agent_navigation.transcript_control.history_pager._loads
             and self.app._finder_prepare_task is None
             and self.app._finder_rank_task is None
@@ -2121,7 +2135,12 @@ def _add_running_children(home: RootHome, count: int) -> None:
 async def _enter_the_child(driver: Driver) -> None:
     navigation = driver.app._agent_navigation
     await driver.until(lambda: bool(navigation.entries), what="no child in the agent list")
-    await driver.until(driver.app.composer_can_focus_agent_list, what="agent list not reachable")
+    # Down's binding also needs startup replay to be over; the last answer can be
+    # drawn before it is.
+    await driver.until(
+        lambda: driver.app.interaction_ready() and driver.app.composer_can_focus_agent_list(),
+        what="agent list not reachable",
+    )
     await driver.send("\x1b[B")
     await driver.until(navigation.list_focused, what="Down did not focus the agent list")
     while navigation.entries[navigation.selected_index].path.name != "1":
