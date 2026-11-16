@@ -1943,9 +1943,13 @@ async def test_finder_shows_no_matches_once_old_history_finds_nothing(
 
 @pytest.mark.asyncio
 async def test_finder_escape_returns_the_composer_to_insert_mode(
-    root_home: RootHome,
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async with running_tui(root_home) as driver:
+    # Own copy: the typed text stays as a draft, which the shared session would
+    # restore into the composer of every later test.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    startup.set()
+    async with running_tui(copy) as driver:
         await driver.send(CTRL_F)
         await driver.until(driver.finder_drawn, what="ctrl+f did not draw the finder")
         await driver.send(OLD_WORDS[40])
