@@ -5774,6 +5774,36 @@ async def _ready_extensions(server):
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_extension_command_uses_real_serve_registry_path(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    extension = home / "extensions" / "serve-ext"
+    extension.mkdir(parents=True)
+    (extension / "zeta-extension.toml").write_text(
+        '[extension]\nname = "serve-ext"\nversion = "0.1.0"\n'
+        'api_version = 1\nentry = "ext_mod:activate"\n', encoding="utf-8"
+    )
+    (extension / "ext_mod.py").write_text(
+        'def activate(zx):\n'
+        '    async def serve(args):\n'
+        '        return "serve " + args\n'
+        '    zx.register_command("serve-echo", handler=serve)\n', encoding="utf-8"
+    )
+    server = ZetaServer(home=home, cwd=tmp_path, port=0, provider="codex")
+    reader, writer, sid = await _ready_extensions(server)
+    try:
+        listed = (await _request(reader, writer, "list", "slash_list", {"session_id": sid}))[-1]["result"]
+        assert any(item["name"] == "serve-echo" for item in listed["commands"])
+        result = (await _request(
+            reader, writer, "run", "slash_run",
+            {"session_id": sid, "text": "/serve-echo ok"},
+        ))[-1]["result"]
+        assert result == {"kind": "output", "text": "serve ok"}
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_extensions_negotiate_and_old_clients_remain_unchanged(tmp_path):
     from zeta.server.protocol import MethodDescriptor
 
