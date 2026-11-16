@@ -123,6 +123,10 @@ def _wrap_status_line(line: str, width: int) -> list[overlay.FragmentLine]:
     ]
 
 
+# Bare commands that open a picker; the other panel commands only show information.
+_PICKER_COMMANDS = frozenset({"/model", "/accounts", "/remote"})
+
+
 def _status_card_lines(
     status: SlashStatus | None, width: int | None = None
 ) -> list[overlay.FragmentLine]:
@@ -310,6 +314,8 @@ class TUIApp(
         self._model_picker_unit: Any = None
         self._accounts_picker: AccountsPicker | None = None
         self._picker_loading: asyncio.Future[Any] | None = None
+        # The loading picker's card: (transcript, unit).
+        self._picker_loading_card: tuple[Any, Any] | None = None
         self._accounts_picker_unit: Any = None
         self._account_switch_task: asyncio.Task[None] | None = None
         self._account_switch_pending = False
@@ -680,6 +686,11 @@ class TUIApp(
             if self._loop_state == "approval":
                 self._approval_units.clear()
                 self._present_pending_approvals()
+            self._reprint_picker_cards()
+        # The redraw replaced the units an open finder's rows point at.
+        transcript = self._viewed_transcript()
+        if self._active_finder is transcript and transcript.finder_active:
+            self._publish_history_search_target(transcript, None, self._finder_field.text)
 
     def _request_history_edge(self, direction: str) -> None:
         """Load the page at the edge the viewed transcript met."""
@@ -897,11 +908,15 @@ class TUIApp(
 
     def _finder_loading(self) -> bool:
         navigation = getattr(self, "_agent_navigation", None)
-        task = navigation.transcript_control.search_task if navigation is not None else None
-        return FinderRuntimeMixin._finder_loading(self) or (
-            task is not None
-            and not task.done()
-            and self._active_finder is self._viewed_transcript()
+        if navigation is None or self._active_finder is not self._viewed_transcript():
+            return FinderRuntimeMixin._finder_loading(self)
+        control = navigation.transcript_control
+        task = control.search_task
+        return (
+            FinderRuntimeMixin._finder_loading(self)
+            or (task is not None and not task.done())
+            # Startup has not drawn the first history page: its rows are coming.
+            or (self._startup_replay_active and not control.history_pager.descriptors)
         )
 
     def _end_history_search(self) -> None:
@@ -1077,8 +1092,9 @@ class TUIApp(
             or not self._full_screen_active()
             # A remote view is read only; /remote still picks another session.
             or (self._remote_view is not None and command != "/remote")
-            # Behind a running slash command it waits its turn, as before.
-            or self.slash_lock.holder is not None
+            # A picker behind a running slash command waits its turn; a panel
+            # only shows information and opens at once.
+            or (self.slash_lock.holder is not None and command in _PICKER_COMMANDS)
             # /model answers that it cannot change the model now.
             or (command == "/model" and (self.active or self.pending_approvals))
         ):

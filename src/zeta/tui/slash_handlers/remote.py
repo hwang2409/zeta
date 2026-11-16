@@ -128,6 +128,7 @@ class RemoteViewMixin:
         self._remote_picker_unit = None
         self._remote_picker_transcript = None
         self._remote_saved_composer = None
+        self._remote_attaching = False
 
     async def _close_remote_view(self) -> None:
         self.remote_picker_cancel()
@@ -179,7 +180,11 @@ class RemoteViewMixin:
         if self._remote_view is not None:
             # a second attach must stop the old consumer and restore the saved composer first.
             await self.slash_detach("")
-        await client.attach(chosen.host, chosen)
+        self._remote_attaching = True
+        try:
+            await client.attach(chosen.host, chosen)
+        finally:
+            self._remote_attaching = False
         self._save_remote_composer()
         state = RemoteViewState.create(self, chosen.host, chosen.session_id, chosen.name)
         self._remote_view = state

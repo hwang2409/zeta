@@ -315,7 +315,7 @@ class Driver:
 
 @asynccontextmanager
 async def running_tui(
-    home: RootHome, backend: FakeBackend | None = None
+    home: RootHome, backend: FakeBackend | None = None, *, painted: bool = True
 ) -> AsyncIterator[Driver]:
     store = await asyncio.to_thread(
         ConversationStore, home.root, session_id=home.session_id
@@ -334,8 +334,11 @@ async def running_tui(
         try:
             driver = Driver(app, session, pipe)
             await driver.until(
-                lambda: _answer(TURNS - 1) in driver.screen(),
-                what="first paint shows the newest answer",
+                (lambda: _answer(TURNS - 1) in driver.screen())
+                if painted
+                # The screen is up and takes keys; the first history page is not drawn.
+                else (lambda: app._full_screen_active() and bool(driver.all_rows())),
+                what="first paint",
                 seconds=90,
             )
             yield driver
@@ -602,6 +605,20 @@ def _panel(drawn: Callable[[Driver], bool]) -> dict:
     return {"drawn": drawn, "accepted": kept, "empty_accepted": kept}
 
 
+PICKER_CARDS = (
+    "select a model",
+    "select an account",
+    "enter select · esc cancel",
+    "accounts · loading…",
+    "remote · loading…",
+)
+
+
+def _picker_card_drawn(driver: Driver) -> bool:
+    screen = driver.screen()
+    return any(card in screen for card in PICKER_CARDS)
+
+
 def _model_picker_closed(driver: Driver) -> bool:
     return not driver.app.model_picker_active and driver.session.default_buffer.text == ""
 
@@ -640,10 +657,14 @@ def _loading_picker(active: Callable[[TUIApp], bool], setup: Callable) -> dict:
     """A picker whose rows load first: Enter before they show must not pick one."""
 
     def shown(driver: Driver) -> bool:
-        return active(driver.app) and driver.session.default_buffer.text == ""
+        return (
+            active(driver.app)
+            and _picker_card_drawn(driver)
+            and driver.session.default_buffer.text == ""
+        )
 
     return {
-        "drawn": lambda driver: driver.app._picker_active,
+        "drawn": lambda driver: driver.app._picker_active and _picker_card_drawn(driver),
         "accepted": shown,
         "empty_accepted": shown,
         "setup": setup,
@@ -738,7 +759,7 @@ OPENERS = [
             "/model" + ENTER,
             UP,
             _model_picker_closed,
-            lambda driver: driver.app.model_picker_active,
+            lambda driver: driver.app.model_picker_active and _picker_card_drawn(driver),
             None,
             escapes=1,
             empty_accepted=_model_picker_closed,
@@ -772,30 +793,44 @@ MISS = "zzsettled"
 
 
 async def _own_home_with_held_startup(
-    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    root_home: RootHome,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    before_first_page: bool = False,
 ) -> tuple[RootHome, asyncio.Event]:
-    """A copy of the home whose startup waits until the returned event is set."""
+    """A copy of the home whose startup waits until the returned event is set.
+
+    The wait is after the first history page is drawn (MCP servers start), or
+    with ``before_first_page`` before it: the slowest part of a long session's
+    startup, whose draw clears the transcript.
+    """
 
     home = tmp_path / "home"
     # Own copy: on a failure the typed keys land in the session as a prompt.
     await asyncio.to_thread(shutil.copytree, root_home.home, home)
     copy = RootHome(home, home / root_home.root.relative_to(root_home.home), root_home.session_id)
     startup = asyncio.Event()
-    ensure_mcp_servers = AgentLoop.ensure_mcp_servers
+    owner, name = (
+        (TUIApp, "_rebuild_transcript_async")
+        if before_first_page
+        else (AgentLoop, "ensure_mcp_servers")
+    )
+    step = getattr(owner, name)
 
-    async def held_startup(loop: AgentLoop) -> None:
+    async def held_startup(self: object, *args: object, **kwargs: object) -> object:
         await await_or_fail(startup.wait(), timeout=60, what="startup gate")
-        await ensure_mcp_servers(loop)
+        return await step(self, *args, **kwargs)
 
-    monkeypatch.setattr(AgentLoop, "ensure_mcp_servers", held_startup)
+    monkeypatch.setattr(owner, name, held_startup)
     return copy, startup
 
 
 OPENER_CASES = [
     pytest.param(opener.values[0], phase, burst, id=f"{opener.id}-{phase}-{burst}")
     for opener in OPENERS
-    for phase in ("startup", "settled")
-    for burst in ("word+enter", "miss+enter", "word+esc", "enter")
+    for phase in ("before-first-page", "startup", "settled")
+    for burst in ("word+enter", "miss+enter", "word+esc", "enter", "word")
     if not (opener.id in LETTERS_TO_COMPOSER and burst == "miss+enter")
 ]
 
@@ -812,14 +847,16 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
 ) -> None:
     # The opener and the keys after it arrive in one write, before the overlay's
     # first paint: they must reach the overlay, never composer submit.
-    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    copy, startup = await _own_home_with_held_startup(
+        root_home, tmp_path, monkeypatch, before_first_page=phase == "before-first-page"
+    )
     if phase == "settled":
         startup.set()
     backend = FakeBackend([])
-    async with running_tui(copy, backend) as driver:
+    async with running_tui(copy, backend, painted=phase != "before-first-page") as driver:
         app = driver.app
         opener.setup(app, monkeypatch)
-        if phase == "startup":
+        if phase != "settled":
             assert app._startup_replay_active, "startup finished before the keys"
         else:
             await driver.until(
@@ -839,7 +876,15 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
             return driver.session.default_buffer.text
 
         typed = {"miss+enter": MISS, "enter": ""}.get(burst, opener.word)
-        if burst == "word+esc":
+        if burst == "word":
+            # Left open while startup ends.
+            await driver.send(opener.key + typed)
+            await driver.until(lambda: opener.drawn(driver), what="the overlay did not open")
+            await driver.settle("overlay holds the typed keys")
+            assert not submitted() and (
+                opener.field is None or opener.field(driver) == typed
+            ), f"the overlay lost {typed!r}: sent {submitted()}; screen:\n{driver.screen()}"
+        elif burst == "word+esc":
             await driver.send(opener.key + typed)
             for _ in range(opener.escapes):
                 await driver.until(lambda: opener.drawn(driver), what="the overlay did not open")
@@ -859,6 +904,14 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
             )
         else:
             await driver.send(opener.key + typed + ENTER)
+            if phase == "before-first-page":
+                # Nothing to accept before the first page: the keys wait for it.
+                await driver.settle("keys held before the first page")
+                assert not submitted(), f"keys typed for the overlay were sent: {submitted()}"
+                startup.set()
+                await driver.until(
+                    lambda: not app._startup_replay_active, what="startup did not finish"
+                )
             expected = {
                 "word+enter": lambda: opener.accepted(driver),
                 "enter": lambda: opener.empty_accepted(driver),
@@ -888,6 +941,7 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
                     assert opener.field(driver) == MISS, (
                         f"the overlay query is {opener.field(driver)!r}, typed {MISS!r}"
                     )
+        drawn = opener.drawn(driver)
         startup.set()
         # Startup sends its queued prompts in the same step that ends it; wait
         # for any turn they started, so a sent prompt reaches the backend.
@@ -899,6 +953,16 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
         await driver.settle("settled screen after startup")
         assert not backend.calls, (
             f"keys typed for the overlay were sent to the model: {submitted()}"
+        )
+        # The first history page draw clears the transcript: an open overlay
+        # stays drawn, and a picker's keys never act on a card that is gone.
+        assert opener.drawn(driver) == drawn, (
+            f"startup changed the overlay: drawn {drawn} -> {opener.drawn(driver)};"
+            f" screen:\n{driver.screen()}"
+        )
+        assert app._picker_active == _picker_card_drawn(driver), (
+            f"picker keys active={app._picker_active}, card drawn="
+            f"{_picker_card_drawn(driver)}; screen:\n{driver.screen()}"
         )
 
 

@@ -680,7 +680,6 @@ class CheckpointTranscriptMixin:
 
     def _render_resident_history(self) -> None:
         rendered_notifications: list[str] = []
-        self._dismiss_model_picker()
         self._presenter.clear()
         self._failed_turn = None
         pages = self._agent_navigation.transcript_control.history_pager.pages

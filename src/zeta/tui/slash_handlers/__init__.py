@@ -188,24 +188,68 @@ class SlashHandlerMixin:
 
         Until the rows show, Esc stops the load and other picker keys do
         nothing: Enter would act on a row nobody has seen (switch an account,
-        attach a session).
+        attach a session). The load runs under the slash lock, as the command
+        did through the pipeline.
         """
 
+        # A second picker command replaces a load still running.
+        self._stop_picker_load()
         presenter = self._screen_presenter()
         unit = presenter.print_unit(Text(f"{name} · loading…", style=_theme.CHROME))
+        self._picker_loading_card = (presenter.transcript, unit)
 
         async def run() -> None:
             try:
-                output = await load()
+                async with self.slash_lock.hold(f"/{name}"):
+                    output = await load()
             except Exception as exc:  # reported as the pipeline reports a slash failure
                 output = f"submission failed: {exc}"
             finally:
-                presenter.transcript.remove(unit)
-                self._picker_loading = None
-                self._invalidate_prompt()
+                self._end_picker_load(asyncio.current_task())
             self._handle_slash_output(output)
 
         self._picker_loading = self._open_overlay(lambda: True, run)
+
+    def _stop_picker_load(self) -> None:
+        task = self._picker_loading
+        # An attach that started finishes: cancelling it would leave the
+        # client half attached. The picker closes when it ends.
+        if task is None or self._remote_attaching:
+            return
+        task.cancel()
+        # The card goes now, also for a load cancelled before it started.
+        self._end_picker_load(task)
+
+    def _end_picker_load(self, task: object) -> None:
+        if self._picker_loading is not task or self._picker_loading_card is None:
+            return
+        transcript, unit = self._picker_loading_card
+        transcript.remove(unit)
+        self._picker_loading = self._picker_loading_card = None
+        self._invalidate_prompt()
+
+    def _reprint_picker_cards(self) -> None:
+        """Draw each open picker's card again after a redraw cleared the root transcript.
+
+        A picker owns the arrow keys and Enter; its card must stay on screen
+        while it does, or Enter acts on a row nobody can see.
+        """
+
+        root = self._transcript
+
+        def again(unit: Any, transcript: Any = root) -> Any:
+            if unit is None or transcript is not root:
+                return unit
+            return self._presenter.print_unit(unit.value)
+
+        if self._picker_loading_card is not None:
+            transcript, unit = self._picker_loading_card
+            self._picker_loading_card = (transcript, again(unit, transcript))
+        self._accounts_picker_unit = again(self._accounts_picker_unit)
+        self._model_picker_unit = again(self._model_picker_unit)
+        self._remote_picker_unit = again(
+            self._remote_picker_unit, self._remote_picker_transcript
+        )
 
     def _picker_move(self, delta: int) -> None:
         if self._picker_loading is not None:
@@ -229,7 +273,7 @@ class SlashHandlerMixin:
 
     def _picker_cancel(self) -> None:
         if self._picker_loading is not None:
-            self._picker_loading.cancel()
+            self._stop_picker_load()
             return
         if self.accounts_picker_active:
             self.accounts_picker_cancel()
