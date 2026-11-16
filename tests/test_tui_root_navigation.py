@@ -985,6 +985,9 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
             f"startup changed the overlay: drawn {drawn} -> {opener.drawn(driver)};"
             f" screen:\n{driver.screen()}"
         )
+        if phase == "before-first-page":
+            # The first page is drawn under an overlay opened before it.
+            assert driver.order(), f"no history after startup; screen:\n{driver.screen()}"
         # A picker's card is drawn once while its keys act, and is never history.
         cards = (_picker_cards(driver), _picker_cards_in_history(app))
         assert cards == (int(app._picker_active), 0), (
@@ -992,8 +995,7 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
             f" history {cards}; screen:\n{driver.screen()}"
         )
         if phase == "before-first-page":
-            # The first page was drawn under the overlay, and stays after it closes.
-            assert driver.order(), f"no history after startup; screen:\n{driver.screen()}"
+            # The history stays once the overlay closes.
             for _ in range(opener.escapes):
                 await driver.send(ESCAPE)
                 await driver.settle("settled screen after Esc")
