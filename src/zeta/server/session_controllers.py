@@ -42,8 +42,11 @@ class SessionControllers:
         """Return the persistent resident record selected by ``session_id``."""
         del connection
         record = self._attached
-        if record.runtime.opened is not None and record.runtime.session_id == session_id:
-            return record
+        try:
+            if record.runtime.session_id == session_id:
+                return record
+        except RuntimeError:
+            pass
         try:
             return self._parked[session_id]
         except KeyError as exc:

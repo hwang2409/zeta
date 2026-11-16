@@ -197,10 +197,10 @@ class ReplayOutput:
         return None
 
     async def begin_replay_join(self, connection: Any, scope: ReplayScopeId) -> None:
-        runtime = connection.server.controllers.selected(connection, scope.value).runtime
         if scope.kind == "child":
             store = self.child_runs.live_store(scope.value)
         else:
+            runtime = connection.server.controllers.selected(connection, scope.value).runtime
             store = validation.active(runtime, {"session_id": scope.value})
         self.invalidate_replay_connection(connection, reason="rejoined")
         pending = self.replay.begin_join(
