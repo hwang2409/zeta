@@ -45,11 +45,11 @@ async def resume(client, request_id, params):
 
 
 async def send(client, request_id, params):
-    return await client.server.control.deliveries.send(params, client.features)
+    return await client.server.controllers.owned(client).control.deliveries.send(params, client.features)
 
 
 async def steer(client, request_id, params):
-    return await client.server.control.deliveries.steer(params, client.features)
+    return await client.server.controllers.owned(client).control.deliveries.steer(params, client.features)
 
 
 async def _resolve_approval(client, params, decision):
@@ -62,7 +62,7 @@ async def _resolve_approval(client, params, decision):
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS, "scope 'always_tool' requires approve"
         )
-    return await client.server.control.resolve_approval(
+    return await client.server.controllers.owned(client).control.resolve_approval(
         decision, validation.required_string(params, "request_id"), scope
     )
 
@@ -76,13 +76,15 @@ async def deny(client, request_id, params):
 
 
 async def abort(client, request_id, params):
-    return await client.server.control.abort(
+    return await client.server.controllers.owned(client).control.abort(
         abort_scope.parse_abort_scope(params, client.features)
     )
 
 
 async def status(client, request_id, params):
-    runtime = client.server.runtime
+    owned = client.server.controllers.owned(client)
+    selected = client.server.controllers.selected(client, owned.runtime.session_id)
+    runtime = selected.runtime
     session_id = runtime.session_id if runtime.opened is not None else None
     if client.role == "observer":
         fallback_config = (
@@ -105,7 +107,7 @@ async def status(client, request_id, params):
 
 async def rename_session(client, request_id, params):
     return await session.rename(
-        client.server.runtime,
+        client.server.controllers.owned(client).runtime,
         validation.required_string(params, "session_id"),
         params.get("name"),
     )
@@ -113,9 +115,9 @@ async def rename_session(client, request_id, params):
 
 async def delete_session(client, request_id, params):
     operation = lambda: session.delete_session(
-        client.server.runtime,
+        client.server.controllers.owned(client).runtime,
         validation.required_string(params, "session_id"),
-        client.server.control.require_idle,
+        client.server.controllers.owned(client).control.require_idle,
     )
     return await operation()
 
@@ -149,7 +151,7 @@ async def child_run_events(client, request_id, params):
     connections = client.connections
     if set(params) != {"session_id", "run_id"} or not all(type(params.get(key)) is str for key in ("session_id", "run_id")):
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "session_id and run_id are required child event parameters")
-    if client.server.runtime.session_id != params["session_id"]:
+    if client.server.controllers.owned(client).runtime.session_id != params["session_id"]:
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
     try:
         await connections.begin_replay_join(client, ReplayScopeId.child(params["run_id"]))
@@ -163,11 +165,11 @@ async def child_run_events(client, request_id, params):
 
 
 async def _mutable_store(client, params):
-    runtime = client.server.runtime
+    runtime = client.server.controllers.owned(client).runtime
     store = validation.active(runtime, params)
-    await client.server.control.require_idle()
+    await client.server.controllers.owned(client).control.require_idle()
     validation.require_mutable(
-        runtime, client.server.control.has_pending_approvals()
+        runtime, client.server.controllers.owned(client).control.has_pending_approvals()
     )
     return runtime, store
 
@@ -195,8 +197,8 @@ async def model_catalog(client, request_id, params):
 async def session_settings(client, request_id, params):
     if client.role == "observer":
         return await client.connections.read_settings(client, params)
-    validation.active(client.server.runtime, params)
-    return settings.settings(client.server.runtime, include_plan_mode=True)
+    validation.active(client.server.controllers.owned(client).runtime, params)
+    return settings.settings(client.server.controllers.owned(client).runtime, include_plan_mode=True)
 
 
 async def set_settings(client, request_id, params):
@@ -218,21 +220,21 @@ async def set_compaction(client, request_id, params):
 
 
 async def send_images(client, request_id, params):
-    validation.active(client.server.runtime, params)
-    return await client.server.control.deliveries.send_images(params, client.features)
+    validation.active(client.server.controllers.owned(client).runtime, params)
+    return await client.server.controllers.owned(client).control.deliveries.send_images(params, client.features)
 
 
 async def path_complete(client, request_id, params):
-    store = validation.active(client.server.runtime, params)
+    store = validation.active(client.server.controllers.owned(client).runtime, params)
     return await path_completion.complete(
         params,
         base_dir=store.cwd,
-        run_blocking=client.server.control._run_blocking,
+        run_blocking=client.server.controllers.owned(client).control._run_blocking,
     )
 
 
 async def slash_list(client, request_id, params):
-    validation.active(client.server.runtime, params)
+    validation.active(client.server.controllers.owned(client).runtime, params)
     include_unavailable = params.get("include_unavailable", False)
     if not isinstance(include_unavailable, bool):
         raise ProtocolError(
@@ -240,16 +242,16 @@ async def slash_list(client, request_id, params):
             "include_unavailable must be a boolean",
         )
     return await slash_commands.list_commands(
-        client.server.runtime, include_unavailable=include_unavailable
+        client.server.controllers.owned(client).runtime, include_unavailable=include_unavailable
     )
 
 
 async def slash_run(client, request_id, params):
-    runtime = client.server.runtime
+    runtime = client.server.controllers.owned(client).runtime
     validation.active(runtime, params)
     text = validation.required_string(params, "text")
     registry = await slash_commands.registry_for_request(runtime)
-    control = client.server.control
+    control = client.server.controllers.owned(client).control
     busy = control.state_change_busy()
     if busy and not slash_commands.can_run_while_busy(registry, text):
         raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")
@@ -265,27 +267,27 @@ async def slash_run(client, request_id, params):
 
 
 async def account_list(client, request_id, params):
-    validation.active(client.server.runtime, params)
-    return await accounts.list_accounts(client.server.runtime)
+    validation.active(client.server.controllers.owned(client).runtime, params)
+    return await accounts.list_accounts(client.server.controllers.owned(client).runtime)
 
 
 async def account_logout(client, request_id, params):
-    validation.active(client.server.runtime, params)
+    validation.active(client.server.controllers.owned(client).runtime, params)
     return await accounts.logout(
-        client.server.runtime, client.server.require_all_idle, params
+        client.server.controllers.owned(client).runtime, client.server.require_all_idle, params
     )
 
 
 async def account_refresh(client, request_id, params):
-    validation.active(client.server.runtime, params)
+    validation.active(client.server.controllers.owned(client).runtime, params)
     await client.server.require_all_idle()
-    return await accounts.refresh(client.server.runtime)
+    return await accounts.refresh(client.server.controllers.owned(client).runtime)
 
 
 async def account_switch(client, request_id, params):
-    validation.active(client.server.runtime, params)
+    validation.active(client.server.controllers.owned(client).runtime, params)
     operation = accounts.switch(
-        client.server.runtime, client.server.require_all_idle, params
+        client.server.controllers.owned(client).runtime, client.server.require_all_idle, params
     )
     return await accounts.run_owned_switch(client, operation)
 
@@ -312,7 +314,7 @@ async def ping(client, request_id, params):
 
 async def set_turn_context(client, request_id, params):
     return client.server.turn_contexts.set_request(
-        client.features, client.server.runtime, params
+        client.features, client.server.controllers.owned(client).runtime, params
     )
 
 
@@ -349,28 +351,28 @@ async def project_inbox(client, request_id, params):
 
 async def clear_steering(client, request_id, params):
     return abort_scope.clear_pending_steering(
-        client.features, client.server.runtime.loop
+        client.features, client.server.controllers.owned(client).runtime.loop
     )
 
 
 async def delivery_status(client, request_id, params):
-    return client.server.control.deliveries.status(params, client.features)
+    return client.server.controllers.owned(client).control.deliveries.status(params, client.features)
 
 
 async def session_grants_read(client, request_id, params):
     session_grants.require_feature(client.features)
-    runtime = client.server.runtime
+    runtime = client.server.controllers.owned(client).runtime
     return session_grants.read(runtime.policy, runtime.session_id, params)
 
 
 async def revoke_session_grants(client, request_id, params):
     session_grants.require_feature(client.features)
-    runtime = client.server.runtime
+    runtime = client.server.controllers.owned(client).runtime
     result, change = session_grants.revoke(
         runtime.policy, runtime.session_id, params
     )
     if change.changed:
-        await client.server.control.publish_session_grant_change(change)
+        await client.server.controllers.owned(client).control.publish_session_grant_change(change)
     return result
 
 
@@ -383,7 +385,7 @@ async def child_run_send(client, request_id, params):
 
 
 async def mcp_refresh_tools(client, request_id, params):
-    runtime = client.server.runtime
+    runtime = client.server.controllers.owned(client).runtime
     validation.active(runtime, params)
     if set(params) - {"session_id", "server"}:
         raise ProtocolError(
@@ -507,7 +509,7 @@ async def dispatch(
             ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
         )
     if descriptor.access is Access.SESSION_MUTATION:
-        client.server.control._reject_if_unhealthy()  # type: ignore[attr-defined]
+        client.server.controllers.owned(client).control._reject_if_unhealthy()  # type: ignore[attr-defined]
     if descriptor.since is not None and tuple(
         int(part) for part in client.protocol_version.split(".")  # type: ignore[attr-defined]
     ) < tuple(int(part) for part in descriptor.since.split(".")):
@@ -515,9 +517,9 @@ async def dispatch(
     if descriptor.feature is not None and descriptor.feature not in client.features:  # type: ignore[attr-defined]
         raise feature_error(descriptor)
     if descriptor.access is Access.DELIVERY:
-        _require_attached_session(client.server.runtime, params)  # type: ignore[attr-defined]
+        _require_attached_session(client.server.controllers.owned(client).runtime, params)  # type: ignore[attr-defined]
     if descriptor.access in {Access.SESSION_MUTATION, Access.CONTROLLER_WRITE}:
         # a queued wake may not start its setup while a state change runs
-        with client.server.control.hold_wake_start():  # type: ignore[attr-defined]
+        with client.server.controllers.owned(client).control.hold_wake_start():  # type: ignore[attr-defined]
             return await HANDLERS[descriptor](client, request_id, params)
     return await HANDLERS[descriptor](client, request_id, params)

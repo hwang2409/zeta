@@ -1020,7 +1020,7 @@ class ConnectionRegistry(ReplayOutput):
         result = await self.run_blocking(callable)
         if (
             session_id is not None
-            and connection.server.runtime.session_id != session_id
+            and connection.server.controllers.owned(connection).runtime.session_id != session_id
         ):
             raise ProtocolError(
                 ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
@@ -1028,7 +1028,9 @@ class ConnectionRegistry(ReplayOutput):
         return result
 
     async def read_tree(self, connection: Any, params: dict[str, Any]) -> object:
-        runtime = connection.server.runtime
+        owned = connection.server.controllers.owned(connection)
+        selected = connection.server.controllers.selected(connection, owned.runtime.session_id)
+        runtime = selected.runtime
         store = validation.active(runtime, params)
         return await self.run_read(
             connection,
@@ -1037,7 +1039,9 @@ class ConnectionRegistry(ReplayOutput):
         )
 
     async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
-        runtime = connection.server.runtime
+        owned = connection.server.controllers.owned(connection)
+        selected = connection.server.controllers.selected(connection, owned.runtime.session_id)
+        runtime = selected.runtime
         store = validation.active(runtime, params)
         features = history_features(self._connections[connection].features)
         result = await self.run_read(
@@ -1058,7 +1062,9 @@ class ConnectionRegistry(ReplayOutput):
     async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
         if set(params) - {"handle", "offset", "limit"}:
             raise ProtocolError(ErrorDescriptor.INVALID_CONTENT_READ, "invalid content read")
-        runtime = connection.server.runtime
+        owned = connection.server.controllers.owned(connection)
+        selected = connection.server.controllers.selected(connection, owned.runtime.session_id)
+        runtime = selected.runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         return await self.run_read(
@@ -1073,10 +1079,10 @@ class ConnectionRegistry(ReplayOutput):
         )
 
     async def read_catalog(self, connection: Any) -> object:
-        return await self.run_read(connection, lambda: settings.catalog(connection.server.runtime))
+        return await self.run_read(connection, lambda: settings.catalog(connection.server.controllers.owned(connection).runtime))
 
     async def read_settings(self, connection: Any, params: dict[str, Any]) -> object:
-        runtime = connection.server.runtime
+        runtime = connection.server.controllers.owned(connection).runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "server has no active session")
         return await self.run_read(connection, lambda: settings.settings(runtime))
@@ -1093,7 +1099,7 @@ class ConnectionRegistry(ReplayOutput):
                 ErrorDescriptor.INVALID_PARAMS,
                 "session_id and run_id are required child history parameters",
             )
-        runtime = connection.server.runtime
+        runtime = connection.server.controllers.owned(connection).runtime
         if runtime.opened is None or params["session_id"] != runtime.session_id:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features
@@ -1112,7 +1118,7 @@ class ConnectionRegistry(ReplayOutput):
 
     async def read_child_run_events(self, connection: Any, params: dict[str, Any]):
         # params are validated by the child_run_events handler before begin_replay_join
-        runtime = connection.server.runtime
+        runtime = connection.server.controllers.owned(connection).runtime
         if runtime.opened is None or params["session_id"] != runtime.session_id:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features

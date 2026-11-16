@@ -60,6 +60,7 @@ from .protocol import (
     negotiate_protocol_version,
 )
 from .runtime import BackendFactory, ServerRuntime
+from .session_controllers import SessionControllers
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
@@ -314,6 +315,7 @@ class ZetaServer:
         self.control = ServeControl(self, runtime, self.foreground_event_publisher)
         self._bind_pair(self.control)
         self.parking = ParkedPairs(lambda: self.connections)
+        self.controllers = SessionControllers(self)
 
     @property
     def runtime(self) -> ServerRuntime:
