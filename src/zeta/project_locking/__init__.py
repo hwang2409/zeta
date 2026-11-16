@@ -179,10 +179,12 @@ class ProjectLockingMixin:
             stack.callback(os.close, root_fd)
             lock_fd = self._open_lock(root_fd, create=True)
             assert lock_fd is not None
+            # Close even when the wait times out; unlock only once acquired.
+            stack.callback(os.close, lock_fd)
             self._acquire_lock(
                 lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
             )
-            stack.callback(self._release_lock, lock_fd)
+            stack.callback(fcntl.flock, lock_fd, fcntl.LOCK_UN)
             project_fds = tuple(
                 self._validated_project_fd(root_fd, project_id)
                 for project_id, _domain in domains
@@ -208,10 +210,11 @@ class ProjectLockingMixin:
                 project_fds.append(project_fd)
                 stack.callback(os.close, project_fd)
                 lock_fd = self._named_lock_fd(project_fd, domain)
+                stack.callback(os.close, lock_fd)
                 self._acquire_lock(
                     lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
                 )
-                stack.callback(self._release_lock, lock_fd)
+                stack.callback(fcntl.flock, lock_fd, fcntl.LOCK_UN)
             yield tuple(project_fds)
 
     @contextmanager

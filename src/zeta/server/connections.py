@@ -20,7 +20,7 @@ from ..core.store._child_runs import (
 )
 from ..core.thread_call import ThreadCallWorkers
 from . import content, event_contract
-from .handlers import history, lifecycle, session, settings, validation
+from .handlers import history, session, settings, validation
 from .protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -1106,83 +1106,6 @@ class ConnectionRegistry(ReplayOutput):
         self._observers.clear()
         self._controller = None
 
-
-def _active_status_parts(
-    client: Any, loop: Any, fallback_config: Any
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    runtime = client.server.runtime
-    transcript_index_failure = (
-        loop.transcript_index_failure(runtime.session_id)
-        if client.protocol_version != "1.0" and loop is not None
-        else None
-    )
-    project_context_health = (
-        (
-            loop.project_context_health.summary
-            if loop is not None and loop.project_context_health is not None
-            else "healthy"
-        )
-        if client.protocol_version != "1.0"
-        else None
-    )
-    status = {
-        "session": lifecycle.session_snapshot(client),
-        "state": (
-            "idle"
-            if client.server.control.unhealthy() or runtime.state is None
-            else runtime.state.status
-        ),
-        "explicit_finish": (
-            loop.explicit_finish
-            if loop is not None
-            else fallback_config.agents_explicit_finish
-        ),
-    }
-    suffix = {
-        "pending_approvals": [],
-        "usage": dict(runtime.usage),
-        **(
-            {"transcript_index_failure": transcript_index_failure}
-            if transcript_index_failure is not None
-            else {}
-        ),
-        **(
-            {"project_context_health": project_context_health}
-            if project_context_health is not None
-            else {}
-        ),
-        "store": runtime.opened.store,
-    }
-    slash_command = client.server.control.slash_lock.status()
-    if slash_command is not None:
-        suffix["slash_command"] = slash_command
-    return status, suffix
-
-
-def _capture_status(client: Any, fallback_config: Any) -> tuple[str | None, object]:
-    runtime = client.server.runtime
-    loop = runtime.loop
-    if loop is None and fallback_config is None:
-        raise RuntimeError("status fallback config was not resolved")
-    if runtime.opened is None:
-        status = {"session": None, "state": "idle", "explicit_finish": False}
-        suffix = {
-            "pending_approvals": [],
-            "usage": {},
-            "compaction_markers": 0,
-        }
-        session_id = None
-    else:
-        status, suffix = _active_status_parts(client, loop, fallback_config)
-        session_id = runtime.session_id
-    if client.protocol_version != "1.0":
-        status["max_agent_depth"] = (
-            loop.max_agent_depth
-            if loop is not None
-            else fallback_config.agents_max_depth
-        )
-    status.update(suffix)
-    return session_id, status
 
 def perform_child_history_read(
     target: tuple[str | None, object],
