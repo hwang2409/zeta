@@ -7010,7 +7010,7 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
         "vim_mode: on\nplan_mode: off\nexplicit_finish: on\nmax_agent_depth: 3\n"
         "retained_tail: 6\ntokens_used_this_session: 150\n"
         "tokens_in_current_context: 120\ncompaction_marker_count: 1\n"
-        "checkpoint_count: 2\nlive_pending_approvals: 1 (approval-1 (bash))\n"
+        "checkpoint_count: 2\ncomputer: disabled, allowed app count=0\nlive_pending_approvals: 1 (approval-1 (bash))\n"
         "mcp: 1 mounted, 0 failed\nusage:\n  input_tokens: 10\n"
         "  output_tokens: 50\n  cache_read_tokens: 60\n  cache_write_tokens: 30\n"
         "  cache_hit_rate: 60.0%\n  child_cache_read_tokens: 0\n"
@@ -7056,7 +7056,7 @@ async def test_status_card_wraps_complete_project_context_health(
 
     try:
         await asyncio.wait_for(app._slash_commands.dispatch_async(app, "/status"), 10)
-        screen = render_full_screen(session, width, height=60)
+        screen = render_full_screen(session, width, height=70)
         with set_app(session.app):
             screen.draw_all_floats()
         app._status_card.bottom()
@@ -7113,12 +7113,12 @@ async def test_status_card_wraps_long_path_at_separator(
     )
     try:
         app.open_status_card(status)
-        screen = render_full_screen(session, width, height=60)
+        screen = render_full_screen(session, width, height=70)
         with set_app(session.app):
             screen.draw_all_floats()
         rendered_lines = [
             "".join(screen.data_buffer[row][column].char for column in range(width)).rstrip()
-            for row in range(60)
+            for row in range(70)
         ]
         path_lines = [
             line.strip(" │")
@@ -7128,7 +7128,7 @@ async def test_status_card_wraps_long_path_at_separator(
         ]
 
         assert path_lines
-        assert "long-token" in "".join(path_lines)
+        assert "wrap-word-boundary" in "".join(path_lines)
         if width == 40:
             assert path_lines[0] == "context_files: /Users/henry/zeta/"
         else:

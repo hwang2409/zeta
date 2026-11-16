@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from textwrap import dedent
@@ -129,9 +130,10 @@ async def test_action_done_is_not_error_when_followup_screenshot_fails(
             )
         )
 
-    assert result["isError"] is True
+    assert result["isError"] is False
     text = result["content"][0]["text"]
-    assert "left_click failed" in text
+    assert "left_click done" in text
+    assert "screenshot failed" in text
     assert "screen recording denied" in text
     assert ("click", 10, 20, "left", 1) in _ops(backend)
 
@@ -301,6 +303,20 @@ async def test_out_of_bounds_coordinate_is_rejected(tmp_path: Path) -> None:
 def _write_settings(base: Path, body: str) -> None:
     base.mkdir(parents=True, exist_ok=True)
     (base / SETTINGS_FILENAME).write_text(dedent(body).lstrip(), encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_denied_app_guidance_is_parseable_and_allows_app(tmp_path: Path) -> None:
+    backend = FakeBackend(frontmost_bundle_id="com.apple.Safari")
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        registry.computer_config = ComputerUseConfig(enabled=True)
+        denied = await registry.execute(ToolCall("c", "computer", {"action": "screenshot"}))
+        line = denied["content"][0]["text"].split("add ", 1)[1]
+        parsed = tomllib.loads(line)
+        registry.computer_config = ComputerUseConfig(enabled=True, bundle_ids={"com.apple.Safari": "allow"})
+        allowed = await registry.execute(ToolCall("c", "computer", {"action": "screenshot"}))
+    assert parsed["computer"]["macos"]["bundle_ids"]["com.apple.Safari"] == "allow"
+    assert allowed["isError"] is False
 
 
 def _resolved_computer_enabled(home: Path, project: Path | None = None) -> bool:

@@ -36,6 +36,7 @@ def capture_slash_status(
     hooks = loop.hooks
     transcript_store = loop.store
     transcript_refs = transcript_store.branch_refs()
+    computer = getattr(getattr(loop, "registry", None), "computer_config", None)
     return SlashStatusSnapshot(
         base=SlashStatus(
             session_id=session_id,
@@ -82,6 +83,9 @@ def capture_slash_status(
             transcript_index_failure=loop.transcript_index_failure(
                 transcript_session_id or session_id
             ),
+            computer_enabled=bool(computer and computer.enabled),
+            computer_allowed_apps=len(computer.bundle_ids) if computer else 0,
+            computer_empty_allow_list=bool(computer and computer.enabled and not computer.bundle_ids),
             unavailable_accounts=(
                 context.unavailable_accounts
                 if (context := getattr(loop, "account_context", None)) is not None

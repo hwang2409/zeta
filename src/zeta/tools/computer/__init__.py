@@ -58,6 +58,12 @@ _REFUSAL_REASON: dict[str, str] = {
 }
 
 
+class _GuardError(ComputerError):
+    def __init__(self, code: str, message: str, state: Any) -> None:
+        super().__init__(code, message)
+        self.state = state
+
+
 class _BadAction(ValueError):
     """Action-specific arguments were missing or malformed."""
 
@@ -94,12 +100,12 @@ def _state_content(action: str, state: Any, *, control: str, has_screenshot: boo
 async def _guard(registry: ToolRegistry, backend: ComputerBackend, action: str) -> Any:
     state = await backend.state()
     if state.locked:
-        raise ComputerError("locked", "the screen is locked")
+        raise _GuardError("locked", "the screen is locked", state)
     if state.secure_input:
-        raise ComputerError("secure_input", "a password field or secure input is active")
+        raise _GuardError("secure_input", "a password field or secure input is active", state)
     if not app_access(registry, state.frontmost_bundle_id):
         bundle = state.frontmost_bundle_id or "<unknown>"
-        raise ComputerError("not_allowed", f'frontmost app {bundle!r} is not allowed; add [computer.macos] bundle_ids = {{ "{bundle}" = "allow" }}')
+        raise _GuardError("not_allowed", f'frontmost app {bundle!r} is not allowed; add [computer.macos.bundle_ids]\n"{bundle}" = "allow"', state)
     return state
 
 
@@ -183,7 +189,11 @@ async def _run_input(registry: ToolRegistry, backend: ComputerBackend, action: s
         amount = arguments.get("scroll_amount", 1)
         if type(amount) is not int or amount < 1: raise _BadAction("scroll_amount must be a positive integer")
         dx, dy = _SCROLL_UNIT[direction]; await backend.scroll(x, y, dx * amount, dy * amount)
-    return await _screenshot(registry, backend, None, action)
+    try:
+        return await _screenshot(registry, backend, None, action)
+    except ComputerError as exc:
+        reason = _REFUSAL_REASON.get(exc.code, exc.message)
+        return {"content": [text_block(f"{action} done; screenshot failed: {reason}")], "isError": False, "structuredContent": _state_content(action, getattr(exc, "state", None), control="denied" if exc.code == "not_allowed" else ("killed" if exc.code == "killed" else "active"), has_screenshot=False)}
 
 
 async def _cursor(registry: ToolRegistry, backend: ComputerBackend, arguments: dict[str, Any]) -> StructuredToolResult:
@@ -226,7 +236,9 @@ async def _computer(registry: ToolRegistry, arguments: dict[str, Any]) -> Struct
         reason = _REFUSAL_REASON.get(exc.code, exc.message)
         if exc.code == "not_allowed": reason = exc.message
         result = _error_result(f"{action} failed: {reason}", kind="error")
-        result["structuredContent"] = {"computer": {"action": action, "control": "denied", "kill_switch": "ctrl+opt+cmd+esc", "frontmost_bundle_id": None, "has_screenshot": False}}
+        state = getattr(exc, "state", None)
+        control = "denied" if exc.code == "not_allowed" else "killed" if exc.code == "killed" else "active"
+        result["structuredContent"] = _state_content(action, state, control=control, has_screenshot=False)
         return result
     except ValueError as exc:
         return _error_result(f"{action} failed: {exc}", kind="error")
