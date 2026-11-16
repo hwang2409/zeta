@@ -948,6 +948,17 @@ class BackgroundTaskRegistry:
                 except BaseException:
                     record.receipt_pending = True
                     raise
+            # the cleared receipt was work an observer may be waiting on
+            sink = self._committed_transition_sink
+            if sink is not None:
+                sink(
+                    BackgroundTaskNotice(
+                        "background task exit delivered: " + record.command,
+                        task_id,
+                        record.terminal_phase or "natural_exit",
+                        record.owner,
+                    )
+                )
         self._pending_recovery.pop(task_id, None)
 
     async def _commit_notice(
@@ -1010,7 +1021,9 @@ class BackgroundTaskRegistry:
                     if type(note) is str
                     else "task exited when the previous session ended"
                 ),
-                receipt_pending=legacy_pending,
+                # a crash after the durable exit notice leaves a stale receipt; only
+                # an undelivered exit is still pending (recovery below clears it)
+                receipt_pending=legacy_pending and notify_on_exit and not delivered,
                 notify_on_exit=notify_on_exit,
                 tui_presented=tui_presented,
                 owner=owner_name if type(owner_name) is str else "run_background",
