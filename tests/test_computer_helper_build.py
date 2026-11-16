@@ -1,0 +1,41 @@
+"""Builds the native macOS helper with swiftc and checks a read-only hello round-trip.
+
+Skipped where swiftc is unavailable (so Ubuntu CI skips and macOS CI builds). Only ``hello`` is
+sent: it reads permission state via CGPreflightScreenCaptureAccess / AXIsProcessTrusted without
+prompting and performs no capture or input, so it is safe on a headless CI runner.
+"""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from zeta.tools.computer.helper_client import HelperClient
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BUILD_SCRIPT = REPO_ROOT / "scripts" / "build-computer-helper.sh"
+
+pytestmark = [
+    pytest.mark.skipif(shutil.which("swiftc") is None, reason="swiftc not available"),
+    pytest.mark.skipif(sys.platform != "darwin", reason="helper is macOS-only"),
+]
+
+
+def test_helper_builds_and_answers_hello() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["sh", str(BUILD_SCRIPT), tmp], check=True, capture_output=True, timeout=300
+        )
+        binary = Path(tmp) / "zeta-computer-helper"
+        assert binary.exists() and binary.stat().st_mode & 0o111
+
+        with HelperClient([str(binary)], timeout=15.0) as client:
+            reply = client.request("hello")
+    assert reply["version"] == "0.1.0"
+    assert isinstance(reply["screen_recording"], bool)
+    assert isinstance(reply["accessibility"], bool)
