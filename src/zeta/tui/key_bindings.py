@@ -1130,10 +1130,11 @@ def build_key_bindings(
         @Condition
         def picker_open() -> bool:
             # Only while the composer is empty: a typed message or a full
-            # "/model <name>" keeps its own enter and arrow keys.
+            # "/model <name>" keeps its own enter and arrow keys. Not gated on
+            # startup: /model opens the picker then, and its keys must not
+            # reach the composer.
             return (
-                interactions_enabled()
-                and picker_active is not None
+                picker_active is not None
                 and picker_active()
                 and not get_app().current_buffer.text
             )

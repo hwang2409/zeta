@@ -37,6 +37,7 @@ from ..core.slash import (
     SlashStatus,
     UsageTracker,
     _format_status,
+    build_slash_status,
     create_slash_registry,
 )
 from ..protocol.types import (
@@ -123,9 +124,10 @@ def _wrap_status_line(line: str, width: int) -> list[overlay.FragmentLine]:
 
 
 def _status_card_lines(
-    status: SlashStatus, width: int | None = None
+    status: SlashStatus | None, width: int | None = None
 ) -> list[overlay.FragmentLine]:
-    formatted = _format_status(status).splitlines()
+    # None: the card is open while its status is built.
+    formatted = ["loading…"] if status is None else _format_status(status).splitlines()
     body = (
         [[overlay.value(line)] for line in formatted]
         if width is None
@@ -1029,6 +1031,8 @@ class TUIApp(
             self._submit_input(f"/{verb} {key}", internal=True)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> bool:
+        if not internal and self._open_panel_command(value):
+            return True
         if self._startup_replay_active and self._input_loop_active:
             self._startup_submissions.append((value, internal))
             return True
@@ -1040,6 +1044,57 @@ class TUIApp(
         self._paste_runtime.advance_buffer_generation()
         super()._submit_input(value, internal=internal)
         return True
+
+    def _open_panel_command(self, value: str) -> bool:
+        """Open a bare panel command's overlay from the Enter that submits it.
+
+        Through the pipeline (or the startup queue) the panel would open a loop
+        step later, after keys typed in the same read reached the composer, and
+        one more Enter would send them as a prompt.
+        """
+
+        command = value.strip()
+        open_panel = {
+            "/tasks": self.open_tasks_panel,
+            "/status": self._open_status_panel,
+            "/mcp": self.open_mcp_manager,
+            "/decisions": self.open_decisions_panel,
+            "/model": lambda: (
+                self._start_model_catalog_load(),
+                self._open_model_picker(self.model_choices(), query=""),
+            ),
+        }.get(command)
+        if (
+            open_panel is None
+            or not self._full_screen_active()
+            or self._remote_view is not None
+            # Behind a running slash command it waits its turn, as before.
+            or self.slash_lock.holder is not None
+            # /model answers that it cannot change the model now.
+            or (command == "/model" and (self.active or self.pending_approvals))
+        ):
+            return False
+        self._dismiss_model_picker()
+        self._paste_runtime.advance_buffer_generation()
+        self._consume_overlay_submission()
+        self._record_prompt(command)
+        open_panel()
+        return True
+
+    def _open_status_panel(self) -> None:
+        snapshot = self._status_snapshot()
+
+        async def load() -> None:
+            # Counting compactions can read the whole transcript: off the loop.
+            status = await asyncio.to_thread(build_slash_status, snapshot)
+            if self._status_card_open and not self._mcp_manager_open:
+                self._set_status_card(status)
+
+        def show() -> bool:
+            self.open_status_card(None)
+            return self._status_card_open
+
+        self._open_overlay(show, load)
 
     def _status_toolbar(self) -> list[tuple[str, str]]:
         return status_toolbar(self, get_app().output.get_size().columns)
@@ -1054,19 +1109,23 @@ class TUIApp(
     def status_card_active(self) -> bool:
         return self._status_card_open and self._full_screen_active()
 
-    def open_status_card(self, status: SlashStatus) -> None:
+    def open_status_card(self, status: SlashStatus | None) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
         buffer = session.default_buffer
         self._status_restore_text = buffer.text
         self._status_restore_cursor = buffer.cursor_position
+        self._set_status_card(status)
+        self._status_card_open = True
+        session.layout.focus(self._status_card_window)
+        self._invalidate_prompt()
+
+    def _set_status_card(self, status: SlashStatus | None) -> None:
         self._status_card.set_lines(
             _status_card_lines(status),
             line_factory=lambda width: _status_card_lines(status, width),
         )
-        self._status_card_open = True
-        session.layout.focus(self._status_card_window)
         self._invalidate_prompt()
 
     def close_status_card(self) -> None:

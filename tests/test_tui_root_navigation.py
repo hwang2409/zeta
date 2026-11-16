@@ -55,6 +55,7 @@ TOOLS_PER_TURN = 15
 OLD_WORDS = {3: "quokka", 40: "wombat"}
 CTRL_UP = "\x1b[1;5A"
 CTRL_DOWN = "\x1b[1;5B"
+UP = "\x1b[A"
 PAGE_UP = "\x1b[5~"
 PAGE_DOWN = "\x1b[6~"
 CTRL_F = "\x06"
@@ -575,11 +576,26 @@ class Opener:
     empty_accepted: Callable[[Driver], bool]
 
 
-def _decisions_drawn(driver: Driver) -> bool:
+def _window_drawn(driver: Driver, window: object) -> bool:
     screen = driver.session.app.renderer._last_screen
-    return screen is not None and driver.app._decisions_panel_window in (
-        screen.visible_windows_to_write_positions
-    )
+    return screen is not None and window in screen.visible_windows_to_write_positions
+
+
+def _decisions_drawn(driver: Driver) -> bool:
+    return _window_drawn(driver, driver.app._decisions_panel_window)
+
+
+def _panel(drawn: Callable[[Driver], bool]) -> dict:
+    """A panel takes no text: typed letters do nothing, Enter keeps it open."""
+
+    def kept(driver: Driver) -> bool:
+        return drawn(driver) and driver.session.default_buffer.text == ""
+
+    return {"drawn": drawn, "accepted": kept, "empty_accepted": kept}
+
+
+def _model_picker_closed(driver: Driver) -> bool:
+    return not driver.app.model_picker_active and driver.session.default_buffer.text == ""
 
 
 OPENERS = [
@@ -623,14 +639,96 @@ OPENERS = [
         ),
         id="ctrl+t",
     ),
+    # A bare slash command that opens a panel opens it from its own Enter.
+    pytest.param(
+        Opener(
+            "/tasks" + ENTER,
+            "zz",
+            field=None,
+            escapes=1,
+            **_panel(lambda driver: _window_drawn(driver, driver.app._tasks_panel_window)),
+        ),
+        id="/tasks",
+    ),
+    pytest.param(
+        Opener(
+            "/status" + ENTER,
+            "zz",
+            field=None,
+            escapes=1,
+            **_panel(
+                lambda driver: _window_drawn(driver, driver.app._status_card_window)
+                and not driver.app._mcp_manager_open
+            ),
+        ),
+        id="/status",
+    ),
+    pytest.param(
+        Opener(
+            "/mcp" + ENTER,
+            "zz",
+            field=None,
+            escapes=1,
+            **_panel(
+                lambda driver: _window_drawn(driver, driver.app._status_card_window)
+                and driver.app._mcp_manager_open
+            ),
+        ),
+        id="/mcp",
+    ),
+    pytest.param(
+        Opener("/decisions" + ENTER, "zz", field=None, escapes=1, **_panel(_decisions_drawn)),
+        id="/decisions",
+    ),
+    # The model picker's keys are the arrows, Enter, and Esc; typed letters are
+    # the composer's by design, so it has no miss+enter case.
+    pytest.param(
+        Opener(
+            "/model" + ENTER,
+            UP,
+            _model_picker_closed,
+            lambda driver: driver.app.model_picker_active,
+            None,
+            escapes=1,
+            empty_accepted=_model_picker_closed,
+        ),
+        id="/model",
+    ),
 ]
 MISS = "zzsettled"
 
 
+async def _own_home_with_held_startup(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[RootHome, asyncio.Event]:
+    """A copy of the home whose startup waits until the returned event is set."""
+
+    home = tmp_path / "home"
+    # Own copy: on a failure the typed keys land in the session as a prompt.
+    await asyncio.to_thread(shutil.copytree, root_home.home, home)
+    copy = RootHome(home, home / root_home.root.relative_to(root_home.home), root_home.session_id)
+    startup = asyncio.Event()
+    ensure_mcp_servers = AgentLoop.ensure_mcp_servers
+
+    async def held_startup(loop: AgentLoop) -> None:
+        await await_or_fail(startup.wait(), timeout=60, what="startup gate")
+        await ensure_mcp_servers(loop)
+
+    monkeypatch.setattr(AgentLoop, "ensure_mcp_servers", held_startup)
+    return copy, startup
+
+
+OPENER_CASES = [
+    pytest.param(opener.values[0], phase, burst, id=f"{opener.id}-{phase}-{burst}")
+    for opener in OPENERS
+    for phase in ("startup", "settled")
+    for burst in ("word+enter", "miss+enter", "word+esc", "enter")
+    if not (opener.id == "/model" and burst == "miss+enter")
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("burst", ["word+enter", "miss+enter", "word+esc", "enter"])
-@pytest.mark.parametrize("phase", ["startup", "settled"])
-@pytest.mark.parametrize("opener", OPENERS)
+@pytest.mark.parametrize(("opener", "phase", "burst"), OPENER_CASES)
 async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
     root_home: RootHome,
     tmp_path: Path,
@@ -641,20 +739,9 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
 ) -> None:
     # The opener and the keys after it arrive in one write, before the overlay's
     # first paint: they must reach the overlay, never composer submit.
-    home = tmp_path / "home"
-    # Own copy: on a failure the typed keys land in the session as a prompt.
-    await asyncio.to_thread(shutil.copytree, root_home.home, home)
-    copy = RootHome(home, home / root_home.root.relative_to(root_home.home), root_home.session_id)
-    startup = asyncio.Event()
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
     if phase == "settled":
         startup.set()
-    ensure_mcp_servers = AgentLoop.ensure_mcp_servers
-
-    async def held_startup(loop: AgentLoop) -> None:
-        await await_or_fail(startup.wait(), timeout=60, what="startup gate")
-        await ensure_mcp_servers(loop)
-
-    monkeypatch.setattr(AgentLoop, "ensure_mcp_servers", held_startup)
     backend = FakeBackend([])
     async with running_tui(copy, backend) as driver:
         app = driver.app
@@ -667,9 +754,12 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
             await driver.settle("settled screen before the opener")
 
         def submitted() -> list[str]:
-            return [value for value, _internal in app._startup_submissions] + [
-                str(messages[-1].content) for messages, _tools in backend.calls
-            ]
+            # Slash commands are not prompts: the opener's own command may queue.
+            return [
+                value
+                for value, _internal in app._startup_submissions
+                if not value.startswith("/")
+            ] + [str(messages[-1].content) for messages, _tools in backend.calls]
 
         def composer() -> str:
             return driver.session.default_buffer.text
@@ -736,6 +826,31 @@ async def test_keys_typed_right_after_an_overlay_opener_belong_to_the_overlay(
         assert not backend.calls, (
             f"keys typed for the overlay were sent to the model: {submitted()}"
         )
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_queued_before_a_panel_command_is_still_sent(
+    root_home: RootHome, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The panel opens from its Enter during startup; the prompt typed before it
+    # still waits for startup and is sent, and only it.
+    copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
+    backend = FakeBackend([])
+    async with running_tui(copy, backend) as driver:
+        app = driver.app
+        assert app._startup_replay_active, "startup finished before the keys"
+        await driver.send("hello" + ENTER + "/tasks" + ENTER + "zz" + ENTER)
+        await driver.settle("settled screen before startup ends")
+        startup.set()
+        await driver.until(
+            lambda: bool(backend.calls)
+            and (app._active_task is None or app._active_task.done()),
+            what="the queued prompt was not sent after startup",
+        )
+        await driver.settle("settled screen after startup")
+        sent = [str(messages[-1].content) for messages, _tools in backend.calls]
+        assert sent == [str([TextContent("hello")])], f"sent {sent}, expected only 'hello'"
+        assert _window_drawn(driver, app._tasks_panel_window), "the panel closed"
 
 
 def _assert_pages_adjacent(driver: Driver, what: str) -> None:
