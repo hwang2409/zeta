@@ -1130,8 +1130,7 @@ async def test_esc_while_remote_attaches_lets_the_attach_finish(
         attached.append(session.session_id)
 
     async def next_event(_client: object) -> str:
-        await asyncio.Event().wait()
-        return ""
+        return ""  # the link ended: the view stays, marked disconnected
 
     monkeypatch.setattr(RemoteSessionClient, "discover", discover)
     monkeypatch.setattr(RemoteSessionClient, "attach", attach)
@@ -1603,7 +1602,9 @@ async def _enter_the_child(driver: Driver) -> None:
     while navigation.entries[navigation.selected_index].path.name != "1":
         before = navigation.selected_index
         await driver.send("\x1b[B")
-        await driver.until(lambda: navigation.selected_index != before, what="no next row")
+        await driver.until(
+            lambda before=before: navigation.selected_index != before, what="no next row"
+        )
     await driver.send(ENTER)
     await driver.until(
         lambda: navigation.child_view_active and _answer(TURNS - 1) in driver.screen(),
