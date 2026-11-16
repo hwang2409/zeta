@@ -175,10 +175,10 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
 
     loop = type("Loop", (), {"steer": lambda self, message: steer(message)})()
     control = type("Control", (), {})()
-    control.server = type("Server", (), {"runtime": type("Runtime", (), {
+    control.runtime = type("Runtime", (), {
         "loop": loop, "opened": type("Opened", (), {"store": store})(),
         "session_id": "session-1",
-    })()})()
+    })()
     control._model_inputs = type("Inputs", (), {
         "resolve": lambda self, session_id, params, enabled: ResolvedModelInput(
             params["text"], params["text"], MessageOrigin.USER, None
@@ -237,10 +237,10 @@ async def test_delivery_id_cancel_before_append_commits_does_nothing(
     store.append_client_delivery_async = append
     loop = type("Loop", (), {"steer": lambda self, message: None})()
     control = type("Control", (), {})()
-    control.server = type("Server", (), {"runtime": type("Runtime", (), {
+    control.runtime = type("Runtime", (), {
         "loop": loop, "opened": type("Opened", (), {"store": store})(),
         "session_id": "session-1",
-    })()})()
+    })()
     control._model_inputs = type("Inputs", (), {
         "resolve": lambda self, session_id, params, enabled: ResolvedModelInput(
             params["text"], params["text"], MessageOrigin.USER, None
@@ -1563,12 +1563,10 @@ class _Control:
         self.echo_stalls = False
         self.release_echo = asyncio.Event()
         self.loop = SimpleNamespace(steer=self._steer)
-        self.server = SimpleNamespace(
-            runtime=SimpleNamespace(
-                loop=self.loop,
-                opened=SimpleNamespace(store=self.store),
-                session_id="session",
-            )
+        self.runtime = SimpleNamespace(
+            loop=self.loop,
+            opened=SimpleNamespace(store=self.store),
+            session_id="session",
         )
         self._model_inputs = SimpleNamespace(
             resolve=lambda *args, **kwargs: SimpleNamespace(
