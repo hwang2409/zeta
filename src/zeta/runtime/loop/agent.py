@@ -81,6 +81,7 @@ from ...providers.completion import (
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
+from ...telemetry import SpanHandle, Telemetry
 from ...tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from ...tools._shared.process import TaskExitInput
 from ...tools.registry import ToolExecutionContext, _validate_unique_tool_call_ids
@@ -91,7 +92,9 @@ from ._completion import (
     _sanitize_account_message,
     account_generation,
     can_retry_context,
+    end_inference,
     ensure_context_reduced,
+    observe_inference,
     observed_completion,
     provider_prompt_tokens,
     subscription_limit_failure,
@@ -169,6 +172,7 @@ class AgentLoop(
         live_config_project_dir: Path | None = None,
         freeze_live_config: bool = False,
         child_turn_control: ChildTurnControl | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         if type(max_agent_depth) is not int or not (
             0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
@@ -181,6 +185,8 @@ class AgentLoop(
                 f"agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
         self.backend = backend
+        # the process owner's telemetry (TUI app or zeta serve); disabled is a no-op
+        self.telemetry = telemetry or Telemetry.disabled()
         self._init_backend_owners(backend)
         self.store = store
         self.store.recover_client_deliveries()
@@ -797,6 +803,7 @@ class AgentLoop(
             partial_blocks: list[ContentBlock] = []
             assistant_message: Message | None = None
             completion: CompletionRun | None = None
+            inference: SpanHandle | None = None
             completion_succeeded = False
             provider_error: ErrorInfo | None = None
             provider_error_source: BaseException | ErrorInfo | None = None
@@ -900,6 +907,14 @@ class AgentLoop(
                 assert admitted_request is not None
                 if self._abort_admitted:
                     return
+                # one span per logical call: provider retries inside the run are events on it
+                inference = self.telemetry.inference_span(
+                    getattr(self.backend, "model", ""),
+                    provider=getattr(self.backend, "provider", ""),
+                    stream=True,
+                    conversation_id=self.store.session_id,
+                )
+                inference.__enter__()
                 completion = self.context_assembler.dispatch_admitted_request(
                     self.backend,
                     admitted_request,
@@ -930,6 +945,7 @@ class AgentLoop(
                     }:
                         provider_started = True
                     self.context_assembler.observe_event(event)
+                    observe_inference(inference, event)
                     if event.type is StreamEventType.ERROR:
                         provider_error = (
                             replace(event.error, provider_error=True)
@@ -982,21 +998,21 @@ class AgentLoop(
                         "provider stream ended before completion",
                         retryable=True,
                     )
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, GeneratorExit) as exc:
+                # end the span first: a failing close must not leave it attached
+                end_inference(inference, exc)
                 if completion is not None:
                     await completion.aclose()
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise
-            except GeneratorExit:
-                if completion is not None:
-                    await completion.aclose()
-                self._persist_partial_for_control(partial_blocks, assistant_message)
-                raise
-            except ProviderAccountSwitched:  # redispatch through the new account's backend
+            except ProviderAccountSwitched as exc:  # redispatch through the new account's backend
+                end_inference(inference, exc)
                 await completion.aclose()  # type: ignore[union-attr]
                 self._dispatch_progress.reset()
                 continue
             except Exception as exc:
+                end_inference(inference, asyncio.CancelledError() if task_is_cancelling() else exc)
+                inference = None
                 if completion is not None:
                     await completion.aclose()
                 if task_is_cancelling():
@@ -1015,11 +1031,16 @@ class AgentLoop(
                 except BaseException as exc:  # noqa: BLE001 - preserve close errors
                     cleanup_error = exc
             if task_is_cancelling():
+                end_inference(inference, asyncio.CancelledError())
                 self._persist_partial_for_control(partial_blocks, assistant_message)
                 raise asyncio.CancelledError()
             if cleanup_error is not None and provider_error is None:
                 provider_error = _error_info(cleanup_error, provider_error=True)
                 provider_error_source = cleanup_error
+            end_inference(
+                inference,
+                None if provider_error is None else provider_error_source or provider_error,
+            )
             if provider_error is not None and can_retry_context(
                 provider_error, retrying_context, partial_blocks, assistant_message
             ):

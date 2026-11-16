@@ -18,6 +18,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..telemetry import SpanHandle
 from .pending_delivery import (
     DeliveryPublications,
     StepDeliveryFlow,
@@ -243,25 +244,58 @@ class AgentNotificationMixin:
             allow_assistant_reset=allow_assistant_reset,
             task_deadline=task_deadline,
         )
-        try:
-            async for event in stream:
-                yield event
-        finally:
+        telemetry = self.telemetry
+        turn_span: SpanHandle | None = None
+        # shortcut: the root is always profile "zeta"; slice 3a names child profiles.
+        with telemetry.agent_span(
+            "zeta",
+            agent_name="zeta",
+            conversation_id=self.store.session_id,
+            model=getattr(self.backend, "model", ""),
+            depth=self.agent_depth,
+            background=False,
+        ):
             try:
-                await stream.aclose()
-            except BaseException:  # noqa: BLE001, S110 - preserve turn cleanup
-                pass
-            if self.child_turn_control is not None:
-                self.child_turn_control.abandon_completion()
-            self.store.retire_terminal_approval_executions()
-            self._turn_active = False
-            self._delivering_prompt_id = None
-            flow = self.step_delivery
-            if flow is not None:
-                flow.release_active()
-            if self.agent_instance_id is None and self._delivery_wake_pending:
-                self._delivery_wake_pending = False
-                self._background_owner.notify_wake()
+                try:
+                    async for event in stream:
+                        # turn spans follow the loop's own turn events, so the
+                        # inference span the loop opens next is their child
+                        if event.type is StreamEventType.TURN_START:
+                            if turn_span is not None:  # a redispatch starts a turn without TURN_END
+                                turn_span.__exit__(None, None, None)
+                            turn_span = telemetry.turn_span(
+                                conversation_id=self.store.session_id,
+                                turn_number=event.data.get("turn", 0),
+                                notification=notification_turn,
+                            )
+                            turn_span.__enter__()
+                        elif event.type is StreamEventType.TURN_END and turn_span is not None:
+                            turn_span.set_tool_count(tool_count=event.data.get("tool_calls", 0))
+                            turn_span.__exit__(None, None, None)
+                            turn_span = None
+                        yield event
+                finally:
+                    try:
+                        await stream.aclose()
+                    except BaseException:  # noqa: BLE001, S110 - preserve turn cleanup
+                        pass
+                    if self.child_turn_control is not None:
+                        self.child_turn_control.abandon_completion()
+                    self.store.retire_terminal_approval_executions()
+                    self._turn_active = False
+                    self._delivering_prompt_id = None
+                    flow = self.step_delivery
+                    if flow is not None:
+                        flow.release_active()
+                    if self.agent_instance_id is None and self._delivery_wake_pending:
+                        self._delivery_wake_pending = False
+                        self._background_owner.notify_wake()
+            except BaseException as exc:
+                if turn_span is not None:
+                    turn_span.__exit__(type(exc), exc, None)
+                raise
+            if turn_span is not None:
+                turn_span.__exit__(None, None, None)
 
     def set_background_wake_callback(self, callback: Callable[[], None] | None) -> None:
         if callback is None:

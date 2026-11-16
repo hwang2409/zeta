@@ -411,6 +411,8 @@ class ZetaServer:
             except TelemetryError as exc:
                 raise SessionError(str(exc)) from None
         if not self._borrowed:
+            # sessions this server opens trace through its process telemetry
+            self.runtime.telemetry = self.telemetry
             await self.runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(

@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Self
 
+from .attributes import GEN_AI_PROVIDER_NAMES
+
 
 @dataclass(frozen=True)
 class TelemetryStatus:
@@ -40,6 +42,7 @@ class SpanHandle:
             self._implementation.set_usage(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens)
 
     def retry(self, *, attempt: int, reason: str, delay: int, after: bool) -> None:
+        """Record one provider retry decision; ``delay`` is in milliseconds."""
         if self._implementation is not None:
             self._implementation.retry(attempt=attempt, reason=reason, delay=delay, after=after)
 
@@ -51,17 +54,26 @@ class SpanHandle:
         if self._implementation is not None:
             self._implementation.approval_resolved(decision=decision, scope=scope, duration=duration)
 
-    def set_response(self, *, model: str, finish_reason: str) -> None:
+    def set_response(self, *, finish_reason: str, model: str | None = None) -> None:
         if self._implementation is not None:
-            self._implementation.set_response(model=model, finish_reason=finish_reason)
+            self._implementation.set_response(finish_reason=finish_reason, model=model)
+
+    def set_tool_count(self, *, tool_count: int) -> None:
+        if self._implementation is not None:
+            self._implementation.set_tool_count(tool_count=tool_count)
 
     def set_sizes(self, *, argument_bytes: int, result_bytes: int) -> None:
         if self._implementation is not None:
             self._implementation.set_sizes(argument_bytes=argument_bytes, result_bytes=result_bytes)
 
-    def fail(self, exc: BaseException | type[BaseException]) -> None:
+    def fail(self, exc: BaseException | type[BaseException] | None) -> None:
+        """Mark the span failed; ``None`` is a failure with no exception (error.type ``_OTHER``)."""
         if self._implementation is not None:
             self._implementation.fail(exc)
+
+
+# the disabled facade hands out this one handle, so a disabled span allocates nothing.
+_NOOP = SpanHandle()
 
 
 class Telemetry:
@@ -120,21 +132,28 @@ class Telemetry:
     def agent_span(
         self, profile: str, *, agent_name: str, conversation_id: str, model: str, depth: int, background: bool
     ) -> SpanHandle:
+        if self._implementation is None:
+            return _NOOP
         return self._span(f"invoke_agent {profile}", operation="agent", attributes={
             "gen_ai.operation.name": "invoke_agent", "zeta.agent.name": agent_name,
             "gen_ai.conversation.id": conversation_id, "gen_ai.request.model": model,
             "zeta.agent.depth": depth, "zeta.background": background,
         })
 
-    def turn_span(self, *, conversation_id: str, turn_number: int, notification: bool, tool_count: int) -> SpanHandle:
+    def turn_span(self, *, conversation_id: str, turn_number: int, notification: bool) -> SpanHandle:
+        if self._implementation is None:
+            return _NOOP
         return self._span("zeta.turn", operation="turn", attributes={
             "gen_ai.conversation.id": conversation_id, "zeta.turn.number": turn_number,
-            "zeta.notification": notification, "zeta.tool.count": tool_count,
+            "zeta.notification": notification,
         })
 
     def inference_span(self, model: str, *, provider: str, stream: bool, conversation_id: str) -> SpanHandle:
+        """``provider`` is the zeta provider id (claude, codex, ollama); spans carry its GenAI name."""
+        if self._implementation is None:
+            return _NOOP
         return self._span("chat " + model, kind="client", operation="inference", attributes={
-            "gen_ai.operation.name": "chat", "gen_ai.provider.name": provider,
+            "gen_ai.operation.name": "chat", "gen_ai.provider.name": GEN_AI_PROVIDER_NAMES.get(provider, provider),
             "gen_ai.request.model": model, "gen_ai.conversation.id": conversation_id,
             "zeta.stream": stream,
         })
@@ -142,6 +161,8 @@ class Telemetry:
     def tool_span(
         self, name: str, *, tool_type: str, call_id: str, agent_name: str, conversation_id: str
     ) -> SpanHandle:
+        if self._implementation is None:
+            return _NOOP
         return self._span("execute_tool " + name, operation="tool", attributes={
             "gen_ai.operation.name": "execute_tool", "zeta.tool.name": name,
             "zeta.tool.type": tool_type, "zeta.tool.call.id": call_id,
@@ -149,14 +170,14 @@ class Telemetry:
         })
 
     def context_span(self, *, emergency: bool, tokens_before: int, tokens_after: int, marker_count: int) -> SpanHandle:
+        if self._implementation is None:
+            return _NOOP
         return self._span("zeta.context.compact", operation="context", attributes={
             "zeta.emergency": emergency, "zeta.tokens.before": tokens_before,
             "zeta.tokens.after": tokens_after, "zeta.marker.count": marker_count,
         })
 
     def _span(self, name: str, *, kind: str = "internal", operation: str, attributes: Mapping[str, object] | None = None) -> SpanHandle:
-        if self._implementation is None:
-            return SpanHandle()
         return self._implementation._span(name, kind=kind, operation=operation, attributes=attributes)
 
 

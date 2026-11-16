@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any
@@ -29,6 +29,7 @@ from ...protocol.types import (
 if TYPE_CHECKING:
     from ...core.store import ConversationStore
     from ...core.store._client_delivery import ClientSteeringBatch
+    from ...telemetry import SpanHandle
 
 MAX_ERROR_MESSAGE = 400
 
@@ -193,3 +194,48 @@ def can_retry_context(
         and not partial
         and message is None
     )
+
+
+def observe_inference(span: SpanHandle, event: StreamEvent) -> None:
+    """Copy retry decisions, normalized usage, and the stop reason onto the call's span."""
+
+    if event.type is StreamEventType.RETRY and "reason" in event.data:
+        delay = event.data.get("delay")
+        span.retry(
+            attempt=event.data.get("attempt", 0),
+            reason=event.data["reason"],
+            delay=round(delay * 1000) if isinstance(delay, (int, float)) else 0,
+            after="retry_after" in event.data,
+        )
+    elif event.type is StreamEventType.MESSAGE_END:
+        usage = event.data.get("usage")
+        if isinstance(usage, Mapping):
+            # normalized input_tokens exclude cache reads and writes; the GenAI count includes them
+            input_tokens = sum(
+                value
+                for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+                if type(value := usage.get(key)) is int and value >= 0
+            )
+            output_tokens = usage.get("output_tokens")
+            output_tokens = output_tokens if type(output_tokens) is int and output_tokens >= 0 else 0
+            span.set_usage(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+            )
+        reason = event.data.get("stop_reason")
+        if type(reason) is str:
+            span.set_response(finish_reason=reason)
+
+
+def end_inference(span: SpanHandle | None, error: BaseException | object | None) -> None:
+    """End the logical call's span; a non-exception error (an ERROR event) is ``_OTHER``."""
+
+    if span is None:
+        return
+    if isinstance(error, BaseException):
+        span.__exit__(type(error), error, None)
+        return
+    if error is not None:
+        span.fail(None)
+    span.__exit__(None, None, None)

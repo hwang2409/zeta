@@ -61,7 +61,7 @@ def test_hostile_environment_does_not_disable_private_configuration(monkeypatch:
         monkeypatch.delenv(name, raising=False)
 
     instance = telemetry.Telemetry.configure(SimpleNamespace(otel_endpoint="http://127.0.0.1:4318/v1/traces"))
-    with instance.turn_span(conversation_id="test", turn_number=1, notification=False, tool_count=0):
+    with instance.turn_span(conversation_id="test", turn_number=1, notification=False):
         carrier = instance.current_trace_context()
     limits = vars(instance._implementation._provider._span_limits)
     instance.shutdown()
@@ -124,7 +124,7 @@ def test_transport_ignores_proxy_and_does_not_follow_redirects(monkeypatch: pyte
     try:
         endpoint = f"http://127.0.0.1:{server.server_port}/v1/traces"
         instance = telemetry.Telemetry.configure(endpoint)
-        with instance.turn_span(conversation_id="test", turn_number=1, notification=False, tool_count=0):
+        with instance.turn_span(conversation_id="test", turn_number=1, notification=False):
             pass
         instance.shutdown()
         assert received.wait(5)
@@ -170,7 +170,7 @@ def test_shutdown_is_synchronous_and_export_failure_is_not_logged(monkeypatch: p
     app_logger.addHandler(handler)
     try:
         instance = telemetry.Telemetry.configure("http://127.0.0.1:4318/v1/traces")
-        with instance.turn_span(conversation_id="test", turn_number=1, notification=False, tool_count=0):
+        with instance.turn_span(conversation_id="test", turn_number=1, notification=False):
             pass
         instance.shutdown()
         instance.shutdown()
@@ -287,7 +287,7 @@ _ADVERSARIAL = {
     "unicode": "unicode-\u2603",
 }
 _HELPERS = ("agent_span", "turn_span", "inference_span", "tool_span", "context_span")
-_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_sizes", "fail")
+_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "fail")
 # where a shape-accepted value may appear: "<name>" is the span name.
 _SHAPE_FIELDS = {
     ("agent_span", "profile"): {"<name>"},
@@ -440,13 +440,12 @@ def _source_finish_reasons() -> set[str]:
 
 def _source_closed_sets() -> dict[str, set[str]]:
     from zeta.core.approval import ApprovalDecision as CoreDecision
-    from zeta.models.catalog import PROVIDER_MODELS
     from zeta.server.protocol import APPROVAL_SCOPES
     from zeta.server.protocol import ApprovalDecision as ServeDecision
 
     return {
         "reason": _source_retry_reasons(), "finish_reason": _source_finish_reasons(),
-        "decision": {*CoreDecision, *ServeDecision}, "scope": set(APPROVAL_SCOPES), "provider": set(PROVIDER_MODELS),
+        "decision": {*CoreDecision, *ServeDecision}, "scope": set(APPROVAL_SCOPES),
     }
 
 
@@ -455,9 +454,18 @@ def test_closed_set_mirrors_equal_their_sources() -> None:
 
     mirrors = {
         "reason": runtime._RETRY_REASONS, "finish_reason": runtime._FINISH_REASONS,
-        "decision": runtime._APPROVAL_DECISIONS, "scope": runtime._APPROVAL_SCOPES, "provider": runtime._PROVIDERS,
+        "decision": runtime._APPROVAL_DECISIONS, "scope": runtime._APPROVAL_SCOPES,
     }
     assert {name: set(values) for name, values in mirrors.items()} == _source_closed_sets()
+
+
+def test_every_catalog_provider_maps_to_an_accepted_genai_name() -> None:
+    from zeta.models.catalog import PROVIDER_MODELS
+    from zeta.telemetry import runtime
+    from zeta.telemetry.attributes import GEN_AI_PROVIDER_NAMES
+
+    assert set(GEN_AI_PROVIDER_NAMES) == set(PROVIDER_MODELS)
+    assert set(GEN_AI_PROVIDER_NAMES.values()) == runtime._PROVIDERS
 
 
 def _real_values() -> list:
@@ -468,7 +476,6 @@ def _real_values() -> list:
         "finish_reason": ("set_response", "gen_ai.response.finish_reasons"),
         "decision": ("approval_resolved", "zeta.approval.resolved.decision"),
         "scope": ("approval_requested", "zeta.approval.requested.scope"),
-        "provider": ("inference_span", "gen_ai.provider.name"),
     }
     cases = [(location[field][0], field, value, location[field][1]) for field, values in _source_closed_sets().items() for value in sorted(values)]
     models = {model for models in PROVIDER_MODELS.values() for model in models} | {"locally-created-model", "qwen3:4b", "hf.co/user/model:Q4_K_M"}

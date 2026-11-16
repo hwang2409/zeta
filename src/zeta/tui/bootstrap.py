@@ -606,6 +606,7 @@ def _create_app_with_root(
         agent_catalog=agent_catalog,
         auto_project=not ephemeral,
         project_discovery=discovery,
+        telemetry=telemetry,
     )
     if opened is None:
         cleanup.enter_context(composition.opened.store)

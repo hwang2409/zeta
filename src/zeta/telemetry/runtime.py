@@ -12,22 +12,21 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
-from zeta.models.catalog import PROVIDER_MODELS
-
 from . import SpanHandle, TelemetryError, TelemetryStatus
-from .attributes import RESERVED_CONTENT_ATTRIBUTES
+from .attributes import GEN_AI_PROVIDER_NAMES, RESERVED_CONTENT_ATTRIBUTES
 
 _OPERATION_ATTRIBUTE_KEYS = {
     "agent": frozenset({"gen_ai.operation.name", "zeta.agent.name", "gen_ai.conversation.id", "gen_ai.request.model", "zeta.agent.depth", "zeta.background"}),
-    "turn": frozenset({"gen_ai.conversation.id", "zeta.turn.number", "zeta.notification", "zeta.tool.count"}),
+    "turn": frozenset({"gen_ai.conversation.id", "zeta.turn.number", "zeta.notification"}),
     "inference": frozenset({"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.conversation.id", "zeta.stream"}),
     "tool": frozenset({"gen_ai.operation.name", "zeta.tool.name", "zeta.tool.type", "zeta.tool.call.id", "zeta.agent.name", "gen_ai.conversation.id"}),
     "context": frozenset({"zeta.emergency", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count"}),
 }
 _EVENT_ATTRIBUTE_KEYS = {"gen_ai.client.retry": frozenset({"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after"}), "zeta.approval.requested": frozenset({"decision", "scope"}), "zeta.approval.resolved": frozenset({"decision", "scope", "duration"})}
-_ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size"})
+_ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.tool.count"})
 # Closed sets mirror repository values; tests/telemetry/test_telemetry.py checks each mirror against its source.
-_PROVIDERS = frozenset(PROVIDER_MODELS)
+# provider names are the GenAI values; the facade maps every catalog provider onto them.
+_PROVIDERS = frozenset(GEN_AI_PROVIDER_NAMES.values())
 _OPERATION_NAMES = frozenset({"invoke_agent", "chat", "execute_tool"})
 # zeta-owned tool families; no repository enum exists yet (slice 3a is the first caller).
 _TOOL_TYPES = frozenset({"function", "computer", "mcp", "agent"})
@@ -143,9 +142,13 @@ class _SpanHandle(SpanHandle):
         self._set("gen_ai.usage.output_tokens", output_tokens)
         self._set("gen_ai.usage.total_tokens", total_tokens)
 
-    def set_response(self, *, model: str, finish_reason: str) -> None:
-        self._set("gen_ai.response.model", model)
+    def set_response(self, *, finish_reason: str, model: str | None = None) -> None:
+        if model is not None:
+            self._set("gen_ai.response.model", model)
         self._set("gen_ai.response.finish_reasons", finish_reason)
+
+    def set_tool_count(self, *, tool_count: int) -> None:
+        self._set("zeta.tool.count", tool_count)
 
     def set_sizes(self, *, argument_bytes: int, result_bytes: int) -> None:
         self._set("zeta.tool.call.arguments.size", argument_bytes)
@@ -163,8 +166,9 @@ class _SpanHandle(SpanHandle):
     def approval_resolved(self, *, decision: str, scope: str, duration: int) -> None:
         self._span.add_event("zeta.approval.resolved", attributes=_safe_attributes({"decision": decision, "scope": scope, "duration": duration}, _EVENT_ATTRIBUTE_KEYS["zeta.approval.resolved"]))
 
-    def fail(self, exc: BaseException | type[BaseException]) -> None:
-        error_type = exc.__qualname__ if isinstance(exc, type) else type(exc).__qualname__
+    def fail(self, exc: BaseException | type[BaseException] | None) -> None:
+        # _OTHER is the semconv fallback when no exception class names the failure
+        error_type = "_OTHER" if exc is None else exc.__qualname__ if isinstance(exc, type) else type(exc).__qualname__
         self._set("error.type", _field_value("error.type", error_type))
         from opentelemetry.trace import Status, StatusCode
 
