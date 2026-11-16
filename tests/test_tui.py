@@ -1770,6 +1770,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
         skill_catalog=SkillCatalog.empty(),
         project_id="project-1",
         project_registry=SimpleNamespace(),
+        computer_enabled=True,
     )
     foreground_child = top_level.clone_for_session(
         stores[1],

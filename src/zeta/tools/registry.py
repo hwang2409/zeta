@@ -105,6 +105,7 @@ from .approval_gate import ApprovalGate
 if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState
     from ..skills.agent_catalog import AgentCatalog
+    from .computer.backend import ComputerBackend
 AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
@@ -222,6 +223,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         project_id: str | None = None,
         project_registry: Any = None,
         inbox_enabled: bool = True,
+        computer_enabled: bool = False,
         tool_allow: Sequence[str] | None = None,
         tool_deny: Sequence[str] = (),
         tool_allow_layers: Sequence[Sequence[str]] = (),
@@ -260,6 +262,11 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         self.project_registry_state: ProjectRegistryState | None = None
         self.inbox_enabled = inbox_enabled
         self.inbox_target_ids: frozenset[str] | None = None
+        self.computer_enabled = computer_enabled
+        # The one OS seam for the computer tool; set by composition when a real
+        # backend exists, or by tests injecting a FakeBackend. None means the
+        # enabled tool reports that no backend is available on this machine.
+        self.computer_backend: ComputerBackend | None = None
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
         self._cwd_finalizer = weakref.finalize(self, os.close, cwd_fd)

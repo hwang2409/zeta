@@ -108,6 +108,7 @@ _PROJECT_SAFE_KEYS = frozenset(
 )
 _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _INBOX_KEYS = frozenset({"enabled"})
+_COMPUTER_KEYS = frozenset({"enabled"})
 _ANTHROPIC_KEYS = frozenset({"oauth_compat"})
 _COMMAND_KEYS = frozenset({"command_niceness"})
 _AGENTS_KEYS = frozenset({"explicit_finish", "max_depth"})
@@ -133,6 +134,7 @@ class Settings:
     ollama_base_url: str | None = None
     auto_project: bool | None = None
     inbox_enabled: bool | None = None
+    computer_enabled: bool | None = None
     anthropic_oauth_compat: bool | None = None
     agents_explicit_finish: bool | None = None
     agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
@@ -170,6 +172,7 @@ class ResolvedConfig:
     workspace_snapshot_cap: int | None = None
     auto_project: bool = True
     inbox_enabled: bool = True
+    computer_enabled: bool = False
     agents_explicit_finish: bool = False
     agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
     tool_allow: tuple[str, ...] | None = None
@@ -330,6 +333,7 @@ def resolve(
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
         auto_project=settings.auto_project is not False,
         inbox_enabled=settings.inbox_enabled is not False,
+        computer_enabled=settings.computer_enabled is True,
         agents_explicit_finish=settings.agents_explicit_finish is True,
         agents_max_depth=settings.agents_max_depth,
         tool_allow=settings.tool_allow if cli_allow is None else cli_allow,
@@ -559,6 +563,7 @@ def _validate(
     )
     auto_project = _validated_bool(data, "auto_project", notices)
     inbox_enabled = _validated_inbox(data, notices)
+    computer_enabled = _validated_computer(data, notices)
     anthropic_oauth_compat = _validated_anthropic(data, notices)
     agents_table = data.get("agents", {})
     if not isinstance(agents_table, Mapping) or set(agents_table) - _AGENTS_KEYS:
@@ -630,6 +635,7 @@ def _validate(
         ollama_base_url=ollama_base_url,
         auto_project=auto_project,
         inbox_enabled=inbox_enabled,
+        computer_enabled=computer_enabled,
         anthropic_oauth_compat=anthropic_oauth_compat,
         agents_explicit_finish=agents_explicit_finish,
         agents_max_depth=agents_max_depth,
@@ -661,6 +667,20 @@ def _validated_inbox(
         return None
     for key in table.keys() - _INBOX_KEYS:
         notices.append(f"settings · ignored unknown key 'inbox.{key}'")
+    return _validated_bool(table, "enabled", notices)
+
+
+def _validated_computer(
+    data: Mapping[str, Any], notices: list[str]
+) -> bool | None:
+    if "computer" not in data:
+        return None
+    table = data["computer"]
+    if not isinstance(table, Mapping):
+        notices.append("settings · ignored key 'computer': expected table")
+        return None
+    for key in table.keys() - _COMPUTER_KEYS:
+        notices.append(f"settings · ignored unknown key 'computer.{key}'")
     return _validated_bool(table, "enabled", notices)
 
 
