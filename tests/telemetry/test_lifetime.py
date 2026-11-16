@@ -66,6 +66,7 @@ async def _serve(home: Path, step: str, monkeypatch: pytest.MonkeyPatch) -> None
 
     runtime._compose = compose
     if step == "prepare":
+        # test-contract: seam inject a failure at the session preparation step
         monkeypatch.setattr(runtime, "_prepare_new_session", fail)
     if step == "activate":
         monkeypatch.setattr(AgentLoop, "activate", fail)
@@ -76,6 +77,7 @@ async def _serve(home: Path, step: str, monkeypatch: pytest.MonkeyPatch) -> None
             # run_server is the serve entry point; it must close a server whose start failed
             with pytest.raises(_Failure):
                 await await_or_fail(run_server(server), what="serve run with a failing start")
+            assert _batch_threads() == [], "run_server closed the failed start"
             return
         await server.start()
         assert len(_batch_threads()) == 1, "configured serve owns one exporter thread"
