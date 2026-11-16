@@ -100,10 +100,14 @@ class SessionControllers:
     def parked_record(self, session_id: str) -> SessionController | None:
         return self._parked.get(session_id)
 
-    def remove(self, record: SessionController) -> None:
-        control = record.control
-        self._parked.pop(record.runtime.session_id, None)
-        self._records.pop(control, None)
+    def retire(self, record: SessionController) -> SessionController:
+        """Take ``record`` out of every index before its close starts: the one
+        step every close of a resident control goes through. ``attached()``
+        keeps naming a retired final record only for shutdown."""
+        # by identity: a record whose setup failed has no session id
+        self._parked = {key: item for key, item in self._parked.items() if item is not record}
+        self._records.pop(record.control, None)
+        return record
 
     def require_current(
         self, connection: Any, record: SessionController, session_id: str | None

@@ -320,6 +320,8 @@ class ZetaServer:
         self.turn_contexts = PendingTurnContexts()
         self.foreground_event_publisher = foreground_event_publisher or ForegroundEventPublisher()
         control = ServeControl(self, runtime, self.foreground_event_publisher)
+        # every pair shares this manager; sessionless reads use it with no record
+        self.manager = runtime.manager
         self.controllers = SessionControllers(control)
         self._bind_pair(control)
         self.parking = ParkedPairs(lambda: self.connections, self.controllers)
@@ -474,17 +476,18 @@ class ZetaServer:
             self._client = None
             self._client_active = False
             self.parking.close_all(approval_settlement_timeout)
+            record = self.controllers.retire(self.controllers.attached())
             try:
                 try:
-                    await self.controllers.attached().control.close()
+                    await record.control.close()
                 finally:
                     await self._close_foreground_events()
                 try:
                     if not self._borrowed:
-                        await self.controllers.attached().runtime.close()
+                        await record.runtime.close()
                 finally:
                     try:
-                        await self.controllers.attached().control.wait_for_approval_settlement(
+                        await record.control.wait_for_approval_settlement(
                             approval_settlement_timeout
                         )
                     finally:

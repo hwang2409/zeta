@@ -4264,7 +4264,7 @@ async def test_list_sessions_marks_oversized_result_as_truncated(
         compaction_budget=200_000,
         system_prompt="x" * MAX_FRAME_BYTES,
     )
-    server.controllers.attached().runtime.list_sessions = lambda: [huge]
+    server.manager.list_sessions_read_only = lambda: [huge]
     reader, writer = await _ready(server)
     try:
         frames = await _request(reader, writer, 3, "list_sessions")
@@ -4307,7 +4307,7 @@ async def test_list_sessions_uses_maximum_request_id_for_boundary(
     server = ZetaServer(
         home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
     )
-    server.controllers.attached().runtime.list_sessions = lambda: [huge]
+    server.manager.list_sessions_read_only = lambda: [huge]
     reader, writer = await _connect(server)
     request_id = "x" * MAX_REQUEST_ID_BYTES
     try:
@@ -7709,7 +7709,7 @@ async def test_status_responsive_during_slow_list_sessions(tmp_path: Path) -> No
         release.wait(10)
         return []
 
-    server.controllers.attached().runtime.list_sessions = blocked_catalog
+    server.manager.list_sessions_read_only = blocked_catalog
     reader, writer = await _connect(server)
     status_reader, status_writer = await asyncio.open_connection(
         "127.0.0.1", server.port
