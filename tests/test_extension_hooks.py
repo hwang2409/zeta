@@ -60,7 +60,7 @@ async def test_timeout_disables_hook_and_warns() -> None:
     gate = asyncio.Event()
 
     async def hangs(_tool: str, _args: dict[str, object]) -> None:
-        await gate.wait()
+        await asyncio.wait_for(gate.wait(), 10)
 
     notices: list[str] = []
     extension_hook = ExtensionHook("hooks", "pre_tool", hangs, timeout_seconds=0.001)
