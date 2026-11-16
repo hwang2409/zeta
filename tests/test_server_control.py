@@ -614,9 +614,9 @@ async def test_serve_control_detach_preserves_controller_raw_bytes(
     await server.start()
     try:
         # Runtime sinks belong to the server lifetime, before any socket claims it.
-        assert server._runtime_for_test._background_event_sink is not None
-        assert server._runtime_for_test._memory_notice_sink is not None
-        assert server._runtime_for_test._background_wake_sink is not None
+        assert server.controllers.attached().runtime._background_event_sink is not None
+        assert server.controllers.attached().runtime._memory_notice_sink is not None
+        assert server.controllers.attached().runtime._background_wake_sink is not None
     finally:
         await server.close()
 
@@ -681,7 +681,7 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         await _request(reader, writer, 2, "new_session", {})
-        root_loop = server._runtime_for_test.loop
+        root_loop = server.controllers.attached().runtime.loop
         assert root_loop is not None
         server_sink = root_loop._background_event_sink
         assert server_sink is not None
@@ -796,7 +796,7 @@ async def test_held_input_notice_reaches_serve_as_display_only_child_idle(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         await _request(reader, writer, 2, "new_session", {})
-        root_loop = server._runtime_for_test.loop
+        root_loop = server.controllers.attached().runtime.loop
         assert root_loop is not None
         child_store.start_agent_lifecycle(
             handle="root:1",
@@ -913,7 +913,7 @@ async def test_post_turn_wake_runs_without_controller(tmp_path: Path) -> None:
         await asyncio.wait_for(backend.finalization_entered.wait(), TIMEOUT)
         server.connections.release(server._client)
         await server._client.close()
-        server._runtime_for_test.opened.store.append_agent_notification(
+        server.controllers.attached().runtime.opened.store.append_agent_notification(
             "first",
             child_session_path="/tmp/first",
             description="first",
@@ -923,16 +923,16 @@ async def test_post_turn_wake_runs_without_controller(tmp_path: Path) -> None:
         backend.release_finalization.set()
         await asyncio.wait_for(backend.woke.wait(), TIMEOUT)
 
-        server._runtime_for_test.opened.store.append_agent_notification(
+        server.controllers.attached().runtime.opened.store.append_agent_notification(
             "later",
             child_session_path="/tmp/later",
             description="later",
             status="completed",
             text="later done",
         )
-        sink = server._runtime_for_test._background_wake_sink
+        sink = server.controllers.attached().runtime._background_wake_sink
         assert sink is not None
-        sink(server._runtime_for_test.session_id)
+        sink(server.controllers.attached().runtime.session_id)
         await asyncio.wait_for(backend.later_woke.wait(), TIMEOUT)
     finally:
         backend.release_finalization.set()
@@ -978,9 +978,9 @@ async def test_closed_client_cannot_clear_serve_control_state(tmp_path: Path) ->
     del client
     gc.collect()
 
-    assert server._runtime_for_test._background_event_sink is not None
-    assert server._runtime_for_test._memory_notice_sink is not None
-    assert server._runtime_for_test._background_wake_sink is not None
+    assert server.controllers.attached().runtime._background_event_sink is not None
+    assert server.controllers.attached().runtime._memory_notice_sink is not None
+    assert server.controllers.attached().runtime._background_wake_sink is not None
     assert reference() is None
 
 
@@ -1002,14 +1002,14 @@ async def _serve_after_first_turn(tmp_path: Path):
 
 
 def _schedule_wake(server: ZetaServer, session_id: str) -> None:
-    server._runtime_for_test.opened.store.append_agent_notification(
+    server.controllers.attached().runtime.opened.store.append_agent_notification(
         "child",
         child_session_path="/tmp/child",
         description="child",
         status="completed",
         text="child done",
     )
-    sink = server._runtime_for_test._background_wake_sink
+    sink = server.controllers.attached().runtime._background_wake_sink
     assert sink is not None
     sink(session_id)
 
@@ -1034,7 +1034,7 @@ async def test_state_change_waits_for_wake_in_setup_before_turn_start(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str, params: dict
 ) -> None:
     server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
-    loop = server._runtime_for_test.loop
+    loop = server.controllers.attached().runtime.loop
     in_setup = asyncio.Event()
     release_setup = asyncio.Event()
     original_ensure = loop._ensure_mcp_servers
@@ -1047,8 +1047,8 @@ async def test_state_change_waits_for_wake_in_setup_before_turn_start(
     # test-contract: seam MCP startup is the slow step a wake runs before turn_start
     monkeypatch.setattr(loop, "_ensure_mcp_servers", held_ensure)
     try:
-        model = server._runtime_for_test.model
-        opened = server._runtime_for_test.opened
+        model = server.controllers.attached().runtime.model
+        opened = server.controllers.attached().runtime.opened
         _schedule_wake(server, session_id)
         await await_or_fail(in_setup.wait(), what="wake in setup")
         assert loop.notification_turn_state == "running"
@@ -1059,8 +1059,8 @@ async def test_state_change_waits_for_wake_in_setup_before_turn_start(
             )
         )[-1]
         assert reply.get("error", {}).get("code") == -32004, reply
-        assert server._runtime_for_test.model == model
-        assert server._runtime_for_test.opened is opened
+        assert server.controllers.attached().runtime.model == model
+        assert server.controllers.attached().runtime.opened is opened
         status = (await _request(reader, writer, "status", "status", {}))[-1]
         assert status["result"]["state"] == "running", status
 
@@ -1090,7 +1090,7 @@ async def test_running_slash_command_holds_wake_start_until_it_ends(
     from zeta.server.slash_commands import ServerSlashSession
 
     server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
-    loop = server._runtime_for_test.loop
+    loop = server.controllers.attached().runtime.loop
     order: list[str] = []
     in_command = asyncio.Event()
     release_command = asyncio.Event()
@@ -1115,7 +1115,7 @@ async def test_running_slash_command_holds_wake_start_until_it_ends(
     monkeypatch.setattr(loop, "_ensure_mcp_servers", observed_ensure)
     # test-contract: seam signal when the wake waits on the start gate; absent on old code
     monkeypatch.setattr(
-        server._control_for_test,
+        server.controllers.attached().control,
         "_no_state_change",
         _GateSignalingEvent(wake_progressed),
         raising=False,
@@ -1171,7 +1171,7 @@ async def test_wake_waits_for_change_that_takes_hold_as_first_releases(
     from zeta.server.slash_commands import ServerSlashSession
 
     server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
-    loop = server._runtime_for_test.loop
+    loop = server.controllers.attached().runtime.loop
     order: list[str] = []
     in_command = asyncio.Event()
     release_command = asyncio.Event()
@@ -1187,12 +1187,12 @@ async def test_wake_waits_for_change_that_takes_hold_as_first_releases(
         order.append("wake setup")
         await original_ensure()
 
-    gate = _SecondHoldOnRelease(server._control_for_test, order)
+    gate = _SecondHoldOnRelease(server.controllers.attached().control, order)
     monkeypatch.setattr(ServerSlashSession, "slash_model", held_model)
     # test-contract: seam MCP startup is the first wake step after its start gate
     monkeypatch.setattr(loop, "_ensure_mcp_servers", observed_ensure)
     # test-contract: seam a second state change takes the hold in the tick the first releases it
-    monkeypatch.setattr(server._control_for_test, "_no_state_change", gate)
+    monkeypatch.setattr(server.controllers.attached().control, "_no_state_change", gate)
     try:
         reply = None
         await send(
@@ -1219,7 +1219,7 @@ async def test_wake_waits_for_change_that_takes_hold_as_first_releases(
         assert reply["result"]["text"] == "model: gpt-5.6-sol", reply
     finally:
         release_command.set()
-        if gate.second_hold is not None and server._control_for_test._state_changes:
+        if gate.second_hold is not None and server.controllers.attached().control._state_changes:
             gate.release_second()
         await close_serve(server, writer)
 
@@ -1238,12 +1238,12 @@ async def test_wake_held_across_session_change_does_not_run_on_old_session(
 
     # test-contract: seam the notification turn body starts only after the start gate
     monkeypatch.setattr(server.turn_contexts, "run_notification_turn", observed_run)
-    hold = server._control_for_test.hold_wake_start()
+    hold = server.controllers.attached().control.hold_wake_start()
     hold.__enter__()
     held = True
     try:
         _schedule_wake(server, session_id)
-        wake = server._control_for_test._notification_task
+        wake = server.controllers.attached().control._notification_task
         assert wake is not None
         # a session change runs while the wake waits at the start gate.
         reply = (await _request(reader, writer, "new", "new_session", {}))[-1]
@@ -1263,7 +1263,7 @@ async def test_abort_with_child_approval_cancels_wake_held_at_start_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
-    control = server._control_for_test
+    control = server.controllers.attached().control
     in_abort = asyncio.Event()
     original_abort = control.abort
 

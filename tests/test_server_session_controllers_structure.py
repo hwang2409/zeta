@@ -78,7 +78,8 @@ def test_server_has_only_private_test_aliases() -> None:
     assert "control" not in names
     assert "runtime" not in names
     assert "__getattr__" not in names
-    assert {"_control_for_test", "_runtime_for_test"} <= names
+    assert "_control" + "_for_test" not in names
+    assert "_runtime" + "_for_test" not in names
 
 
 def test_records_are_resolved_once_at_request_entries() -> None:

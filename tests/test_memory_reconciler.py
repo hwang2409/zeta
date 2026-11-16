@@ -407,7 +407,7 @@ async def test_dropped_steer_text_never_reaches_memory_reconciler(
         await event(reader, "turn_aborted")
         transcript = Transcript(
             SESSION,
-            tuple(entry.to_dict() for entry in branch_entries(server._runtime_for_test.opened.store)),
+            tuple(entry.to_dict() for entry in branch_entries(server.controllers.attached().runtime.opened.store)),
         )
 
         reconciliation = prepare_request(transcript, {}, as_of=TODAY)

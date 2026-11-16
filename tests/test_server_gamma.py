@@ -146,8 +146,8 @@ async def test_new_session_settings_apply_before_first_turn(tmp_path: Path) -> N
         assert created[-1]["result"]["session"]["model"] == "gpt-5.4-mini"
         await _request(reader, writer, 3, "send", {"text": "hello"})
         await _event(reader, "agent_end")
-        assert server._runtime_for_test.metadata.model == "gpt-5.4-mini"
-        assert server._runtime_for_test.policy.default.value == "allow"
+        assert server.controllers.attached().runtime.metadata.model == "gpt-5.4-mini"
+        assert server.controllers.attached().runtime.policy.default.value == "allow"
         assert backend.calls
     finally:
         await close_serve(server, writer)
@@ -174,7 +174,7 @@ async def test_new_session_settings_invalid_does_not_create_session(
             "code": -32602,
             "message": "invalid model or approval mode",
         }
-        assert server._runtime_for_test.opened is None
+        assert server.controllers.attached().runtime.opened is None
     finally:
         await close_serve(server, writer)
 
@@ -319,9 +319,9 @@ async def test_active_resume_rejects_a_session_whose_cwd_was_removed(
         await _legacy_hello(reader, writer)
         created = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"]
         session_id = created["session"]["session_id"]
-        assert server._runtime_for_test.session_id == session_id
-        assert server._runtime_for_test.loop is not None
-        await server._runtime_for_test.loop.ensure_mcp_servers()
+        assert server.controllers.attached().runtime.session_id == session_id
+        assert server.controllers.attached().runtime.loop is not None
+        await server.controllers.attached().runtime.loop.ensure_mcp_servers()
         shutil.rmtree(original)
 
         resumed = await _request(
@@ -497,8 +497,8 @@ async def test_slash_requests_reuse_session_repo_root_and_build_once(
                 )
             )[-1]["result"]["session"]["session_id"]
             if index == 0:
-                original_turn_busy = server._control_for_test.turn_busy
-                monkeypatch.setattr(server._control_for_test, "turn_busy", lambda: True)
+                original_turn_busy = server.controllers.attached().control.turn_busy
+                monkeypatch.setattr(server.controllers.attached().control, "turn_busy", lambda: True)
                 for request_id in range(3):
                     result = (
                         await _request(
@@ -511,7 +511,7 @@ async def test_slash_requests_reuse_session_repo_root_and_build_once(
                     )[-1]["result"]
                     assert result["kind"] == "output"
                 busy_registry_builds = registry_builds
-                monkeypatch.setattr(server._control_for_test, "turn_busy", original_turn_busy)
+                monkeypatch.setattr(server.controllers.attached().control, "turn_busy", original_turn_busy)
             result = (
                 await _request(
                     reader,
@@ -669,7 +669,7 @@ async def test_user_message_delivery_id_is_opt_in(tmp_path: Path) -> None:
         )
         assert (await _event(reader, "user_message")) == {
             "event": "user_message",
-            "session_id": server._runtime_for_test.session_id,
+            "session_id": server.controllers.attached().runtime.session_id,
             "text": "hello",
             "mode": "send",
             "attachments": [],
@@ -690,7 +690,7 @@ async def test_user_message_delivery_id_is_opt_in(tmp_path: Path) -> None:
                 writer,
                 5,
                 "session_history",
-                {"session_id": server._runtime_for_test.session_id},
+                {"session_id": server.controllers.attached().runtime.session_id},
             )
         )[-1]["result"]["messages"]
         assert all("delivery_id" not in row for row in history)
@@ -948,7 +948,7 @@ async def test_send_images_with_delivery_id_keeps_serve_loop_responsive(
             "result"
         ]["session"]["session_id"]
         request = asyncio.create_task(
-            server._control_for_test.deliveries.send_images(
+            server.controllers.attached().control.deliveries.send_images(
                 {
                     "session_id": session_id,
                     "text": "look",
@@ -1001,7 +1001,7 @@ async def test_cancelled_send_images_publishes_nothing(
             "result"
         ]["session"]["session_id"]
         request = asyncio.create_task(
-            server._control_for_test.deliveries.send_images(
+            server.controllers.attached().control.deliveries.send_images(
                 {
                     "session_id": session_id,
                     "text": "look",
@@ -1023,8 +1023,8 @@ async def test_cancelled_send_images_publishes_nothing(
             await asyncio.wait_for(request, 10)
         await asyncio.wait_for(asyncio.to_thread(worker_finished.wait), 10)
 
-        assert branch_messages(server._runtime_for_test.opened.store) == []
-        assert not (server._runtime_for_test.opened.store.session_dir / "attachments").exists()
+        assert branch_messages(server.controllers.attached().runtime.opened.store) == []
+        assert not (server.controllers.attached().runtime.opened.store.session_dir / "attachments").exists()
     finally:
         release_worker.set()
         await close_serve(server, writer)
@@ -1470,8 +1470,8 @@ async def test_session_host_commands_negotiation_validation_and_redaction(
         )
         assert token not in json.dumps(created)
         session_id = created[-1]["result"]["session"]["session_id"]
-        assert server._control_for_test._active_host_commands is not None
-        assert token not in repr(server._control_for_test._active_host_commands)
+        assert server.controllers.attached().control._active_host_commands is not None
+        assert token not in repr(server.controllers.attached().control._active_host_commands)
 
         status = await _request(reader, writer, 4, "status")
         assert token not in json.dumps(status)
@@ -1504,8 +1504,8 @@ async def test_session_host_commands_negotiation_validation_and_redaction(
             reader, writer, 5, "resume", {"session_id": session_id}
         )
         assert token not in json.dumps(resumed)
-        assert server._control_for_test._active_host_commands is not None
-        assert not server._control_for_test._active_host_commands.commands
+        assert server.controllers.attached().control._active_host_commands is not None
+        assert not server.controllers.attached().control._active_host_commands.commands
         await _request(
             reader,
             writer,
@@ -1524,8 +1524,8 @@ async def test_session_host_commands_negotiation_validation_and_redaction(
             {"session_id": session_id, "host_commands": []},
         )
         assert token not in json.dumps(emptied)
-        assert server._control_for_test._active_host_commands is not None
-        assert not server._control_for_test._active_host_commands.commands
+        assert server.controllers.attached().control._active_host_commands is not None
+        assert not server.controllers.attached().control._active_host_commands.commands
     finally:
         await close_serve(
             server, writer, *([observer_writer] if observer_writer is not None else [])
@@ -1577,7 +1577,7 @@ async def test_session_host_commands_do_not_persist_or_reach_children(
             "new_session",
             {"host_commands": _host_binding(token)},
         )
-        session_id = server._runtime_for_test.session_id
+        session_id = server.controllers.attached().runtime.session_id
         assert session_id is not None
         captured += await _request(reader, writer, 3, "send", {"text": "check"})
         approval = await _event(reader, "approval_request")
@@ -1591,7 +1591,7 @@ async def test_session_host_commands_do_not_persist_or_reach_children(
         )
         tool_end = await _event(reader, "tool_end")
         captured.append(tool_end)
-        turn_task = server._control_for_test._turn_task
+        turn_task = server.controllers.attached().control._turn_task
         assert turn_task is not None
         await asyncio.wait_for(asyncio.shield(turn_task), 10)
         captured += await _request(reader, writer, 5, "status")
@@ -1602,12 +1602,12 @@ async def test_session_host_commands_do_not_persist_or_reach_children(
             "session_history",
             {"session_id": session_id},
         )
-        captured.append(server._runtime_for_test.metadata.to_dict())
+        captured.append(server.controllers.attached().runtime.metadata.to_dict())
         captured.append(
-            await asyncio.to_thread(server._runtime_for_test.manager.export, session_id)
+            await asyncio.to_thread(server.controllers.attached().runtime.manager.export, session_id)
         )
 
-        snapshots = server._runtime_for_test.loop.tool_registry.background_tasks.snapshot()
+        snapshots = server.controllers.attached().runtime.loop.tool_registry.background_tasks.snapshot()
         assert snapshots
         assert token not in json.dumps(
             [
@@ -1701,14 +1701,14 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             {"host_commands": _host_binding("snapshot-a", name="gamma-a")},
         )
         session_id = created[-1]["result"]["session"]["session_id"]
-        real_resume = server._runtime_for_test.resume_session
+        real_resume = server.controllers.attached().runtime.resume_session
 
         async def paused_resume(*args, **kwargs):
             started.set()
             await asyncio.wait_for(release_resume.wait(), TIMEOUT)
             return await real_resume(*args, **kwargs)
 
-        monkeypatch.setattr(server._runtime_for_test, "resume_session", paused_resume)
+        monkeypatch.setattr(server.controllers.attached().runtime, "resume_session", paused_resume)
         resume = asyncio.create_task(
             _request(
                 reader,
@@ -1722,15 +1722,15 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             )
         )
         await asyncio.wait_for(started.wait(), TIMEOUT)
-        server._runtime_for_test.opened.store.append_agent_notification(
+        server.controllers.attached().runtime.opened.store.append_agent_notification(
             "wake-a",
             child_session_path="/wake-a",
             description="child",
             status="completed",
             text="wake a",
         )
-        server._control_for_test._schedule_background_wake(session_id)
-        assert server._control_for_test._turn_task is None
+        server.controllers.attached().control._schedule_background_wake(session_id)
+        assert server.controllers.attached().control._turn_task is None
         release_resume.set()
         assert "result" in (await asyncio.wait_for(resume, TIMEOUT))[-1]
         await asyncio.wait_for(entered[0].wait(), TIMEOUT)
@@ -1760,14 +1760,14 @@ async def test_session_host_commands_wake_during_same_session_resume_uses_one_tu
             for block in message.content
         )
 
-        server._runtime_for_test.opened.store.append_agent_notification(
+        server.controllers.attached().runtime.opened.store.append_agent_notification(
             "wake-b",
             child_session_path="/wake-b",
             description="child",
             status="completed",
             text="wake b",
         )
-        server._control_for_test._schedule_background_wake(session_id)
+        server.controllers.attached().control._schedule_background_wake(session_id)
         await asyncio.wait_for(entered[1].wait(), TIMEOUT)
         release_backend[1].set()
         approval = await asyncio.wait_for(
@@ -1837,7 +1837,7 @@ async def test_session_host_commands_reject_client_turn_before_resume(
         else:
             raise AssertionError("controller was not released")
 
-        durable_rows = tuple(resident_entries(server._runtime_for_test.opened.store))
+        durable_rows = tuple(resident_entries(server.controllers.attached().runtime.opened.store))
         replay_reader, replay_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
         )
@@ -1866,7 +1866,7 @@ async def test_session_host_commands_reject_client_turn_before_resume(
             "data": {"code": "host_binding_required"},
         }
         assert backend.calls == []
-        assert tuple(resident_entries(server._runtime_for_test.opened.store)) == durable_rows
+        assert tuple(resident_entries(server.controllers.attached().runtime.opened.store)) == durable_rows
     finally:
         await close_serve(server, replay_writer or writer)
 
@@ -1942,7 +1942,7 @@ async def test_detached_session_returns_existing_duplicate_delivery(
             str(server.socket_path)
         )
         await _hello(replay_reader, replay_writer, features)
-        durable_rows = tuple(resident_entries(server._runtime_for_test.opened.store))
+        durable_rows = tuple(resident_entries(server.controllers.attached().runtime.opened.store))
         duplicate = await _request(
             replay_reader,
             replay_writer,
@@ -1955,7 +1955,7 @@ async def test_detached_session_returns_existing_duplicate_delivery(
             "duplicate": True,
         }
         assert len(backend.calls) == 1
-        assert tuple(resident_entries(server._runtime_for_test.opened.store)) == durable_rows
+        assert tuple(resident_entries(server.controllers.attached().runtime.opened.store)) == durable_rows
     finally:
         await close_serve(server, replay_writer or writer)
 
@@ -2012,17 +2012,17 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             await asyncio.sleep(0)
         else:
             raise AssertionError("controller was not released")
-        assert server._control_for_test._active_host_commands is None
+        assert server.controllers.attached().control._active_host_commands is None
 
-        server._runtime_for_test.opened.store.append_agent_notification(
+        server.controllers.attached().runtime.opened.store.append_agent_notification(
             "released-wake",
             child_session_path="/released-wake",
             description="child",
             status="completed",
             text="wake while detached",
         )
-        server._control_for_test._schedule_background_wake(session_id)
-        assert server._control_for_test._turn_task is None
+        server.controllers.attached().control._schedule_background_wake(session_id)
+        assert server.controllers.attached().control._turn_task is None
         for _ in range(10):
             await asyncio.sleep(0)
         assert backend.calls == []
@@ -2039,7 +2039,7 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             {"protocol_version": "1.2", "features": probe_features},
         )
         await asyncio.sleep(0)
-        assert server._control_for_test._turn_task is None
+        assert server.controllers.attached().control._turn_task is None
         assert backend.calls == []
         probe_writer.close()
         await probe_writer.wait_closed()
@@ -2064,7 +2064,7 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
             {"protocol_version": "1.2", "features": features},
         )
         await asyncio.sleep(0)
-        assert server._control_for_test._active_host_commands is None
+        assert server.controllers.attached().control._active_host_commands is None
         assert backend.calls == []
 
         resumed = await _request(
@@ -2260,11 +2260,11 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
             {"host_commands": _host_binding("durable-a", name="gamma-a")},
         )
         session_id = created[-1]["result"]["session"]["session_id"]
-        server._runtime_for_test.opened.store.append_message_with_approval_requests(
+        server.controllers.attached().runtime.opened.store.append_message_with_approval_requests(
             Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
             [(call.id, call)],
         )
-        await server._control_for_test._event(
+        await server.controllers.attached().control._event(
             StreamEvent(StreamEventType.TOOL_APPROVAL_START, tool_call=call)
         )
         await _event(reader, "approval_request")
@@ -2280,7 +2280,7 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
             await asyncio.sleep(0)
         else:
             raise AssertionError("controller was not released")
-        assert server._control_for_test._active_host_commands is None
+        assert server.controllers.attached().control._active_host_commands is None
 
         replay_reader, replay_writer = await asyncio.open_unix_connection(
             str(server.socket_path)
@@ -2306,7 +2306,7 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
         assert approved[-1]["result"]["request_id"] == call.id
         tool_end = await _event(replay_reader, "tool_end")
         assert _tool_stdout(tool_end) == "durable-none"
-        turn_task = server._control_for_test._turn_task
+        turn_task = server.controllers.attached().control._turn_task
         assert turn_task is not None
         await asyncio.wait_for(asyncio.shield(turn_task), 10)
         assert backend.calls == []
@@ -2326,7 +2326,7 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
             len(
                 [
                     row
-                    for row in resident_entries(server._runtime_for_test.opened.store)
+                    for row in resident_entries(server.controllers.attached().runtime.opened.store)
                     if row.type == "approval_resolution"
                     and row.data.get("request_id") == call.id
                 ]
@@ -2363,7 +2363,7 @@ async def test_resume_ambiguous_prefix_has_dedicated_error(
     tmp_path: Path,
 ) -> None:
     server = _server(tmp_path, None, _launch(tmp_path))
-    sessions = server._runtime_for_test.manager.sessions_dir
+    sessions = server.controllers.attached().runtime.manager.sessions_dir
     session_ids = (
         "abcd1111aaaa0000",
         "abcd1111bbbb0000",
@@ -2386,7 +2386,7 @@ async def test_resume_ambiguous_prefix_has_dedicated_error(
             "abcd1111b",
         ]
         resolved = tuple(
-            server._runtime_for_test.manager.resolve_id(candidate) for candidate in candidates
+            server.controllers.attached().runtime.manager.resolve_id(candidate) for candidate in candidates
         )
         assert len(set(resolved)) == len(candidates)
     finally:
@@ -2413,7 +2413,7 @@ async def test_resume_owned_session_prefix_preserves_session_owned_error(
         async def owned_resume(_session_id, *, force=False):
             raise SessionOwnedError("session is active in another process")
 
-        server._runtime_for_test.resume_session = owned_resume
+        server.controllers.attached().runtime.resume_session = owned_resume
         failed = await _request(
             reader, writer, 2, "resume", {"session_id": session_id[:8]}
         )
@@ -2439,10 +2439,10 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
             {"host_commands": _host_binding("failure-a")},
         )
         session_id = created[-1]["result"]["session"]["session_id"]
-        binding_a = server._control_for_test._active_host_commands
-        real_resume = server._runtime_for_test.resume_session
+        binding_a = server.controllers.attached().control._active_host_commands
+        real_resume = server.controllers.attached().runtime.resume_session
         monkeypatch.setattr(
-            server._runtime_for_test.manager,
+            server.controllers.attached().runtime.manager,
             "resolve_id",
             lambda requested, **kwargs: (
                 session_id if requested == session_id[:8] else requested
@@ -2453,7 +2453,7 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
             assert not force
             raise RuntimeError("setup failed before replacement")
 
-        monkeypatch.setattr(server._runtime_for_test, "resume_session", fail_with_runtime)
+        monkeypatch.setattr(server.controllers.attached().runtime, "resume_session", fail_with_runtime)
         failed = await _request(
             reader,
             writer,
@@ -2462,17 +2462,17 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
             {"session_id": "different-session", "host_commands": _host_binding("b")},
         )
         assert failed[-1]["error"]["code"] == -32000
-        assert server._runtime_for_test.state is not None
-        assert server._control_for_test._active_host_commands is binding_a
+        assert server.controllers.attached().runtime.state is not None
+        assert server.controllers.attached().control._active_host_commands is binding_a
 
-        monkeypatch.setattr(server._control_for_test, "unhealthy", lambda: True)
+        monkeypatch.setattr(server.controllers.attached().control, "unhealthy", lambda: True)
 
         async def fail_after_close(requested, *, force=False):
             assert requested == session_id and force
-            await server._runtime_for_test.close()
+            await server.controllers.attached().runtime.close()
             raise RuntimeError("forced resume failed after close")
 
-        monkeypatch.setattr(server._runtime_for_test, "resume_session", fail_after_close)
+        monkeypatch.setattr(server.controllers.attached().runtime, "resume_session", fail_after_close)
         forced = await _request(
             reader,
             writer,
@@ -2484,23 +2484,23 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
             },
         )
         assert forced[-1]["error"]["code"] == -32000
-        assert server._runtime_for_test.state is None
-        assert server._control_for_test._active_host_commands is None
+        assert server.controllers.attached().runtime.state is None
+        assert server.controllers.attached().control._active_host_commands is None
         no_send = await _request(reader, writer, 40, "send", {"text": "must fail"})
         assert no_send[-1]["error"]["code"] == -32003
-        server._control_for_test._schedule_background_wake(session_id)
-        assert server._control_for_test._turn_task is None
+        server.controllers.attached().control._schedule_background_wake(session_id)
+        assert server.controllers.attached().control._turn_task is None
 
         await real_resume(session_id)
-        server._control_for_test._active_host_commands = binding_a
+        server.controllers.attached().control._active_host_commands = binding_a
 
         async def fail_replacement_after_close(requested, *, force=False):
             assert requested == "replacement-session" and not force
-            await server._runtime_for_test.close()
+            await server.controllers.attached().runtime.close()
             raise RuntimeError("replacement failed after close")
 
         monkeypatch.setattr(
-            server._runtime_for_test, "resume_session", fail_replacement_after_close
+            server.controllers.attached().runtime, "resume_session", fail_replacement_after_close
         )
         replacement = await _request(
             reader,
@@ -2513,15 +2513,15 @@ async def test_session_host_commands_replacement_failure_matches_runtime_state(
             },
         )
         assert replacement[-1]["error"]["code"] == -32000
-        assert server._runtime_for_test.state is None
-        assert server._control_for_test._active_host_commands is None
+        assert server.controllers.attached().runtime.state is None
+        assert server.controllers.attached().control._active_host_commands is None
         no_send = await _request(reader, writer, 50, "send", {"text": "must fail"})
         assert no_send[-1]["error"]["code"] == -32003
-        server._control_for_test._schedule_background_wake(session_id)
-        assert server._control_for_test._turn_task is None
+        server.controllers.attached().control._schedule_background_wake(session_id)
+        assert server.controllers.attached().control._turn_task is None
 
-        monkeypatch.setattr(server._control_for_test, "unhealthy", lambda: False)
-        monkeypatch.setattr(server._runtime_for_test, "resume_session", real_resume)
+        monkeypatch.setattr(server.controllers.attached().control, "unhealthy", lambda: False)
+        monkeypatch.setattr(server.controllers.attached().runtime, "resume_session", real_resume)
     finally:
         await close_serve(server, writer)
 
@@ -2667,7 +2667,7 @@ async def test_send_images_delivery_id_rejects_different_payload(tmp_path: Path)
         }
         await _request(reader, writer, 3, "send_images", params)
         await _event(reader, "agent_end")
-        attachments = server._runtime_for_test.opened.store.session_dir / "attachments"
+        attachments = server.controllers.attached().runtime.opened.store.session_dir / "attachments"
         published = set(attachments.iterdir())
         conflict = await _request(
             reader,

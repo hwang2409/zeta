@@ -131,14 +131,14 @@ async def test_new_session_parks_busy_turn_and_each_session_keeps_its_reply(
         client = await _open(server, FEATURES)
         await client.new()
         idle_swap_status = await client.call("status")
-        manager = server._runtime_for_test.manager
+        manager = server.controllers.attached().runtime.manager
         a = await client.new()
         await client.call("send", {"text": "go"})
         await await_or_fail(backend.held[0].wait(), what="alpha-1 streamed")
 
         b = await client.new()  # without session_park: -32004
         assert b != a
-        assert server._runtime_for_test.manager is manager
+        assert server.controllers.attached().runtime.manager is manager
         b_status = await client.call("status")
         assert b_status["project_context_health"] == idle_swap_status["project_context_health"]
         assert [row["session_id"] for row in b_status["parked_sessions"]] == [a]
@@ -213,7 +213,7 @@ async def test_parked_approval_is_read_from_join_after_resume(tmp_path: Path) ->
             frame.get("params", {}).get("event") for frame in seen
         ]
         joined = await client.call("session_history_and_subscribe", {"session_id": a})
-        durable = await server._control_for_test.pending_approvals()
+        durable = await server.controllers.attached().control.pending_approvals()
         request_id = joined["status"]["pending_approvals"][0]["request_id"]
         assert request_id == durable[0]["request_id"]
 
@@ -416,8 +416,8 @@ async def test_resume_during_idle_close_waits_for_it_and_new_session_does_not(
                 resume.cancel()
         assert result["session"]["session_id"] == a
         assert "attached" not in result
-        assert server._control_for_test is not parked
-        assert server._runtime_for_test.opened.store.last_turn_end().data["reason"] == "completed"
+        assert server.controllers.attached().control is not parked
+        assert server.controllers.attached().runtime.opened.store.last_turn_end().data["reason"] == "completed"
     finally:
         close_gate.set()
         backend.open_all()
@@ -440,7 +440,7 @@ async def test_turn_ending_during_incoming_setup_closes_instead_of_parking(
         a = await client.new()
         await client.call("send", {"text": "go"})
         await await_or_fail(backend.held[0].wait(), what="A mid-reply")
-        outgoing = server._control_for_test
+        outgoing = server.controllers.attached().control
         original_new_pair = server.new_pair
 
         def new_pair():

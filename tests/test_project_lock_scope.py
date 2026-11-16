@@ -378,7 +378,7 @@ async def test_p06_below_epoch_real_tui_serve_journey(
             "project-init",
         )
         assert "project" in project_result["text"].lower()
-        registry = server._runtime_for_test.manager.project_registry
+        registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
         project = (await asyncio.to_thread(registry.list_projects))[0]
         assert project.name == project_dir.name
@@ -458,7 +458,7 @@ async def test_p06_below_epoch_real_tui_serve_journey(
                 message["id"] == message_id
                 for message in listed["structuredContent"]["messages"]
             )
-            server._runtime_for_test.loop.notify_project_inbox_publication()
+            server.controllers.attached().runtime.loop.notify_project_inbox_publication()
             await read_until(
                 reader,
                 lambda frame: frame.get("params", {}).get("event") == "turn_end"

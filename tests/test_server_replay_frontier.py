@@ -81,7 +81,7 @@ class Serve:
 
     @property
     def store(self) -> Any:
-        return self.server._runtime_for_test.opened.store
+        return self.server.controllers.attached().runtime.opened.store
 
     async def client(self) -> ReplayClient:
         client = await connect_replay(self.server, self.transport)
@@ -246,7 +246,7 @@ async def _wait_event(
 
 
 def _background_diagnostic(serve: Serve, backend: PerActorFakeBackend, parent_started: bool) -> str:
-    active = tuple(serve.server._control_for_test._approvals.active_keys())
+    active = tuple(serve.server.controllers.attached().control._approvals.active_keys())
     published = [event.value for event, _fields, _facts, _covers in serve.published]
     buffered = [frame.get("params", {}).get("event") for frame in serve.observer.buffered]
     milestones = {
@@ -312,7 +312,7 @@ async def _send_images(serve: Serve) -> None:
 
 
 async def _send_skill(serve: Serve) -> None:
-    input_id = serve.server._control_for_test._model_inputs.register(
+    input_id = serve.server.controllers.attached().control._model_inputs.register(
         serve.session_id,
         ModelInputEnvelope("skill-marker expanded body", "skill-marker", MessageOrigin.SKILL_EXPANSION),
     )
@@ -344,7 +344,7 @@ async def _delivery_after_newer_row(serve: Serve) -> None:
     """The echo is admitted after a newer row installed, so its row is not the newest."""
     release = asyncio.Event()
     entered = asyncio.Event()
-    original = serve.server._control_for_test.user_message
+    original = serve.server.controllers.attached().control.user_message
 
     async def held(*args: Any, **kwargs: Any) -> None:
         entered.set()
@@ -352,7 +352,7 @@ async def _delivery_after_newer_row(serve: Serve) -> None:
         await original(*args, **kwargs)
 
     # test-contract: seam hold the echo after its delivery row installed
-    serve.server._control_for_test.user_message = held  # type: ignore[method-assign]
+    serve.server.controllers.attached().control.user_message = held  # type: ignore[method-assign]
     send = asyncio.create_task(
         serve.controller.request(serve.request_id(), "send", {"text": "delivery-marker", "delivery_id": "d-1"})
     )
@@ -363,7 +363,7 @@ async def _delivery_after_newer_row(serve: Serve) -> None:
         await await_or_fail(send, what="send response")
     finally:
         release.set()
-        serve.server._control_for_test.user_message = original  # type: ignore[method-assign]
+        serve.server.controllers.attached().control.user_message = original  # type: ignore[method-assign]
     await _wait_event(serve.observer, "user_message", text="delivery-marker")
     await _wait_event(serve.observer, "agent_end")
 
@@ -491,7 +491,7 @@ async def _synthetic_abort(serve: Serve) -> None:
         Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls]),
         [(call.id, call) for call in calls],
     )
-    control = serve.server._control_for_test
+    control = serve.server.controllers.attached().control
     for call in calls:
         await control._event(StreamEvent(StreamEventType.TOOL_APPROVAL_START, tool_call=call))
 
@@ -698,7 +698,7 @@ def test_every_serve_event_kind_has_a_route_or_is_never_published() -> None:
 
 
 async def _turn_start(serve: Serve) -> None:
-    await serve.server._control_for_test._notify(EventDescriptor.TURN_START, serve.session_id, data={})
+    await serve.server.controllers.attached().control._notify(EventDescriptor.TURN_START, serve.session_id, data={})
 
 
 @pytest.mark.asyncio
@@ -722,7 +722,7 @@ async def test_unrouted_event_ends_the_stream_and_is_logged(
 
 
 async def _publish_tool_end(serve: Serve, call_id: str) -> None:
-    await serve.server._control_for_test._notify(
+    await serve.server.controllers.attached().control._notify(
         EventDescriptor.TOOL_END,
         serve.session_id,
         tool_call={"id": call_id, "name": "read", "arguments": {}},

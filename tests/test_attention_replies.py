@@ -201,13 +201,13 @@ async def test_broken_sealed_journal_does_not_discard_loaded_session(
         )
         try:
             try:
-                await server._runtime_for_test.resume_session(fixture.session_id)
+                await server.controllers.attached().runtime.resume_session(fixture.session_id)
             # Capture the old failure so fail-first reaches the behavior assertion.
             except attention_replies.ReplyConflict as exc:
                 failure = exc
             assert failure is None, f"serve load discarded session: {failure!r}"
-            assert server._runtime_for_test.opened is not None
-            assert server._runtime_for_test.opened.metadata.session_id == fixture.session_id
+            assert server.controllers.attached().runtime.opened is not None
+            assert server.controllers.attached().runtime.opened.metadata.session_id == fixture.session_id
         finally:
             await server.close()
 
