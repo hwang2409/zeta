@@ -1128,6 +1128,7 @@ async def test_an_open_picker_is_one_card_across_history_redraws(
             redraws += 1
             draw()
 
+        # test-contract: seam counts the history redraws the picker must survive
         monkeypatch.setattr(app, "_render_resident_history", counted_draw)
         await driver.send(command + ENTER)
         await driver.until(
