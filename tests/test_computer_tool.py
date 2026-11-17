@@ -162,7 +162,7 @@ async def test_computer_exit_acceptance_table(tmp_path: Path, case: str, argumen
         "control": control,
         "kill_switch": "ctrl+opt+cmd+esc",
         "frontmost_bundle_id": frontmost,
-        "has_screenshot": bool(expected_actions) and not (case == "capture_failure") and expected_actions[-1][0] == "screenshot",
+        "has_screenshot": bool(expected_actions) and case != "capture_failure" and expected_actions[-1][0] == "screenshot",
     }
     actual_actions = [] if backend is None else backend.actions
     assert actual_actions == expected_actions
