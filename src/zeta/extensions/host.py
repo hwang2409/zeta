@@ -142,7 +142,7 @@ class ExtensionHost:
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self.notify_dropped = 0
         self._pending_notifications: deque[StreamEvent] = deque()
-        self._pending_notification_drops: dict[str, int] = {}
+        self._pending_notification_drops: int = 0
         self._event_thread_id: int | None = None
         self._foreign_thread_warnings: set[str] = set()
         self._notification_clock = clock
@@ -183,7 +183,7 @@ class ExtensionHost:
         self._event_sink = None
         self._event_loop = None
         self._pending_notifications.clear()
-        self._pending_notification_drops.clear()
+        self._pending_notification_drops = 0
 
         for package in tuple(self._packages):
             self.remove_package(package)
@@ -202,19 +202,19 @@ class ExtensionHost:
             return
         pending = tuple(self._pending_notifications)
         self._pending_notifications.clear()
-        drops = tuple(self._pending_notification_drops.items())
-        self._pending_notification_drops.clear()
+        dropped = self._pending_notification_drops
+        self._pending_notification_drops = 0
         for event in pending:
             loop.call_soon(self._send, event)
-        for extension, count in drops:
+        if dropped:
             loop.call_soon(
                 self._send,
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={
                         "kind": "extension",
-                        "extension": extension,
-                        "text": f"{count} extension notices dropped",
+                        "extension": "extensions",
+                        "text": f"{dropped} extension notices dropped",
                         "level": "warning",
                     },
                 ),
@@ -273,9 +273,7 @@ class ExtensionHost:
             if len(self._pending_notifications) < 32:
                 self._pending_notifications.append(event)
             else:
-                self._pending_notification_drops[extension] = (
-                    self._pending_notification_drops.get(extension, 0) + 1
-                )
+                self._pending_notification_drops += 1
                 self.notify_dropped += 1
             return
         self._event_loop.call_soon(self._send, event)

@@ -247,13 +247,18 @@ async def test_notify_flood_bounds_scheduled_callbacks(tmp_path: Path) -> None:
         delivered = []
 
         for index in range(10_000):
-            host.notify("thread-ext", str(index), "info")
+            host.notify(f"extension-{index}", str(index), "info")
         assert len(host._pending_notifications) == 32
         assert host.notify_dropped > 9_000
         host.set_event_sink(delivered.append, asyncio.get_running_loop())
         await asyncio.sleep(0)
         assert len(delivered) == 33
-        assert delivered[-1].data["text"].endswith("extension notices dropped")
+        assert delivered[-1].data == {
+            "kind": "extension",
+            "extension": "extensions",
+            "text": "9968 extension notices dropped",
+            "level": "warning",
+        }
 
 
 @pytest.mark.asyncio
