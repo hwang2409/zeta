@@ -621,6 +621,12 @@ def _history_entry_rows(
         structured = result.get("structured_content")
         state = computer_state(None, {}, structured, running=False)
         if fidelity and state is not None:
+            computer = structured.get("computer") if isinstance(structured, dict) else None
+            screenshot = (
+                computer.get("screenshot") if isinstance(computer, dict) else None
+            )
+            if isinstance(screenshot, dict) and screenshot.get("type") == "image":
+                blocks.append(event_contract.image_stub(screenshot))
             result["content"] = ""
             result["structured_content"] = {"computer": state}
             result["structured_content_truncated"] = False
