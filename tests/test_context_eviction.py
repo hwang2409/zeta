@@ -3516,6 +3516,7 @@ async def test_parallel_results_stay_ordered_and_paired_across_evictions(tmp_pat
         for index in range(4):
             with patch("zeta.core.context.evict_messages", wraps=evict_messages) as evict:
                 context = await assembler.assemble_context(force=True, bypass_eviction_hysteresis=True)
+            # test-contract: seam verifies the persisted-record order at the production planner boundary.
             assert evict.call_args_list
             for call in evict.call_args_list:
                 records = call.args[0]
