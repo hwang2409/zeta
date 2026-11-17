@@ -243,7 +243,10 @@ async def test_public_action_identity_matrix(tmp_path: Path, action: str, shape:
             registry = ToolRegistry(cwd, skill_catalog=SkillCatalog.empty())
             try:
                 host = apply_extensions(registry, home=home, project_dir=None, builtin_names=registry.registered_names)
-                assert not host.loaded if shape != "match" else host.loaded
+                if shape == "match":
+                    assert host.loaded
+                else:
+                    assert not host.loaded
                 if shape == "named_symlink":
                     assert any("real directory" in notice for notice in host.notices)
                 elif shape == "mismatch":
