@@ -120,8 +120,14 @@ class AttentionRecord:
         require_closed_variant("attention.kind", normalized["kind"])
         normalized["options"] = tuple(value.get("options", ()))
         record = cls(**normalized)
+        try:
+            created_at = datetime.fromisoformat(record.created_at)
+        except (TypeError, ValueError):
+            created_at = None
         if (
-            not isinstance(record.id, str)
+            created_at is None
+            or created_at.tzinfo is None
+            or not isinstance(record.id, str)
             or len(record.id) != 32
             or any(ch not in "0123456789abcdef" for ch in record.id)
             or record.status not in {"open", "resolved"}

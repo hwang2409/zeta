@@ -2723,6 +2723,39 @@ def test_diff_card_truncates_at_the_shared_line_budget() -> None:
     assert "… +18 diff lines" in plain
 
 
+def test_list_attention_tool_result_renders_owner_and_age() -> None:
+    call = ToolCall("attention-list", "list_attention", {})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "abc [decision, 4m] Choose a path (session-1)",
+                structured_content={
+                    "items": [
+                        {
+                            "id": "abc",
+                            "kind": "decision",
+                            "title": "Choose a path",
+                            "age": "4m",
+                            "created_at": "2026-11-16T12:00:00Z",
+                            "owning_session": "session-1",
+                        }
+                    ],
+                    "total": 1,
+                },
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "Choose a path" in plain
+    assert "4m" in plain
+    assert "session-1" in plain
+
+
 def test_unknown_tool_keeps_the_generic_fallback_card() -> None:
     call = ToolCall("unknown-card", "mystery", {"value": "kept"})
     rendered = render_event(
@@ -5842,6 +5875,22 @@ def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> 
 
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     assert "plan · task research" in rendered
+
+
+def test_tool_approval_origin_does_not_change_tui_rendering() -> None:
+    call = ToolCall("read-1", "read", {"path": "file.txt"})
+    plain = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    with_origin = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=call,
+            data={"approval_origin": "automatic"},
+        )
+    )
+
+    assert with_origin == plain
 
 
 def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
