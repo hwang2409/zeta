@@ -631,6 +631,8 @@ class AgentLoop(
                 _scope_signal=abort_signal,
                 _host_environment=host_environment,
                 _lifecycle_sink=lifecycle,
+                _lifecycle_payload=True,
+                _retain_approval_origin=True,
                 _pending_execution_claimed=prepared,
             )
         except asyncio.CancelledError:

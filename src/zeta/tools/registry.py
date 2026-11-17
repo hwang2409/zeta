@@ -964,6 +964,8 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         _boundary_signal: ToolAbortSignal | None = None,
         _stream_sink: ToolStreamSink | None = None,
         _lifecycle_sink: ToolLifecycleSink | None = None,
+        _lifecycle_payload: bool = False,
+        _retain_approval_origin: bool = False,
         _persist_approval: bool = True,
         _log_path: str | Path | None = None,
         _background: bool = False,
@@ -1104,12 +1106,12 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             execution_signal = _scope_signal
             if execution_signal.is_set():
                 return await finalize(_legacy_result(_canceled_result(tool_call.id)))
-        self._approval_origins[tool_call.id] = approval_origin
+        if _retain_approval_origin:
+            self._approval_origins[tool_call.id] = approval_origin
         if _lifecycle_sink is not None:
-            parameters = inspect.signature(_lifecycle_sink).parameters
-            if "data" in parameters:
+            if _lifecycle_payload:
                 _lifecycle_sink(
-                    "execution_start", data={"approval_origin": approval_origin}
+                    "execution_start", {"approval_origin": approval_origin}
                 )
             else:
                 _lifecycle_sink("execution_start")
