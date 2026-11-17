@@ -47,6 +47,7 @@ from zeta.server import ZetaServer
 from zeta.server.handlers import lifecycle, registry
 from zeta.server.protocol import EventDescriptor, ProtocolError
 from zeta.server.slash_commands import ServerSlashSession
+from zeta.session_retention import RetentionPlanner
 from zeta.tools.agent.approval import ChildApprovalPolicy
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -1341,6 +1342,24 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
         return result
 
     monkeypatch.setattr(old_state.loop, "close", gated_close)
+    # Force the race seen on CI: serve's retention scan holds the closed
+    # session's directory while the test lists open descriptors.
+    retention = server._retention_owner
+    assert retention is not None
+    scan_armed = threading.Event()
+    scan_holding = threading.Event()
+    scan_release = threading.Event()
+    original_hold = RetentionPlanner._hold
+
+    def held_scan(planner, sessions_fd, root_id, scan):
+        flight = original_hold(planner, sessions_fd, root_id, scan)
+        if scan_armed.is_set() and root_id == old_state.session_id:
+            scan_holding.set()
+            scan_release.wait(10)
+        return flight
+
+    # test-contract: seam holds the retention scan on this session to force the CI order
+    monkeypatch.setattr(RetentionPlanner, "_hold", held_scan)
     try:
         await _make_unhealthy(server, call, monkeypatch)
         resume = asyncio.create_task(
@@ -1368,6 +1387,15 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
             assert reopened.metadata.session_id == old_state.session_id
         finally:
             await asyncio.to_thread(reopened.store.close)
+        # serve scans only while a session is open; keep this scan enabled.
+        # test-contract: seam enables the scan after the session closed
+        monkeypatch.setattr(retention, "_days", lambda: 30)
+        scan_armed.set()
+        retention.wake()
+        assert await asyncio.to_thread(scan_holding.wait, 10)
+        # The scan is serve's, not leaked cleanup: wait for it to end.
+        scan_release.set()
+        await await_or_fail(retention.stop(), what="retention scan to stop")
         fd_directory = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
         leaked_targets = []
         for name in os.listdir(fd_directory):
@@ -1381,6 +1409,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
                 leaked_targets.append(target)
         assert leaked_targets == []
     finally:
+        scan_release.set()
         release.set()
         if not old_store._closed:
             await server.runtime._close_state(old_state)
