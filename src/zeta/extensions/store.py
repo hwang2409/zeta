@@ -336,14 +336,9 @@ class ExtensionStore:
     def discover(self, scope: str) -> DiscoveryResult:
         root = self._root(scope, create=True)
         with self._locked():
-            notices: list[str] = []
-            try:
-                trust = self._read_trust()
-            except ExtensionTrustError as exc:
-                trust = {}
-                notices.append(str(exc))
-                if any(self._private_root(root).glob("update-*")):
-                    return DiscoveryResult((), tuple(notices))
+            trust, notices, blocked = self._discovery_trust(root)
+            if blocked:
+                return DiscoveryResult((), tuple(notices))
             try:
                 self._recover(root, trust)
             except ExtensionTrustError as exc:
@@ -353,35 +348,51 @@ class ExtensionStore:
                     (),
                     (f"extension loading disabled for {scope} scope: update recovery requires attention",),
                 )
-            extensions: list[InstalledExtension] = []
+            return self._discover_extensions(root, scope, trust, notices)
+
+    def _discovery_trust(self, root: Path) -> tuple[dict[str, str], list[str], bool]:
+        try:
+            return self._read_trust(), [], False
+        except ExtensionTrustError as exc:
+            notices = [str(exc)]
+            return {}, notices, any(self._private_root(root).glob("update-*"))
+
+    def _discover_extensions(
+        self,
+        root: Path,
+        scope: str,
+        trust: dict[str, str],
+        notices: list[str],
+    ) -> DiscoveryResult:
+        extensions: list[InstalledExtension] = []
+        try:
+            entries = sorted(os.scandir(root), key=lambda item: item.name)
+        except OSError:
+            return DiscoveryResult((), (f"cannot inspect extension root: {root}",))
+        for entry in entries:
+            if entry.name == _STORE_NAME or not _NAME.fullmatch(entry.name):
+                continue
             try:
-                entries = sorted(os.scandir(root), key=lambda item: item.name)
-            except OSError:
-                return DiscoveryResult((), (f"cannot inspect extension root: {root}",))
-            for entry in entries:
-                if entry.name == _STORE_NAME or not _NAME.fullmatch(entry.name):
-                    continue
-                try:
-                    if not stat.S_ISDIR(entry.stat(follow_symlinks=False).st_mode):
-                        raise ExtensionTrustError(f"extension tree is not a real directory: {entry.path}")
-                    snapshot = self._snapshot_existing(Path(entry.path), root)
-                    if snapshot.manifest.name != entry.name:
-                        raise ExtensionTrustError(
-                            f"manifest name {snapshot.manifest.name!r} does not match folder {entry.name!r}"
-                        )
-                    extensions.append(
-                        InstalledExtension(
-                            scope,
-                            entry.name,
-                            Path(entry.path),
-                            snapshot.manifest,
-                            snapshot.digest,
-                            trust.get(self._key(scope, entry.name)) == snapshot.digest,
-                        )
+                if not stat.S_ISDIR(entry.stat(follow_symlinks=False).st_mode):
+                    raise ExtensionTrustError(f"extension tree is not a real directory: {entry.path}")
+                snapshot = self._snapshot_existing(Path(entry.path), root)
+                if snapshot.manifest.name != entry.name:
+                    raise ExtensionTrustError(
+                        f"manifest name {snapshot.manifest.name!r} does not match folder {entry.name!r}"
                     )
-                except ExtensionTrustError as exc:
-                    notices.append(f"ignored {scope} extension {entry.name}: {exc}")
-            return DiscoveryResult(tuple(extensions), tuple(notices))
+                extensions.append(
+                    InstalledExtension(
+                        scope,
+                        entry.name,
+                        Path(entry.path),
+                        snapshot.manifest,
+                        snapshot.digest,
+                        trust.get(self._key(scope, entry.name)) == snapshot.digest,
+                    )
+                )
+            except ExtensionTrustError as exc:
+                notices.append(f"ignored {scope} extension {entry.name}: {exc}")
+        return DiscoveryResult(tuple(extensions), tuple(notices))
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
@@ -528,9 +539,21 @@ class ExtensionStore:
         return _Snapshot(operation, tree, manifest, files, digest, source, commit)
 
     def _inventory(self, root: Path) -> tuple[tuple[str, ...], str]:
-        files: list[str] = []
+        files = self._inventory_paths(root)
         digest = hashlib.sha256()
         total = 0
+        for relative in files:
+            size, file_digest = self._hash_inventory_file(root / relative, _MAX_TOTAL_BYTES - total)
+            total += size
+            encoded = relative.encode()
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            digest.update(size.to_bytes(8, "big"))
+            digest.update(file_digest)
+        return tuple(files), digest.hexdigest()
+
+    def _inventory_paths(self, root: Path) -> list[str]:
+        files: list[str] = []
         pending = [root]
         while pending:
             directory = pending.pop()
@@ -551,29 +574,24 @@ class ExtensionStore:
         files.sort()
         if len(files) > _MAX_FILES:
             raise ExtensionTrustError(f"extension tree exceeds {_MAX_FILES} files")
-        for relative in files:
-            path = root / relative
-            file_digest = hashlib.sha256()
-            size = 0
+        return files
+
+    def _hash_inventory_file(self, path: Path, remaining: int) -> tuple[int, bytes]:
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
             try:
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-                try:
-                    while chunk := os.read(fd, 1024 * 1024):
-                        size += len(chunk)
-                        total += len(chunk)
-                        if size > _MAX_FILE_BYTES or total > _MAX_TOTAL_BYTES:
-                            raise ExtensionTrustError("extension tree exceeds byte limit")
-                        file_digest.update(chunk)
-                finally:
-                    os.close(fd)
-            except OSError as exc:
-                raise ExtensionTrustError(f"cannot open extension file: {path}") from exc
-            encoded = relative.encode()
-            digest.update(len(encoded).to_bytes(8, "big"))
-            digest.update(encoded)
-            digest.update(size.to_bytes(8, "big"))
-            digest.update(file_digest.digest())
-        return tuple(files), digest.hexdigest()
+                while chunk := os.read(fd, 1024 * 1024):
+                    size += len(chunk)
+                    if size > _MAX_FILE_BYTES or size > remaining:
+                        raise ExtensionTrustError("extension tree exceeds byte limit")
+                    digest.update(chunk)
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise ExtensionTrustError(f"cannot open extension file: {path}") from exc
+        return size, digest.digest()
 
     def _review(
         self,
@@ -693,7 +711,8 @@ class ExtensionStore:
             raw = _json_object(path.read_text(encoding="utf-8"), str(error))
         except (OSError, UnicodeError) as exc:
             raise error from exc
-        if set(raw) != {"name", "new_digest", "old_digest", "old_trust", "version"}:
+        keys = {"name", "new_digest", "old_digest", "old_trust", "version"}
+        if len(raw) != len(keys) or any(key not in keys for key in raw):
             raise error
         name, new, old, old_trust, version = (raw["name"], raw["new_digest"], raw["old_digest"], raw["old_trust"], raw["version"])
         if type(name) is not str or not _NAME.fullmatch(name) or type(new) is not str or not _DIGEST.fullmatch(new) or type(old) is not str or not _DIGEST.fullmatch(old) or (old_trust is not None and (type(old_trust) is not str or not _DIGEST.fullmatch(old_trust))) or type(version) is not int or version != 1:
@@ -775,7 +794,10 @@ class ExtensionStore:
             raw = _json_object(path.read_text(encoding="utf-8"), str(error))
         except (OSError, UnicodeError):
             raise error from None
-        if set(raw) != {"source", "commit"} or type(raw["source"]) is not str or type(raw["commit"]) is not str or not _COMMIT.fullmatch(raw["commit"]):
+        keys = {"source", "commit"}
+        if len(raw) != len(keys) or any(key not in keys for key in raw):
+            raise error
+        if type(raw["source"]) is not str or type(raw["commit"]) is not str or not _COMMIT.fullmatch(raw["commit"]):
             raise error
         self._parse_git_source(str(raw["source"]), required=True)
         return {"source": str(raw["source"]), "commit": str(raw["commit"])}
