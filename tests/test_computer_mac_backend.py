@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,44 @@ FAKE = Path(__file__).parent / "fixtures" / "computer_fake_helper.py"
 
 def make_backend() -> MacBackend:
     return MacBackend([sys.executable, str(FAKE)])
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_drains_one_cleanup_and_restarts() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.release = threading.Event()
+            self.started = 0
+            self.cancelled = 0
+            self.closed = 0
+
+        def start(self) -> None:
+            self.started += 1
+
+        def request(self, _op: str, **_args: object) -> dict:
+            self.release.wait(10)
+            return {}
+
+        def cancel(self) -> None:
+            self.cancelled += 1
+            self.release.set()
+
+        def close(self) -> None:
+            self.closed += 1
+
+    client = FakeClient()
+    backend = MacBackend([])
+    backend._client = client  # type: ignore[assignment]
+    call = asyncio.create_task(backend._call("move", x=1, y=2))
+    await asyncio.sleep(0)
+    call.cancel()
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(call, 10)
+    assert (client.cancelled, client.closed, backend._started) == (1, 1, False)
+
+    await asyncio.wait_for(backend._call("move", x=1, y=2), 10)
+    assert client.started == 2
 
 
 def _compose(tmp_path: Path, computer: ComputerUseConfig):

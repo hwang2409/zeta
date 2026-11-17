@@ -58,6 +58,7 @@ class MacBackend:
         self._client = HelperClient(argv)
         self._started = False
         self._start_lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     async def _call(self, op: str, **args: object) -> dict:
         if not self._started:
@@ -68,14 +69,36 @@ class MacBackend:
         try:
             return await asyncio.to_thread(self._client.request, op, **args)
         except asyncio.CancelledError:
-            await asyncio.to_thread(self._client.cancel)
-            await asyncio.to_thread(self._client.close)
-            self._started = False
+            cleanup = self._cleanup_task
+            if cleanup is None or cleanup.done():
+                cleanup = asyncio.create_task(self._cleanup())
+                self._cleanup_task = cleanup
+            # Cleanup is owned by one task. Repeated cancellation may interrupt
+            # the wait, but never the cancel/close/reset sequence itself.
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            await cleanup
             raise
         except HelperError as exc:
             raise ComputerError(exc.code, exc.message) from exc
         except (HelperTimeout, HelperProtocolError) as exc:
             raise ComputerError("internal", str(exc)) from exc
+
+    async def _cleanup(self) -> None:
+        try:
+            try:
+                await asyncio.to_thread(self._client.cancel)
+            except (OSError, RuntimeError, HelperError, HelperTimeout, HelperProtocolError) as exc:
+                _ = exc
+            try:
+                await asyncio.to_thread(self._client.close)
+            except (OSError, RuntimeError) as exc:
+                _ = exc
+        finally:
+            self._started = False
 
     async def screenshot(self, display: int | None = None) -> ScreenFrame:
         args = {} if display is None else {"display": display}

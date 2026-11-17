@@ -198,12 +198,17 @@ func captureDisplay(_ index: Int) throws -> Capture {
             config.width = pxWidth
             config.height = pxHeight
             config.showsCursor = true
+            // The desktop can become protected while ScreenCaptureKit awaits content or pixels.
+            try guardSafety()
             let cgImage = try await SCScreenshotManager.captureImage(
                 contentFilter: filter, configuration: config)
+            try guardSafety()
             let rep = NSBitmapImageRep(cgImage: cgImage)
             guard let png = rep.representation(using: .png, properties: [:]) else {
                 throw HelperError.internalError("png encode failed")
             }
+            // Refuse bytes if protection began during encoding as well.
+            try guardSafety()
             result = Capture(
                 pngBase64: png.base64EncodedString(),
                 width: cgImage.width, height: cgImage.height, scale: scale,
@@ -760,8 +765,10 @@ Thread {
             runRequest(id: id, op: op, request: req, indicator: indicator, sink: writeResponse)
         }
     }
-    eventGate.kill()
+    // Shutdown owns the boundary: stop new posts, drain accepted work, then release again.
+    activeKill.set()
     actionQueue.sync {}
+    eventGate.kill()
     DispatchQueue.main.sync {
         indicator.hide()
         app.terminate(nil)
