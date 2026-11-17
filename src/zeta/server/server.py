@@ -486,21 +486,28 @@ class ZetaServer:
                 for client in clients
                 if client._run_task is not None and not client._run_task.done()
             )
+            # Start semantic releases while outputs are still available. The
+            # registry closes transports below, so release notifications must be
+            # published first.
+            registry = self.connections
+            for client in clients:
+                release = client._begin_controller_release()
+                if release is not None:
+                    await asyncio.shield(release)
+                if registry is not None:
+                    await registry.flush(client)
+            # Cancel registry-owned reads before waiting for request handlers. A
+            # slash read can be queued behind the registry's worker pool.
+            if registry is not None:
+                await registry.aclose()
+                self.connections = None
             for handler in handlers:
                 handler.cancel()
             await asyncio.gather(*handlers, return_exceptions=True)
-            results = await asyncio.gather(
-                *(client.close(graceful=True) for client in clients),
-                return_exceptions=True,
-            )
             self.parking.close_all(approval_settlement_timeout)
             await self.controllers.close(
                 approval_settlement_timeout, self._close_foreground_events
             )
-            if failure := next(
-                (result for result in results if isinstance(result, BaseException)), None
-            ):
-                raise failure
         finally:
             if self.connections is not None:
                 await self.connections.aclose()
@@ -534,7 +541,8 @@ class ZetaServer:
         try:
             await client.run()
         finally:
-            registry.release(client)
+            if self.connections is not None:
+                self.connections.unregister(client)
 
 
 @dataclass(frozen=True)
@@ -897,7 +905,7 @@ class _Client:
         if (
             self.role == "controller"
             and self._hello_admission is not None
-            and self.server.controllers.is_controller(self)
+            and self.connections.is_controller(self)
         ):
             reconnect = "approval_reconnect" in self.features
             keep_turn = "turn_reconnect" in self.features
@@ -927,6 +935,7 @@ class _Client:
         async with self._close_lock:
             if self._closed:
                 return
+            had_physical_controller = self.connections.is_controller(self)
             release = self._begin_controller_release()
             if release is not None:
                 await asyncio.shield(release)
@@ -935,11 +944,17 @@ class _Client:
             if graceful:
                 await self.connections.flush(self)
             self._local_close = True
-            self.writer.close()
-            with contextlib.suppress(Exception):
-                await self.writer.wait_closed()
-            self.server.controllers.release_connection(self)
+            close = getattr(self.writer, "close", None)
+            if close is not None:
+                close()
+            wait_closed = getattr(self.writer, "wait_closed", None)
+            if wait_closed is not None:
+                with contextlib.suppress(Exception):
+                    await wait_closed()
+            if had_physical_controller or self.server.controllers.is_controller(self):
+                self.server.controllers.release_connection(self)
             self.connections.release(self)
+            self.connections.unregister(self)
             self._closed = True
 
     async def _route_hello(self, params: dict[str, Any]) -> tuple[bool, object]:

@@ -580,9 +580,10 @@ class ConnectionRegistry(ReplayOutput):
                 self._publish_observer(state, frame)
 
     def release(self, connection: Any) -> None:
+        """Release physical role/output state, retaining the client until close."""
         self.invalidate_replay_connection(connection)
-        state = self._connections.pop(connection, None)
-        if state is None:
+        state = self._connections.get(connection)
+        if state is None or state.role is None:
             return
         state.released.set()
         if state in self._controllers:
@@ -593,6 +594,11 @@ class ConnectionRegistry(ReplayOutput):
         output = state.output
         if output is not None:
             self._release_output(output, state.role)
+        state.role = None
+
+    def unregister(self, connection: Any) -> None:
+        """Remove a physically closed client from shutdown enumeration."""
+        self._connections.pop(connection, None)
 
     async def send(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)
