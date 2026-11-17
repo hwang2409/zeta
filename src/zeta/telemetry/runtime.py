@@ -21,8 +21,9 @@ _OPERATION_ATTRIBUTE_KEYS = {
     "inference": frozenset({"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.conversation.id", "zeta.stream"}),
     "tool": frozenset({"gen_ai.operation.name", "zeta.tool.name", "zeta.tool.type", "zeta.tool.call.id", "zeta.agent.name", "gen_ai.conversation.id"}),
     "context": frozenset({"zeta.emergency", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count"}),
+    "serve": frozenset({"rpc.system", "rpc.method"}),
 }
-_EVENT_ATTRIBUTE_KEYS = {"gen_ai.client.retry": frozenset({"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after"}), "zeta.approval.requested": frozenset({"decision", "scope"}), "zeta.approval.resolved": frozenset({"decision", "scope", "duration"})}
+_EVENT_ATTRIBUTE_KEYS = {"gen_ai.client.retry": frozenset({"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after"}), "zeta.approval.requested": frozenset({"decision", "scope"}), "zeta.approval.resolved": frozenset({"decision", "scope", "duration"}), "zeta.serve.invalid_propagation": frozenset()}
 _ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.tool.count"})
 # Closed sets mirror repository values; tests/telemetry/test_telemetry.py checks each mirror against its source.
 # provider names are the GenAI values; the facade maps every catalog provider onto them.
@@ -42,6 +43,16 @@ _RETRY_REASONS = frozenset({
 _APPROVAL_DECISIONS = frozenset({"allow", "deny", "ask", "approve"})
 # server.protocol.APPROVAL_SCOPES.
 _APPROVAL_SCOPES = frozenset({"once", "always_tool"})
+
+
+def _serve_methods() -> frozenset[str]:
+    # one source: the served method table, plus hello, which the connection routes before that table
+    from ..server.protocol import MethodDescriptor
+
+    return frozenset({"hello", *(descriptor.wire for descriptor in MethodDescriptor)})
+
+
+_SERVE_METHODS = _serve_methods()
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 _SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
 _TOOL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:__[A-Za-z0-9][A-Za-z0-9_-]{0,127})?\Z")
@@ -55,6 +66,7 @@ _STRING_RULES = {
     "zeta.tool.name": _TOOL_NAME, "zeta.tool.type": _TOOL_TYPES, "zeta.tool.call.id": _CALL_ID,
     "gen_ai.response.finish_reasons": _FINISH_REASONS, "gen_ai.retry.reason": _RETRY_REASONS,
     "decision": _APPROVAL_DECISIONS, "scope": _APPROVAL_SCOPES, "error.type": _PYTHON_NAME,
+    "rpc.system": frozenset({"jsonrpc"}), "rpc.method": _SERVE_METHODS,
 }
 _INT_KEYS = frozenset({"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.agent.depth", "zeta.turn.number", "zeta.tool.count", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count", "gen_ai.retry.attempt", "gen_ai.retry.delay", "duration"})
 _BOOL_KEYS = frozenset({"zeta.background", "zeta.notification", "zeta.stream", "zeta.emergency", "gen_ai.retry.after"})
@@ -167,6 +179,9 @@ class _SpanHandle(SpanHandle):
     def approval_resolved(self, *, decision: str, scope: str, duration: int) -> None:
         self._span.add_event("zeta.approval.resolved", attributes=_safe_attributes({"decision": decision, "scope": scope, "duration": duration}, _EVENT_ATTRIBUTE_KEYS["zeta.approval.resolved"]))
 
+    def invalid_propagation(self) -> None:
+        self._span.add_event("zeta.serve.invalid_propagation", attributes=_safe_attributes({}, _EVENT_ATTRIBUTE_KEYS["zeta.serve.invalid_propagation"]))
+
     def fail(self, exc: BaseException | type[BaseException] | None) -> None:
         # _OTHER is the semconv fallback when no exception class names the failure
         error_type = "_OTHER" if exc is None else exc.__qualname__ if isinstance(exc, type) else type(exc).__qualname__
@@ -238,7 +253,7 @@ class _Runtime:
         span_kind = {"internal": SpanKind.INTERNAL, "client": SpanKind.CLIENT, "server": SpanKind.SERVER}[kind]
         if " " in name:
             prefix, suffix = name.split(" ", 1)
-            key = "zeta.tool.name" if operation == "tool" else "gen_ai.request.model" if operation == "inference" else "zeta.agent.name"
+            key = {"tool": "zeta.tool.name", "inference": "gen_ai.request.model", "serve": "rpc.method"}.get(operation, "zeta.agent.name")
             name = f"{prefix} {_field_value(key, suffix)}"
         safe_attributes = _safe_attributes(attributes, _OPERATION_ATTRIBUTE_KEYS[operation])
         return _SpanHandle(self._tracer.start_as_current_span(name, kind=span_kind, attributes=safe_attributes, record_exception=False, set_status_on_exception=False))
@@ -315,7 +330,8 @@ def configure(endpoint: str) -> _Runtime:
     )
     provider.add_span_processor(BatchSpanProcessor(exporter, max_queue_size=2048, max_export_batch_size=256, schedule_delay_millis=5000))
     logger_state: list[tuple[logging.Logger, bool, bool, int, list[logging.Handler]]] = []
-    for name in ("opentelemetry.exporter", "opentelemetry.sdk._shared_internal"):
+    # the trace-context loggers print received tracestate members, which are client input
+    for name in ("opentelemetry.exporter", "opentelemetry.sdk._shared_internal", "opentelemetry.trace.span", "opentelemetry.trace.propagation.tracecontext"):
         logger = logging.getLogger(name)
         logger_state.append((logger, logger.disabled, logger.propagate, logger.level, list(logger.handlers)))
         logger.disabled = True
