@@ -55,7 +55,7 @@ def resolve_child_profile_tools(
     runtime_tool_names: frozenset[str],
 ) -> tuple[set[str], frozenset[str] | None]:
     """Resolve hard exclusions and one child's profile tool layer."""
-    excluded_names = {"inbox", "request_attention", "resolve_attention"}
+    excluded_names = {"inbox", "list_attention", "request_attention", "resolve_attention"}
     if not preset.allow_delegation:
         excluded_names.add("agent")
     resolvable_names = (
