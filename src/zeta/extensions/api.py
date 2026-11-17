@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..runtime.execution import ToolHandler
-    from .host import ExtensionHost, LoadingExtension
+    from .host import ExtensionHost, ExtensionOwnerBridge, LoadingExtension
     from .ui import ExtensionUI
 
 # Host capability version. Bump when the ExtensionAPI grows a surface. A
@@ -36,22 +36,35 @@ class ExtensionAPI:
     """Handed to one extension's ``activate``; bound to one session."""
 
     def __init__(self, host: ExtensionHost, extension: LoadingExtension) -> None:
-        self._host = host
-        self._extension = extension
+        self._owner: ExtensionOwnerBridge = host.facade_bridge()
+        self._extension: LoadingExtension | None = extension
+        self._name = extension.manifest.name
+        self._scope = extension.scope
+        self._home = host.home
+        self._project_dir = host.project_dir
+
+    def detach_activation(self) -> None:
+        """Release activation-only declaration state."""
+        self._extension = None
+
+    def _loading(self) -> LoadingExtension:
+        if self._extension is None:
+            raise ExtensionError("extension activation is complete")
+        return self._extension
 
     @property
     def name(self) -> str:
-        return self._extension.manifest.name
+        return self._name
 
     @property
     def ui(self) -> ExtensionUI:
         from .ui import ExtensionUI
 
-        return ExtensionUI(self._host, self.name)
+        return ExtensionUI(self._owner, self.name)
 
     @property
     def scope(self) -> str:
-        return self._extension.scope
+        return self._scope
 
     @property
     def api_version(self) -> int:
@@ -59,14 +72,18 @@ class ExtensionAPI:
 
     @property
     def home(self) -> Path:
-        return self._host.home
+        return self._home
 
     @property
     def project_dir(self) -> Path | None:
-        return self._host.project_dir
+        return self._project_dir
 
     def on(self, event: str, handler: Any) -> None:
-        """Register an async lifecycle hook for this session."""
+        """Register an async hook on the private per-session extension loop.
+
+        Hooks have no session-loop affinity and receive a fresh empty context.
+        Use ``zx.*`` methods; do not await session-loop-bound asyncio objects.
+        """
         if not isinstance(event, str) or event not in {
             "session_start",
             "user_prompt_submit",
@@ -76,10 +93,14 @@ class ExtensionAPI:
             "tool_result",
         }:
             raise ExtensionError(f"unknown extension hook event: {event!r}")
-        self._extension.declare_hook(event, handler)
+        self._loading().declare_hook(event, handler)
 
     def run_blocking(self, fn: Any, *args: Any) -> Any:
-        """Return an awaitable that runs synchronous work off the event loop."""
+        """Move work off the hook loop and resume on that same private loop.
+
+        This does not give the work session-loop affinity. Use ``zx.*`` methods
+        instead of session-loop-bound asyncio objects.
+        """
         return asyncio.to_thread(fn, *args)
 
     def register_command(
@@ -104,7 +125,7 @@ class ExtensionAPI:
             raise ExtensionError("register_command body must be a string")
         if kind not in {"prompt", "exec"}:
             raise ExtensionError("register_command kind must be 'prompt' or 'exec'")
-        self._extension.declare_command(name, description, handler, body, kind)
+        self._loading().declare_command(name, description, handler, body, kind)
 
     def register_tool(
         self,
@@ -129,7 +150,7 @@ class ExtensionAPI:
             raise ExtensionError("register_tool name must be a nonempty string")
         if not callable(handler):
             raise ExtensionError("register_tool handler must be callable")
-        self._extension.declare_tool(
+        self._loading().declare_tool(
             name,
             handler,
             description=description,

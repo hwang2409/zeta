@@ -93,9 +93,10 @@ class StreamEventMixin:
         if not self._defer_startup_notice(notice):
             background_notice(self, notice)
 
-    def _handle_background_event(self, event: StreamEvent) -> None:
+    def _handle_background_event(self, event: StreamEvent) -> bool:
         if not self._defer_startup_runtime_event(event):
             self._handle_background_event_now(event)
+        return True
 
     def _print_background_rendered(self, event: StreamEvent, rendered: object) -> None:
         if (

@@ -239,7 +239,8 @@ def activate(zx):
             await asyncio.sleep(0)
             assert host.notices == []
             assert len(host._notification_buckets) == 1
-            assert host.notify_dropped > 0
+            assert host.notify_dropped == 0
+            assert host._safety_pending == {}
             assert len(host._pending_notifications) == 0
             assert agent_loop._tracked_tasks == set()
     finally:

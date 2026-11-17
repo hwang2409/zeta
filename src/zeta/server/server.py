@@ -390,7 +390,7 @@ class ZetaServer:
 
     async def publish_update(self, old_revision: str, new_revision: str) -> None:
         if self.connections is not None:
-            await self.connections.publish_feature_event(
+            _ = await self.connections.publish_feature_event(
                 "zeta_updated",
                 EventDescriptor.ZETA_UPDATED,
                 self.runtime.session_id if self.runtime.opened is not None else None,
@@ -448,7 +448,7 @@ class ZetaServer:
                     return
                 if self.connections is None or self.runtime.opened is None:
                     return
-                await self.connections.publish_feature_event(
+                _ = await self.connections.publish_feature_event(
                     "session_retention", EventDescriptor.SESSION_RETENTION,
                     self.runtime.opened.metadata.session_id, data=projection,
                 )
@@ -480,12 +480,12 @@ class ZetaServer:
             self.parking.close_all(approval_settlement_timeout)
             try:
                 try:
-                    await self.control.close()
+                    if not self._borrowed:
+                        await self.runtime.close()
                 finally:
                     await self._close_foreground_events()
                 try:
-                    if not self._borrowed:
-                        await self.runtime.close()
+                    await self.control.close()
                 finally:
                     try:
                         await self.control.wait_for_approval_settlement(

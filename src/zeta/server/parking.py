@@ -130,15 +130,14 @@ class ParkedPairs:
         self, control: ServeControl, settlement_timeout: float | None = None
     ) -> None:
         session_id = control.runtime.session_id
-        control.closing = True  # no wake starts from here on
 
         async def close() -> None:
             try:
                 try:
-                    await control.close()
+                    await control.runtime.close()
                 finally:
                     try:
-                        await control.runtime.close()
+                        await control.close()
                     finally:
                         await control.wait_for_approval_settlement(settlement_timeout)
             finally:

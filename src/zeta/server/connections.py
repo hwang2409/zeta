@@ -47,6 +47,12 @@ logger = logging.getLogger(__name__)
 
 CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
 
+
+@dataclass(frozen=True, slots=True)
+class FeaturePublicationReceipt:
+    admitted_count: int = 0
+    rejected_count: int = 0
+
 OBSERVER_REQUESTS = frozenset(
     {
         "list_sessions",
@@ -546,8 +552,8 @@ class ConnectionRegistry(ReplayOutput):
         session_id: str,
         *,
         data: dict[str, object],
-    ) -> None:
-        """Queue one live event for every connection that negotiated a feature."""
+    ) -> FeaturePublicationReceipt:
+        """Attempt every negotiated recipient and report exact admissions."""
         states = tuple(
             state
             for state in (self._controller, *self._observers)
@@ -558,16 +564,27 @@ class ConnectionRegistry(ReplayOutput):
         covers = self._replay_covers(event, session_id, {"data": data}, None)
         # feature events have no publish-first route
         assert not isinstance(covers, DeferredFrame)
+        admitted = 0
+        rejected = 0
         for state in states:
-            frame = state.connection.codec.notification(event, session_id, data=data)
-            if frame is None:
-                continue
-            if self._publish_replay(state, event, session_id, {"data": data}, covers):
-                continue
-            if state is self._controller:
-                await self.send(state.connection, frame)
+            try:
+                frame = state.connection.codec.notification(event, session_id, data=data)
+                accepted = frame is not None and (
+                    self._publish_replay(state, event, session_id, {"data": data}, covers)
+                    or (
+                        await self.send(state.connection, frame)
+                        if state is self._controller
+                        else self._publish_observer(state, frame)
+                    )
+                )
+            except Exception:  # one broken recipient must not stop fanout
+                logger.exception("feature event recipient rejected %s", event.value)
+                accepted = False
+            if accepted:
+                admitted += 1
             else:
-                self._publish_observer(state, frame)
+                rejected += 1
+        return FeaturePublicationReceipt(admitted, rejected)
 
     def release(self, connection: Any) -> None:
         self.invalidate_replay_connection(connection)
@@ -801,7 +818,7 @@ class ConnectionRegistry(ReplayOutput):
         output.ready = self.loop.create_future()
         output.phase = "claimed_buffering"
 
-    def _publish_observer(self, state: _Connection, frame: _Frame) -> None:
+    def _publish_observer(self, state: _Connection, frame: _Frame) -> bool:
         output = state.output
         if (
             state.connection not in self._connections
@@ -809,8 +826,9 @@ class ConnectionRegistry(ReplayOutput):
             or output.phase != "ready"
             or not self._admit(state, frame)
         ):
-            return
+            return False
         self._enqueue(output, _OutputFrame(frame))
+        return True
 
     def _fits(self, output: _OutputState, size: int, frames: int = 1) -> bool:
         control = output.overflow_frame

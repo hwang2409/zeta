@@ -139,11 +139,12 @@ class PromptRuntimeMixin:
         ):
             extension_notice_loop = asyncio.get_running_loop()
 
-            def extension_notice_sink(event: StreamEvent) -> None:
+            def extension_notice_sink(event: StreamEvent) -> bool:
                 if getattr(self, "_extension_notice_first_paint_draining", False):
                     self._handle_background_event_now(event)
                 else:
                     self._handle_background_event(event)
+                return True
 
             def bind_extension_notice_sink(application: object) -> None:
                 nonlocal extension_notice_pending

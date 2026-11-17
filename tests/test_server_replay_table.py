@@ -840,12 +840,13 @@ async def _publication_routes(
         EventDescriptor.DELIVERY_STATUS, session_id, data={"route": "direct"}
     )
     observed.append(await client.event(EventDescriptor.DELIVERY_STATUS.value))
-    await server.connections.publish_feature_event(
+    receipt = await server.connections.publish_feature_event(
         "session_replay_seq",
         EventDescriptor.SESSION_GRANTS_CHANGED,
         session_id,
         data={"route": "grants"},
     )
+    assert (receipt.admitted_count, receipt.rejected_count) == (1, 0)
     observed.append(await client.event(EventDescriptor.SESSION_GRANTS_CHANGED.value))
     assert [event.get("stream_id") for event in observed] == [stream_id] * len(observed)
     assert [event["seq"] for event in observed] == list(range(1, len(observed) + 1))

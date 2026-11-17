@@ -760,7 +760,7 @@ class ServeControl:
         session_id = self.runtime.session_id
         if connections is None or session_id is None or not self.attached:
             return
-        await connections.publish_feature_event(
+        _ = await connections.publish_feature_event(
             FEATURE, EVENT, session_id, data=event_data(change, session_id)
         )
 
@@ -1113,7 +1113,7 @@ class ServeControl:
         session_id: str | None = None,
         background: bool = False,
         turn_id: str | None = None,
-    ) -> None:
+    ) -> bool | None:
         state = self.runtime.state
         if session_id is None and not background and state is not None:
             session_id = state.session_id
@@ -1250,9 +1250,13 @@ class ServeControl:
             return
         if kind is StreamEventType.AGENT_NOTIFICATION and event.data.get("kind") == "extension":
             connections = self.server.connections
-            if connections is not None:
-                await connections.publish_feature_event("extensions", EventDescriptor.EXTENSION_NOTICE, session_id, data=dict(event.data))
-            return
+            if connections is None:
+                return False
+            receipt = await connections.publish_feature_event(
+                "extensions", EventDescriptor.EXTENSION_NOTICE, session_id,
+                data=dict(event.data),
+            )
+            return receipt.admitted_count > 0
         if kind is StreamEventType.AGENT_NOTIFICATION:
             await self.server.notification_presentations.publish(
                 session_id,
@@ -1315,13 +1319,19 @@ class ServeControl:
         )
         return controller.protocol_version if controller is not None else "1.0"
 
-    def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
-        """Schedule child events from the loop's synchronous sink."""
+    def _publish_background_event(
+        self, session_id: str, event: StreamEvent
+    ) -> bool | asyncio.Task[bool | None]:
+        """Schedule an event and return its truthful publication receipt."""
         self._maybe_idle()
-        if not self.closing:
-            asyncio.create_task(
+        if self.closing:
+            return False
+        try:
+            return asyncio.create_task(
                 self._event(event, session_id=session_id, background=True)
             )
+        except RuntimeError:
+            return False
 
     def _publish_run_work_event(self, session_id: str, event: EventDescriptor, fields: dict[str, object]) -> None:
         connections = self.server.connections

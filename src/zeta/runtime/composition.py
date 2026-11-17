@@ -457,7 +457,6 @@ def compose_runtime(
             home=home,
             project_dir=repo_root,
             builtin_names=builtin_tool_names,
-            task_owner=loop._create_task,
             disabled=config.extensions_disabled,
         )
         loop.extensions = extensions

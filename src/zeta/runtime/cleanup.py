@@ -41,4 +41,4 @@ async def close_session(
                         await asyncio.to_thread(loop.store.close)
                     finally:
                         if extensions is not None:
-                            extensions.close()
+                            await extensions.aclose()
