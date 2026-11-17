@@ -76,7 +76,7 @@ class Hold:
         cancelled = False
         while not self.opened.is_set():
             try:
-                await asyncio.shield(self.opened.wait())
+                await asyncio.wait_for(asyncio.shield(self.opened.wait()), 10)
             except asyncio.CancelledError:
                 cancelled = True
         if cancelled:
@@ -313,6 +313,7 @@ async def approval_after_decision(run: Run) -> None:
         await run.hold()
         return await original(*args, **kwargs)
 
+    # test-contract: seam gates the one approval publication step
     run.monkeypatch.setattr(approvals, "_publish_end", publish_end)
     store = record.runtime.opened.store
     await run.send(client, "approve", {"request_id": request_id})
@@ -334,6 +335,7 @@ async def approval_publication_fails(run: Run) -> None:
         await run.hold()
         raise OSError("publication failed")
 
+    # test-contract: seam gates the one approval publication step
     run.monkeypatch.setattr(approvals, "_publish_end", publish_end)
     store = record.runtime.opened.store
     sent = await run.send(client, "approve", {"request_id": request_id})

@@ -1685,7 +1685,7 @@ async def test_cancel_cleans_up_echo_and_runs_committed_work(method: str) -> Non
             frozenset({"delivery_id", "user_message_event"}),
         )
     )
-    await control.echo_started.wait()
+    await await_or_fail(control.echo_started.wait(), what="echo starts")
     request.cancel()
 
     with pytest.raises(asyncio.CancelledError):
