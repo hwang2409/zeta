@@ -12,6 +12,7 @@ from ..runtime.foreground_events import ForegroundEventPublisher
 from ..server.protocol import EventDescriptor
 from ..server.runtime import ServerRuntime
 from ..server.server import ZetaServer
+from ..telemetry import Telemetry
 from .descriptor import (
     Descriptor,
     create_observer_socket,
@@ -39,8 +40,10 @@ class ObserverHost:
         cwd: str = "",
         provider: str = "",
         model: str = "",
+        telemetry: Telemetry | None = None,
     ) -> None:
         self.home = home
+        self.telemetry = telemetry
         self.session_id = session_id
         self.runtime = runtime
         self._runtime_args = (opened, loop, policy, project_dir, repo_root)
@@ -83,6 +86,7 @@ class ObserverHost:
                 foreground_event_publisher=self.publisher,
                 max_role="observer",
                 prebound_socket=observer_socket,
+                telemetry=self.telemetry,
             )
             await server.start()
         except BaseException:

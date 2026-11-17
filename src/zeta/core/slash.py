@@ -556,6 +556,7 @@ class SlashStatus:
     computer_allowed_apps: int = 0
     computer_default_app_access: str = "deny"
     computer_empty_allow_list: bool = False
+    otel_status: str = "off"
 
 
 @dataclass(frozen=True, slots=True)
@@ -743,6 +744,7 @@ def _format_status(status: SlashStatus) -> str:
         f"session_id: {status.session_id}",
         f"provider: {status.provider}",
         f"model: {status.model}",
+        f"otel: {status.otel_status}",
         "completion_client_setups: "
         + (
             ", ".join(
