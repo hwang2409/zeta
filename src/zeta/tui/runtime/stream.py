@@ -103,7 +103,11 @@ class StreamEventMixin:
         if event.type in render.BACKGROUND_EVENTS_RENDERED_IMMEDIATELY:
             rendered = self._presenter.render_event(event)
             if rendered is not None:
-                self._print_unit(rendered)
+                if (event.type is StreamEventType.AGENT_NOTIFICATION
+                        and event.data.get("kind") == "extension"):
+                    self._presenter.print_transient(rendered)
+                else:
+                    self._print_unit(rendered)
                 self._invalidate_background_prompt()
             return
         if event.type in {

@@ -21,6 +21,7 @@ import itertools
 import re
 import sys
 import threading
+import time
 import types
 from collections import deque
 from collections.abc import Callable
@@ -126,6 +127,7 @@ class ExtensionHost:
         home: Path,
         project_dir: Path | None,
         builtin_names: frozenset[str],
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._registry = registry
         self.home = home
@@ -142,6 +144,8 @@ class ExtensionHost:
         self._pending_notifications: deque[StreamEvent] = deque(maxlen=32)
         self._notification_lock = threading.Lock()
         self._notifications_outstanding = 0
+        self._notification_clock = clock
+        self._notification_buckets: dict[str, tuple[float, float, int]] = {}
         self._packages: dict[str, Path] = {}
         self._closed = False
 
@@ -228,20 +232,38 @@ class ExtensionHost:
             self.notify_dropped += 1
             return
         with self._notification_lock:
-            if self._notifications_outstanding >= 32:
+            now = self._notification_clock()
+            last, tokens, dropped = self._notification_buckets.get(extension, (now, 20.0, 0))
+            tokens = min(20.0, tokens + max(0.0, now - last) * 10.0)
+            if tokens < 1.0:
+                self._notification_buckets[extension] = (now, tokens, dropped + 1)
                 self.notify_dropped += 1
                 return
-            self._notifications_outstanding += 1
+            tokens -= 1.0
+            events = [event]
+            if dropped:
+                events = [StreamEvent(
+                    StreamEventType.AGENT_NOTIFICATION,
+                    data={"kind": "extension", "extension": extension,
+                          "text": f"{dropped} extension notices dropped", "level": "warning"},
+                )]
+                dropped = 0
+            self._notification_buckets[extension] = (now, tokens, dropped)
+            if self._notifications_outstanding + len(events) > 32:
+                self.notify_dropped += 1
+                return
+            self._notifications_outstanding += len(events)
             if self._event_sink is None or self._event_loop is None:
-                self._pending_notifications.append(event)
+                self._pending_notifications.extend(events)
                 return
             loop = self._event_loop
         try:
-            loop.call_soon_threadsafe(self._send, event)
+            for queued in events:
+                loop.call_soon_threadsafe(self._send, queued)
         except RuntimeError:
             with self._notification_lock:
-                self._notifications_outstanding -= 1
-            self.notify_dropped += 1
+                self._notifications_outstanding -= len(events)
+            self.notify_dropped += len(events)
 
     def add_status(self, manifest: ExtensionManifest, scope: str, *, enabled: bool) -> None:
         self.statuses[(manifest.name, scope)] = ExtensionStatus(

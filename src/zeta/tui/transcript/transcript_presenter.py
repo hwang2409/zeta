@@ -84,6 +84,10 @@ class TranscriptPresenter:
             return
         self._print_callback(renderable)
 
+    def print_transient(self, renderable: RenderableType | None) -> None:
+        if renderable is not None:
+            self.console.print(renderable)
+
     def print_unit(
         self,
         renderable: RenderableType | None,

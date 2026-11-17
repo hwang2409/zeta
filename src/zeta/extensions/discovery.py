@@ -27,6 +27,8 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .api import EXTENSION_API_VERSION, ExtensionAPI
@@ -54,6 +56,7 @@ def apply_extensions(
     project_dir: str | Path | None,
     builtin_names: frozenset[str],
     disabled: tuple[str, ...] = (),
+    clock: Callable[[], float] = time.monotonic,
 ) -> ExtensionHost:
     """Load user extensions into ``registry`` and stage project extensions.
 
@@ -68,6 +71,7 @@ def apply_extensions(
         home=_as_path(home),
         project_dir=_as_path(project_dir),
         builtin_names=builtin_names,
+        clock=clock,
     )
     disabled_set = frozenset(disabled)
     user_dir = _scope_dir(home, "")

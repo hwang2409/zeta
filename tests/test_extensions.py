@@ -183,22 +183,27 @@ async def test_notify_from_foreign_thread_after_loop_binding(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_notify_flood_bounds_scheduled_callbacks(tmp_path: Path) -> None:
     async with _open_registry(tmp_path) as registry:
-        host = apply_extensions(registry, home=tmp_path / "home", project_dir=None, builtin_names=registry.registered_names)
-        callbacks = []
+        clock = [0.0]
+        host = apply_extensions(
+            registry, home=tmp_path / "home", project_dir=None,
+            builtin_names=registry.registered_names,
+            clock=lambda: (clock.__setitem__(0, clock[0] + 0.006) or clock[0]),
+        )
+        delivered = []
 
         class Loop:
             def call_soon_threadsafe(self, callback: object, event: object) -> None:
-                callbacks.append((callback, event))
+                callback(event)  # type: ignore[operator]
 
-        host.set_event_sink(lambda event: None, Loop())  # type: ignore[arg-type]
+        host.set_event_sink(delivered.append, Loop())  # type: ignore[arg-type]
         thread = threading.Thread(
             target=lambda: [host.notify("thread-ext", str(index), "info") for index in range(10_000)]
         )
         thread.start()
         await asyncio.to_thread(thread.join)
 
-        assert len(callbacks) <= 32
-        assert host.notify_dropped >= 10_000 - 32
+        assert len(delivered) <= 620
+        assert host.notify_dropped > 9_000
 
 
 @pytest.mark.asyncio
