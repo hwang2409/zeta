@@ -172,9 +172,9 @@ class ReplayOutput:
 
     def _admit_deferred(self, record: DeferredFrame, covers: rows.Covers) -> None:
         """Send one deferred copy to every replay stream of its scope."""
-        for state in (self._controller, *self._observers):
+        for state in (self._primary_controller, *self._observers):
             if state is None or (
-                state is self._controller and self._controller_output_paused
+                state is self._primary_controller and self._controller_output_paused
             ):
                 continue
             if not self._feature_rejected(
@@ -563,7 +563,7 @@ class ReplayOutput:
         state.connection.writer.close()
 
     def publish_child_lifecycle(self, event, scope, session_id, fields, covers=None):
-        for state in (self._controller, *self._observers):
+        for state in (self._primary_controller, *self._observers):
             if state is None or "child_run_events" not in state.features:
                 continue
             if self.replay.scope_for(state.connection) != scope:

@@ -200,7 +200,7 @@ class ConnectionRegistry(ReplayOutput):
     ) -> None:
         self.loop = loop
         self._connections: dict[Any, _Connection] = {}
-        self._controller: _Connection | None = None
+        self._controllers: list[_Connection] = []
         self._controller_output_paused = False
         # Rate-limit state for the contended-slot refusal log: the holder a
         # refusal was last logged against, that log's time, and how many later
@@ -220,6 +220,10 @@ class ConnectionRegistry(ReplayOutput):
         self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
         self._child_reader_lock = threading.Lock()
         self._reads = ThreadCallWorkers(loop, workers=2, name="zeta-read")
+
+    @property
+    def _primary_controller(self) -> _Connection | None:
+        return self._controllers[0] if self._controllers else None
 
     def register(self, connection: Any) -> None:
         if self._closed:
@@ -276,6 +280,10 @@ class ConnectionRegistry(ReplayOutput):
         connection.role = role
         return role
 
+    def log_controller_refusal(self, refused: Any) -> None:
+        """Record the physical diagnostic for a semantic controller refusal."""
+        self._log_controller_refusal(refused)
+
     def _log_controller_refusal(self, refused: Any) -> None:
         """Name the holder and the refused connection on a -32001 slot refusal.
 
@@ -284,7 +292,7 @@ class ConnectionRegistry(ReplayOutput):
         count. The holder's stuck request and await chain are added only when
         its connection is already closed while a request still runs.
         """
-        holder = self._controller
+        holder = self._primary_controller
         if holder is None:
             return
         client = holder.connection
@@ -312,9 +320,7 @@ class ConnectionRegistry(ReplayOutput):
         if state.role is not None:
             raise ValueError("connection already claimed")
         if role == "controller":
-            if self._controller is not None:
-                raise RuntimeError("controller occupied")
-            self._controller = state
+            self._controllers.append(state)
         else:
             if len(self._observers) >= 8:
                 raise RuntimeError("observer limit reached")
@@ -327,7 +333,7 @@ class ConnectionRegistry(ReplayOutput):
 
     def is_controller(self, connection: Any) -> bool:
         state = self._connections.get(connection)
-        return state is not None and state is self._controller
+        return state is not None and state is self._primary_controller
 
     def output_state(self, connection: Any) -> _OutputState | None:
         state = self._connections.get(connection)
@@ -348,7 +354,7 @@ class ConnectionRegistry(ReplayOutput):
     async def wait_for_lost_controller(self, deadline: float) -> None:
         """If the controller slot is held by a lost holder, signal contention
         and wait up to ``deadline`` seconds for the slot to be released."""
-        state = self._controller
+        state = self._primary_controller
         if state is None or not state.lost:
             return
         state.contended.set()
@@ -360,7 +366,7 @@ class ConnectionRegistry(ReplayOutput):
             self._controller_output_paused = False
 
     def controller_metadata(self) -> ControllerMetadata | None:
-        state = self._controller
+        state = self._primary_controller
         if state is None:
             return None
         return ControllerMetadata(
@@ -378,7 +384,7 @@ class ConnectionRegistry(ReplayOutput):
     ) -> tuple[Admission, _Frame | None, _OutputState | None]:
         if state is None:
             return Admission("no_controller"), None, None
-        if state is self._controller and self._controller_output_paused:
+        if state is self._primary_controller and self._controller_output_paused:
             return Admission("not_writable"), None, None
         if self._feature_rejected(state, event, required_feature, fields):
             return Admission("feature_rejected"), None, None
@@ -452,7 +458,7 @@ class ConnectionRegistry(ReplayOutput):
                 event, session_id, required_feature, fields, covers, replay_row
             )
         outcome, frame, output = self._controller_preflight(
-            self._controller,
+            self._primary_controller,
             event,
             session_id,
             required_feature=required_feature,
@@ -460,19 +466,19 @@ class ConnectionRegistry(ReplayOutput):
         )
         if outcome.kind != "admitted" or frame is None or output is None:
             return outcome
-        assert self._controller is not None
-        if self._replay_holds_copy(self._controller, covers):
+        assert self._primary_controller is not None
+        if self._replay_holds_copy(self._primary_controller, covers):
             return outcome
         if not isinstance(covers, DeferredFrame) and self._publish_replay(
-            self._controller,
+            self._primary_controller,
             event,
             session_id,
-            self._fields_for_connection(self._controller, event, fields),
+            self._fields_for_connection(self._primary_controller, event, fields),
             covers,
             replay_row=replay_row,
         ):
             return outcome
-        if not self._admit(self._controller, frame):
+        if not self._admit(self._primary_controller, frame):
             return Admission("capacity_rejected")
         self._enqueue(
             output,
@@ -507,7 +513,7 @@ class ConnectionRegistry(ReplayOutput):
                 event, session_id, required_feature, fields, covers, replay_row
             )
         outcome, frame, output = self._controller_preflight(
-            self._controller,
+            self._primary_controller,
             event,
             session_id,
             required_feature=required_feature,
@@ -515,7 +521,7 @@ class ConnectionRegistry(ReplayOutput):
         )
         if outcome.kind != "admitted" or frame is None or output is None:
             return False
-        state = self._controller
+        state = self._primary_controller
         assert state is not None
         if self._replay_holds_copy(state, covers):
             return True
@@ -550,10 +556,10 @@ class ConnectionRegistry(ReplayOutput):
         """Queue one live event for every connection that negotiated a feature."""
         states = tuple(
             state
-            for state in (self._controller, *self._observers)
+            for state in (self._primary_controller, *self._observers)
             if state is not None
             and feature in state.features
-            and (state is not self._controller or not self._controller_output_paused)
+            and (state is not self._primary_controller or not self._controller_output_paused)
         )
         covers = self._replay_covers(event, session_id, {"data": data}, None)
         # feature events have no publish-first route
@@ -564,7 +570,7 @@ class ConnectionRegistry(ReplayOutput):
                 continue
             if self._publish_replay(state, event, session_id, {"data": data}, covers):
                 continue
-            if state is self._controller:
+            if state is self._primary_controller:
                 await self.send(state.connection, frame)
             else:
                 self._publish_observer(state, frame)
@@ -575,8 +581,8 @@ class ConnectionRegistry(ReplayOutput):
         if state is None:
             return
         state.released.set()
-        if state is self._controller:
-            self._controller = None
+        if state in self._controllers:
+            self._controllers.remove(state)
             self._controller_output_paused = True
         if state in self._observers:
             self._observers.remove(state)
@@ -1253,7 +1259,7 @@ class ConnectionRegistry(ReplayOutput):
         )
         self._connections.clear()
         self._observers.clear()
-        self._controller = None
+        self._controllers.clear()
 
 
 def perform_child_history_read(

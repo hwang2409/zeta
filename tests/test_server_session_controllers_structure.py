@@ -17,7 +17,7 @@ SCANNED = [*sorted(ROOT.rglob("*.py")), *sorted((ROOT.parent / "remote").rglob("
 # everything below them takes the record as an argument
 RESOLVER_ENTRIES = {
     "handlers/registry.py:dispatch": "owned",
-    "server.py:_Client._route_request": "owned",
+    "server.py:_Client._route_hello": "owned",
     "session_replay/__init__.py:join_history_and_subscribe": "selected",
     "handlers/registry.py:child_run_events": "selected",
     "handlers/registry.py:path_complete": "selected",
@@ -151,8 +151,27 @@ def test_record_indexes_have_one_owner() -> None:
                 attrs = [child.attr for child in ast.walk(node) if isinstance(child, ast.Attribute)]
                 text = ast.unparse(node)
                 if (
-                    any(name in attrs for name in ("_parked", "_attached", "_records"))
-                    and ("SessionController" in text or "ServeControl" in text or "_parked" in attrs)
+                    any(
+                        name in attrs
+                        for name in (
+                            "_parked",
+                            "_attached",
+                            "_records",
+                            "_controller_mode",
+                            "_controller_members",
+                            "_hello_generations",
+                            "_grace_session_id",
+                        )
+                    )
+                    and (
+                        "SessionController" in text
+                        or "ServeControl" in text
+                        or "_parked" in attrs
+                        or "_controller_mode" in attrs
+                        or "_controller_members" in attrs
+                        or "_hello_generations" in attrs
+                        or "_grace_session_id" in attrs
+                    )
                 ):
                     assert path.name == "session_controllers.py", f"{path}:{node.lineno}: {text}"
 
