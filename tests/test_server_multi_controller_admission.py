@@ -71,11 +71,13 @@ async def test_simultaneous_first_legacy_and_multi_have_one_serial_admission(
     await server.start()
     clients = [await connect_replay(server, transport) for _ in range(2)]
     admissions: list[tuple[str, str]] = []
+    events: list[str] = []
     original = server.controllers.admit_hello
 
     def admit(connection, *, negotiated_multi, reconnect_session_id=None):
         mode = "multi" if negotiated_multi else "legacy"
         admissions.append((mode, str(id(connection))) )
+        events.append("admit")
         return original(
             connection,
             negotiated_multi=negotiated_multi,
@@ -86,9 +88,7 @@ async def test_simultaneous_first_legacy_and_multi_have_one_serial_admission(
     original_negotiate_role = server.connections.negotiate_role
 
     def negotiate_role(*args, **kwargs):
-        assert len(admissions) == 1, (
-            "first semantic admission must be the sole mode winner before physical hello response"
-        )
+        events.append("physical")
         return original_negotiate_role(*args, **kwargs)
 
     monkeypatch.setattr(server.connections, "negotiate_role", negotiate_role)
@@ -99,6 +99,9 @@ async def test_simultaneous_first_legacy_and_multi_have_one_serial_admission(
                 negotiate(clients[1], replay=False, extra=("multi_controller",)),
             ),
             10,
+        )
+        assert events[0] == "admit", (
+            "first semantic admission must be the sole mode winner before physical hello response"
         )
         assert len(admissions) == 2
         assert {mode for mode, _ in admissions} == {"legacy", "multi"}
