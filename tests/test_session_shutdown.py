@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import threading
+import weakref
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.input import DummyInput
 from prompt_toolkit.output import DummyOutput
 
+from tests.support.fake_backend import FakeBackend
 from zeta.cli.main import build_parser, main
 from zeta.core.checkpoints.workspace import (
     WorkspaceSnapshotError,
@@ -162,7 +164,62 @@ def test_entrypoint_shutdown_releases_every_lease(
 
 
 @pytest.mark.usefixtures("no_gc")
+@pytest.mark.asyncio
+async def test_closing_app_cancels_pending_model_catalog_refresh(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls: list[str] = []
+
+    def load_catalog(provider: str) -> frozenset[str] | None:
+        calls.append(provider)
+        started.set()
+        assert release.wait(10)
+        finished.set()
+        return None
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        on_model_change=lambda model: None,
+        model_catalog_loader=load_catalog,
+    )
+    refreshes = 0
+
+    def refresh_model_picker() -> None:
+        nonlocal refreshes
+        refreshes += 1
+
+    app.refresh_model_picker = refresh_model_picker
+    app._start_model_catalog_load()
+    await asyncio.to_thread(started.wait, 10)
+    app._start_model_catalog_load()
+    app_ref = weakref.ref(app)
+
+    await app.close()
+    assert app._model_catalog_task is None
+    assert calls == ["claude"]
+    assert refreshes == 0
+
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 10)
+    assert calls == ["claude"]
+    assert refreshes == 0
+    del app
+    gc.collect()
+    assert app_ref() is None
+
+
+@pytest.mark.usefixtures("no_gc")
 @pytest.mark.parametrize("opened_snapshots", [False, True])
+@pytest.mark.asyncio
 async def test_closed_app_rejects_snapshot_access(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opened_snapshots: bool,
 ) -> None:
