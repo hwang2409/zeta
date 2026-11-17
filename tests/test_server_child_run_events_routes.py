@@ -34,7 +34,12 @@ from zeta.server import ZetaServer
 pytest_plugins = ("tests.support.socket_fixtures",)
 
 TRANSPORTS: tuple[Transport, ...] = ("unix", "websocket")
-FEATURES = ("child_run_history", "child_run_events", "child_runs")
+FEATURES = (
+    "child_run_history",
+    "child_run_events",
+    "child_runs",
+    "tool_approval_origin",
+)
 TERMINAL = {"completed", "failed", "canceled"}
 
 
@@ -777,6 +782,26 @@ async def test_delegated_child_approval_round_trip_on_parent_and_child_streams(
             assert target_file.exists(), "the approved tool did not run"
             assert target_file.read_text() == "written"
             assert tool_ends[0]["tool_result"]["is_error"] is False, tool_ends
+            starts = [
+                event
+                for event in child_events
+                if event["event"] == "tool_start"
+                and event["tool_call"]["id"] == "call-write"
+            ]
+            assert starts[0]["tool_call"]["approval_origin"] == "user"
+            history = await child.request(
+                serve.request_id(),
+                "child_run_history",
+                {"session_id": session_id, "run_id": target},
+            )
+            replayed = next(
+                block["tool_call"]
+                for row in history["result"]["messages"]
+                for block in row.get("content", [])
+                if block.get("type") == "tool_use"
+                and block["tool_call"]["id"] == "call-write"
+            )
+            assert replayed["approval_origin"] == "user"
         else:
             assert not target_file.exists()
             assert tool_ends[0]["tool_result"]["is_error"] is True, tool_ends

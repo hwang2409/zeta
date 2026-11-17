@@ -1070,6 +1070,7 @@ class ConnectionRegistry(ReplayOutput):
                     fidelity="session_history_fidelity" in features,
                     content_read="content_read" in features,
                     served_turn_end="served_turn_end" in features,
+                    approval_origin="tool_approval_origin" in features,
                 ),
                 selected,
             )
@@ -1133,6 +1134,7 @@ class ConnectionRegistry(ReplayOutput):
                     params,
                     registry=self,
                     fidelity="session_history_fidelity" in features,
+                    approval_origin="tool_approval_origin" in features,
                 ),
                 selected,
             )
@@ -1148,7 +1150,13 @@ class ConnectionRegistry(ReplayOutput):
         features = self._connections[connection].features
         target = (runtime.session_id, runtime.opened.store)
         def read():
-            result = perform_child_history_read(target, params, registry=self, fidelity="session_history_fidelity" in features)
+            result = perform_child_history_read(
+                target,
+                params,
+                registry=self,
+                fidelity="session_history_fidelity" in features,
+                approval_origin="tool_approval_origin" in features,
+            )
             from ..core.agent_progress import read_agent_lifecycle
             from ..core.child_runs import project_child_run_row
             reader = self._child_reader_for(target[1], params["run_id"])
@@ -1260,6 +1268,7 @@ def perform_child_history_read(
     *,
     registry: ConnectionRegistry,
     fidelity: bool,
+    approval_origin: bool,
 ) -> object:
     root_store = target[1]
     try:
@@ -1280,7 +1289,12 @@ def perform_child_history_read(
             ) from exc
 
     try:
-        return history.child_history(produce, history_params, fidelity=fidelity)
+        return history.child_history(
+            produce,
+            history_params,
+            fidelity=fidelity,
+            approval_origin=approval_origin,
+        )
     except ObserverSnapshotChanged as exc:
         raise ProtocolError(
             ErrorDescriptor.HISTORY_SNAPSHOT_STALE,
