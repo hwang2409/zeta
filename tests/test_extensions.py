@@ -17,7 +17,6 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.fake_backend import FakeBackend
 from zeta.extensions import (
     EXTENSION_API_VERSION,
     ExtensionManifestError,
