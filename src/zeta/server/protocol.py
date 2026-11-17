@@ -773,7 +773,9 @@ class FrameCodec:
                 "request params must be an object",
                 request_id=request_id,
             )
-        return {"id": raw_request_id, "method": method, "params": params}
+        # W3C trace context: kept raw here; the connection uses it only after `otel` was negotiated
+        trace_context = {key: value[key] for key in ("traceparent", "tracestate") if key in value}
+        return {"id": raw_request_id, "method": method, "params": params, "trace_context": trace_context}
 
     def response(self, request_id: str | int | None, result: object) -> _Frame:
         value = {"jsonrpc": "2.0", "id": request_id, "result": result}

@@ -72,6 +72,11 @@ class SpanHandle:
         if self._implementation is not None:
             self._implementation.set_compaction(tokens_after=tokens_after)
 
+    def invalid_propagation(self) -> None:
+        """Record that a received W3C trace context was malformed and ignored; carries no value."""
+        if self._implementation is not None:
+            self._implementation.invalid_propagation()
+
     def fail(self, exc: BaseException | type[BaseException] | None) -> None:
         """Mark the span failed; ``None`` is a failure with no exception (error.type ``_OTHER``)."""
         if self._implementation is not None:
@@ -181,6 +186,14 @@ class Telemetry:
             return _NOOP
         return self._span("zeta.context.compact", operation="context", attributes={
             "zeta.emergency": emergency, "zeta.tokens.before": tokens_before,
+        })
+
+    def serve_span(self, method: str) -> SpanHandle:
+        """One served JSON-RPC request; ``method`` outside the serve method table exports as ``_invalid``."""
+        if self._implementation is None:
+            return _NOOP
+        return self._span("serve " + method, kind="server", operation="serve", attributes={
+            "rpc.system": "jsonrpc", "rpc.method": method,
         })
 
     def _span(self, name: str, *, kind: str = "internal", operation: str, attributes: Mapping[str, object] | None = None) -> SpanHandle:

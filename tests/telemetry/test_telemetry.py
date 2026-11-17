@@ -266,7 +266,7 @@ _VALID: dict[str, object] = {
     "call_id": "toolu_01A09q90qw90lq917835lq9", "emergency": False, "tokens_before": 10, "tokens_after": 5,
     "input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "attempt": 1,
     "reason": "stream_error", "delay": 2, "after": False, "decision": "allow", "scope": "once", "duration": 4,
-    "finish_reason": "end_turn", "argument_bytes": 5, "result_bytes": 6,
+    "finish_reason": "end_turn", "argument_bytes": 5, "result_bytes": 6, "method": "send",
 }
 _RESERVED = (
     "gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.system_instructions",
@@ -286,8 +286,8 @@ _ADVERSARIAL = {
     "overlong": "x" * 300,
     "unicode": "unicode-\u2603",
 }
-_HELPERS = ("agent_span", "turn_span", "inference_span", "tool_span", "context_span")
-_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "set_compaction", "fail")
+_HELPERS = ("agent_span", "turn_span", "inference_span", "tool_span", "context_span", "serve_span")
+_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "set_compaction", "invalid_propagation", "fail")
 # where a shape-accepted value may appear: "<name>" is the span name.
 _SHAPE_FIELDS = {
     ("agent_span", "profile"): {"<name>"},
@@ -358,7 +358,8 @@ def _emit(memory_telemetry, route: str, field: str, value: object) -> list:
             if route == "fail":
                 span.fail(value if isinstance(value, BaseException) else ValueError(value))
             else:
-                getattr(span, route)(**({name: _VALID[name] for name in _params(route)} | {field: value}))
+                # a value-free route (invalid_propagation) takes no field
+                getattr(span, route)(**({name: _VALID[name] for name in _params(route)} | ({field: value} if field else {})))
     instance._implementation._provider.force_flush()
     return list(exported)
 
@@ -392,7 +393,7 @@ def test_adversarial_value_never_leaves_its_field(memory_telemetry, route, field
 def test_table_covers_every_route_and_string_parameter() -> None:
     helpers = {name for name in dir(telemetry.Telemetry) if name.endswith("_span") and not name.startswith("_")}
     methods = {name for name in vars(telemetry.SpanHandle) if not name.startswith("_")}
-    routes = {route for route, _field in _FIELDS}
+    routes = {*_HELPERS, *_HANDLE_METHODS}
     assert helpers | methods == routes
     for route in routes:
         owner = telemetry.Telemetry if route in helpers else telemetry.SpanHandle
@@ -440,12 +441,15 @@ def _source_finish_reasons() -> set[str]:
 
 def _source_closed_sets() -> dict[str, set[str]]:
     from zeta.core.approval import ApprovalDecision as CoreDecision
+    from zeta.server.handlers.registry import HANDLERS
     from zeta.server.protocol import APPROVAL_SCOPES
     from zeta.server.protocol import ApprovalDecision as ServeDecision
 
     return {
         "reason": _source_retry_reasons(), "finish_reason": _source_finish_reasons(),
         "decision": {*CoreDecision, *ServeDecision}, "scope": set(APPROVAL_SCOPES),
+        # the dispatch registry, plus hello, which the connection routes before it
+        "method": {"hello", *(descriptor.wire for descriptor in HANDLERS)},
     }
 
 
@@ -455,6 +459,7 @@ def test_closed_set_mirrors_equal_their_sources() -> None:
     mirrors = {
         "reason": runtime._RETRY_REASONS, "finish_reason": runtime._FINISH_REASONS,
         "decision": runtime._APPROVAL_DECISIONS, "scope": runtime._APPROVAL_SCOPES,
+        "method": runtime._SERVE_METHODS,
     }
     assert {name: set(values) for name, values in mirrors.items()} == _source_closed_sets()
 
@@ -476,6 +481,7 @@ def _real_values() -> list:
         "finish_reason": ("set_response", "gen_ai.response.finish_reasons"),
         "decision": ("approval_resolved", "zeta.approval.resolved.decision"),
         "scope": ("approval_requested", "zeta.approval.requested.scope"),
+        "method": ("serve_span", "rpc.method"),
     }
     cases = [(location[field][0], field, value, location[field][1]) for field, values in _source_closed_sets().items() for value in sorted(values)]
     models = {model for models in PROVIDER_MODELS.values() for model in models} | {"locally-created-model", "qwen3:4b", "hf.co/user/model:Q4_K_M"}
@@ -523,3 +529,14 @@ def test_profile_name_and_error_type_are_exported(memory_telemetry) -> None:
     surfaces = dict(_surfaces(_emit(memory_telemetry, "fail", "exc", LookupError("secret detail"))))
     assert surfaces["error.type"] == "LookupError"
     assert "secret detail" not in str(surfaces)
+
+
+def test_invalid_propagation_event_carries_no_value(memory_telemetry) -> None:
+    surfaces = _surfaces(_emit(memory_telemetry, "invalid_propagation", "", None))
+    assert ("<event>", "zeta.serve.invalid_propagation") in surfaces
+    assert not [location for location, _text in surfaces if location.startswith("zeta.serve.invalid_propagation.")]
+
+
+def test_serve_span_name_and_attributes_are_fixed(memory_telemetry) -> None:
+    surfaces = dict(_surfaces(_emit(memory_telemetry, "serve_span", "method", "session_history")))
+    assert surfaces == {"<name>": "serve session_history", "rpc.system": "jsonrpc", "rpc.method": "session_history"}

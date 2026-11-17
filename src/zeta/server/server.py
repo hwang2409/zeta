@@ -709,9 +709,10 @@ class _Client:
         self._request = (request["method"], request_id, time.monotonic())
         await self.connections.wait_until_settled(self)
         try:
-            result = await self._dispatch(
-                request_id, request["method"], request["params"]
-            )
+            with self._traced(request):
+                result = await self._dispatch(
+                    request_id, request["method"], request["params"]
+                )
         except ProtocolError as exc:
             await self._write(
                 self.codec.error_response(
@@ -799,6 +800,27 @@ class _Client:
                 for control in self.server.controls():
                     await control.controller_ready(reconnect=True)
         self._request = None
+
+    @contextlib.contextmanager
+    def _traced(self, request: dict[str, Any]) -> Iterator[None]:
+        """Serve span for one request, under the client's W3C parent once it negotiated `otel`.
+
+        Tasks the handler starts (a send's turn) copy this context. A malformed
+        carrier is ignored whole and leaves only a value-free event on the span.
+        """
+        telemetry = self.server.telemetry
+        # hello itself is never parented: features are still empty while it runs
+        received = request["trace_context"] if "otel" in self.features else {}
+        carrier = {key: value for key, value in received.items() if type(value) is str}
+        accepted = telemetry.extract(carrier)
+        malformed = any(key not in accepted for key in received)
+        with (
+            telemetry.use_trace_context({} if malformed else accepted),
+            telemetry.serve_span(request["method"]) as span,
+        ):
+            if malformed:
+                span.invalid_propagation()
+            yield
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
