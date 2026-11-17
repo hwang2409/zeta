@@ -159,6 +159,7 @@ async def consume_child(
             tool_result=tool_result,
             depth=lifecycle_depth(event.tool_call),
             owner=event.data.get("agent_instance_id"),
+            approval_origin=event.data.get("approval_origin"),
         )
 
     async def consume_events(
@@ -961,6 +962,7 @@ async def run_agent_tool(
         tool_result: ToolResult | None = None,
         depth: int | None = None,
         owner: object = None,
+        approval_origin: object = None,
     ) -> None:
         if call is None:
             return
@@ -974,6 +976,8 @@ async def run_agent_tool(
             return
         data = {"depth": child_depth if depth is None else depth}
         data["agent_instance_id"] = owner if type(owner) is str else child_instance_id
+        if approval_origin in {"automatic", "user"}:
+            data["approval_origin"] = approval_origin
         if background:
             loop._publish_background_event(
                 StreamEvent(

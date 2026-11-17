@@ -6146,7 +6146,7 @@ async def test_agent_returns_child_text_and_persists_child_session(
     assert {schema["name"] for schema in backend.calls[1][1]} == {
         schema["name"]
         for schema in backend.calls[0][1]
-        if schema["name"] not in {"request_attention", "resolve_attention"}
+        if schema["name"] not in {"list_attention", "request_attention", "resolve_attention"}
     }
 
 
@@ -9511,6 +9511,55 @@ async def test_newer_cancel_wins_over_persisted_setup_failure_receipt(
         assert result.is_canceled is True
     finally:
         child.close()
+
+
+def test_tool_result_retry_keeps_approval_origin(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path, session_id="parent")
+    call = ToolCall("call-1", "bash", {"command": "true"})
+    result = ToolResult(call.id, "done")
+    origins = {call.id: "user"}
+    append_message = store.append_message
+    attempts = 0
+
+    def fail_first_append(message: Message):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("injected append failure")
+        return append_message(message)
+
+    registry = SimpleNamespace(
+        peek_approval_origin=origins.get,
+        take_approval_origin=lambda call_id: origins.pop(call_id, None),
+    )
+    owner = SimpleNamespace(
+        store=store,
+        hooks=None,
+        tool_registry=registry,
+        _agent_child_stores={},
+        _agent_child_turns={},
+        _agent_child_types={},
+        _background_owner=SimpleNamespace(release_unused_stores=lambda: None),
+        agent_instance_id=None,
+        _existing_tool_result=lambda call_id: None,
+    )
+    store.append_message = fail_first_append
+
+    try:
+        with pytest.raises(OSError, match="injected append failure"):
+            agent_receipt_module.finalize_agent_results(owner, [call], [result])
+        agent_receipt_module.finalize_agent_results(owner, [call], [result])
+
+        committed = next(
+            message
+            for message in branch_messages(store)
+            if message.tool_result is not None
+            and message.tool_result.tool_call_id == call.id
+        )
+        assert committed.metadata["zeta.approval_origin"] == "user"
+        assert origins == {}
+    finally:
+        store.close()
 
 
 @pytest.mark.asyncio

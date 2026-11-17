@@ -179,11 +179,20 @@ def structured_content_truncated(
     return None
 
 
-def tool_start(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
+def tool_start(
+    event: StreamEvent,
+    *,
+    fidelity: bool = False,
+    approval_origin: bool = False,
+) -> dict[str, object]:
     tool_call = _tool_call(event)
+    data = dict(event.data)
+    origin = data.pop("approval_origin", None)
+    if approval_origin and tool_call is not None and origin in {"automatic", "user"}:
+        tool_call = {**tool_call, "approval_origin": origin}
     if fidelity:
         tool_call = _project_tool_call(tool_call)
-    return {"tool_call": tool_call, "data": dict(event.data)}
+    return {"tool_call": tool_call, "data": data}
 
 
 def tool_output(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
