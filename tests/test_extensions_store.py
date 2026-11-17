@@ -493,6 +493,7 @@ class _WaitingStore(ExtensionStore):
     def _locked(self) -> Iterator[None]:
         self.connection.send("locking")
         with super()._locked():
+            self.connection.send("locked")
             yield
 
 
@@ -621,7 +622,9 @@ def test_real_process_writer_waits_for_held_store_lock(tmp_path: Path) -> None:
     child.close()
     parent.send("start")
     assert parent.recv() == "locking"
+    assert not parent.poll(0.2), "writer entered the store while another process held its lock"
     release.set()
+    assert parent.recv() == "locked"
     for process in (holder, waiter):
         process.join(20)
         assert process.exitcode == 0
