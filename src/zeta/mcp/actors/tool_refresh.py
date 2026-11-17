@@ -220,4 +220,7 @@ class ToolRefreshActor:
     async def close(self) -> None:
         task = self.cancel()
         if task is not None:
-            await asyncio.gather(task, return_exceptions=True)
+            # the refresh task is owned in owner._children; a list_tools() that
+            # ignores cancellation must not wedge the loop, so bound the wait
+            # through the one owner for stuck closes instead of gathering here.
+            await self._owner._drain_closes((task,), "tool refresh close")

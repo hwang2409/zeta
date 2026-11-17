@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from ..protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
+    StreamEventType,
     TextContent,
     user_message_for_turn,
     with_message_origin,
@@ -28,6 +30,8 @@ from . import event_contract
 from .handlers import validation
 from .protocol import ErrorDescriptor, ProtocolError
 from .session_replay.rows import RowFacts
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .control import ServeControl
@@ -321,7 +325,6 @@ class DeliveryRequests:
         *,
         owner_task: asyncio.Task[Any] | None,
     ) -> None:
-        control = self._control
         # a completed turn keeps its unconsumed steering: continue_after_turn
         # starts the next turn with it once turn_end is published.
         reason = {
@@ -339,6 +342,48 @@ class DeliveryRequests:
             TurnOutcome.DISCONNECTED: "disconnect",
         }[outcome]
         await state.opened.store.append_turn_end_async(turn_id, turn_reason)
+        self._release_turn(state, owner_task)
+
+    async def finalize_or_fail(
+        self,
+        session_id: str,
+        state: SessionState,
+        turn_id: str,
+        outcome: TurnOutcome,
+    ) -> TurnOutcome:
+        """Finalize the turn; if that raises, end it as failed so the client
+        still gets an error, turn_end, and agent_end, and no steer stays queued."""
+        try:
+            await self.finalize_turn(session_id, state, turn_id, outcome)
+            return outcome
+        except Exception as exc:  # a raise here would wedge the session
+            logger.exception(
+                "serve turn finalization failed: session=%s turn=%s",
+                session_id,
+                turn_id,
+            )
+            error = {"code": "server_error", "message": str(exc)}
+        try:
+            await self._drop_steering(session_id, state, "failed")
+        except Exception:  # the turn must still be released
+            logger.exception(
+                "dropping steering after failed finalization failed: session=%s",
+                session_id,
+            )
+        finally:
+            self._release_turn(state, asyncio.current_task())
+        await self._control._notify(
+            event_contract.STREAM_EVENT_WIRE_EVENTS[StreamEventType.ERROR],
+            session_id,
+            error=error,
+            data={},
+        )
+        return TurnOutcome.FAILED
+
+    def _release_turn(
+        self, state: SessionState, owner_task: asyncio.Task[Any] | None
+    ) -> None:
+        control = self._control
         control._approvals.prune_ended()
         if control.runtime.state is state:
             state.turn_finished()
