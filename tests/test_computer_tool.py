@@ -46,6 +46,60 @@ def _ops(backend: FakeBackend) -> list[tuple]:
     return [action for action in backend.actions if action[0] != "state"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["success", "input_policy", "capture_policy", "capture_error", "input_error", "killed", "locked", "secure_input"])
+async def test_action_capture_result_table(tmp_path: Path, case: str) -> None:
+    class CaseBackend(FakeBackend):
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            self.capture_count = 0
+
+        async def state(self):
+            self.actions.append(("state",))
+            if case == "capture_policy" and getattr(self, "input_done", False):
+                self.frontmost_bundle_id = "com.denied.app"
+            return type(await super().state())(self.locked, self.secure_input, self.frontmost_bundle_id)
+
+        async def screenshot(self, display=None):
+            self.capture_count += 1
+            if case == "capture_error" and self.capture_count > 1:
+                raise ComputerError("not_permitted", "screen recording denied")
+            return await super().screenshot(display)
+
+        async def click(self, x, y, button, count):
+            if case == "input_error":
+                raise ComputerError("internal", "input failed")
+            if case == "killed":
+                raise ComputerError("killed", "kill switch engaged")
+            self.input_done = True
+            return await super().click(x, y, button, count)
+
+    backend = CaseBackend(locked=case == "locked", secure_input=case == "secure_input")
+    config = ComputerUseConfig(enabled=True, default_app_access="deny", bundle_ids={"com.example.app": "allow"})
+    if case == "input_policy":
+        config = ComputerUseConfig(enabled=True)
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        registry.computer_config = config
+        await registry.execute(ToolCall("s", "computer", {"action": "screenshot"}))
+        result = await registry.execute(ToolCall("c", "computer", {"action": "left_click", "coordinate": [1, 2]}))
+    if case == "success":
+        assert result["isError"] is False and result["content"][-1]["type"] == "image"
+    elif case in {"capture_policy", "capture_error"}:
+        assert result["isError"] is False and "screenshot failed" in result["content"][0]["text"]
+    else:
+        assert result["isError"] is True
+    if case == "input_policy":
+        assert not any(action[0] == "click" for action in backend.actions)
+
+
+@pytest.mark.asyncio
+async def test_wait_is_guarded_and_returns_screenshot(tmp_path: Path) -> None:
+    async with _computer_registry(tmp_path, backend=FakeBackend()) as registry:
+        result = await registry.execute(ToolCall("w", "computer", {"action": "wait"}))
+    assert result["isError"] is False
+    assert result["content"][-1]["type"] == "image"
+
+
 def _tool_names(registry: ToolRegistry) -> set[str]:
     return {schema["name"] for schema in registry.schemas}
 
