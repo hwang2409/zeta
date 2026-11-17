@@ -205,17 +205,23 @@ class SessionControllers:
 
     def release_connection(self, connection: Any, reason: str = "eof") -> None:
         del reason
+        previous = self._by_connection.get(connection)
         generation = self._controller_members.pop(connection, None)
         if generation is None:
             self._refresh_controller_mode()
             return
         self._by_connection.pop(connection, None)
         if not self._controller_members:
-            session_id = None
-            for record in self._records.values():
-                if record.runtime.opened is not None:
-                    session_id = record.runtime.session_id
-                    break
+            session_id = (
+                previous.runtime.session_id
+                if previous is not None and previous.runtime.opened is not None
+                else None
+            )
+            if session_id is None:
+                for record in self._records.values():
+                    if record.runtime.opened is not None:
+                        session_id = record.runtime.session_id
+                        break
             self._grace_session_id = session_id
             # legacy has a reconnect grace without a session id; dormant multi
             # does not. the mode selected by the released token distinguishes them.
