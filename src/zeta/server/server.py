@@ -977,25 +977,20 @@ class _Client:
 
             async def attempt(operation: Awaitable[object]) -> None:
                 nonlocal first
-                task = asyncio.ensure_future(operation)
                 try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError as exc:
-                    if first is None:
-                        first = exc
-                    try:
-                        await asyncio.shield(task)
-                    except BaseException as task_error:  # noqa: BLE001
-                        if first is None:
-                            first = task_error
+                    await operation
                 except BaseException as exc:  # noqa: BLE001
                     if first is None:
                         first = exc
 
             had_physical_controller = self.connections.is_controller(self)
-            release = self._begin_controller_release()
+            try:
+                release = self._begin_controller_release()
+            except BaseException as exc:  # noqa: BLE001
+                release = None
+                first = exc
             if release is not None:
-                await attempt(release)
+                await attempt(asyncio.shield(release))
             await attempt(accounts.cancel_owned_switch(self))
             await attempt(self.logins.close())
             if graceful:
