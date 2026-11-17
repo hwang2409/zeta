@@ -46,16 +46,22 @@ async def _wait_until(check: Callable[[], bool], *, what: str) -> None:
         raise AssertionError(f"timed out waiting for {what}") from exc
 
 
+def _drawn_terminal_text(app: TUIApp) -> str:
+    """Read the characters from the terminal's current completed screen."""
+
+    screen = app._active_session.app.renderer._last_screen
+    return "\n".join(
+        "".join(screen.data_buffer[row][column].char for column in range(120))
+        for row in range(42)
+    )
+
+
 async def _terminal_text(app: TUIApp) -> str:
     """Read the characters the terminal last drew."""
 
     session = app._active_session
     await _wait_until(lambda: not session.app.invalidated, what="drawn screen")
-    screen = session.app.renderer._last_screen
-    return "\n".join(
-        "".join(screen.data_buffer[row][column].char for column in range(120))
-        for row in range(42)
-    )
+    return _drawn_terminal_text(app)
 
 
 async def _wait_for_screen(app: TUIApp, text: str, what: str) -> None:
@@ -328,6 +334,19 @@ async def test_real_tui_child_view_journey(
     source.page = gated_page
     with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
         session = app._make_session()
+        redraw_events: list[str] = []
+        invalidate = session.app.invalidate
+
+        def record_invalidate() -> None:
+            redraw_events.append(
+                f"{sys._getframe(1).f_code.co_name}:"
+                f"render={session.app.render_counter}:"
+                f"pending={session.app.invalidated}"
+            )
+            del redraw_events[:-8]
+            invalidate()
+
+        session.app.invalidate = record_invalidate
         run_task = asyncio.create_task(app.run(session))
         try:
             await _wait_until(lambda: session.app.is_running, what="running TUIApp")
@@ -627,17 +646,23 @@ async def test_real_tui_child_view_journey(
                 assert ROOT_MARKER in after, (
                     "root-anchor-return: complex root marker is not in the restored rendered widget"
                 )
+                anchor_before_reentry = child_transcript.durable_scroll_anchor
                 await _enter_child(app, pipe)
+                anchor_after_reentry = child_transcript.durable_scroll_anchor
                 await _wait_until(
                     lambda: not app._agent_navigation.transcript_control.transition_pending(),
                     what="published child re-entry",
                 )
-                restored_anchor = (
-                    app._agent_navigation.transcript_control.transcript.durable_scroll_anchor
-                )
+                restored_anchor = child_transcript.durable_scroll_anchor
                 assert restored_anchor == child_anchor, (
                     "child-return: durable anchor changed; "
-                    f"expected={child_anchor!r} actual={restored_anchor!r}"
+                    f"before_pageup={prior_child_anchor!r} "
+                    f"parked={child_anchor!r} "
+                    f"before_reentry={anchor_before_reentry!r} "
+                    f"after_reentry={anchor_after_reentry!r} "
+                    f"at_check={restored_anchor!r}; "
+                    f"redraws={redraw_events!r}; "
+                    f"screen={_drawn_terminal_text(app)!r}"
                 )
                 assert not app._transcript.units, (
                     "child-return: the inactive root widget still holds rendered units"
