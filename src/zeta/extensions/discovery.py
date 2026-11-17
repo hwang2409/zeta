@@ -79,16 +79,20 @@ def apply_extensions(
     project_scope_dir = _scope_dir(project_dir, ".zeta")
     for directory in _extension_dirs(user_dir):
         manifest = _manifest_or_notice(host, directory, USER_SCOPE)
-        if manifest is None or _skip(host, manifest, directory, disabled_set):
+        if manifest is None or _skip(
+            host, manifest, directory, USER_SCOPE, disabled_set,
+        ):
             continue
         _load_one(host, directory, manifest, USER_SCOPE)
     if project_scope_dir is not None and project_scope_dir != user_dir:
         pending_names: list[str] = []
         for directory in _extension_dirs(project_scope_dir):
             manifest = _manifest_or_notice(host, directory, PROJECT_SCOPE)
-            if manifest is None or _skip(host, manifest, directory, disabled_set):
+            if manifest is None or _skip(
+                host, manifest, directory, PROJECT_SCOPE, disabled_set,
+            ):
                 continue
-            host.pending_project.append(PendingExtension(manifest, directory))
+            host.pending_project.append(PendingExtension(manifest, directory, PROJECT_SCOPE))
             pending_names.append(manifest.name)
         if pending_names:
             host.warnings.append(
@@ -109,17 +113,18 @@ def trust_project_extensions(host: ExtensionHost) -> None:
     pending = list(host.pending_project)
     host.pending_project.clear()
     for item in pending:
-        _load_one(host, item.directory, item.manifest, PROJECT_SCOPE)
+        _load_one(host, item.directory, item.manifest, item.scope)
 
 
 def _skip(
     host: ExtensionHost,
     manifest: ExtensionManifest,
     directory: Path,
+    scope: str,
     disabled: frozenset[str],
 ) -> bool:
     if manifest.name in disabled:
-        host.disabled_inventory.append(PendingExtension(manifest, directory))
+        host.disabled_inventory.append(PendingExtension(manifest, directory, scope))
         host.notices.append(f"extensions · {manifest.name} disabled by settings")
         return True
     if manifest.api_version > EXTENSION_API_VERSION:

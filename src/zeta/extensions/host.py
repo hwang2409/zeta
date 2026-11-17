@@ -112,10 +112,23 @@ class LoadedExtension:
 
 @dataclass(frozen=True, slots=True)
 class PendingExtension:
-    """A project-scope extension discovered but not yet trusted (not loaded)."""
+    """An extension discovered but not loaded in this session."""
 
     manifest: ExtensionManifest
     directory: Path
+    scope: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExtensionStatus:
+    """Current public state of one discovered extension."""
+
+    name: str
+    version: str
+    scope: str
+    state: str
+    tool_names: tuple[str, ...] = ()
+    command_names: tuple[str, ...] = ()
 
 
 _NAMESPACE = "_zeta_extensions"
@@ -235,11 +248,16 @@ class ExtensionHost:
         directory = self._disabled_directory(create=False)
         if directory is None:
             return
-        self._disabled.update(
-            entry.name for entry in directory.iterdir()
-            if stat.S_ISREG(entry.lstat().st_mode)
-            and _DISABLED_NAME_RE.fullmatch(entry.name)
-        )
+        for entry in directory.iterdir():
+            if _DISABLED_NAME_RE.fullmatch(entry.name) is None:
+                continue
+            try:
+                exists = self._disabled_marker(entry, "read")
+            except OSError as exc:
+                self.notices.append(f"extensions · cannot read disabled marker {entry.name}: {exc}")
+                continue
+            if exists:
+                self._disabled.add(entry.name)
 
     def persist_disabled(self, name: str, enabled: bool) -> bool:
         """Create or remove one zeta-owned disabled marker."""
@@ -248,51 +266,78 @@ class ExtensionHost:
         if name in self._settings_disabled and enabled:
             return False
         directory = self._disabled_directory(create=True)
-        marker = directory / name
-        if enabled:
-            try:
-                marker.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                if not stat.S_ISREG(marker.lstat().st_mode):
-                    raise OSError(f"disabled marker is not a file: {name}")
-                marker.unlink()
-            self._disabled.discard(name)
+        exists = self._disabled_marker(directory / name, "remove" if enabled else "create")
+        if exists:
+            self._disabled.add(name)
         else:
-            try:
-                marker.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                if not stat.S_ISREG(marker.lstat().st_mode):
-                    raise OSError(f"disabled marker is not a file: {name}")
+            self._disabled.discard(name)
+        return True
+
+    def _disabled_marker(self, marker: Path, action: str) -> bool:
+        if action == "create":
             try:
                 fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
-                pass
+                action = "read"
             else:
                 os.close(fd)
-            self._disabled.add(name)
+                return True
+        try:
+            mode = marker.lstat().st_mode
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(mode):
+            raise OSError(f"disabled marker is not a file: {marker.name}")
+        if action == "remove":
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            return False
         return True
 
-    def status(self, name: str) -> tuple[str, LoadedExtension | PendingExtension | None]:
-        item = next((item for item in self.loaded if item.name == name), None)
-        if item is None:
-            item = next((item for item in self.disabled_inventory if item.manifest.name == name), None)
-        if item is None:
-            item = next((item for item in self.pending_project if item.manifest.name == name), None)
-        if item is None:
-            return "missing", None
+    def statuses(self) -> tuple[ExtensionStatus, ...]:
+        """Project current loading state into one record per discovered name."""
+        records: list[ExtensionStatus] = []
+        seen: set[str] = set()
+        for item in self.loaded:
+            if item.name not in seen:
+                seen.add(item.name)
+                records.append(self._loaded_status(item))
+        for item in (*self.disabled_inventory, *self.pending_project):
+            if item.manifest.name not in seen:
+                seen.add(item.manifest.name)
+                records.append(self._pending_status(item))
+        return tuple(records)
+
+    def status(self, name: str) -> ExtensionStatus | None:
+        return next((record for record in self.statuses() if record.name == name), None)
+
+    def _loaded_status(self, item: LoadedExtension) -> ExtensionStatus:
+        return ExtensionStatus(
+            name=item.name, version=item.version, scope=item.scope,
+            state=self._state(item.name, loaded=True),
+            tool_names=item.tool_names, command_names=item.command_names,
+        )
+
+    def _pending_status(self, item: PendingExtension) -> ExtensionStatus:
+        return ExtensionStatus(
+            name=item.manifest.name, version=item.manifest.version, scope=item.scope,
+            state=self._state(
+                item.manifest.name,
+                loaded=False,
+                disabled_inventory=item in self.disabled_inventory,
+            ),
+        )
+
+    def _state(self, name: str, *, loaded: bool, disabled_inventory: bool = False) -> str:
         if name in self._settings_disabled:
-            return "disabled_in_settings", item
+            return "disabled_in_settings"
         if name in self._disabled:
-            return "disabled_next_session", item
-        if any(candidate.manifest.name == name for candidate in self.disabled_inventory):
-            return "enabled_next_session", item
-        if isinstance(item, PendingExtension):
-            return "pending", item
-        return "loaded", item
+            return "disabled_next_session"
+        if disabled_inventory:
+            return "enabled_next_session"
+        return "loaded" if loaded else "pending"
 
     def _disabled_directory(self, *, create: bool) -> Path | None:
         directory = self.home / "extensions-disabled"
@@ -348,6 +393,7 @@ __all__ = [
     "PROJECT_SCOPE",
     "USER_SCOPE",
     "ExtensionHost",
+    "ExtensionStatus",
     "LoadedExtension",
     "LoadingExtension",
     "PendingExtension",

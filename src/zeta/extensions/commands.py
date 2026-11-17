@@ -11,7 +11,7 @@ from ..core.commands.slash_registry import (
     SlashCommand,
     SlashCommandRegistry,
 )
-from .host import ExtensionHost, LoadedExtension
+from .host import ExtensionHost, ExtensionStatus, LoadedExtension
 
 
 def register_commands(registry: SlashCommandRegistry, host: ExtensionHost) -> None:
@@ -93,39 +93,30 @@ async def _run_ext(host: ExtensionHost, args: str) -> str:
 async def _ext_list(host: ExtensionHost, name: str) -> str:
     if name:
         return "usage: /ext [list|info|enable|disable] [name]"
-    names = {item.name for item in host.loaded}
-    names.update(item.manifest.name for item in host.disabled_inventory)
-    names.update(item.manifest.name for item in host.pending_project)
-    rows = [_status_line(host, extension_name) for extension_name in sorted(names)]
+    rows = [_status_line(record) for record in sorted(host.statuses(), key=lambda item: item.name)]
     return "\n".join(rows) or "no extensions loaded"
 
 
-def _status_line(host: ExtensionHost, name: str) -> str:
-    state, item = host.status(name)
-    if item is None:
-        return f"{name} not found"
-    manifest = item.manifest if hasattr(item, "manifest") else None
-    version = item.version if manifest is None else manifest.version
-    scope = item.scope if manifest is None else "project"
+def _status_line(record: ExtensionStatus) -> str:
     suffix = {
         "disabled_in_settings": " disabled in settings",
         "disabled_next_session": " disabled (next session)",
         "enabled_next_session": " enabled (next session)",
         "pending": " pending trust",
-    }.get(state, "")
-    return f"{name} {version} ({scope}){suffix}"
+    }.get(record.state, "")
+    return f"{record.name} {record.version} ({record.scope}){suffix}"
 
 
 async def _ext_info(host: ExtensionHost, name: str) -> str:
-    state, item = host.status(name)
-    if item is None:
+    record = host.status(name)
+    if record is None:
         return f"extension not found: {name}"
-    if state != "loaded":
-        return _status_line(host, name)
+    if record.state != "loaded":
+        return _status_line(record)
     return (
-        f"{item.name} {item.version} ({item.scope})\n"
-        f"tools: {', '.join(item.tool_names) or 'none'}\n"
-        f"commands: {', '.join(item.command_names) or 'none'}"
+        f"{record.name} {record.version} ({record.scope})\n"
+        f"tools: {', '.join(record.tool_names) or 'none'}\n"
+        f"commands: {', '.join(record.command_names) or 'none'}"
     )
 
 
@@ -138,10 +129,8 @@ async def _ext_disable(host: ExtensionHost, name: str) -> str:
 
 
 async def _set_extension(host: ExtensionHost, name: str, enabled: bool) -> str:
-    known = any(item.name == name for item in host.loaded) or any(
-        item.manifest.name == name for item in (*host.disabled_inventory, *host.pending_project)
-    )
-    if not name or not known:
+    record = host.status(name)
+    if not name or record is None:
         return f"extension not found: {name}"
     changed = await asyncio.to_thread(host.persist_disabled, name, enabled)
     if not changed:

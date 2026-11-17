@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.core.commands.slash_registry import SlashLock, SlashSurface
 from zeta.core.slash import create_slash_registry
 from zeta.extensions import (
@@ -373,28 +375,171 @@ def activate(zx):
 
 
 @pytest.mark.asyncio
-async def test_extension_disabled_sources_and_round_trip(tmp_path: Path) -> None:
+async def test_disabled_user_extension_keeps_user_scope(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    home.mkdir()
-    (home / "settings.toml").write_text('[extensions]\ndisabled = ["settings-off"]\n', encoding="utf-8")
-    _write_extension(home / "extensions", "settings-off")
+    project = tmp_path / "project"
     _write_extension(home / "extensions", "active")
+    _write_extension(home / "extensions", "settings-off")
+    _write_extension(home / "extensions", "user-off")
+    _write_extension(project / ".zeta" / "extensions", "active")
+    _write_extension(project / ".zeta" / "extensions", "pending-project")
+    _write_extension(project / ".zeta" / "extensions", "project-off")
+    markers = home / "extensions-disabled"
+    markers.mkdir()
+    (markers / "user-off").touch()
+    (markers / "project-off").touch()
     async with _open_registry(tmp_path) as tools:
-        host = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names,
-                               disabled=("settings-off",))
+        host = apply_extensions(
+            tools, home=home, project_dir=project, builtin_names=tools.registered_names,
+            disabled=("settings-off",),
+        )
         registry = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=host)
+
         class Session:
             slash_lock = SlashLock()
-        assert "settings.toml" in await registry.dispatch_async(Session(), "/ext enable settings-off")
+
+        async def assert_statuses(expected: dict[str, str]) -> None:
+            listing = await registry.dispatch_async(Session(), "/ext list")
+            lines = set(listing.splitlines())
+            for name, line in expected.items():
+                assert line in lines
+                info = await registry.dispatch_async(Session(), f"/ext info {name}")
+                assert info.splitlines()[0] == line
+
+        expected = {
+            "active": "active 0.1.0 (user)",
+            "pending-project": "pending-project 0.1.0 (project) pending trust",
+            "project-off": "project-off 0.1.0 (project) disabled (next session)",
+            "settings-off": "settings-off 0.1.0 (user) disabled in settings",
+            "user-off": "user-off 0.1.0 (user) disabled (next session)",
+        }
+        await assert_statuses(expected)
+        assert "settings.toml" in await registry.dispatch_async(
+            Session(), "/ext enable settings-off",
+        )
+
         await registry.dispatch_async(Session(), "/ext disable active")
-        marker = home / "extensions-disabled" / "active"
-        assert marker.is_file()
-        assert "disabled (next session)" in await registry.dispatch_async(Session(), "/ext info active")
-        next_host = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names,
-                                     disabled=("settings-off",))
-        next_registry = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=next_host)
-        await next_registry.dispatch_async(Session(), "/ext enable active")
-        assert "enabled (next session)" in await next_registry.dispatch_async(Session(), "/ext info active")
+        assert (markers / "active").is_file()
+        assert "ext_echo" in tools.registered_names
+        expected["active"] = "active 0.1.0 (user) disabled (next session)"
+        await assert_statuses(expected)
+
+        await registry.dispatch_async(Session(), "/ext enable user-off")
+        assert not (markers / "user-off").exists()
+        expected["user-off"] = "user-off 0.1.0 (user) enabled (next session)"
+        await assert_statuses(expected)
+
+
+@pytest.mark.asyncio
+async def test_marker_scan_continues_when_enable_removes_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    _write_extension(home / "extensions", "first")
+    _write_extension(home / "extensions", "second")
+    markers = home / "extensions-disabled"
+    markers.mkdir()
+    first = markers / "first"
+    second = markers / "second"
+    first.touch()
+    second.touch()
+    entered = threading.Event()
+    release = threading.Event()
+    original_iterdir = Path.iterdir
+    original_lstat = Path.lstat
+    first_lstat = True
+
+    def ordered_iterdir(path: Path):
+        if path == markers:
+            return iter((first, second))
+        return original_iterdir(path)
+
+    def blocked_lstat(path: Path):
+        nonlocal first_lstat
+        if path == first and first_lstat:
+            first_lstat = False
+            entered.set()
+            release.wait(10)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "iterdir", ordered_iterdir)
+    monkeypatch.setattr(Path, "lstat", blocked_lstat)
+    async with _open_registry(tmp_path) as tools:
+        scan = asyncio.create_task(asyncio.to_thread(
+            apply_extensions, tools, home=home, project_dir=None,
+            builtin_names=tools.registered_names,
+        ))
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(entered.wait), 10)
+            first.unlink()
+        finally:
+            release.set()
+        result = (await await_or_fail(
+            asyncio.gather(scan, return_exceptions=True), what="marker scan",
+        ))[0]
+        assert not isinstance(result, BaseException), f"marker scan failed: {result!r}"
+        registry = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=result)
+
+        class Session:
+            slash_lock = SlashLock()
+
+        listing = await registry.dispatch_async(Session(), "/ext list")
+        assert "second 0.1.0 (user) disabled (next session)" in listing
+
+
+@pytest.mark.asyncio
+async def test_concurrent_enable_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    _write_extension(home / "extensions", "shared")
+    markers = home / "extensions-disabled"
+    markers.mkdir()
+    marker = markers / "shared"
+    marker.touch()
+    async with _open_registry(tmp_path) as tools:
+        host_a = apply_extensions(
+            tools, home=home, project_dir=None, builtin_names=tools.registered_names,
+        )
+        host_b = apply_extensions(
+            tools, home=home, project_dir=None, builtin_names=tools.registered_names,
+        )
+        registry_a = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=host_a)
+        registry_b = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=host_b)
+        entered = threading.Event()
+        release = threading.Event()
+        lock = threading.Lock()
+        entered_count = 0
+        original_unlink = Path.unlink
+
+        def blocked_unlink(path: Path, *args: object, **kwargs: object) -> None:
+            nonlocal entered_count
+            if path == marker:
+                with lock:
+                    entered_count += 1
+                    if entered_count == 2:
+                        entered.set()
+                release.wait(10)
+            original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", blocked_unlink)
+
+        class Session:
+            def __init__(self) -> None:
+                self.slash_lock = SlashLock()
+
+        enables = asyncio.gather(
+            registry_a.dispatch_async(Session(), "/ext enable shared"),
+            registry_b.dispatch_async(Session(), "/ext enable shared"),
+            return_exceptions=True,
+        )
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(entered.wait), 10)
+        finally:
+            release.set()
+        results = await await_or_fail(enables, what="concurrent extension enable")
+        assert all(not isinstance(result, BaseException) for result in results), results
+        assert not marker.exists()
 
 
 @pytest.mark.asyncio
