@@ -43,9 +43,9 @@ from ...agent.tool_results import validated_tool_result as _validated_tool_resul
 from ...agent.turn_limit import ChildTurnControl
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
-from ...core.computer_retention import ComputerScreenshotRetention
 from ...core.context import BudgetExceeded, ContextAssembler
 from ...core.hooks import HookManager
+from ...core.retention.computer import ComputerScreenshotRetention
 from ...core.session_links import ChildLineagePublisher
 from ...core.store import ConversationStore
 from ...core.store._approval_display import ApprovalAuditRequest

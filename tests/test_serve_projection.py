@@ -1,4 +1,4 @@
-from zeta.core.computer_retention import ComputerScreenshotRetention
+from zeta.core.retention.computer import ComputerScreenshotRetention
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,

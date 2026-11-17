@@ -6,7 +6,7 @@ from zeta.agent.receipt import (
     build_explicit_finish_receipt,
     encode_json,
 )
-from zeta.core.computer_retention import ComputerScreenshotRetention
+from zeta.core.retention.computer import ComputerScreenshotRetention
 from zeta.protocol.types import ToolCall, ToolResult
 
 

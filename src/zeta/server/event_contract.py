@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from enum import Enum, auto
 
 from ..core.checkpoints import ConversationEntry
-from ..core.computer_retention import public_tool_result
+from ..core.retention.computer import public_tool_result
 from ..protocol.types import Message, StreamEvent, StreamEventType
 from .protocol import TOOL_OUTPUT_MAX_BYTES, EventDescriptor, bounded
 

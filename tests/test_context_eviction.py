@@ -21,9 +21,9 @@ from zeta.context_eviction import (
     eviction_view,
     recall_history,
 )
-from zeta.core.computer_retention import ComputerScreenshotRetention
 from zeta.core.context import CompactionPolicy, ContextAssembler
 from zeta.core.context_parts.tool_results import truncate_tool_results
+from zeta.core.retention.computer import ComputerScreenshotRetention
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry

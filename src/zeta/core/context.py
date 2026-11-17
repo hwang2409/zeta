@@ -5,7 +5,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
-from .computer_retention import ComputerScreenshotRetention
+from .retention.computer import ComputerScreenshotRetention
 from .context_parts.budget import ContextRequestBudget
 from .context_parts.markers import ContextMarkerMixin
 from .context_parts.preparation import ContextPreparation

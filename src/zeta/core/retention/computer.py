@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
-from ..protocol.types import Message, ToolContentBlock, ToolResult
+from ...protocol.types import Message, ToolContentBlock, ToolResult
 
 
 def _computer_screenshot(result: ToolResult | None) -> bool:
