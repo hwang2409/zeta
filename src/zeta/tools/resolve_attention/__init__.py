@@ -84,7 +84,11 @@ def _close_attention_sync(
     ):
         raise ValueError("attention record ownership does not match the current project")
 
-    matches = _foreign_matches(registry, attention_id)
+    matches = (
+        _foreign_matches(registry, attention_id)
+        if registry.project_id is not None
+        else ()
+    )
     if own is not None and matches:
         owners = ", ".join((store.session_id, *(session_id for session_id, _ in matches)))
         raise ValueError(f"attention item is ambiguous across predecessor sessions: {owners}")
