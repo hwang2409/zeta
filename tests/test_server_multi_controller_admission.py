@@ -778,8 +778,9 @@ async def test_target_is_reserved_before_one_awaited_open(
             nonlocal opens
             if session_id == target_id:
                 opens += 1
-                entered.set()
-                await await_or_fail(release.wait(), what="release target open")
+                if opens == 1:
+                    entered.set()
+                    await await_or_fail(release.wait(), what="release target open")
             return await original_resume(runtime, session_id, *args, **kwargs)
 
         monkeypatch.setattr(ServerRuntime, "resume_session", gated_resume)

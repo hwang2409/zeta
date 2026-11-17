@@ -471,8 +471,9 @@ class SessionControllers:
         runtime would close (owned or not), and that close's error propagates;
         the others are logged by their close. A cancel of the shutdown does not
         cancel a close."""
-        for record in tuple(self._parked.values()):
-            self.retire(record, settlement_timeout)
+        for record in tuple(self._records.values()):
+            if record is not self._attached:
+                self.retire(record, settlement_timeout)
         done = self._attached.close_task
         if done is not None and done.done():
             # a repeated shutdown: the first one already reported this close
