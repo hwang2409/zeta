@@ -89,6 +89,7 @@ from zeta.accounts import (
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.attention_decisions import DecisionItem
 from zeta.attention_records import AttentionRecord
+from zeta.config.settings import ComputerUseConfig
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
@@ -1770,7 +1771,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
         skill_catalog=SkillCatalog.empty(),
         project_id="project-1",
         project_registry=SimpleNamespace(),
-        computer_enabled=True,
+        computer=ComputerUseConfig(enabled=True, default_app_access="allow"),
     )
     foreground_child = top_level.clone_for_session(
         stores[1],
