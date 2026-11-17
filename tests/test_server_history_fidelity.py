@@ -465,7 +465,7 @@ async def test_automatic_approval_origin_is_live_and_replayed_over_socket(
         features=["session_history_fidelity", "tool_approval_origin"],
     )
     try:
-        policy = server.runtime.loop.tool_registry.approval_policy
+        policy = server.controllers.attached().runtime.loop.tool_registry.approval_policy
         assert policy is not None
         policy.default = ApprovalDecision.ALLOW
         await request(reader, writer, 3, "send", {"text": "hello"})
@@ -474,7 +474,7 @@ async def test_automatic_approval_origin_is_live_and_replayed_over_socket(
         assert "approval_origin" not in started["data"]
         await event(reader, "agent_end")
 
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         old_call = ToolCall("old-call", "read", {"path": str(target)})
         store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(old_call)]))
         store.append_message(
