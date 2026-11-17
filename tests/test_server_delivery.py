@@ -1051,10 +1051,10 @@ async def test_disconnect_marks_accepted_steering_dropped(tmp_path: Path) -> Non
     writer.close()
     await writer.wait_closed()
     for _ in range(100):
-        if not server._client_active:
+        if not (server.connections is not None and next(iter(server.connections.clients()), None) is not None):
             break
         await asyncio.sleep(0.01)
-    assert not server._client_active
+    assert not (server.connections is not None and next(iter(server.connections.clients()), None) is not None)
 
     reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
     try:

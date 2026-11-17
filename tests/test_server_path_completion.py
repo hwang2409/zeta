@@ -528,7 +528,7 @@ async def test_cancelled_path_complete_publishes_no_response_or_event(
         assert status[-1]["id"] == "live"
         assert not release.is_set()
 
-        client = server._client
+        client = next(iter(server.connections.clients()), None)
         assert client is not None
         request_task = client._run_task
         assert request_task is not None

@@ -309,7 +309,7 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
         assert event["params"]["delta"] == "new-controller"
         assert [
             (client, frame["params"]["delta"]) for client, frame in raw_after_fence
-        ] == [(server._client, "new-controller")]
+        ] == [(next(iter(server.connections.clients()), None), "new-controller")]
     finally:
         cleanup_release.set()
         old_output_release.set()

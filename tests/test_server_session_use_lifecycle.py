@@ -111,7 +111,7 @@ async def test_shutdown_waits_for_a_cancelled_history_worker(
         session_id = created["result"]["session"]["session_id"]
         record = server.controllers.attached()
         gate.watch(record)
-        connection = server._client
+        connection = next(iter(server.connections.clients()), None)
         assert connection is not None
         await client.send(3, "session_history", {"session_id": session_id})
         await gate.worker_reading()

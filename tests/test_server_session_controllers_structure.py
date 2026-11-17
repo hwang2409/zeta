@@ -157,8 +157,11 @@ def test_record_indexes_have_one_owner() -> None:
                             "_parked",
                             "_attached",
                             "_records",
+                            "_by_connection",
+                            "_by_session",
                             "_controller_mode",
                             "_controller_members",
+                            "_hello_records",
                             "_hello_generations",
                             "_grace_session_id",
                         )
@@ -167,13 +170,58 @@ def test_record_indexes_have_one_owner() -> None:
                         "SessionController" in text
                         or "ServeControl" in text
                         or "_parked" in attrs
+                        or "_by_connection" in attrs
+                        or "_by_session" in attrs
                         or "_controller_mode" in attrs
                         or "_controller_members" in attrs
+                        or "_hello_records" in attrs
                         or "_hello_generations" in attrs
                         or "_grace_session_id" in attrs
                     )
                 ):
                     assert path.name == "session_controllers.py", f"{path}:{node.lineno}: {text}"
+
+
+def test_multi_controller_lifecycle_has_no_semantic_server_slot_or_global_bypass() -> None:
+    problems: list[str] = []
+    for path in ROOT.rglob("*.py"):
+        rel = _rel(path)
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in {"_client", "_client_active"}:
+                problems.append(f"{rel}:{node.lineno}: {ast.unparse(node)}")
+    def check_legacy_only_calls(node: ast.AST, *, legacy_only: bool = False) -> None:
+        if isinstance(node, ast.If):
+            condition = ast.unparse(node.test)
+            if (
+                "controller_mode ==" in condition and "multi" in condition
+            ) or condition == "multi":
+                for child in node.body:
+                    check_legacy_only_calls(child, legacy_only=False)
+                for child in node.orelse:
+                    check_legacy_only_calls(child, legacy_only=True)
+                return
+            if (
+                "controller_mode ==" in condition and "legacy" in condition
+            ) or condition == "not multi":
+                for child in node.body:
+                    check_legacy_only_calls(child, legacy_only=True)
+                for child in node.orelse:
+                    check_legacy_only_calls(child, legacy_only=False)
+                return
+        if isinstance(node, ast.Call):
+            called = ast.unparse(node.func)
+            if (
+                called.endswith(("server.controls", "server.parking.claim"))
+                or called == "_resume_live_or_parked"
+            ) and not legacy_only:
+                problems.append(f"unguarded legacy owner path: {called}:{node.lineno}")
+        for child in ast.iter_child_nodes(node):
+            check_legacy_only_calls(child, legacy_only=legacy_only)
+
+    check_legacy_only_calls(ast.parse((ROOT / "server.py").read_text()))
+    check_legacy_only_calls(ast.parse((ROOT / "handlers" / "lifecycle.py").read_text()))
+    assert problems == []
 
 
 def test_server_has_only_private_test_aliases() -> None:
