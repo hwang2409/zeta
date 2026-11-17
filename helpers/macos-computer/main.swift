@@ -51,8 +51,33 @@ enum HelperError: Error {
 final class Flag {
     private let lock = NSLock()
     private var value = false
-    func set() { lock.lock(); value = true; lock.unlock() }
+    private var observers: [() -> Void] = []
+
+    func observe(_ observer: @escaping () -> Void) {
+        lock.lock()
+        observers.append(observer)
+        let alreadySet = value
+        lock.unlock()
+        if alreadySet { observer() }
+    }
+
+    func set() {
+        lock.lock()
+        guard !value else { lock.unlock(); return }
+        value = true
+        let callbacks = observers
+        lock.unlock()
+        callbacks.forEach { $0() }
+    }
+
     var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
+
+    // The reply commit is the linearization point. stdout is written after this lock is released.
+    func commitReply() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !value
+    }
 }
 
 let killed = Flag()
@@ -68,7 +93,7 @@ func killCallback(
             && flags.contains(.maskAlternate)
             && flags.contains(.maskCommand)
         {
-            killed.set()
+            activeKill.set()
         }
     }
     return Unmanaged.passUnretained(event)
@@ -208,59 +233,142 @@ func mouseButton(_ name: String) throws -> (down: CGEventType, up: CGEventType, 
     }
 }
 
-func postMouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, clickState: Int = 1) {
-    guard
-        let event = CGEvent(
-            mouseEventSource: eventSource, mouseType: type, mouseCursorPosition: point,
-            mouseButton: button)
-    else { return }
-    if clickState > 1 { event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState)) }
-    event.post(tap: .cghidEventTap)
+final class EventGate {
+    private let lock = NSLock()
+    private let killed: Flag
+    private let poster: (CGEvent) -> Void
+    private var held: Set<CGMouseButton> = []
+    private var heldKeys: [CGKeyCode: CGEventFlags] = [:]
+    private var cursor = CGPoint.zero
+
+    init(killed: Flag, poster: @escaping (CGEvent) -> Void) {
+        self.killed = killed
+        self.poster = poster
+    }
+
+    func post(_ event: CGEvent, type: CGEventType, point: CGPoint, button: CGMouseButton) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !killed.isSet else { throw HelperError.killed }
+        poster(event)
+        if type == .mouseMoved || type == .leftMouseDown || type == .leftMouseDragged ||
+            type == .leftMouseUp || type == .rightMouseDown || type == .rightMouseDragged ||
+            type == .rightMouseUp || type == .otherMouseDown || type == .otherMouseDragged ||
+            type == .otherMouseUp || type == .scrollWheel {
+            cursor = point
+        }
+        if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
+            held.insert(button)
+        } else if type == .leftMouseUp || type == .rightMouseUp || type == .otherMouseUp {
+            held.remove(button)
+        }
+    }
+
+    func postKeyPair(_ down: CGEvent, _ up: CGEvent, keycode: CGKeyCode, flags: CGEventFlags) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !killed.isSet else { throw HelperError.killed }
+        poster(down)
+        heldKeys[keycode] = flags
+        poster(up)
+        heldKeys.removeValue(forKey: keycode)
+    }
+
+    func kill() {
+        lock.lock()
+        defer { lock.unlock() }
+        for button in held {
+            let type: CGEventType = button == .left ? .leftMouseUp :
+                button == .right ? .rightMouseUp : .otherMouseUp
+            if let event = CGEvent(mouseEventSource: eventSource, mouseType: type,
+                                   mouseCursorPosition: cursor, mouseButton: button) {
+                // cleanup is committed under the same lock, at the current cursor position.
+                poster(event)
+            }
+        }
+        held.removeAll()
+        for (keycode, flags) in heldKeys {
+            if let event = CGEvent(keyboardEventSource: eventSource, virtualKey: keycode, keyDown: false) {
+                event.flags = flags
+                poster(event)
+            }
+        }
+        heldKeys.removeAll()
+    }
 }
 
-func moveMouse(_ point: CGPoint) {
-    postMouse(.mouseMoved, point, .left)
+var eventGate = EventGate(killed: killed) { $0.post(tap: .cghidEventTap) }
+var activeKill = killed
+killed.observe { DispatchQueue.global().async { eventGate.kill() } }
+func currentKill() -> Flag { activeKill }
+
+func postMouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, clickState: Int = 1) throws {
+    guard let event = CGEvent(mouseEventSource: eventSource, mouseType: type,
+                              mouseCursorPosition: point, mouseButton: button) else { return }
+    if clickState > 1 { event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState)) }
+    try eventGate.post(event, type: type, point: point, button: button)
+}
+
+func moveMouse(_ point: CGPoint) throws {
+    try postMouse(.mouseMoved, point, .left)
+}
+
+func checkKilled(_ source: Flag = killed) throws {
+    if source.isSet { throw HelperError.killed }
+}
+
+func runInterruptibleSteps<Step>(
+    _ steps: some Sequence<Step>, killSource: Flag, post: (Step) throws -> Void
+) throws {
+    for step in steps {
+        try checkKilled(killSource)
+        try post(step)
+    }
 }
 
 func click(_ point: CGPoint, button name: String, count: Int) throws {
     let b = try mouseButton(name)
     let n = max(1, min(count, 3))
-    for i in 1...n {
-        postMouse(b.down, point, b.button, clickState: i)
-        postMouse(b.up, point, b.button, clickState: i)
+    try runInterruptibleSteps(1...n, killSource: currentKill()) { i in
+        try postMouse(b.down, point, b.button, clickState: i)
+        try postMouse(b.up, point, b.button, clickState: i)
     }
 }
 
-func drag(_ path: [CGPoint]) throws {
+func drag(_ path: [CGPoint], killSource: Flag? = nil) throws {
+    let killSource = killSource ?? currentKill()
     guard let start = path.first else { throw HelperError.badRequest("drag path is empty") }
-    postMouse(.leftMouseDown, start, .left)
-    for point in path.dropFirst() {
-        postMouse(.leftMouseDragged, point, .left)
+    try checkKilled(killSource)
+    try postMouse(.leftMouseDown, start, .left)
+    var lastPostedPoint = start
+    defer { try? postMouse(.leftMouseUp, lastPostedPoint, .left) }
+    try runInterruptibleSteps(path.dropFirst(), killSource: killSource) { point in
+        try postMouse(.leftMouseDragged, point, .left)
+        lastPostedPoint = point
     }
-    postMouse(.leftMouseUp, path.last ?? start, .left)
+    try checkKilled(killSource)
 }
 
-func scroll(at point: CGPoint, dx: Int, dy: Int) {
-    moveMouse(point)
+func scroll(at point: CGPoint, dx: Int, dy: Int) throws {
+    try moveMouse(point)
     guard
         let event = CGEvent(
             scrollWheelEvent2Source: eventSource, units: .pixel, wheelCount: 2, wheel1: Int32(dy),
             wheel2: Int32(dx), wheel3: 0)
     else { return }
-    event.post(tap: .cghidEventTap)
+    try eventGate.post(event, type: .scrollWheel, point: point, button: .left)
 }
 
-func typeText(_ text: String) {
-    for ch in text {
+func typeText(_ text: String, killSource: Flag? = nil) throws {
+    try runInterruptibleSteps(Array(text), killSource: killSource ?? currentKill()) { ch in
         var utf16 = Array(String(ch).utf16)
         guard
             let down = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true),
             let up = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: false)
-        else { continue }
+        else { return }
         down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
         up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        try eventGate.postKeyPair(down, up, keycode: 0, flags: down.flags)
     }
 }
 
@@ -281,6 +389,7 @@ let keyCodes: [String: CGKeyCode] = [
 ]
 
 func keyCombo(_ combo: String) throws {
+    try checkKilled(currentKill())
     let parts = combo.lowercased().split(separator: "+").map(String.init)
     guard !parts.isEmpty else { throw HelperError.badRequest("empty key combo") }
     var flags: CGEventFlags = []
@@ -306,8 +415,7 @@ func keyCombo(_ combo: String) throws {
     else { throw HelperError.internalError("could not create key event") }
     down.flags = flags
     up.flags = flags
-    down.post(tap: .cghidEventTap)
-    up.post(tap: .cghidEventTap)
+    try eventGate.postKeyPair(down, up, keycode: code, flags: flags)
 }
 
 // MARK: - request handling
@@ -322,7 +430,10 @@ func pointArg(_ req: [String: Any]) throws -> CGPoint {
     return CGPoint(x: Double(try intArg(req, "x")), y: Double(try intArg(req, "y")))
 }
 
+var selfTestMode = false
+
 func guardInput() throws {
+    if selfTestMode { return }
     if screenIsLocked() { throw HelperError.locked }
     if secureInputEnabled() || securityPromptFrontmost() { throw HelperError.secureInput }
     if !AXIsProcessTrusted() { throw HelperError.notPermitted("Accessibility permission is required") }
@@ -361,7 +472,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         ]
     case "move":
         try guardInput()
-        moveMouse(try pointArg(req))
+        try moveMouse(try pointArg(req))
         return [:]
     case "click":
         try guardInput()
@@ -372,12 +483,12 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
     case "mouse_down":
         try guardInput()
         let b = try mouseButton((req["button"] as? String) ?? "left")
-        postMouse(b.down, try pointArg(req), b.button)
+        try postMouse(b.down, try pointArg(req), b.button)
         return [:]
     case "mouse_up":
         try guardInput()
         let b = try mouseButton((req["button"] as? String) ?? "left")
-        postMouse(b.up, try pointArg(req), b.button)
+        try postMouse(b.up, try pointArg(req), b.button)
         return [:]
     case "drag":
         try guardInput()
@@ -400,7 +511,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         guard let text = req["text"] as? String else {
             throw HelperError.badRequest("type needs text")
         }
-        typeText(text)
+        try typeText(text)
         return [:]
     case "key":
         try guardInput()
@@ -411,21 +522,74 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         return [:]
     case "scroll":
         try guardInput()
-        scroll(at: try pointArg(req), dx: try intArg(req, "dx"), dy: try intArg(req, "dy"))
+        try scroll(at: try pointArg(req), dx: try intArg(req, "dx"), dy: try intArg(req, "dy"))
         return [:]
     default:
         throw HelperError.badRequest("unknown op: \(op)")
     }
 }
 
+// MARK: - indicator and application lifecycle
+
+final class Indicator {
+    private var windows: [NSWindow] = []
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+    init() {
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Zeta controls the desktop", action: nil, keyEquivalent: "")
+        menu.addItem(withTitle: "kill: ctrl+opt+cmd+esc", action: nil, keyEquivalent: "")
+        statusItem.menu = menu
+        statusItem.button?.title = "Zeta controls the desktop"
+        killed.observe { [weak self] in
+            DispatchQueue.main.async { self?.showKilled() }
+        }
+    }
+
+    func showActive() {
+        guard !killed.isSet else { return }
+        windows = NSScreen.screens.map { screen in
+            let window = NSWindow(contentRect: screen.frame, styleMask: .borderless, backing: .buffered, defer: false)
+            window.backgroundColor = .clear
+            window.isOpaque = false
+            window.ignoresMouseEvents = true
+            window.level = .screenSaver
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            let view = NSView(frame: window.contentView?.bounds ?? screen.frame)
+            view.wantsLayer = true
+            view.layer?.borderColor = NSColor.systemRed.cgColor
+            view.layer?.borderWidth = 4
+            view.autoresizingMask = [.width, .height]
+            window.contentView = view
+            window.orderFrontRegardless()
+            return window
+        }
+    }
+
+    func hide() {
+        windows.forEach { $0.orderOut(nil) }
+        windows.removeAll()
+    }
+
+    private func showKilled() {
+        hide()
+        statusItem.button?.title = "Zeta desktop control killed"
+        statusItem.menu?.items.forEach { $0.isEnabled = false }
+    }
+}
+
 // MARK: - stdio loop
 
 let stdout = FileHandle.standardOutput
+let responseLock = NSLock()
+let actionQueue = DispatchQueue(label: "zeta-computer-helper.actions")
 
 func writeResponse(_ dict: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
+    responseLock.lock()
     stdout.write(data)
     stdout.write(Data([0x0a]))
+    responseLock.unlock()
 }
 
 func errorResponse(_ id: Int, _ error: Error) -> [String: Any] {
@@ -433,34 +597,132 @@ func errorResponse(_ id: Int, _ error: Error) -> [String: Any] {
     return ["id": id, "ok": false, "error": ["code": he.code, "message": he.message]]
 }
 
-installKillSwitch()
-
-while let line = readLine(strippingNewline: true) {
-    if line.isEmpty { continue }
-    guard let data = line.data(using: .utf8),
-        let req = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-    else {
-        writeResponse([
-            "id": 0, "ok": false,
-            "error": ["code": "bad_request", "message": "malformed request line"],
-        ])
-        continue
+func runRequest(
+    id: Int, op: String, request: [String: Any], indicator: Indicator,
+    beforeCommit: (() -> Void)? = nil, sink: @escaping ([String: Any]) -> Void
+) {
+    if currentKill().isSet {
+        sink(errorResponse(id, HelperError.killed))
+        return
     }
-    let id = (req["id"] as? Int) ?? 0
-    guard let op = req["op"] as? String else {
-        writeResponse(errorResponse(id, HelperError.badRequest("missing op")))
-        continue
-    }
-    if killed.isSet {
-        writeResponse(errorResponse(id, HelperError.killed))
-        continue
-    }
+    if !selfTestMode { DispatchQueue.main.sync { indicator.showActive() } }
     do {
-        var payload = try handle(op, req)
+        var payload = try handle(op, request)
         payload["id"] = id
         payload["ok"] = true
-        writeResponse(payload)
+        beforeCommit?()
+        sink(currentKill().commitReply() ? payload : errorResponse(id, HelperError.killed))
     } catch {
-        writeResponse(errorResponse(id, error))
+        sink(errorResponse(id, error))
+    }
+    if !selfTestMode { DispatchQueue.main.sync { if !killed.isSet { indicator.hide() } } }
+}
+
+func selfTestKill() {
+    selfTestMode = true
+    let cases: [(String, String, Int)] = [
+        ("drag", "drag", 2), ("type", "type", 1), ("mouse_down", "mouse_down", 1),
+        ("kill_after_last_step", "type", 2), ("kill_before_commit", "type", 2),
+        ("kill_after_commit", "type", 2),
+    ]
+    func triggerKill() {
+        let event = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true)!
+        event.flags = [.maskControl, .maskAlternate, .maskCommand]
+        _ = killCallback(proxy: OpaquePointer(bitPattern: 1)!, type: .keyDown, event: event, userInfo: nil)
+    }
+    for (name, op, blockAfter) in cases {
+        let flag = Flag()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let cleanup = DispatchSemaphore(value: 0)
+        var events: [String] = []
+        var posts = 0
+        let gate = EventGate(killed: flag) { event in
+            posts += 1
+            if event.type == .leftMouseDown { events.append("mouse_down") }
+            else if event.type == .leftMouseDragged { events.append("drag_\(posts - 1)") }
+            else if event.type == .leftMouseUp { events.append("mouse_up"); cleanup.signal() }
+            else if event.type == .keyDown { events.append("key_down") }
+            else if event.type == .keyUp { events.append("key_up") }
+            if posts == blockAfter { entered.signal(); release.wait() }
+        }
+        eventGate = gate
+        activeKill = flag
+        flag.observe { DispatchQueue.global().async { gate.kill() } }
+        let replies = DispatchSemaphore(value: 0)
+        var reply = ""
+        actionQueue.async {
+            let req: [String: Any] = op == "drag"
+                ? ["path": [[1, 1], [2, 2], [3, 3]]]
+                : op == "mouse_down" ? ["x": 4, "y": 5, "button": "left"]
+                : ["text": "ab"]
+            runRequest(
+                id: 1, op: op, request: req, indicator: indicator,
+                beforeCommit: name == "kill_before_commit" ? triggerKill : nil
+            ) { response in
+                reply = (response["ok"] as? Bool == true) ? "ok" :
+                    ((response["error"] as? [String: Any])?["code"] as? String ?? "internal")
+                replies.signal()
+            }
+        }
+        entered.wait()
+        if name == "kill_after_commit" {
+            release.signal(); replies.wait(); triggerKill(); actionQueue.sync {}
+        } else if name == "kill_before_commit" {
+            release.signal(); actionQueue.sync {}
+        } else {
+            triggerKill()
+            release.signal(); actionQueue.sync {}
+            if name == "mouse_down" { cleanup.wait() }
+        }
+        var later = ""
+        runRequest(id: 2, op: "type", request: ["text": "z"], indicator: indicator) { response in
+            later = (response["ok"] as? Bool == true) ? "ok" :
+                ((response["error"] as? [String: Any])?["code"] as? String ?? "internal")
+        }
+        if name != "kill_after_commit" { replies.wait() }
+        print((try? JSONSerialization.data(withJSONObject: [
+            "name": name, "events": events, "reply": reply, "later_reply": later,
+        ])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
     }
 }
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+let indicator = Indicator()
+killed.observe { DispatchQueue.main.async { indicator.hide() } }
+if CommandLine.arguments.contains("--selftest-kill") {
+    selfTestKill()
+    exit(0)
+}
+installKillSwitch()
+
+Thread {
+    while let line = readLine(strippingNewline: true) {
+        if line.isEmpty { continue }
+        guard let data = line.data(using: .utf8),
+            let req = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            writeResponse([
+                "id": 0, "ok": false,
+                "error": ["code": "bad_request", "message": "malformed request line"],
+            ])
+            continue
+        }
+        let id = (req["id"] as? Int) ?? 0
+        guard let op = req["op"] as? String else {
+            writeResponse(errorResponse(id, HelperError.badRequest("missing op")))
+            continue
+        }
+        actionQueue.async {
+            runRequest(id: id, op: op, request: req, indicator: indicator, sink: writeResponse)
+        }
+    }
+    actionQueue.sync {}
+    DispatchQueue.main.sync {
+        indicator.hide()
+        app.terminate(nil)
+    }
+}.start()
+
+app.run()
