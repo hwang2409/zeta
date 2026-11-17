@@ -264,7 +264,7 @@ _VALID: dict[str, object] = {
     "depth": 1, "background": True, "turn_number": 1, "notification": False, "tool_count": 0,
     "provider": "claude", "stream": True, "name": "bash", "tool_type": "function",
     "call_id": "toolu_01A09q90qw90lq917835lq9", "emergency": False, "tokens_before": 10, "tokens_after": 5,
-    "marker_count": 1, "input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "attempt": 1,
+    "input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "attempt": 1,
     "reason": "stream_error", "delay": 2, "after": False, "decision": "allow", "scope": "once", "duration": 4,
     "finish_reason": "end_turn", "argument_bytes": 5, "result_bytes": 6,
 }
@@ -287,7 +287,7 @@ _ADVERSARIAL = {
     "unicode": "unicode-\u2603",
 }
 _HELPERS = ("agent_span", "turn_span", "inference_span", "tool_span", "context_span")
-_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "fail")
+_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "set_compaction", "fail")
 # where a shape-accepted value may appear: "<name>" is the span name.
 _SHAPE_FIELDS = {
     ("agent_span", "profile"): {"<name>"},

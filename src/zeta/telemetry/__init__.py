@@ -68,6 +68,10 @@ class SpanHandle:
         if self._implementation is not None:
             self._implementation.set_sizes(argument_bytes=argument_bytes, result_bytes=result_bytes)
 
+    def set_compaction(self, *, tokens_after: int) -> None:
+        if self._implementation is not None:
+            self._implementation.set_compaction(tokens_after=tokens_after)
+
     def fail(self, exc: BaseException | type[BaseException] | None) -> None:
         """Mark the span failed; ``None`` is a failure with no exception (error.type ``_OTHER``)."""
         if self._implementation is not None:
@@ -171,12 +175,12 @@ class Telemetry:
             "zeta.agent.name": agent_name, "gen_ai.conversation.id": conversation_id,
         })
 
-    def context_span(self, *, emergency: bool, tokens_before: int, tokens_after: int, marker_count: int) -> SpanHandle:
+    def context_span(self, *, emergency: bool, tokens_before: int) -> SpanHandle:
+        """One compaction; its handle's ``set_compaction`` records the result."""
         if self._implementation is None:
             return _NOOP
         return self._span("zeta.context.compact", operation="context", attributes={
             "zeta.emergency": emergency, "zeta.tokens.before": tokens_before,
-            "zeta.tokens.after": tokens_after, "zeta.marker.count": marker_count,
         })
 
     def _span(self, name: str, *, kind: str = "internal", operation: str, attributes: Mapping[str, object] | None = None) -> SpanHandle:

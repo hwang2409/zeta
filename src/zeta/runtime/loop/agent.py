@@ -303,6 +303,7 @@ class AgentLoop(
             on_completion_success=on_completion_success,
             usage_sink=usage_sink,
         )
+        self.context_assembler.telemetry = self.telemetry
         self._initialize_step_delivery(store)
         self._configure_live_config(
             skill_catalog=self.tool_registry.skill_catalog,
