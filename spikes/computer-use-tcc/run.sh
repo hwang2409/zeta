@@ -184,12 +184,28 @@ _report_line() {
 }
 
 cmd_selftest() {
+  local real_results="$HOME/.zeta/scratch/computer-use/slice0-results.md"
+  local real_results_path results_path selftest_results
+  real_results_path="$(cd "$(dirname "$real_results")" && pwd -P)/$(basename "$real_results")"
+  results_path="$(cd "$(dirname "$RESULTS")" 2>/dev/null && pwd -P)/$(basename "$RESULTS")" || results_path="$RESULTS"
+  if [ -n "${CUSPIKE_RESULTS+x}" ] && [ "$results_path" = "$real_results_path" ]; then
+    printf 'FAIL selftest refuses real results file: %s\n' "$RESULTS"
+    return 1
+  fi
+  selftest_results="$(mktemp "${TMPDIR:-/tmp}/cuspike-selftest-results.XXXXXX")" || return 1
+  chmod 700 "$selftest_results"
+  trap 'agent_cleanup; rm -f "${selftest_results:-}"' EXIT
+  RESULTS="$selftest_results"
+
   local name input expected expected_status values actual status
   while IFS='|' read -r name input expected expected_status; do
     values="$(_preflight_values "$input")"
     if actual="$(classify_rebuild_result "$values" old new 0)"; then status=0; else status=$?; fi
     printf '%-18s %-12s status=%s\n' "$name" "$actual" "$status"
-    [ "$actual" = "$expected" ] && [ "$status" -eq "$expected_status" ] || return 1
+    if [ "$actual" != "$expected" ] || [ "$status" -ne "$expected_status" ]; then
+      printf 'FAIL classify %s: expected %s/status=%s, got %s/status=%s\n' "$name" "$expected" "$expected_status" "$actual" "$status"
+      return 1
+    fi
   done <<'EOF'
 both-true|screen_recording=true accessibility=true|SURVIVED|0
 both-false|screen_recording=false accessibility=false|LOST|1
@@ -197,14 +213,32 @@ split|screen_recording=true accessibility=false|INCONCLUSIVE|2
 malformed|screen_recording=yes accessibility=false|INCONCLUSIVE|2
 empty||INCONCLUSIVE|2
 EOF
+  # Keep the helper's responsible-process line in this fixture: round 1 saw the
+  # real two-line output rejected as malformed.
+  local real_helper_output='responsible_pid=123 executable=/usr/bin/cuspike bundle_id=com.henry.zeta.cuspike
+screen_recording=true accessibility=true'
+  for name in real-helper-old-rebuild real-helper-agent-rebuild; do
+    if actual="$(classify_rebuild_result "$(_preflight_values "$real_helper_output")" old new 0)"; then status=0; else status=$?; fi
+    printf '%-18s %-12s status=%s\n' "$name" "$actual" "$status"
+    if [ "$actual" != SURVIVED ] || [ "$status" -ne 0 ]; then
+      printf 'FAIL classify %s: expected SURVIVED/status=0, got %s/status=%s\n' "$name" "$actual" "$status"
+      return 1
+    fi
+  done
   # The last two cases exercise the same failure gates used by rebuild commands.
   if actual="$(classify_rebuild_result "true true" same same 0)"; then status=0; else status=$?; fi
   printf '%-18s %-12s status=%s\n' unchanged-cdhash "$actual" "$status"
-  [ "$actual" = INCONCLUSIVE ] && [ "$status" -eq 2 ] || return 1
+  if [ "$actual" != INCONCLUSIVE ] || [ "$status" -ne 2 ]; then
+    printf 'FAIL classify unchanged-cdhash: expected INCONCLUSIVE/status=2, got %s/status=%s\n' "$actual" "$status"
+    return 1
+  fi
   if actual="$(classify_rebuild_result "true true" old new 1)"; then status=0; else status=$?; fi
   printf '%-18s %-12s status=%s\n' build-failure "$actual" "$status"
-  [ "$actual" = INCONCLUSIVE ] && [ "$status" -eq 2 ] || return 1
-  local path mode output status_line
+  if [ "$actual" != INCONCLUSIVE ] || [ "$status" -ne 2 ]; then
+    printf 'FAIL classify build-failure: expected INCONCLUSIVE/status=2, got %s/status=%s\n' "$actual" "$status"
+    return 1
+  fi
+  local path mode output status_line expected_status
   for path in agent agent-rebuild; do
     for mode in success failure timeout; do
       output="${TMPDIR:-/tmp}/com.henry.zeta.cuspike-selftest-output.$$"
@@ -214,13 +248,28 @@ EOF
       else
         if cmd_agent_rebuild adhoc >"$output" 2>&1; then status_line=0; else status_line=$?; fi
       fi
-      awk '
+      case "$path:$mode" in
+        agent:success|agent-rebuild:success) expected_status=0 ;;
+        agent:failure) expected_status=7 ;;
+        agent:timeout) expected_status=124 ;;
+        agent-rebuild:failure|agent-rebuild:timeout) expected_status=2 ;;
+      esac
+      if [ "$status_line" -ne "$expected_status" ]; then
+        printf 'FAIL %s %s: expected status=%s, got status=%s\n' "$path" "$mode" "$expected_status" "$status_line"
+        return 1
+      fi
+      if ! awk '
         /dry-run: rm -rf / { removed = NR }
         /dry-run: launchctl bootout / { booted = NR }
         END { exit !(removed && booted && booted > removed) }
-      ' "$output" || return 1
-      [ -z "$AGENT_DIR" ] || return 1
-      if find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'com.henry.zeta.cuspike.*' -print -quit 2>/dev/null | grep -q .; then return 1; fi
+      ' "$output"; then
+        printf 'FAIL %s %s: cleanup order is invalid\n' "$path" "$mode"
+        return 1
+      fi
+      if [ -n "$AGENT_DIR" ]; then
+        printf 'FAIL %s %s: AGENT_DIR remains set\n' "$path" "$mode"
+        return 1
+      fi
       printf '%-18s %-12s status=%s cleanup=ok\n' "$path" "$mode" "$status_line"
       rm -f "$output"
     done
