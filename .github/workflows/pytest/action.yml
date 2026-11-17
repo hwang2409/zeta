@@ -31,6 +31,11 @@ runs:
 
     # --frozen pins the resolution to uv.lock so a transitive bump cannot
     # turn main red without a lockfile change in the diff.
+    - name: Install tmux on macOS
+      if: runner.os == 'macOS'
+      shell: bash
+      run: brew install tmux
+
     # Bound worker count on both runners and rebalance uneven test durations.
     # Report slow tests so future bottlenecks are visible in the CI logs.
     - name: Run the suite
