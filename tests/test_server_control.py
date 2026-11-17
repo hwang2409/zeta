@@ -187,6 +187,7 @@ async def test_feature_publication_receipt_accounts_every_recipient(
         return controller_accepts
 
     monkeypatch.setattr(registry, "send", send)
+    # test-contract: seam force each observer admission result independently
     monkeypatch.setattr(
         registry, "_publish_observer", lambda _state, _frame: observer_accepts
     )

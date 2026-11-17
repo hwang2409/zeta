@@ -390,14 +390,8 @@ class ExtensionHost:
                 "text": text, "level": "warning",
             },
         )
-        accepted = False
         try:
-            receipt = sink(event)
-            if inspect.isawaitable(receipt):
-                receipt = await asyncio.wait_for(receipt, 0.25)
-            accepted = receipt is not False
-        except Exception:  # noqa: BLE001 - warning delivery is best effort
-            self.notify_dropped += 1
+            accepted = await self._deliver_safety(sink, event)
         finally:
             self._safety_in_flight.discard(extension)
             if not self._safety_in_flight:
@@ -412,6 +406,16 @@ class ExtensionHost:
             self.notify_dropped += count
         elif not self._closing:
             self._ensure_safety_refill()
+
+    async def _deliver_safety(self, sink: Any, event: StreamEvent) -> bool:
+        try:
+            receipt = sink(event)
+            if inspect.isawaitable(receipt):
+                receipt = await asyncio.wait_for(receipt, 0.25)
+            return receipt is not False
+        except Exception:  # noqa: BLE001 - warning delivery is best effort
+            self.notify_dropped += 1
+            return False
 
     def _ensure_safety_refill(self) -> None:
         if self._safety_refill_task is None or self._safety_refill_task.done():

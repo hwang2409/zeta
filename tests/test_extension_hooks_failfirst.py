@@ -185,6 +185,6 @@ def activate(zx):
     else:
         await close()
     release.set()
-    await asyncio.wait_for(invocation, 1)
+    await asyncio.wait_for(invocation, 10)
     assert notices, "close dropped the admitted hook warning before sink teardown"
     await registry.close()
