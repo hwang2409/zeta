@@ -8785,6 +8785,9 @@ class _RecordingExtensionHost:
     ) -> None:
         self.binds.append((sink, loop))
 
+    def register_commands(self, registry: object) -> None:
+        del registry
+
     def close(self) -> None:
         pass
 
