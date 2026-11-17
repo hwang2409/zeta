@@ -38,7 +38,6 @@ from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, Scripte
 from tests.support.owned import await_or_fail
 from tests.support.processes import wait_for_path_command
 from zeta.accounts import AccountCredentialLockTimeoutError
-from zeta.agent.receipt import finalize_agent_results
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.background_lifecycle import (
@@ -58,6 +57,7 @@ from zeta.agent.presets import (
     GENERAL_PRESET,
     AgentPreset,
 )
+from zeta.agent.receipt import finalize_agent_results
 from zeta.agent.runner import _child_base_system_prompt
 from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.config.settings import SettingsError, load_settings
