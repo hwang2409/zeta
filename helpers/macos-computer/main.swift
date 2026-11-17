@@ -264,6 +264,14 @@ final class EventGate {
         }
     }
 
+    func postKey(_ event: CGEvent, keycode: CGKeyCode, flags: CGEventFlags, down: Bool) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !killed.isSet else { throw HelperError.killed }
+        poster(event)
+        if down { heldKeys[keycode] = flags } else { heldKeys.removeValue(forKey: keycode) }
+    }
+
     func postKeyPair(_ down: CGEvent, _ up: CGEvent, keycode: CGKeyCode, flags: CGEventFlags) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -302,10 +310,27 @@ var activeKill = killed
 killed.observe { DispatchQueue.global().async { eventGate.kill() } }
 func currentKill() -> Flag { activeKill }
 
-func postMouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, clickState: Int = 1) throws {
+func modifierFlags(_ raw: Any?) -> CGEventFlags {
+    guard let names = raw as? [String] else { return [] }
+    var flags: CGEventFlags = []
+    for name in names {
+        switch name.lowercased() {
+        case "cmd", "command", "meta", "super": flags.insert(.maskCommand)
+        case "shift": flags.insert(.maskShift)
+        case "ctrl", "control": flags.insert(.maskControl)
+        case "opt", "option", "alt": flags.insert(.maskAlternate)
+        case "fn", "function": flags.insert(.maskSecondaryFn)
+        default: break
+        }
+    }
+    return flags
+}
+
+func postMouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, clickState: Int = 1, flags: CGEventFlags = []) throws {
     guard let event = CGEvent(mouseEventSource: eventSource, mouseType: type,
                               mouseCursorPosition: point, mouseButton: button) else { return }
     if clickState > 1 { event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState)) }
+    event.flags = flags
     try eventGate.post(event, type: type, point: point, button: button)
 }
 
@@ -326,12 +351,12 @@ func runInterruptibleSteps<Step>(
     }
 }
 
-func click(_ point: CGPoint, button name: String, count: Int) throws {
+func click(_ point: CGPoint, button name: String, count: Int, flags: CGEventFlags = []) throws {
     let b = try mouseButton(name)
     let n = max(1, min(count, 3))
     try runInterruptibleSteps(1...n, killSource: currentKill()) { i in
-        try postMouse(b.down, point, b.button, clickState: i)
-        try postMouse(b.up, point, b.button, clickState: i)
+        try postMouse(b.down, point, b.button, clickState: i, flags: flags)
+        try postMouse(b.up, point, b.button, clickState: i, flags: flags)
     }
 }
 
@@ -349,13 +374,14 @@ func drag(_ path: [CGPoint], killSource: Flag? = nil) throws {
     try checkKilled(killSource)
 }
 
-func scroll(at point: CGPoint, dx: Int, dy: Int) throws {
+func scroll(at point: CGPoint, dx: Int, dy: Int, flags: CGEventFlags = []) throws {
     try moveMouse(point)
     guard
         let event = CGEvent(
-            scrollWheelEvent2Source: eventSource, units: .pixel, wheelCount: 2, wheel1: Int32(dy),
+            scrollWheelEvent2Source: eventSource, units: .line, wheelCount: 2, wheel1: Int32(dy),
             wheel2: Int32(dx), wheel3: 0)
     else { return }
+    event.flags = flags
     try eventGate.post(event, type: .scrollWheel, point: point, button: .left)
 }
 
@@ -388,7 +414,7 @@ let keyCodes: [String: CGKeyCode] = [
     "f9": 101, "f10": 109, "f11": 103, "f12": 111,
 ]
 
-func keyCombo(_ combo: String) throws {
+func keyCombo(_ combo: String, repeatCount: Int = 1, hold: Bool = false, release: Bool = false) throws {
     try checkKilled(currentKill())
     let parts = combo.lowercased().split(separator: "+").map(String.init)
     guard !parts.isEmpty else { throw HelperError.badRequest("empty key combo") }
@@ -415,7 +441,12 @@ func keyCombo(_ combo: String) throws {
     else { throw HelperError.internalError("could not create key event") }
     down.flags = flags
     up.flags = flags
-    try eventGate.postKeyPair(down, up, keycode: code, flags: flags)
+    let count = max(1, min(repeatCount, 100))
+    if hold || release {
+        try eventGate.postKey(hold ? down : up, keycode: code, flags: flags, down: hold)
+    } else {
+        for _ in 0..<count { try eventGate.postKeyPair(down, up, keycode: code, flags: flags) }
+    }
 }
 
 // MARK: - request handling
@@ -427,6 +458,9 @@ func intArg(_ req: [String: Any], _ key: String) throws -> Int {
 }
 
 func pointArg(_ req: [String: Any]) throws -> CGPoint {
+    if req["x"] == nil && req["y"] == nil {
+        return CGEvent(source: nil)?.location ?? .zero
+    }
     return CGPoint(x: Double(try intArg(req, "x")), y: Double(try intArg(req, "y")))
 }
 
@@ -478,7 +512,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         try guardInput()
         let button = (req["button"] as? String) ?? "left"
         let count = (req["count"] as? Int) ?? 1
-        try click(try pointArg(req), button: button, count: count)
+        try click(try pointArg(req), button: button, count: count, flags: modifierFlags(req["modifiers"]))
         return [:]
     case "mouse_down":
         try guardInput()
@@ -518,11 +552,15 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         guard let combo = req["combo"] as? String else {
             throw HelperError.badRequest("key needs combo")
         }
-        try keyCombo(combo)
+        let repeatCount = (req["repeat"] as? Int) ?? 1
+        let hold = (req["hold"] as? Bool) ?? false
+        let release = (req["release"] as? Bool) ?? false
+        if hold && release { throw HelperError.badRequest("hold and release are exclusive") }
+        try keyCombo(combo, repeatCount: repeatCount, hold: hold, release: release)
         return [:]
     case "scroll":
         try guardInput()
-        try scroll(at: try pointArg(req), dx: try intArg(req, "dx"), dy: try intArg(req, "dy"))
+        try scroll(at: try pointArg(req), dx: try intArg(req, "dx"), dy: try intArg(req, "dy"), flags: modifierFlags(req["modifiers"]))
         return [:]
     default:
         throw HelperError.badRequest("unknown op: \(op)")

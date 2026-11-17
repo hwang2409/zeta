@@ -142,6 +142,10 @@ class HelperClient:
             raise HelperError(error["code"], error["message"])
         return {k: v for k, v in response.items() if k not in ("id", "ok")}
 
+    def cancel(self) -> None:
+        """Abort the in-flight request so its lock and pipe are released."""
+        self._kill()
+
     def _kill(self) -> None:
         proc = self._proc
         if proc is not None and proc.poll() is None:
