@@ -295,6 +295,7 @@ def test_telemetry_off_leaves_mcp_wire_bytes_unchanged(tmp_path, monkeypatch, tr
             MCPServerConfig("fake", "streamable-http", url="https://mcp.test"),
             client=httpx.AsyncClient(transport=httpx.MockTransport(_http_handler(seen))),
         )
+        # test-contract: seam the mount builds this real HTTP client over an in-process transport
         monkeypatch.setattr(mount_module, "_build_client", lambda _config: client)
     params = {
         "tools/call": {"name": "echo", "arguments": {"value": SECRET}},
