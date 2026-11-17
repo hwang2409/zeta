@@ -23,6 +23,7 @@ from rich.console import Console
 import zeta.agent.background_lifecycle as agent_background_module
 import zeta.agent.child_context as child_context_module
 import zeta.agent.pending_delivery as pending_delivery_module
+import zeta.agent.receipt as agent_receipt_module
 import zeta.agent.run_consumer as run_consumer_module
 import zeta.agent.runner as agent_runner_module
 import zeta.core.store._log as store_log_module
@@ -9394,6 +9395,22 @@ async def test_setup_failure_persists_canonical_terminal_receipt(
         raise RuntimeError("child setup failed")
 
     monkeypatch.setattr(registry, "clone_for_session", fail_setup)
+    original_agent_stats = agent_receipt_module.agent_stats
+
+    def advance_render_clock(
+        lifecycle: dict[str, object] | None,
+        *,
+        status: str | None = None,
+        turns_used: int = 0,
+    ) -> dict[str, object]:
+        stats = original_agent_stats(
+            lifecycle, status=status, turns_used=turns_used
+        )
+        stats["elapsed"] = 0.2
+        return stats
+
+    # Force the parent finalization render to observe a later clock reading.
+    monkeypatch.setattr(agent_receipt_module, "agent_stats", advance_render_clock)
     await _collect(
         AgentLoop(
             backend,
@@ -9413,6 +9430,87 @@ async def test_setup_failure_persists_canonical_terminal_receipt(
     assert lifecycle["final_result"] == result.content
     assert lifecycle["final_result_is_receipt"] is True
     assert result.content.endswith("error=true · canceled=false")
+
+
+@pytest.mark.asyncio
+async def test_newer_cancel_wins_over_persisted_setup_failure_receipt(
+    tmp_path: Path,
+) -> None:
+    call = _agent_call("cancel-after-setup-failure")
+    child = ConversationStore(tmp_path / "child", session_id="1")
+    child.start_agent_lifecycle(
+        handle="parent:1",
+        started_at="2026-09-30T00:00:00Z",
+        depth=1,
+        agent_type="agent",
+        description="child",
+    )
+    child.finish_agent_lifecycle(
+        "failed",
+        final_result="stale setup failure receipt",
+        turns_used=0,
+    )
+    child.update_agent_lifecycle_result(
+        "stale setup failure receipt", canonical_receipt=True
+    )
+    cancel = ToolResult(
+        call.id,
+        "cancel wins",
+        is_error=True,
+        is_canceled=True,
+        structured_content={"status": "failed"},
+        lifecycle_projection={"state": "failed"},
+    )
+
+    class Owner:
+        hooks = None
+        agent_instance_id = None
+
+        def __init__(self) -> None:
+            self.store = SimpleNamespace(
+                session_id="parent",
+                finish_agent_child=lambda child_id: None,
+            )
+            self._background_owner = SimpleNamespace(
+                release_unused_stores=lambda: None,
+                mark_store_finished=lambda store: None,
+            )
+            self._agent_child_stores = {call.id: child}
+            self._agent_child_turns = {call.id: 0}
+            self._agent_child_types = {call.id: "agent"}
+
+        def _existing_tool_result(self, tool_call_id: str) -> ToolResult:
+            assert tool_call_id == call.id
+            return cancel
+
+        def _child_result_payload(
+            self, tool_call_id: str, content: str, **kwargs: object
+        ) -> dict[str, object]:
+            del tool_call_id, kwargs
+            return {
+                "content": [{"type": "text", "text": content, "truncated": False}],
+                "isError": True,
+                "isCanceled": True,
+                "structuredContent": {"status": "failed"},
+            }
+
+        def _canceled_agent_result(
+            self, tool_call_id: str, **kwargs: object
+        ) -> ToolResult:
+            del kwargs
+            return ToolResult(
+                tool_call_id,
+                "cancel wins",
+                is_error=True,
+                is_canceled=True,
+            )
+
+    try:
+        result = agent_receipt_module.finalize_agent_results(Owner(), [call], [None])[0]
+        assert result.content == "cancel wins"
+        assert result.is_canceled is True
+    finally:
+        child.close()
 
 
 @pytest.mark.asyncio

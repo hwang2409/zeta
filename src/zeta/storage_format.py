@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, shape_lock
 
-WRITER_EPOCH: Final = 11
+WRITER_EPOCH: Final = 12
 P06_FEATURE_EPOCH: Final = 6
 
 
@@ -39,6 +39,7 @@ class StorageFeature(StrEnum):
     SESSION_RETENTION = "session_retention"
     SESSION_RETENTION_ACTIVATION = "session_retention_activation"
     INBOX_DURABLE_INTENT = "inbox_durable_intent"
+    TRANSCRIPT_TAIL_EVIDENCE = "transcript_tail_evidence"
 
 
 FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
@@ -50,6 +51,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.INBOX_DELEGATION: 7,
     StorageFeature.SESSION_RETENTION: 8,
     StorageFeature.SESSION_RETENTION_ACTIVATION: 11,
+    StorageFeature.TRANSCRIPT_TAIL_EVIDENCE: 12,
     # APPROVAL_RESTART_REASON and INBOX_DURABLE_INTENT must be fixed int literals
     # (test_storage_feature_epochs forbids referencing WRITER_EPOCH here).
     # Recheck main+1 at the final merge.
@@ -299,7 +301,9 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "sent_message_ledger.reported_status": frozenset({"claimed", "done"}),
     "sent_message_ledger.schema_version": frozenset({1, 2}),
     "sent_message_ledger.publication": frozenset({"pending", "published"}),
-    "transcript_recovery.evidence_schema": frozenset({"zeta.transcript-quarantine.v1"}),
+    "transcript_recovery.evidence_schema": frozenset(
+        {"zeta.transcript-quarantine.v1", "zeta.transcript-quarantine.v2"}
+    ),
     "transcript_recovery.state_schema": frozenset({"zeta.transcript-recovery.v1"}),
     "transcript_recovery.state": frozenset({"pending", "committed", "abandoned"}),
     "transcript_recovery.memory_step": frozenset(

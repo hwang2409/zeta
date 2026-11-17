@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
@@ -33,10 +34,16 @@ from .errors import (
 _BUFFER_SIZE = 1024 * 1024
 _MAX_RECORD_BYTES = 64 * 1024
 _MAX_RECORDS = 1024
+# A recovery file listed by a lock-free reader can be pruned before it is read.
+_LISTING_ATTEMPTS = 3
+# Resolved quarantine sets kept per transcript; older ones are pruned.
+_RETAINED_RESOLVED_SETS = 3
 _MAX_TEXT_BYTES = 1024
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _ID = re.compile(r"[0-9a-f]{32}\Z")
-_EVIDENCE_SCHEMA = "zeta.transcript-quarantine.v1"
+# v1 payload is the whole original transcript; v2 payload is only the dropped tail.
+_EVIDENCE_SCHEMA_V1 = "zeta.transcript-quarantine.v1"
+_EVIDENCE_SCHEMA_V2 = "zeta.transcript-quarantine.v2"
 _STATE_SCHEMA = "zeta.transcript-recovery.v1"
 _EVIDENCE_PREFIX = "conversation.quarantine."
 _STATE_PREFIX = "conversation.recovery."
@@ -51,7 +58,11 @@ FaultStep = Literal[
     "active_replaced",
     "strict_reopened",
     "state_committed",
+    "prune_state_removed",
+    "prune_manifest_removed",
+    "prune_payload_removed",
 ]
+_LOGGER = logging.getLogger(__name__)
 
 
 class TranscriptRecoveryError(ValueError):
@@ -171,10 +182,11 @@ class EvidenceManifest:
     diagnosed_at: str
     payload_digest: str
     payload_size: int
+    schema: str = _EVIDENCE_SCHEMA_V1
 
     def to_dict(self) -> dict[str, object]:
         return {
-            "schema": _EVIDENCE_SCHEMA,
+            "schema": self.schema,
             "quarantine_id": self.quarantine_id,
             "target": _target_dict(self.target),
             "source_digest": self.source_digest,
@@ -250,7 +262,8 @@ def parse_evidence_manifest(value: Mapping[str, Any]) -> EvidenceManifest:
         raise TranscriptRecoveryIntegrityError(
             "invalid quarantine manifest shape"
         ) from exc
-    if value.get("schema") != _EVIDENCE_SCHEMA:
+    schema = value.get("schema")
+    if schema not in CLOSED_VARIANTS["transcript_recovery.evidence_schema"]:
         raise TranscriptRecoveryIntegrityError("invalid quarantine manifest shape")
     manifest = EvidenceManifest(
         quarantine_id=_record_id(value.get("quarantine_id")),
@@ -271,13 +284,22 @@ def parse_evidence_manifest(value: Mapping[str, Any]) -> EvidenceManifest:
         diagnosed_at=_text(value.get("diagnosed_at"), "diagnosis timestamp"),
         payload_digest=_digest(value.get("payload_digest")),
         payload_size=_nonnegative(value.get("payload_size"), "payload size"),
+        schema=schema,
     )
+    if schema == _EVIDENCE_SCHEMA_V1:
+        payload_matches = (
+            manifest.payload_size == manifest.source_size
+            and manifest.payload_digest == manifest.source_digest
+        )
+    else:
+        payload_matches = (
+            manifest.payload_size == manifest.source_size - manifest.valid_prefix_end
+        )
     if (
         manifest.first_bad_row < 2
         or manifest.first_bad_offset != manifest.valid_prefix_end
         or manifest.source_size < manifest.valid_prefix_end
-        or manifest.payload_size != manifest.source_size
-        or manifest.payload_digest != manifest.source_digest
+        or not payload_matches
     ):
         raise TranscriptRecoveryIntegrityError("inconsistent quarantine manifest")
     return manifest
@@ -320,8 +342,13 @@ def repair_transcript(
     *,
     strict_reopen: StrictReopen,
     memory_review_required: bool,
+    tail_evidence: bool,
 ) -> RepairResult:
-    """Run one already-owned repair transaction."""
+    """Run one already-owned repair transaction.
+
+    With tail_evidence the quarantine keeps only the dropped bytes and older
+    resolved quarantine sets are pruned; without it the whole original is kept.
+    """
     quarantine_id = uuid.uuid4().hex
     payload_name = _payload_name(quarantine_id)
     evidence_name = _evidence_name(quarantine_id)
@@ -343,9 +370,12 @@ def repair_transcript(
             directory_fd, payload_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL
         )
         try:
-            source_digest, source_size = _copy_and_hash(
-                source_fd, payload_fd, source.size
+            payload_start = source.prefix.end_offset if tail_evidence else 0
+            source_digest, payload_digest = _copy_and_hash(
+                source_fd, payload_fd, source.size, payload_start
             )
+            source_size = source.size
+            payload_size = source_size - payload_start
             if source_digest != source.source_digest:
                 raise TranscriptSourceChanged(
                     "transcript bytes changed after diagnosis"
@@ -381,8 +411,9 @@ def repair_transcript(
             retained_last_sequence=source.prefix.last_sequence,
             repaired_digest=repaired_digest,
             diagnosed_at=source.diagnosed_at,
-            payload_digest=source_digest,
-            payload_size=source_size,
+            payload_digest=payload_digest,
+            payload_size=payload_size,
+            schema=_EVIDENCE_SCHEMA_V2 if tail_evidence else _EVIDENCE_SCHEMA_V1,
         )
         _publish_immutable_json(directory_fd, evidence_name, manifest.to_dict())
         evidence_published = True
@@ -416,6 +447,12 @@ def repair_transcript(
             directory_fd, state_name, replace(record, state="committed").to_dict()
         )
         _after_recovery_step("state_committed")
+        if tail_evidence:
+            try:
+                _prune_resolved_sets(directory_fd, target, quarantine_id)
+            except (OSError, TranscriptRecoveryError):
+                # The repair is committed; the next repair retries the prune.
+                _LOGGER.warning("transcript quarantine prune failed", exc_info=True)
         return RepairResult(
             quarantine_id=quarantine_id,
             target=target,
@@ -433,6 +470,68 @@ def repair_transcript(
         _unlink_if_present(directory_fd, staged_name)
         if not evidence_published:
             _unlink_if_present(directory_fd, payload_name)
+
+
+def _prune_resolved_sets(
+    directory_fd: int, target: RepairTarget, current_id: str
+) -> None:
+    """Delete resolved quarantine sets beyond the newest few, plus orphan payloads.
+
+    Pending and review_pending sets are never deleted. Each set is deleted in the
+    order state -> manifest -> payload, so every crash leaves a readable shape.
+    """
+    names = os.listdir(directory_fd)
+    _manifests, records = _read_all_records(directory_fd, target, names)
+    resolved = sorted(
+        (
+            record
+            for record in records.values()
+            if record.state != "pending" and record.memory_step != "review_pending"
+        ),
+        key=_record_order,
+        reverse=True,
+    )
+    keep = {current_id}
+    keep.update(record.quarantine_id for record in resolved[:_RETAINED_RESOLVED_SETS])
+    latest = _latest_committed(records)
+    if latest is not None:
+        keep.add(latest.quarantine_id)
+    for record in resolved:
+        if record.quarantine_id in keep:
+            continue
+        _unlink_synced(directory_fd, _state_name(record.quarantine_id))
+        _after_recovery_step("prune_state_removed")
+        _unlink_synced(directory_fd, _evidence_name(record.quarantine_id))
+        _after_recovery_step("prune_manifest_removed")
+        _unlink_synced(directory_fd, _payload_name(record.quarantine_id))
+        _after_recovery_step("prune_payload_removed")
+    listed = set(names)
+    for name in names:
+        if (
+            name.startswith(_EVIDENCE_PREFIX)
+            and name.endswith(".jsonl")
+            and name.removesuffix(".jsonl") + ".json" not in listed
+        ):
+            _unlink_synced(directory_fd, name)
+
+
+def _unlink_synced(directory_fd: int, name: str) -> None:
+    _unlink_if_present(directory_fd, name)
+    os.fsync(directory_fd)
+
+
+def _record_order(record: RecoveryRecord) -> tuple[str, str]:
+    return record.diagnosis_timestamp, record.quarantine_id
+
+
+def _latest_committed(
+    records: Mapping[str, RecoveryRecord],
+) -> RecoveryRecord | None:
+    return max(
+        (record for record in records.values() if record.state == "committed"),
+        key=_record_order,
+        default=None,
+    )
 
 
 def _abandon_recovery(directory_fd: int, quarantine_id: str, state_name: str) -> None:
@@ -555,11 +654,7 @@ def validate_recovery_records(directory_fd: int, target: RepairTarget) -> None:
 
 def recovery_status(directory_fd: int, target: RepairTarget) -> RecoveryStatus:
     manifests, records = _read_all_records(directory_fd, target)
-    latest = max(
-        (record for record in records.values() if record.state == "committed"),
-        key=lambda record: (record.diagnosis_timestamp, record.quarantine_id),
-        default=None,
-    )
+    latest = _latest_committed(records)
     abandoned = sum(
         records.get(quarantine_id) is None
         or records[quarantine_id].state == "abandoned"
@@ -591,7 +686,28 @@ def classify_recovery_records(
 def _read_all_records(
     directory_fd: int, target: RepairTarget, names: list[str] | None = None
 ) -> tuple[dict[str, EvidenceManifest], dict[str, RecoveryRecord]]:
-    names = os.listdir(directory_fd) if names is None else names
+    if names is not None:
+        return _read_listed_records(directory_fd, target, names)
+    listing = os.listdir(directory_fd)
+    attempts = 1
+    while True:
+        try:
+            return _read_listed_records(directory_fd, target, listing)
+        except FileNotFoundError as exc:
+            # A set pruned between listing and reading is just absent; a file
+            # missing from a stable listing is broken evidence.
+            relisted = os.listdir(directory_fd)
+            if sorted(relisted) == sorted(listing) or attempts == _LISTING_ATTEMPTS:
+                raise TranscriptRecoveryIntegrityError(
+                    "transcript recovery file is missing"
+                ) from exc
+            listing = relisted
+            attempts += 1
+
+
+def _read_listed_records(
+    directory_fd: int, target: RepairTarget, names: list[str]
+) -> tuple[dict[str, EvidenceManifest], dict[str, RecoveryRecord]]:
     evidence_names = _recovery_names(names, _EVIDENCE_PREFIX)
     state_names = _recovery_names(names, _STATE_PREFIX)
     if len(evidence_names) + len(state_names) > _MAX_RECORDS:
@@ -702,20 +818,27 @@ def _warning_entry(
     )
 
 
-def _copy_and_hash(source_fd: int, destination_fd: int, length: int) -> tuple[str, int]:
+def _copy_and_hash(
+    source_fd: int, destination_fd: int, length: int, start: int
+) -> tuple[str, str]:
+    """Hash the whole source and copy bytes [start, length); return both digests."""
     os.lseek(source_fd, 0, os.SEEK_SET)
-    digest = hashlib.sha256()
-    copied = 0
-    while copied < length:
-        chunk = os.read(source_fd, min(_BUFFER_SIZE, length - copied))
+    source_digest = hashlib.sha256()
+    payload_digest = hashlib.sha256()
+    offset = 0
+    while offset < length:
+        chunk = os.read(source_fd, min(_BUFFER_SIZE, length - offset))
         if not chunk:
             raise TranscriptSourceChanged("transcript shortened during recovery")
-        _write_all(destination_fd, chunk)
-        digest.update(chunk)
-        copied += len(chunk)
+        source_digest.update(chunk)
+        payload = memoryview(chunk)[max(start - offset, 0) :]
+        if payload:
+            _write_all(destination_fd, payload)
+            payload_digest.update(payload)
+        offset += len(chunk)
     if os.read(source_fd, 1):
         raise TranscriptSourceChanged("transcript grew during recovery")
-    return digest.hexdigest(), copied
+    return source_digest.hexdigest(), payload_digest.hexdigest()
 
 
 def _copy_exact(source_fd: int, destination_fd: int, length: int) -> None:
@@ -728,7 +851,7 @@ def _copy_exact(source_fd: int, destination_fd: int, length: int) -> None:
         copied += len(chunk)
 
 
-def _write_all(fd: int, data: bytes) -> None:
+def _write_all(fd: int, data: bytes | memoryview) -> None:
     view = memoryview(data)
     while view:
         written = os.write(fd, view)
