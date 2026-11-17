@@ -496,6 +496,10 @@ class ZetaServer:
                     await asyncio.shield(release)
                 if registry is not None:
                     await registry.flush(client)
+            close_results = await asyncio.gather(
+                *(client.close(graceful=True) for client in clients),
+                return_exceptions=True,
+            )
             # Cancel registry-owned reads before waiting for request handlers. A
             # slash read can be queued behind the registry's worker pool.
             if registry is not None:
@@ -508,6 +512,11 @@ class ZetaServer:
             await self.controllers.close(
                 approval_settlement_timeout, self._close_foreground_events
             )
+            if failure := next(
+                (result for result in close_results if isinstance(result, BaseException)),
+                None,
+            ):
+                raise failure
         finally:
             if self.connections is not None:
                 await self.connections.aclose()
