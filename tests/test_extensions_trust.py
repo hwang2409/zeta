@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib.util
+import json
 import marshal
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -20,6 +23,7 @@ from zeta.extensions.trust import (
     remove,
     set_trusted,
     trust,
+    untrust,
     update,
 )
 from zeta.skills import SkillCatalog
@@ -121,34 +125,6 @@ def test_management_public_api_rejects_unsafe_names(tmp_path: Path, name: str) -
     assert outside.exists()
 
 
-@pytest.mark.parametrize("component", [".zeta", "extensions"])
-def test_project_management_rejects_each_symlinked_component(tmp_path: Path, component: str) -> None:
-    project = tmp_path / "project"
-    outside = tmp_path / "outside"
-    _extension(outside / "demo")
-    if component == "extensions":
-        (project / ".zeta").mkdir(parents=True)
-    link = project / component if component == ".zeta" else project / ".zeta" / component
-    try:
-        link.symlink_to(outside, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlinks unavailable")
-    with pytest.raises(ExtensionTrustError):
-        remove(home=tmp_path / "home", project_dir=project, scope="project", name="demo")
-    assert (outside / "demo").exists()
-
-
-def test_internal_named_symlink_cannot_delete_sibling(tmp_path: Path) -> None:
-    home = tmp_path / "home"
-    root = home / "extensions"
-    _extension(root / "demo")
-    try:
-        (root / "link").symlink_to(root / "demo", target_is_directory=True)
-    except OSError:
-        pytest.skip("symlinks unavailable")
-    with pytest.raises(ExtensionTrustError):
-        remove(home=home, project_dir=None, scope="user", name="link")
-    assert (root / "demo").exists()
 
 
 def test_user_home_symlink_is_allowed(tmp_path: Path) -> None:
@@ -204,33 +180,85 @@ def test_fingerprint_rejects_symlink_and_size_bound(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("shape", "expected_notice"),
-    [("match", False), ("mismatch", True), ("named_symlink", True)],
-)
-async def test_public_discovery_identity_table(
-    tmp_path: Path, shape: str, expected_notice: bool
-) -> None:
+@pytest.mark.parametrize("action", ["install", "update", "trust", "untrust", "remove", "discover"])
+@pytest.mark.parametrize("shape", ["match", "mismatch", "component_symlink", "named_symlink"])
+async def test_public_action_identity_matrix(tmp_path: Path, action: str, shape: str) -> None:
     home = tmp_path / "home"
     root = home / "extensions"
-    extension = _extension(root / "demo", name="bar" if shape == "mismatch" else "demo")
-    if shape == "named_symlink":
-        extension.rename(root / "real")
+    source = _extension(tmp_path / "source")
+    await asyncio.to_thread(subprocess.run, ["git", "init", "--quiet", str(source)], check=True)
+    await asyncio.to_thread(subprocess.run, ["git", "-C", str(source), "add", "."], check=True)
+    await asyncio.to_thread(subprocess.run, ["git", "-C", str(source), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "init"], check=True)
+    name = "foo" if shape == "mismatch" else "demo"
+    if action != "install":
+        _extension(root / "demo", name="demo")
+        if action == "update":
+            (root / "demo" / ".zeta-extension-git.json").write_text(
+                json.dumps({"source": str(source), "commit": ""}), encoding="utf-8"
+            )
+        if shape == "mismatch":
+            (root / "demo").rename(root / "foo")
+        elif shape == "named_symlink":
+            (root / "demo").rename(root / "real")
+            try:
+                (root / "demo").symlink_to(root / "real", target_is_directory=True)
+            except OSError:
+                pytest.skip("symlinks unavailable")
+    elif shape == "mismatch":
+        _extension(root / "foo", name="demo")
+    elif shape == "named_symlink":
+        _extension(root / "real", name="demo")
         try:
             (root / "demo").symlink_to(root / "real", target_is_directory=True)
         except OSError:
             pytest.skip("symlinks unavailable")
-    cwd = tmp_path / "cwd"
-    cwd.mkdir()
-    registry = ToolRegistry(cwd, skill_catalog=SkillCatalog.empty())
+    if shape == "component_symlink":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        if root.exists():
+            shutil.rmtree(root)
+        root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            root.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+    target = root / name
+    expected_error = shape in {"component_symlink", "named_symlink"} or (
+        shape == "mismatch" and action in {"update", "trust"}
+    )
     try:
-        host = apply_extensions(
-            registry, home=home, project_dir=None, builtin_names=registry.registered_names
-        )
-        assert bool(host.loaded) is (shape == "match")
-        assert any("rename the folder" in notice or "real directory" in notice for notice in host.notices) is expected_notice
-    finally:
-        await registry.close()
+        if action == "install":
+            install(str(source), home=home, project_dir=None, scope="user", accept=True)
+        elif action == "update":
+            update(name, home=home, project_dir=None, scope="user", accept=True)
+        elif action == "trust":
+            trust(home=home, project_dir=None, scope="user", name=name, accept=True)
+        elif action == "untrust":
+            untrust(home=home, project_dir=None, scope="user", name=name)
+        elif action == "remove":
+            remove(home=home, project_dir=None, scope="user", name=name)
+        else:
+            cwd = tmp_path / "cwd"
+            cwd.mkdir()
+            registry = ToolRegistry(cwd, skill_catalog=SkillCatalog.empty())
+            try:
+                host = apply_extensions(registry, home=home, project_dir=None, builtin_names=registry.registered_names)
+                assert not host.loaded if shape != "match" else host.loaded
+                if shape == "named_symlink":
+                    assert any("real directory" in notice for notice in host.notices)
+                elif shape == "mismatch":
+                    assert any("rename the folder" in notice for notice in host.notices)
+            finally:
+                await registry.close()
+            return
+    except (ExtensionTrustError, OSError):
+        assert expected_error
+    else:
+        assert not expected_error
+        if action == "remove" and shape == "mismatch":
+            assert not target.exists()
+        if action == "untrust" and shape == "mismatch":
+            assert target.exists()
 
 
 @pytest.mark.asyncio
