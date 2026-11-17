@@ -548,24 +548,30 @@ def valid_eviction_view(
     ):
         return False
     tool_call_ids: set[str] = set()
+    orphan_result = False
     for item in view:
         message_data = item.get("message")
         if not isinstance(message_data, Mapping):
             return False
-        message = Message.from_dict(message_data)
-        if message.role is MessageRole.ASSISTANT:
-            tool_call_ids.update(
-                block.tool_call.id
-                for block in message.content
-                if isinstance(block, ToolUseContent)
-            )
-        elif (
-            message.role is MessageRole.TOOL_RESULT
-            and message.tool_result is not None
-            and message.tool_result.tool_call_id not in tool_call_ids
-        ):
-            return False
-    return True
+        if message_data.get("role") == MessageRole.ASSISTANT.value:
+            content = message_data.get("content", [])
+            if isinstance(content, list):
+                tool_call_ids.update(
+                    block["tool_call"]["id"]
+                    for block in content
+                    if isinstance(block, Mapping)
+                    and block.get("type") == "tool_use"
+                    and isinstance(block.get("tool_call"), Mapping)
+                    and isinstance(block["tool_call"].get("id"), str)
+                )
+        elif message_data.get("role") == MessageRole.TOOL_RESULT.value:
+            result = message_data.get("tool_result")
+            if (
+                isinstance(result, Mapping)
+                and result.get("tool_call_id") not in tool_call_ids
+            ):
+                orphan_result = True
+    return not (tool_call_ids and orphan_result)
 
 
 def invalid_eviction_markers(
