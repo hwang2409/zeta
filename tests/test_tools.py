@@ -127,6 +127,50 @@ async def test_clone_for_session_close_releases_cwd_descriptor(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_nonpersisted_calls_do_not_retain_approval_origins(tmp_path: Path) -> None:
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    registry.register("fast", lambda arguments: "done")
+
+    try:
+        for index in range(100):
+            await registry.execute(
+                ToolCall(f"call-{index}", "fast", {}),
+                _persist_approval=False,
+            )
+
+        assert registry._approval_origins == {}
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_payload_capability_does_not_depend_on_parameter_name(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    registry.register("fast", lambda arguments: "done")
+    events: list[tuple[str, dict[str, object] | None]] = []
+
+    def lifecycle(kind: str, payload: dict[str, object] | None = None) -> None:
+        events.append((kind, payload))
+
+    try:
+        await registry.execute(
+            ToolCall("call-1", "fast", {}),
+            _lifecycle_sink=lifecycle,
+            _lifecycle_payload_sink=lifecycle,
+        )
+
+        assert ("execution_start", {"approval_origin": "automatic"}) in events
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_registry_validates_arguments_before_running_handler(tmp_path: Path) -> None:
     called = False
 
