@@ -22,6 +22,7 @@ from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
+from tests.support.server_client import read_until, send
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
@@ -342,6 +343,72 @@ async def test_active_resume_rejects_a_session_whose_cwd_was_removed(
 
 
 # Feature negotiation for the gamma extensions.
+
+
+@pytest.mark.asyncio
+async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
+    extension_dir = tmp_path / "home" / "extensions" / "notice"
+    extension_dir.mkdir(parents=True)
+    (extension_dir / "zeta-extension.toml").write_text(
+        '[extension]\nname = "notice"\nversion = "1"\napi_version = 1\nentry = "ext:activate"\n'
+    )
+    (extension_dir / "ext.py").write_text("def activate(zx): pass\n")
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer)
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        server.runtime.extensions.notify("notice", "hello", "info")
+        frames = await _request(reader, writer, 3, "ping")
+        assert frames[-1]["error"]["code"] == -32601
+        assert all(frame.get("method") != "extension_notice" for frame in frames)
+    finally:
+        await close_serve(server, writer)
+
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["extensions"])
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        server.runtime.extensions.notify("notice", "hello", "info")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await send(reader, writer, 3, "ping")
+        frames = await read_until(
+            reader, lambda frame: frame.get("id") == 3, what="ping response"
+        )
+        ping_index = next(i for i, frame in enumerate(frames) if frame.get("id") == 3)
+        notice_indexes = [
+            i for i, frame in enumerate(frames) if frame.get("params", {}).get("event") == "extension_notice"
+        ]
+        assert notice_indexes and notice_indexes[0] < ping_index
+        assert frames[notice_indexes[0]]["params"]["data"] == {
+            "kind": "extension", "extension": "notice", "text": "hello", "level": "info"
+        }
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_extensions_list_returns_loaded_rows(tmp_path: Path) -> None:
+    extension_dir = tmp_path / "home" / "extensions" / "listed"
+    extension_dir.mkdir(parents=True)
+    (extension_dir / "zeta-extension.toml").write_text(
+        '[extension]\nname = "listed"\nversion = "1"\napi_version = 1\nentry = "ext:activate"\n'
+    )
+    (extension_dir / "ext.py").write_text("def activate(zx): pass\n")
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["extensions"])
+        session = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"]["session"]
+        rows = (await _request(reader, writer, 3, "extensions_list", {"session_id": session["session_id"]}))[-1]["result"]
+        assert rows == [{
+            "name": "listed", "scope": "user", "version": "1", "enabled": True,
+            "trusted": True, "loaded": True, "error": None,
+        }]
+    finally:
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio

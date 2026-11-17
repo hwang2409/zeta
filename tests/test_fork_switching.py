@@ -156,6 +156,7 @@ def test_tui_run_replays_transcript_only_on_initial_start(
 
     async def driver() -> None:
         app = object.__new__(TUIApp)
+        app.extensions = None
         app._paste_runtime = PasteRuntime(weakref.proxy(app))
         replay_count = 0
         read_count = 0
@@ -257,6 +258,7 @@ def test_tui_run_releases_ui_ownership_before_restoring_terminal(
 
     async def driver() -> None:
         app = object.__new__(TUIApp)
+        app.extensions = None
         app._paste_runtime = PasteRuntime(weakref.proxy(app))
         app._startup_submissions = []
         at_restore: list[tuple[object, int]] = []
@@ -332,6 +334,7 @@ def test_fork_suspend_continues_after_failed_draft_save(
 ) -> None:
     async def driver() -> None:
         app = object.__new__(TUIApp)
+        app.extensions = None
         errors: list[BaseException] = []
 
         class Watchdog:
@@ -396,6 +399,7 @@ def test_fork_suspend_continues_after_failed_draft_save(
 def test_approval_shortcut_submits_owner_qualified_handle() -> None:
     submitted: list[tuple[str, bool]] = []
     app = object.__new__(TUIApp)
+    app.extensions = None
     request = ApprovalRequest("same", ToolCall("same", "read", {"path": "x"}))
     app._fork_controller = SimpleNamespace(
         pending_approvals=(OwnedApproval(SimpleNamespace(), request, "approval-7"),)

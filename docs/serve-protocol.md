@@ -198,6 +198,7 @@ feature. Observer connections receive only methods with `read` access.
 | `background_task_cancel` | `1.0` | `run_work` | `session_mutation` |
 | `child_run_list` | `1.0` | `child_runs` | `read` |
 | `child_run_send` | `1.0` | `child_runs` | `controller_write` |
+| `extensions_list` | `1.1` | `extensions` | `read` |
 | `mcp_refresh_tools` | `1.0` | `mcp_refresh_tools` | `session_mutation` |
 
 ## common JSON-RPC shapes
@@ -1553,6 +1554,7 @@ Event fields are:
 | `child_progress` | `event`, `run_id: string`, `sequence: integer`, `revision: integer`, `child: ChildRun` | `session_id`, `stream_id`, `seq` |
 | `child_ended` | `event`, `run_id: string`, `sequence: integer`, `child: ChildRun` | `session_id`, `stream_id`, `seq` |
 | `sub_agent_receipt` | `event`, `data: object` | `session_id` |
+| `extension_notice` (feature `extensions`) | `event`, `data: {kind: "extension", extension: string, text: string, level: "info" | "warning" | "error"}` | `session_id` |
 | `task_exit_notification` | `event`, `data: object` | `session_id` |
 | `project_inbox_notification` | `event`, `data: object` | `session_id` |
 | `project_inbox_health` (protocol 1.2 only) | `event`, `data: object` | `session_id` |
@@ -2206,10 +2208,19 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_restart_reason` | exposes the `server_restarted` abort reason on `approval_end`; a client without this feature still receives the terminal end but never the reason (see "approve and deny") |
 | `session_retention` | enables negotiated live `session_retention` events; durable retention history remains available through `/retention` after reconnect |
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
+| `extensions` | adds read-only `extensions_list` and gated transient `extension_notice` events |
 | `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
 | `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
 | `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 are parked or closing (`-32004` with `data.reason: "parked_limit"`), `status` adds `parked_sessions`, and the controller gets `parked_session_changed` events (see "parking a busy session") |
 | `in_flight_replay` | requires `session_replay_seq`; a `session_history_and_subscribe` join during a reply starts its stream with the reply text, thinking, and running-tool output streamed so far, as ordinary `assistant_delta` and `tool_output` events (see "joining during a reply") |
+
+### `extensions_list`
+
+request: `{ "session_id": string }`. result: an array of objects with `name`, `scope`, `version`, `enabled`, `trusted`, `loaded`, and `error` (a string or `null`). `session_id` is required and non-empty. missing, empty, or non-string values return `-32602`; no active, closed, or mismatched sessions return `-32003`; clients that do not negotiate `extensions` receive `-32601`.
+
+### `extension_notice`
+
+this event is sent only to clients that negotiated `extensions`. its exact `params.data` is `{"kind":"extension","extension":string,"text":string,"level":"info"|"warning"|"error"}`. it is transient: it is not stored and does not create a notification row. text longer than 2000 characters is cut to 1997 characters plus `...`.
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
 `client_version: "1.2"` to a 1.1 server negotiates 1.0, so it must continue to
@@ -2227,7 +2238,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `child_run_history`, `child_run_events`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated, `content_read` when both `serve_observers` and `content_read` are negotiated, and `child_run_list` when `child_runs` is negotiated. `child_run_history` and `child_run_events` are available only when their respective features are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `child_run_history`, `child_run_events`, `model_catalog`, `session_settings`, `ping`, `delivery_status`, and `extensions_list` when `extensions` is negotiated, plus `session_grants` when that feature is negotiated, `content_read` when both `serve_observers` and `content_read` are negotiated, and `child_run_list` when `child_runs` is negotiated. `child_run_history` and `child_run_events` are available only when their respective features are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 

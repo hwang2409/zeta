@@ -125,6 +125,11 @@ class PromptRuntimeMixin:
         Re-entrant: the fork controller re-shows a suspended main runtime by
         calling this again without replaying its transcript.
         """
+        if self.extensions is not None:
+            self.extensions.set_event_sink(
+                lambda event: self._handle_background_event(event),
+                asyncio.get_running_loop(),
+            )
         set_notice_loop = getattr(self._draft, "set_notice_loop", None)
         if set_notice_loop is not None:
             set_notice_loop(asyncio.get_running_loop())

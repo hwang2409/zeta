@@ -26,6 +26,9 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .api import EXTENSION_API_VERSION, ExtensionAPI
@@ -53,6 +56,7 @@ def apply_extensions(
     project_dir: str | Path | None,
     builtin_names: frozenset[str],
     disabled: tuple[str, ...] = (),
+    clock: Callable[[], float] = time.monotonic,
 ) -> ExtensionHost:
     """Load user extensions into ``registry`` and stage project extensions.
 
@@ -67,6 +71,7 @@ def apply_extensions(
         home=_as_path(home),
         project_dir=_as_path(project_dir),
         builtin_names=builtin_names,
+        clock=clock,
     )
     host._settings_disabled = set(disabled)
     host._disabled = set(disabled)
@@ -147,17 +152,19 @@ def _load_one(
     try:
         module = _import_entry(directory, manifest, host=host)
     except Exception as exc:  # noqa: BLE001 - loading must fail open
+        error = f"import failed: {_short(exc)}"
+        host.record_error(manifest.name, scope, error)
         host.notices.append(
-            f"extensions · ignored {scope} extension {manifest.name} ({display}): "
-            f"import failed: {_short(exc)}"
+            f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
         return
     entry = getattr(module, manifest.entry_function, None)
     if not callable(entry):
         host.remove_package_for_directory(directory)
+        error = f"no callable {manifest.entry_function}(zx)"
+        host.record_error(manifest.name, scope, error)
         host.notices.append(
-            f"extensions · ignored {scope} extension {manifest.name} ({display}): "
-            f"no callable {manifest.entry_function}(zx)"
+            f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
         return
     loading = LoadingExtension(manifest, scope, directory)
@@ -166,18 +173,20 @@ def _load_one(
         result = entry(api)
     except Exception as exc:  # noqa: BLE001 - a broken activate must not break the session
         host.remove_package_for_directory(directory)
+        error = f"activate raised: {_short(exc)}"
+        host.record_error(manifest.name, scope, error)
         host.notices.append(
-            f"extensions · ignored {scope} extension {manifest.name} ({display}): "
-            f"activate raised: {_short(exc)}"
+            f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
         return
     if inspect.isawaitable(result):
         if inspect.iscoroutine(result):
             result.close()
         host.remove_package_for_directory(directory)
+        error = "activate must be synchronous"
+        host.record_error(manifest.name, scope, error)
         host.notices.append(
-            f"extensions · ignored {scope} extension {manifest.name} ({display}): "
-            "activate must be synchronous"
+            f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
         return
     host.commit(loading)
