@@ -937,6 +937,7 @@ class _Client:
         self._client_version = hello.client_version
         self.features = frozenset(hello.features)
         admission = None
+        acquisition = None
         try:
             role, admission = self._claim_hello_role(hello, params)
             result = self._hello_result(hello, role)
@@ -950,13 +951,24 @@ class _Client:
                     self.server.controllers.controller_mode == "multi"
                     and isinstance(params.get("session_id"), str)
                 ):
-                    self.server.controllers.claim_existing(self, params["session_id"])
-                with self.server.controllers.owned(self) as controller:
+                    acquisition = self.server.controllers.reserve_existing(
+                        self, params["session_id"]
+                    )
+                    controller_use = self.server.controllers.use_acquisition(acquisition)
+                else:
+                    controller_use = self.server.controllers.owned(self)
+                with controller_use as controller:
                     await self._setup_controller_hello(params, deadline, controller)
             if admission is not None:
                 self.server.controllers.commit_hello(admission)
+            if acquisition is not None:
+                self.server.controllers.commit_session(acquisition).release()
             self.handshaken = True
         except BaseException:
+            if acquisition is not None:
+                closed = self.server.controllers.abort_session(acquisition)
+                if closed is not None:
+                    await asyncio.shield(closed)
             await self._rollback_hello(admission)
             raise
         return True, result

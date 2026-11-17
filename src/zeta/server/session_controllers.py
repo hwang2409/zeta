@@ -274,6 +274,12 @@ class SessionControllers:
             return self._use(current)
         record = self._by_session.get(session_id)
         if isinstance(record, SessionAcquisition):
+            if record.connection is not connection:
+                raise ProtocolError(
+                    ErrorDescriptor.SESSION_CONTROLLED,
+                    "session is controlled by another client",
+                    {"session_id": session_id},
+                )
             record = record.target
         if record is None:
             record = self._parked.get(session_id)
@@ -283,48 +289,49 @@ class SessionControllers:
             raise unattached_error
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
 
-    def claim_existing(self, connection: Any, session_id: str) -> None:
-        """Claim an already resident session for a reconnecting controller."""
+    def reserve_existing(self, connection: Any, session_id: str) -> SessionAcquisition:
+        """Reserve an existing resident session for an exact reconnect."""
         record = self._by_session.get(session_id)
         if isinstance(record, SessionAcquisition):
             record = record.target
         if record is None:
-            for candidate in self._records.values():
-                if candidate.runtime.session_id == session_id and not candidate.closing:
-                    record = candidate
-                    break
+            record = next((
+                candidate for candidate in self._records.values()
+                if candidate.runtime.session_id == session_id and not candidate.closing
+            ), None)
         if record is None or record.closing:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
-        holder = next((owner for owner, item in self._by_connection.items() if item is record), None)
-        if holder is not None and holder is not connection:
-            raise ProtocolError(
-                ErrorDescriptor.SESSION_CONTROLLED,
-                "session is controlled by another client",
-                {"session_id": session_id},
-            )
-        self._by_session[session_id] = record
-        self._by_connection[connection] = record
+        return self.reserve_session(connection, session_id, record)
 
     def reserve_session(
         self, connection: Any, session_id: str, candidate: SessionController
     ) -> SessionAcquisition:
         """Reserve a session synchronously, before opening its runtime."""
         existing = self._by_session.get(session_id)
-        if existing is not None:
-            target = existing.target if isinstance(existing, SessionAcquisition) else existing
-            if self._by_connection.get(connection) is not target:
-                raise ProtocolError(
-                    ErrorDescriptor.SESSION_CONTROLLED,
-                    "session is controlled by another client",
-                    {"session_id": session_id},
-                )
+        target = existing.target if isinstance(existing, SessionAcquisition) else existing
+        holder = next((
+            owner for owner, record in self._by_connection.items()
+            if record is target and owner is not connection
+        ), None)
+        if isinstance(existing, SessionAcquisition) or holder is not None:
+            raise ProtocolError(
+                ErrorDescriptor.SESSION_CONTROLLED,
+                "session is controlled by another client",
+                {"session_id": session_id},
+            )
         previous = self._by_connection.get(connection)
         acquisition = SessionAcquisition(
             connection, session_id, next(self._session_generations), previous,
-            candidate, candidate not in self._records.values() or existing is None,
+            candidate, existing is None and candidate is not previous,
         )
         self._by_session[session_id] = acquisition
         return acquisition
+
+    def use_acquisition(self, acquisition: SessionAcquisition) -> SessionUse:
+        """Hold the exact target reserved by ``acquisition`` during setup."""
+        if self._by_session.get(acquisition.session_id) is not acquisition:
+            raise RuntimeError("session acquisition is no longer current")
+        return self._use(acquisition.target)
 
     def commit_session(self, acquisition: SessionAcquisition) -> SessionUse:
         if self._by_session.get(acquisition.session_id) is not acquisition:
@@ -333,19 +340,15 @@ class SessionControllers:
         self._by_connection[acquisition.connection] = acquisition.target
         return self._use(acquisition.target)
 
-    def acquire_created(self, connection: Any, record: SessionController) -> SessionUse:
-        """Reserve and commit a newly created target after it gets its id."""
-        session_id = record.runtime.session_id
-        if session_id is None:
-            raise RuntimeError("created session has no id")
-        acquisition = self.reserve_session(connection, session_id, record)
-        return self.commit_session(acquisition)
-
     def abort_session(self, acquisition: SessionAcquisition) -> asyncio.Task[None] | None:
-        if self._by_session.get(acquisition.session_id) is acquisition:
+        if self._by_session.get(acquisition.session_id) is not acquisition:
+            return None
+        if acquisition.created:
             del self._by_session[acquisition.session_id]
-        if acquisition.created and self._records.get(acquisition.target.control) is acquisition.target:
-            return self.retire(acquisition.target)
+            if self._records.get(acquisition.target.control) is acquisition.target:
+                return self.retire(acquisition.target)
+        else:
+            self._by_session[acquisition.session_id] = acquisition.target
         return None
 
     def attach(self, record: SessionController) -> SessionController:

@@ -120,6 +120,7 @@ async def _setup(self, body: Any, params: dict[str, Any], controller: SessionUse
 async def _new_session(
     self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
+    acquisition = None
     try:
         bindings = await mcp_bindings(self, params, controller)
         initial_model = validation.optional_string(params, "model")
@@ -144,7 +145,10 @@ async def _new_session(
             )
             if incoming is not None:
                 if self.server.controllers.controller_mode == "multi":
-                    controller = self.server.controllers.acquire_created(self, incoming)
+                    acquisition = self.server.controllers.reserve_session(
+                        self, incoming.runtime.session_id, incoming
+                    )
+                    controller = incoming
                 else:
                     controller = self.server.attach(incoming)
             if initial_model is not None and initial_mode is not None:
@@ -175,8 +179,20 @@ async def _new_session(
             await controller.control.controller_ready()
             await _publish_project_registry_notice(self, controller)
             await controller.control.publish_session_grant_reset()
-            return {"session": session_snapshot(self, controller)}
+            snapshot = {"session": session_snapshot(self, controller)}
+            if acquisition is not None:
+                self.server.controllers.commit_session(acquisition).release()
+                if (
+                    acquisition.previous is not None
+                    and acquisition.previous is not acquisition.target
+                ):
+                    self.server.parking.leave(acquisition.previous.control)
+            return snapshot
     except BaseException:
+        if acquisition is not None:
+            closed = self.server.controllers.abort_session(acquisition)
+            if closed is not None:
+                await asyncio.shield(closed)
         if controller.runtime.state is None:
             controller.control._active_host_commands = None
             controller.control._host_binding_required = False
@@ -243,8 +259,7 @@ async def _resume(
                         {"session_id": session_id},
                     ) from exc
             if acquisition is not None:
-                committed = self.server.controllers.commit_session(acquisition)
-                controller = committed
+                controller = acquisition.target
             if incoming is not None and not multi:
                 controller = self.server.attach(incoming)
             if bindings is not None:
@@ -271,7 +286,15 @@ async def _resume(
             await controller.control.controller_ready()
             await _publish_project_registry_notice(self, controller)
             await controller.control.publish_session_grant_reset()
-            return {"session": session_snapshot(self, controller)}
+            snapshot = {"session": session_snapshot(self, controller)}
+            if acquisition is not None:
+                self.server.controllers.commit_session(acquisition).release()
+                if (
+                    acquisition.previous is not None
+                    and acquisition.previous is not acquisition.target
+                ):
+                    self.server.parking.leave(acquisition.previous.control)
+            return snapshot
     except BaseException:
         if acquisition is not None:
             closed = self.server.controllers.abort_session(acquisition)

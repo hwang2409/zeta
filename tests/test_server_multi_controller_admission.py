@@ -288,7 +288,7 @@ _CANCEL_ROWS = (
 )
 
 
-async def _bound_reconnect_params(server, transport: Transport) -> dict[str, Any]:
+async def _bound_reconnect_params(server, transport: Transport) -> tuple[dict[str, Any], Any]:
     seed = await connect_replay(server, transport)
     hello = await negotiate(
         seed,
@@ -298,7 +298,12 @@ async def _bound_reconnect_params(server, transport: Transport) -> dict[str, Any
     assert "result" in hello
     created = await seed.request(2, "new_session", {})
     session_id = created["result"]["session"]["session_id"]
-    control = server.controllers.attached().control
+    record = next(
+        record
+        for record in server.controllers._records.values()
+        if record.runtime.state is not None and record.runtime.session_id == session_id
+    )
+    control = record.control
     control._mcp_binding_required = True
     control._mcp_binding_servers = frozenset()
     control._active_mcp_bindings = {}
@@ -312,7 +317,7 @@ async def _bound_reconnect_params(server, transport: Transport) -> dict[str, Any
         ],
         "mcp_bindings": [],
         "session_id": session_id,
-    }
+    }, control
 
 
 def _gate_async(monkeypatch, owner, name: str, entered: asyncio.Event, release: asyncio.Event, *, after: bool) -> None:
@@ -412,11 +417,11 @@ async def test_cancelled_hello_transaction_public_recovery(
         "protocol_version": "1.1",
         "features": ["multi_controller"],
     }
+    control = server.controllers.attached().control
     if row.startswith(("reconnect_mcp_bindings", "reattach_mcp_bindings")):
-        params = await _bound_reconnect_params(server, transport)
+        params, control = await _bound_reconnect_params(server, transport)
 
     failed = await connect_replay(server, transport)
-    control = server.controllers.attached().control
     entered = asyncio.Event()
     release = asyncio.Event()
     release_started = asyncio.Event()
@@ -634,3 +639,172 @@ async def test_cancelled_old_cleanup_does_not_remove_concurrent_newer_multi_toke
             server,
             tuple(client for client in (old, newer, legacy, recovered) if client is not None),
         )
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_four_multi_controllers_keep_distinct_session_ownership(
+    tmp_path: Path, transport: Transport
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    clients = [await connect_replay(server, transport) for _ in range(4)]
+    try:
+        for client in clients:
+            hello = await negotiate(client, replay=False, extra=("multi_controller",))
+            assert "result" in hello
+        session_ids = []
+        for request_id, client in enumerate(clients, 2):
+            created = await client.request(request_id, "new_session", {})
+            session_ids.append(created["result"]["session"]["session_id"])
+        assert len(set(session_ids)) == 4
+        for request_id, (client, session_id) in enumerate(zip(clients, session_ids), 10):
+            status = await client.request(request_id, "status", {})
+            assert status["result"]["session"]["session_id"] == session_id
+    finally:
+        await _close_server(server, clients)
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_same_session_refusal_is_structured_and_keeps_socket_open(
+    tmp_path: Path, transport: Transport
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    owner = await connect_replay(server, transport)
+    contender = await connect_replay(server, transport)
+    try:
+        await negotiate(owner, replay=False, extra=("multi_controller",))
+        created = await owner.request(2, "new_session", {})
+        session_id = created["result"]["session"]["session_id"]
+        await negotiate(contender, replay=False, extra=("multi_controller", "ping"))
+        refused = await contender.request(2, "resume", {"session_id": session_id})
+        assert refused["error"] == {
+            "code": -32014,
+            "message": "session is controlled by another client",
+            "data": {"code": "session_controlled", "session_id": session_id},
+        }
+        ping = await contender.request(3, "ping", {})
+        assert "result" in ping, "session conflict closed the controller socket"
+        replacement = await contender.request(4, "new_session", {})
+        assert replacement["result"]["session"]["session_id"] != session_id
+    finally:
+        await _close_server(server, (owner, contender))
+
+async def _make_persisted_target(server, transport: Transport) -> str:
+    creator = await connect_replay(server, transport)
+    await negotiate(creator, replay=False, extra=("multi_controller",))
+    created = await creator.request(2, "new_session", {})
+    session_id = created["result"]["session"]["session_id"]
+    await creator.close()
+    record = next(
+        record
+        for record in server.controllers._records.values()
+        if record.runtime.state is not None and record.runtime.session_id == session_id
+    )
+    await await_or_fail(
+        asyncio.shield(server.controllers.retire(record)),
+        what="persist target before acquisition",
+    )
+    return session_id
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_failed_target_acquisition_keeps_old_session_and_releases_target(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.server.runtime import ServerRuntime
+
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    owner = await connect_replay(server, transport)
+    recovery = None
+    try:
+        await negotiate(owner, replay=False, extra=("multi_controller",))
+        old = await owner.request(2, "new_session", {})
+        old_id = old["result"]["session"]["session_id"]
+        target_id = await _make_persisted_target(server, transport)
+        original_resume = ServerRuntime.resume_session
+
+        async def fail_target(runtime, session_id: str, *args: Any, **kwargs: Any):
+            if session_id == target_id:
+                raise RuntimeError("forced target setup failure")
+            return await original_resume(runtime, session_id, *args, **kwargs)
+
+        monkeypatch.setattr(ServerRuntime, "resume_session", fail_target)
+        failed = await owner.request(3, "resume", {"session_id": target_id})
+        assert failed["error"]["code"] == -32000
+        still_old = await owner.request(4, "status", {})
+        assert still_old["result"]["session"]["session_id"] == old_id
+        monkeypatch.undo()
+
+        recovery = await connect_replay(server, transport)
+        await negotiate(recovery, replay=False, extra=("multi_controller",))
+        resumed = await recovery.request(2, "resume", {"session_id": target_id})
+        assert resumed["result"]["session"]["session_id"] == target_id
+    finally:
+        monkeypatch.undo()
+        await _close_server(
+            server,
+            tuple(client for client in (owner, recovery) if client is not None),
+        )
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_target_is_reserved_before_one_awaited_open(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.server.runtime import ServerRuntime
+
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    first = await connect_replay(server, transport)
+    second = await connect_replay(server, transport)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    first_request = None
+    try:
+        await negotiate(first, replay=False, extra=("multi_controller",))
+        await first.request(2, "new_session", {})
+        target_id = await _make_persisted_target(server, transport)
+        await negotiate(second, replay=False, extra=("multi_controller", "ping"))
+        await second.request(2, "new_session", {})
+        original_resume = ServerRuntime.resume_session
+        opens = 0
+
+        async def gated_resume(runtime, session_id: str, *args: Any, **kwargs: Any):
+            nonlocal opens
+            if session_id == target_id:
+                opens += 1
+                entered.set()
+                await await_or_fail(release.wait(), what="release target open")
+            return await original_resume(runtime, session_id, *args, **kwargs)
+
+        monkeypatch.setattr(ServerRuntime, "resume_session", gated_resume)
+        first_request = asyncio.create_task(
+            first.request(3, "resume", {"session_id": target_id})
+        )
+        await await_or_fail(entered.wait(), what="target open entered")
+        refused = await second.request(3, "resume", {"session_id": target_id})
+        assert refused["error"] == {
+            "code": -32014,
+            "message": "session is controlled by another client",
+            "data": {"code": "session_controlled", "session_id": target_id},
+        }
+        assert opens == 1, "a conflicting controller opened the reserved target"
+        ping = await second.request(4, "ping", {})
+        assert "result" in ping
+        release.set()
+        acquired = await await_or_fail(first_request, what="first target acquisition")
+        assert acquired["result"]["session"]["session_id"] == target_id
+        assert opens == 1
+    finally:
+        release.set()
+        if first_request is not None and not first_request.done():
+            first_request.cancel()
+            with contextlib.suppress(BaseException):
+                await await_or_fail(first_request, what="cancel target acquisition")
+        monkeypatch.undo()
+        await _close_server(server, (first, second))
