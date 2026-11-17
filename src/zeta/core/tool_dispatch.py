@@ -36,6 +36,8 @@ class _ToolRegistry(Protocol):
         _scope_signal: AbortSignal | None = None,
         _stream_sink: Callable[[StreamEvent], None],
         _lifecycle_sink: Callable[..., None],
+        _lifecycle_payload_sink: Callable[..., None] | None = None,
+        _retain_approval_origin: bool = False,
         _host_environment: Mapping[str, str] | None = None,
         _pending_execution_owner: asyncio.Task[object] | None = None,
     ) -> Coroutine[Any, Any, StructuredToolResult]: ...
@@ -187,6 +189,12 @@ async def dispatch_tool_calls(
                                     kind, call, data, tool_result
                                 )
                             ),
+                            _lifecycle_payload_sink=(
+                                lambda kind, data, call=tool_call: enqueue_tool_lifecycle(
+                                    kind, call, data
+                                )
+                            ),
+                            _retain_approval_origin=True,
                         )
                     ): (call_index + offset, tool_call)
                     for offset, tool_call in enumerate(parallel_calls)
@@ -257,6 +265,12 @@ async def dispatch_tool_calls(
                             kind, call, data, tool_result
                         )
                     ),
+                    _lifecycle_payload_sink=(
+                        lambda kind, data, call=tool_call: enqueue_tool_lifecycle(
+                            kind, call, data
+                        )
+                    ),
+                    _retain_approval_origin=True,
                 )
             )
             try:

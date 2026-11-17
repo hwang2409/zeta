@@ -514,6 +514,7 @@ def test_history_index_rejects_a_repaired_transcript_snapshot(tmp_path: Path) ->
             source_facts,
             strict_reopen=lambda: None,
             memory_review_required=False,
+            tail_evidence=True,
         )
     repaired = ConversationStore(root, session_id="history-repair")
     try:
@@ -2943,6 +2944,7 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     store.append_message(
         with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
     )
+    retained = store.path.read_bytes()
     with store.path.open("ab") as handle:
         handle.write(b'{"seq": 3, "id": "torn"')
     damaged = store.path.read_bytes()
@@ -2958,7 +2960,7 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
         reopened.path.with_name(
             f"conversation.quarantine.{quarantine_id}.jsonl"
         ).read_bytes()
-        == damaged
+        == damaged[len(retained) :]
     )
     warning_id = resident_entries(reopened)[-1].id
     warning_seq = resident_entries(reopened)[-1].seq
