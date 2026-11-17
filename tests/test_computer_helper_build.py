@@ -76,14 +76,16 @@ def test_selftest_kill_interrupts_steps_and_releases_drag() -> None:
         "reply": "killed", "later_reply": "killed"
     }
     assert results["type"] == {
-        "name": "type", "events": ["key_down"], "reply": "killed", "later_reply": "killed"
+        "name": "type", "events": ["key_down", "key_up"], "reply": "killed", "later_reply": "killed"
     }
-    assert results["mouse_down"]["events"] == ["mouse_down"]
+    assert results["mouse_down"]["events"] == ["mouse_down", "mouse_up"]
     assert results["mouse_down"]["later_reply"] == "killed"
     assert results["kill_after_last_step"]["reply"] == "killed"
     assert results["kill_after_last_step"]["later_reply"] == "killed"
+    assert results["kill_before_commit"]["reply"] == "killed"
+    assert results["kill_before_commit"]["later_reply"] == "killed"
     assert results["kill_after_commit"]["reply"] == "ok"
-    assert results["kill_after_commit"]["later_reply"] == "ok"
+    assert results["kill_after_commit"]["later_reply"] == "killed"
 
 
 def test_helper_exits_when_stdin_reaches_eof() -> None:

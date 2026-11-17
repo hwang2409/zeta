@@ -238,6 +238,7 @@ final class EventGate {
     private let killed: Flag
     private let poster: (CGEvent) -> Void
     private var held: Set<CGMouseButton> = []
+    private var heldKeys: [CGKeyCode: CGEventFlags] = [:]
     private var cursor = CGPoint.zero
 
     init(killed: Flag, poster: @escaping (CGEvent) -> Void) {
@@ -263,6 +264,16 @@ final class EventGate {
         }
     }
 
+    func postKeyPair(_ down: CGEvent, _ up: CGEvent, keycode: CGKeyCode, flags: CGEventFlags) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !killed.isSet else { throw HelperError.killed }
+        poster(down)
+        heldKeys[keycode] = flags
+        poster(up)
+        heldKeys.removeValue(forKey: keycode)
+    }
+
     func kill() {
         lock.lock()
         defer { lock.unlock() }
@@ -276,6 +287,13 @@ final class EventGate {
             }
         }
         held.removeAll()
+        for (keycode, flags) in heldKeys {
+            if let event = CGEvent(keyboardEventSource: eventSource, virtualKey: keycode, keyDown: false) {
+                event.flags = flags
+                poster(event)
+            }
+        }
+        heldKeys.removeAll()
     }
 }
 
@@ -350,8 +368,7 @@ func typeText(_ text: String, killSource: Flag? = nil) throws {
         else { return }
         down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
         up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-        try eventGate.post(down, type: .keyDown, point: .zero, button: .left)
-        try eventGate.post(up, type: .keyUp, point: .zero, button: .left)
+        try eventGate.postKeyPair(down, up, keycode: 0, flags: down.flags)
     }
 }
 
@@ -398,8 +415,7 @@ func keyCombo(_ combo: String) throws {
     else { throw HelperError.internalError("could not create key event") }
     down.flags = flags
     up.flags = flags
-    try eventGate.post(down, type: .keyDown, point: .zero, button: .left)
-    try eventGate.post(up, type: .keyUp, point: .zero, button: .left)
+    try eventGate.postKeyPair(down, up, keycode: code, flags: flags)
 }
 
 // MARK: - request handling
@@ -581,11 +597,33 @@ func errorResponse(_ id: Int, _ error: Error) -> [String: Any] {
     return ["id": id, "ok": false, "error": ["code": he.code, "message": he.message]]
 }
 
+func runRequest(
+    id: Int, op: String, request: [String: Any], indicator: Indicator,
+    beforeCommit: (() -> Void)? = nil, sink: @escaping ([String: Any]) -> Void
+) {
+    if currentKill().isSet {
+        sink(errorResponse(id, HelperError.killed))
+        return
+    }
+    if !selfTestMode { DispatchQueue.main.sync { indicator.showActive() } }
+    do {
+        var payload = try handle(op, request)
+        payload["id"] = id
+        payload["ok"] = true
+        beforeCommit?()
+        sink(currentKill().commitReply() ? payload : errorResponse(id, HelperError.killed))
+    } catch {
+        sink(errorResponse(id, error))
+    }
+    if !selfTestMode { DispatchQueue.main.sync { if !killed.isSet { indicator.hide() } } }
+}
+
 func selfTestKill() {
     selfTestMode = true
     let cases: [(String, String, Int)] = [
         ("drag", "drag", 2), ("type", "type", 1), ("mouse_down", "mouse_down", 1),
-        ("kill_after_last_step", "type", 2), ("kill_after_commit", "type", 2),
+        ("kill_after_last_step", "type", 2), ("kill_before_commit", "type", 2),
+        ("kill_after_commit", "type", 2),
     ]
     func triggerKill() {
         let event = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true)!
@@ -601,41 +639,51 @@ func selfTestKill() {
         var posts = 0
         let gate = EventGate(killed: flag) { event in
             posts += 1
-            let type = event.type
-            if type == .leftMouseDown { events.append("mouse_down") }
-            else if type == .leftMouseDragged { events.append("drag_\(posts - 1)") }
-            else if type == .leftMouseUp { events.append("mouse_up"); cleanup.signal() }
-            else if type == .keyDown { events.append("key_down") }
+            if event.type == .leftMouseDown { events.append("mouse_down") }
+            else if event.type == .leftMouseDragged { events.append("drag_\(posts - 1)") }
+            else if event.type == .leftMouseUp { events.append("mouse_up"); cleanup.signal() }
+            else if event.type == .keyDown { events.append("key_down") }
+            else if event.type == .keyUp { events.append("key_up") }
             if posts == blockAfter { entered.signal(); release.wait() }
         }
         eventGate = gate
         activeKill = flag
         flag.observe { DispatchQueue.global().async { gate.kill() } }
-        actionQueue.async(execute: DispatchWorkItem {
+        let replies = DispatchSemaphore(value: 0)
+        var reply = ""
+        actionQueue.async {
             let req: [String: Any] = op == "drag"
                 ? ["path": [[1, 1], [2, 2], [3, 3]]]
                 : op == "mouse_down" ? ["x": 4, "y": 5, "button": "left"]
                 : ["text": "ab"]
-            let result = Result { try handle(op, req) }
-            if name == "drag" { cleanup.wait() }
-            let committed = flag.commitReply()
-            let failureCode = if case .failure(let error) = result {
-                (error as? HelperError)?.code ?? "killed"
-            } else { "ok" }
-            print((try? JSONSerialization.data(withJSONObject: [
-                "name": name, "events": events,
-                "reply": committed ? "ok" : failureCode,
-                "later_reply": flag.commitReply() ? "ok" : "killed",
-            ])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
-        })
+            runRequest(
+                id: 1, op: op, request: req, indicator: indicator,
+                beforeCommit: name == "kill_before_commit" ? triggerKill : nil
+            ) { response in
+                reply = (response["ok"] as? Bool == true) ? "ok" :
+                    ((response["error"] as? [String: Any])?["code"] as? String ?? "internal")
+                replies.signal()
+            }
+        }
         entered.wait()
         if name == "kill_after_commit" {
+            release.signal(); replies.wait(); triggerKill(); actionQueue.sync {}
+        } else if name == "kill_before_commit" {
             release.signal(); actionQueue.sync {}
-            triggerKill()
         } else {
             triggerKill()
             release.signal(); actionQueue.sync {}
+            if name == "mouse_down" { cleanup.wait() }
         }
+        var later = ""
+        runRequest(id: 2, op: "type", request: ["text": "z"], indicator: indicator) { response in
+            later = (response["ok"] as? Bool == true) ? "ok" :
+                ((response["error"] as? [String: Any])?["code"] as? String ?? "internal")
+        }
+        if name != "kill_after_commit" { replies.wait() }
+        print((try? JSONSerialization.data(withJSONObject: [
+            "name": name, "events": events, "reply": reply, "later_reply": later,
+        ])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
     }
 }
 
@@ -667,24 +715,7 @@ Thread {
             continue
         }
         actionQueue.async {
-            if currentKill().isSet {
-                writeResponse(errorResponse(id, HelperError.killed))
-                return
-            }
-            DispatchQueue.main.sync { indicator.showActive() }
-            do {
-                var payload = try handle(op, req)
-                payload["id"] = id
-                payload["ok"] = true
-                if killed.commitReply() {
-                    writeResponse(payload)
-                } else {
-                    writeResponse(errorResponse(id, HelperError.killed))
-                }
-            } catch {
-                writeResponse(errorResponse(id, error))
-            }
-            DispatchQueue.main.sync { if !killed.isSet { indicator.hide() } }
+            runRequest(id: id, op: op, request: req, indicator: indicator, sink: writeResponse)
         }
     }
     actionQueue.sync {}
