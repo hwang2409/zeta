@@ -162,7 +162,7 @@ async def test_lifecycle_payload_capability_does_not_depend_on_parameter_name(
         await registry.execute(
             ToolCall("call-1", "fast", {}),
             _lifecycle_sink=lifecycle,
-            _lifecycle_payload=True,
+            _lifecycle_payload_sink=lifecycle,
         )
 
         assert ("execution_start", {"approval_origin": "automatic"}) in events
