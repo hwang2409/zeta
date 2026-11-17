@@ -524,6 +524,78 @@ def test_plan_2_project_settings_cannot_enable_or_broaden(tmp_path: Path) -> Non
     assert settings.computer.default_app_access == "deny"
 
 
+@pytest.mark.parametrize("value", ["[]", "{}"])
+def test_invalid_whole_computer_setting_falls_back_to_deny(
+    tmp_path: Path, value: str
+) -> None:
+    home = tmp_path / "home"
+    _write_settings(
+        home,
+        f"[computer]\nenabled = true\ndefault_app_access = {value}\n",
+    )
+    loaded = load_settings(home=home)
+    assert loaded.settings.computer.default_app_access == "deny"
+    assert any("default_app_access" in notice for notice in loaded.notices)
+
+
+def test_whole_computer_setting_is_honored_and_default_stays_deny(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_settings(home, "[computer]\nenabled = true\ndefault_app_access = \"allow\"\n")
+    loaded = load_settings(home=home)
+    assert loaded.settings.computer.default_app_access == "allow"
+    assert not any("default_app_access=allow" in notice for notice in loaded.notices)
+    assert load_settings(home=tmp_path / "default").settings.computer.default_app_access == "deny"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", ["locked", "secure_input"])
+async def test_whole_computer_setting_uses_production_guards(
+    tmp_path: Path, blocked: str
+) -> None:
+    home = tmp_path / "home"
+    _write_settings(home, "[computer]\nenabled = true\ndefault_app_access = \"allow\"\n")
+    config = load_settings(home=home).settings.computer
+    backend = FakeBackend(
+        frontmost_bundle_id="com.apple.Terminal",
+        locked=blocked == "locked",
+        secure_input=blocked == "secure_input",
+    )
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        registry.computer_config = config
+        screenshot = await registry.execute(
+            ToolCall("s", "computer", {"action": "screenshot"})
+        )
+        click = await registry.execute(
+            ToolCall("c", "computer", {"action": "left_click", "coordinate": [1, 2]})
+        )
+    assert screenshot["isError"] is True
+    assert click["isError"] is True
+    assert all(action[0] == "state" for action in backend.actions)
+
+
+@pytest.mark.asyncio
+async def test_whole_computer_setting_allows_frontmost_app_and_follow_up_screenshot(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    _write_settings(home, "[computer]\nenabled = true\ndefault_app_access = \"allow\"\n")
+    config = load_settings(home=home).settings.computer
+    backend = FakeBackend(frontmost_bundle_id="com.apple.Terminal")
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        registry.computer_config = config
+        screenshot = await registry.execute(
+            ToolCall("s", "computer", {"action": "screenshot"})
+        )
+        click = await registry.execute(
+            ToolCall("c", "computer", {"action": "left_click", "coordinate": [1, 2]})
+        )
+    assert screenshot["isError"] is False
+    assert click["isError"] is False
+    assert ("click", 1, 2, "left", 1) in backend.actions
+    assert backend.actions[-1] == ("screenshot", None)
+    assert any(block["type"] == "image" for block in click["content"])
+
+
 @pytest.mark.asyncio
 async def test_plan_7_child_registry_has_no_computer_capability(tmp_path: Path) -> None:
     async with _computer_registry(tmp_path, backend=FakeBackend()) as registry:

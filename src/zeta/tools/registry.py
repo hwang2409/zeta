@@ -105,6 +105,7 @@ from .approval_gate import ApprovalGate
 if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState
     from ..skills.agent_catalog import AgentCatalog
+    from ..telemetry import SpanHandle
     from .computer.backend import ComputerBackend
     from .computer.scaling import ScreenGeometry
 AbortSignal = ToolAbortSignal
@@ -644,6 +645,10 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         self._mcp_owned[name] = (owner, generation)
         return True
 
+    def is_mcp_tool(self, name: str) -> bool:
+        """Return whether ``name`` is a mounted MCP tool."""
+        return name in self._mcp_owned
+
     def is_mcp_owned(self, name: str, owner: object, generation: int) -> bool:
         """Return whether an MCP definition has this exact owner and generation."""
         return self._mcp_owned.get(name) == (owner, generation)
@@ -998,6 +1003,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         _host_environment: Mapping[str, str] | None = None,
         _pending_execution_claimed: bool = False,
         _pending_execution_owner: asyncio.Task[object] | None = None,
+        _span: SpanHandle | None = None,
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
 
@@ -1092,6 +1098,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 ),
                 persist_request=_persist_approval,
                 capability=capability,
+                span=_span,
             )
             gate_result = gate_outcome.result
             execution_signal = gate_outcome.signal

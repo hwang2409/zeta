@@ -27,6 +27,7 @@ def capture_slash_status(
     usage_tracker: UsageTracker,
     project_context_health: str | None,
     transcript_session_id: str | None = None,
+    otel_status: str = "off",
 ) -> SlashStatusSnapshot:
     """Capture loop-owned status state without transcript-sized processing."""
 
@@ -85,13 +86,19 @@ def capture_slash_status(
             ),
             computer_enabled=computer.enabled,
             computer_allowed_apps=len(computer.bundle_ids),
-            computer_empty_allow_list=computer.enabled and not computer.bundle_ids,
+            computer_default_app_access=computer.default_app_access,
+            computer_empty_allow_list=(
+                computer.enabled
+                and computer.default_app_access == "deny"
+                and not computer.bundle_ids
+            ),
             unavailable_accounts=(
                 context.unavailable_accounts
                 if (context := getattr(loop, "account_context", None)) is not None
                 else ()
             ),
             project_context_health=project_context_health,
+            otel_status=otel_status,
         ),
         transcript_entries=transcript_store.transcript_rows(transcript_refs),
         token_counter=context_assembler.token_counter,
