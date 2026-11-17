@@ -16,6 +16,11 @@ from typing import Any
 import pytest
 
 import zeta.extensions as extensions_package
+from tests.support.processes import (
+    reap_process,
+    recv_process_message,
+    run_with_captured_stderr,
+)
 from zeta.extensions.store import ExtensionStore, ExtensionTrustError, InstallResult
 
 
@@ -500,7 +505,7 @@ class _WaitingStore(ExtensionStore):
 def _waiting_writer(home: str, source: str, connection: Connection) -> None:
     store = _WaitingStore(home=Path(home), project_dir=None, connection=connection)
     try:
-        assert connection.recv() == "start"
+        assert recv_process_message(connection, what="start") == "start"
         store.install(source, scope="user", accept=True)
     finally:
         connection.close()
@@ -510,10 +515,16 @@ def _writer(home: str, source: str, connection: Connection) -> None:
     store = ExtensionStore(home=Path(home), project_dir=None)
     try:
         connection.send("ready")
-        assert connection.recv() == "start"
+        assert recv_process_message(connection, what="start") == "start"
         store.install(source, scope="user", accept=True)
     finally:
         connection.close()
+
+
+def _exit_before_message(connection: Connection) -> None:
+    connection.close()
+    os.write(2, b"early child stderr\n")
+    os._exit(73)
 
 
 class _ExitStore(ExtensionStore):
@@ -536,24 +547,69 @@ def test_two_process_writers_preserve_both_trust_keys(tmp_path: Path) -> None:
     second = _extension(tmp_path / "second", name="second")
     context = multiprocessing.get_context("spawn")
     connections = [context.Pipe() for _ in range(2)]
+    stderr_paths = [tmp_path / f"writer-{index}.stderr" for index in range(2)]
     processes = [
-        context.Process(target=_writer, args=(str(home), str(source), child))
-        for source, (_parent, child) in zip((first, second), connections, strict=True)
+        context.Process(
+            target=run_with_captured_stderr,
+            args=(str(stderr_path), _writer, (str(home), str(source), child)),
+        )
+        for source, (_parent, child), stderr_path in zip(
+            (first, second), connections, stderr_paths, strict=True,
+        )
     ]
-    for process in processes:
-        process.start()
-    for parent, child in connections:
-        child.close()
-        assert parent.recv() == "ready"
-    for parent, _child in connections:
-        parent.send("start")
-    for process in processes:
-        process.join(20)
-        assert process.exitcode == 0
-        process.close()
-    for parent, _child in connections:
-        parent.close()
+    try:
+        for process in processes:
+            process.start()
+        for index, (parent, child) in enumerate(connections):
+            child.close()
+            assert recv_process_message(
+                parent,
+                process=processes[index],
+                stderr_path=stderr_paths[index],
+                what="ready",
+            ) == "ready"
+        for parent, _child in connections:
+            parent.send("start")
+        for process in processes:
+            process.join(20)
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            reap_process(process, timeout=10)
+            try:
+                process.close()
+            except ValueError:
+                pass
+        for pair in connections:
+            for connection in pair:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
     assert set(_trust(home)) == {"user:first", "user:second"}
+
+
+def test_process_receive_reports_early_exit_and_stderr(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    stderr_path = tmp_path / "early.stderr"
+    process = context.Process(
+        target=run_with_captured_stderr,
+        args=(str(stderr_path), _exit_before_message, (child,)),
+    )
+    process.start()
+    child.close()
+
+    with pytest.raises(
+        AssertionError,
+        match="child closed its pipe; exit code 73; captured stderr: early child stderr",
+    ):
+        recv_process_message(
+            parent,
+            process=process,
+            stderr_path=stderr_path,
+            what="ready",
+        )
 
 
 @pytest.mark.parametrize(
@@ -614,22 +670,48 @@ def test_real_process_writer_waits_for_held_store_lock(tmp_path: Path) -> None:
     entered = context.Event()
     release = context.Event()
     holder = context.Process(target=_lock_holder, args=(str(home), entered, release))
-    holder.start()
-    assert entered.wait(10)
     parent, child = context.Pipe()
-    waiter = context.Process(target=_waiting_writer, args=(str(home), str(source), child))
-    waiter.start()
-    child.close()
-    parent.send("start")
-    assert parent.recv() == "locking"
-    assert not parent.poll(0.2), "writer entered the store while another process held its lock"
-    release.set()
-    assert parent.recv() == "locked"
-    for process in (holder, waiter):
-        process.join(20)
-        assert process.exitcode == 0
-        process.close()
-    parent.close()
+    stderr_path = tmp_path / "waiter.stderr"
+    waiter = context.Process(
+        target=run_with_captured_stderr,
+        args=(str(stderr_path), _waiting_writer, (str(home), str(source), child)),
+    )
+    try:
+        holder.start()
+        assert entered.wait(10)
+        waiter.start()
+        child.close()
+        parent.send("start")
+        assert recv_process_message(
+            parent,
+            process=waiter,
+            stderr_path=stderr_path,
+            what="locking",
+        ) == "locking"
+        assert not parent.poll(0.2), "writer entered the store while another process held its lock"
+        release.set()
+        assert recv_process_message(
+            parent,
+            process=waiter,
+            stderr_path=stderr_path,
+            what="locked",
+        ) == "locked"
+        for process in (holder, waiter):
+            process.join(20)
+            assert process.exitcode == 0
+    finally:
+        release.set()
+        parent.close()
+        try:
+            child.close()
+        except OSError:
+            pass
+        for process in (holder, waiter):
+            reap_process(process, timeout=10)
+            try:
+                process.close()
+            except ValueError:
+                pass
     assert set(_trust(home)) == {"user:waiter"}
     assert (home / "extensions" / "waiter").is_dir()
 

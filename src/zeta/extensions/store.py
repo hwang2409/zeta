@@ -129,6 +129,20 @@ def _publish(path: Path, payload: bytes) -> None:
         raise ExtensionTrustError(f"cannot publish extension file: {path}") from exc
 
 
+def _remove_tree_entries(path: Path, progress: Callable[[], None] | None) -> None:
+    called = False
+    for entry in sorted(os.scandir(path), key=lambda item: item.name):
+        item = Path(entry.path)
+        if stat.S_ISDIR(entry.stat(follow_symlinks=False).st_mode):
+            _remove_tree(item, progress if not called else None)
+        else:
+            os.unlink(item)
+            if progress is not None and not called:
+                called = True
+                progress()
+        _fsync_directory(path)
+
+
 def _remove_tree(path: Path, progress: Callable[[], None] | None = None) -> None:
     if not path.exists():
         return
@@ -136,18 +150,7 @@ def _remove_tree(path: Path, progress: Callable[[], None] | None = None) -> None
         mode = path.lstat().st_mode
         if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
             raise ExtensionTrustError(f"unsafe extension cleanup path: {path}")
-        called = False
-        for entry in sorted(os.scandir(path), key=lambda item: item.name):
-            item = Path(entry.path)
-            item_mode = entry.stat(follow_symlinks=False).st_mode
-            if stat.S_ISDIR(item_mode):
-                _remove_tree(item, progress if not called else None)
-            else:
-                os.unlink(item)
-                if progress is not None and not called:
-                    called = True
-                    progress()
-            _fsync_directory(path)
+        _remove_tree_entries(path, progress)
         os.rmdir(path)
         _fsync_directory(path.parent)
     except ExtensionTrustError:
@@ -417,25 +420,30 @@ class ExtensionStore:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
-    def _root(self, scope: str, *, create: bool) -> Path:
+    def _scope_root(self, scope: str) -> tuple[Path, Path]:
         if scope == "user":
-            root = self.home / "extensions"
-        elif scope == "project":
+            return self.home / "extensions", self.home
+        if scope == "project":
             if self.project_dir is None:
                 raise ExtensionTrustError("project scope requires a project directory")
-            root = self.project_dir / ".zeta" / "extensions"
-        else:
-            raise ExtensionTrustError(f"invalid extension scope: {scope}")
+            return self.project_dir / ".zeta" / "extensions", self.project_dir
+        raise ExtensionTrustError(f"invalid extension scope: {scope}")
+
+    def _validate_root_components(self, root: Path, boundary: Path) -> None:
+        current = root
+        while current != boundary:
+            mode = current.lstat().st_mode
+            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                raise ExtensionTrustError(f"extension path is not a real directory: {current}")
+            current = current.parent
+
+    def _root(self, scope: str, *, create: bool) -> Path:
+        root, boundary = self._scope_root(scope)
         try:
             if create:
                 root.mkdir(parents=True, exist_ok=True)
             if root.exists():
-                current = root
-                while current != (self.home if scope == "user" else self.project_dir):
-                    mode = current.lstat().st_mode
-                    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-                        raise ExtensionTrustError(f"extension path is not a real directory: {current}")
-                    current = current.parent
+                self._validate_root_components(root, boundary)
             return root
         except OSError as exc:
             raise ExtensionTrustError(f"invalid extension root: {root}") from exc
@@ -668,37 +676,72 @@ class ExtensionStore:
             else:
                 self._finish_rollback(root, recovery.directory, recovery.owner)
 
+    def _recovery_decision(
+        self,
+        owner: _UpdateOwner,
+        *,
+        target_digest: str | None,
+        backup_digest: str | None,
+        tree_digest: str | None,
+        current_trust: str | None,
+    ) -> str:
+        committed = (
+            target_digest == owner.new_digest
+            and current_trust == owner.new_digest
+            and tree_digest is None
+        )
+        rollback_in_progress = (
+            current_trust == owner.old_trust
+            and backup_digest == owner.old_digest
+            and target_digest in {None, owner.new_digest}
+            and tree_digest in {None, owner.new_digest}
+        )
+        rolled_back = (
+            target_digest == owner.old_digest
+            and current_trust == owner.old_trust
+            and backup_digest is None
+        )
+        if committed:
+            return "commit"
+        if rollback_in_progress or rolled_back:
+            return "rollback"
+        raise ExtensionTrustError(f"ambiguous extension update transaction: {owner.name}")
+
+    def _classify_update(
+        self,
+        root: Path,
+        path: Path,
+        trust: dict[str, str],
+        names: set[str],
+        error: ExtensionTrustError,
+    ) -> _Recovery:
+        if stat.S_ISLNK(path.lstat().st_mode) or not path.is_dir():
+            raise error
+        entries = {item.name for item in os.scandir(path)}
+        if not entries:
+            return _Recovery(path, None, "empty")
+        if "owner.json" not in entries or not entries <= {"owner.json", "tree", "backup"}:
+            raise error
+        owner = self._read_owner(path / "owner.json", error)
+        if owner.name in names:
+            raise ExtensionTrustError(f"ambiguous extension update transaction: {owner.name}")
+        names.add(owner.name)
+        decision = self._recovery_decision(
+            owner,
+            target_digest=self._safe_digest(root / owner.name, root, owner.name),
+            backup_digest=self._safe_digest(path / "backup", path, owner.name),
+            tree_digest=self._safe_digest(path / "tree", path, owner.name),
+            current_trust=trust.get(self._key(self._scope_for_root(root), owner.name)),
+        )
+        return _Recovery(path, owner, decision)
+
     def _classify_recovery(self, root: Path, trust: dict[str, str]) -> tuple[_Recovery, ...]:
-        store = self._private_root(root)
         found: list[_Recovery] = []
         names: set[str] = set()
-        for path in sorted(store.glob("update-*")):
+        for path in sorted(self._private_root(root).glob("update-*")):
             error = ExtensionTrustError(f"invalid extension update transaction: {path}")
             try:
-                if stat.S_ISLNK(path.lstat().st_mode) or not path.is_dir():
-                    raise error
-                entries = {item.name for item in os.scandir(path)}
-                if not entries:
-                    found.append(_Recovery(path, None, "empty"))
-                    continue
-                if "owner.json" not in entries or not entries <= {"owner.json", "tree", "backup"}:
-                    raise error
-                owner = self._read_owner(path / "owner.json", error)
-                if owner.name in names:
-                    raise ExtensionTrustError(f"ambiguous extension update transaction: {owner.name}")
-                names.add(owner.name)
-                target = root / owner.name
-                target_digest = self._safe_digest(target, root, owner.name)
-                backup_digest = self._safe_digest(path / "backup", path, owner.name)
-                tree_digest = self._safe_digest(path / "tree", path, owner.name)
-                current_trust = trust.get(self._key(self._scope_for_root(root), owner.name))
-                if target_digest == owner.new_digest and current_trust == owner.new_digest and tree_digest is None:
-                    decision = "commit"
-                elif current_trust == owner.old_trust and backup_digest == owner.old_digest and target_digest in {None, owner.new_digest} and tree_digest in {None, owner.new_digest} or target_digest == owner.old_digest and current_trust == owner.old_trust and backup_digest is None:
-                    decision = "rollback"
-                else:
-                    raise ExtensionTrustError(f"ambiguous extension update transaction: {owner.name}")
-                found.append(_Recovery(path, owner, decision))
+                found.append(self._classify_update(root, path, trust, names, error))
             except ExtensionTrustError:
                 raise
             except OSError as exc:
