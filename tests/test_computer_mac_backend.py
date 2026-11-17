@@ -115,7 +115,7 @@ async def test_status_reports_effective_empty_allow_list_policy(
         await close_session(runtime.loop)
     assert result["kind"] == "output"
     for text in (tui_text, result["text"]):
-        assert f"computer: enabled, allowed app count=0" in text
+        assert "computer: enabled, allowed app count=0" in text
         assert expected in text
         if default == "deny":
             assert '[computer.macos.bundle_ids]\n"com.apple.Safari" = "allow"' in text
