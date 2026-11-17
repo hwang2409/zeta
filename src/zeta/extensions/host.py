@@ -17,7 +17,9 @@ skipped. One broken extension never breaks the session or stops the rest.
 from __future__ import annotations
 
 import asyncio
+import importlib.abc
 import importlib.machinery
+import importlib.util
 import itertools
 import re
 import sys
@@ -124,6 +126,29 @@ class _SourceExtensionLoader(importlib.machinery.SourceFileLoader):
     def get_code(self, fullname: str) -> object:
         source = self.get_data(self.get_filename(fullname))
         return compile(source, self.get_filename(fullname), "exec", dont_inherit=True)
+
+
+class _ExtensionFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, package: str, directory: Path) -> None:
+        self.package = package
+        self.directory = directory
+
+    def find_spec(self, fullname: str, path: object = None, target: object = None):
+        prefix = self.package + "."
+        if not fullname.startswith(prefix):
+            return None
+        relative = fullname[len(prefix):].split(".")
+        if any(not part.isidentifier() for part in relative):
+            return None
+        base = self.directory.joinpath(*relative)
+        source = base / "__init__.py" if base.is_dir() else base.with_suffix(".py")
+        if not source.is_file():
+            return None
+        loader = _SourceExtensionLoader(fullname, str(source))
+        locations = [str(base)] if source.name == "__init__.py" else None
+        return importlib.util.spec_from_file_location(
+            fullname, source, loader=loader, submodule_search_locations=locations
+        )
 
 
 class ExtensionHost:
