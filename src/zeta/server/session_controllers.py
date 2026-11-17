@@ -288,8 +288,11 @@ class SessionControllers:
             await asyncio.gather(*others, return_exceptions=True)
 
     async def _drained(self, record: SessionController) -> None:
-        """Wait until no use holds ``record``."""
-        while record.uses:
+        """Wait until no use of ``record`` is held by a completion. A use its
+        request still holds does not delay the close: that request may wait on
+        the registry close that follows, and its finalizer work, if any, already
+        owns a transferred use."""
+        while self._transferred(record):
             waiter = asyncio.get_running_loop().create_future()
             self._drains.setdefault(record, []).append(waiter)
             await waiter
@@ -302,10 +305,14 @@ class SessionControllers:
     def _settle(self, use: SessionUse) -> None:
         record = use.record
         record.uses.discard(use)
-        if not record.uses:
+        if not self._transferred(record):
             for waiter in self._drains.pop(record, ()):
                 if not waiter.done():
                     waiter.set_result(None)
+
+    @staticmethod
+    def _transferred(record: SessionController) -> bool:
+        return any(use._state == "transferred" for use in record.uses)
 
     def require_current(
         self, connection: Any, use: SessionUse, session_id: str | None

@@ -4980,7 +4980,8 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
 ) -> None:
     policy = ApprovalPolicy(store=ConversationStore(tmp_path))
     client = ServeControl(
-        SimpleNamespace(),
+        # a fake server whose one record never closes
+        SimpleNamespace(controllers=SimpleNamespace(is_closing=lambda control: False)),
         SimpleNamespace(policy=policy, state=None),
         ForegroundEventPublisher(),
     )
@@ -13265,7 +13266,8 @@ async def test_serve_maps_non_owner_agent_cancel_through_tool_end(tmp_path: Path
     policy_store = ConversationStore(tmp_path)
     policy = ApprovalPolicy(store=policy_store)
     client = ServeControl(
-        SimpleNamespace(),
+        # a fake server whose one record never closes
+        SimpleNamespace(controllers=SimpleNamespace(is_closing=lambda control: False)),
         SimpleNamespace(policy=policy, state=None),
         ForegroundEventPublisher(),
     )
@@ -13340,7 +13342,8 @@ async def test_serve_maps_real_descendant_status_tool_result(tmp_path: Path) -> 
     policy_store = ConversationStore(tmp_path / "serve")
     policy = ApprovalPolicy(store=policy_store)
     client = ServeControl(
-        SimpleNamespace(),
+        # a fake server whose one record never closes
+        SimpleNamespace(controllers=SimpleNamespace(is_closing=lambda control: False)),
         SimpleNamespace(policy=policy, state=None),
         ForegroundEventPublisher(),
     )

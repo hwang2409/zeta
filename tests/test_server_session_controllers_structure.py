@@ -252,7 +252,7 @@ def test_every_resident_close_goes_through_retire() -> None:
 
 def test_a_closing_record_stays_resident_until_its_close_ends() -> None:
     """Identity and generation survive transitions; ``retire`` stops resolution
-    at once, keeps the record resident while a held use delays the close, closes
+    at once, keeps the record resident while a transferred use delays the close, closes
     control then runtime once, and only then drops the record."""
     events: list[str] = []
 
@@ -288,6 +288,8 @@ def test_a_closing_record_stays_resident_until_its_close_ends() -> None:
         assert record.uses == set()
         owner.park(record)
         held = owner.selected(None, "s")
+        completion = asyncio.get_running_loop().create_future()
+        held.transfer_to(completion)
         close = owner.retire(record)
         assert owner.retire(record) is close
         assert (record.closing, record.generation) == (True, generation)
@@ -296,7 +298,7 @@ def test_a_closing_record_stays_resident_until_its_close_ends() -> None:
         for _ in range(5):
             await asyncio.sleep(0)
         assert (events, record in owner.records()) == ([], True)
-        held.release()
+        completion.set_result(None)
         await await_or_fail(owner.wait_closed("s"), what="close after the use settles")
         assert events == ["control", "runtime", "settled"]
         assert record not in owner.records()
