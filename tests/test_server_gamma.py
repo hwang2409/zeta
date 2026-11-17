@@ -390,6 +390,33 @@ async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_extension_recovery_failure_is_one_real_serve_notice(tmp_path: Path) -> None:
+    transaction = tmp_path / "home" / "extensions" / ".zeta-extension-store" / "update-bad"
+    transaction.mkdir(parents=True)
+    (transaction / "owner.json").write_text("{}", encoding="utf-8")
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["extensions"])
+        await send(reader, writer, 2, "new_session", {"provider": "codex"})
+        frames = await read_until(reader, lambda frame: frame.get("id") == 2, what="new session response")
+        notices = [
+            frame for frame in frames
+            if frame.get("params", {}).get("event") == "extension_notice"
+        ]
+        assert [frame["params"]["data"] for frame in notices] == [{
+            "kind": "extension",
+            "extension": "extensions",
+            "text": "extension loading disabled for user scope: update recovery requires attention",
+            "level": "warning",
+        }]
+        assert frames[-1].get("result") is not None
+        assert (transaction / "owner.json").read_text(encoding="utf-8") == "{}"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
 async def test_extensions_list_returns_loaded_rows(tmp_path: Path) -> None:
     extension_dir = tmp_path / "home" / "extensions" / "listed"
     extension_dir.mkdir(parents=True)

@@ -40,7 +40,7 @@ _DURABILITY_CALLBACKS = {
     ("remote_sync/project_publish.py", "_publish_payloads", "atomic_publish_file"),
     ("remote_sync/project_publish.py", "_publish_side_files", "atomic_publish_file"),
     ("runtime/loop/persistence.py", "_persist", "write_json_file"),
-    ("extensions/trust.py", "_write", "atomic_publish_file"),
+    ("extensions/store.py", "_publish", "atomic_publish_file"),
 }
 
 # Raw replace/rename sites are classified so a newly named direct writer cannot
@@ -78,6 +78,11 @@ _RAW_PUBLICATION = {
     ("remote_sync/project_publish.py", "publish_local_project", "os.rename"),
     ("remote_sync/project_publish.py", "atomic_publish_file", "os.replace"),
     ("accounts/publication.py", "atomic_publish", "os.replace"),
+    ("extensions/store.py", "install", "os.rename"),
+    ("extensions/store.py", "update", "os.rename"),
+    ("extensions/store.py", "remove", "os.rename"),
+    ("extensions/store.py", "_publish_owner", "os.rename"),
+    ("extensions/store.py", "_finish_rollback", "os.rename"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "os.replace"),
     ("transcript_search/index.py", "_publish", "os.replace"),
     ("attention_replies.py", "stage", "os.replace"),
@@ -86,6 +91,8 @@ _RAW_PUBLICATION = {
 }
 
 _RAW_DELETION = {
+    ("extensions/store.py", "_remove_tree", "unlink"),
+    ("extensions/store.py", "_finish_owner", "unlink"),
     ("accounts/logout.py", "_remove_directory_files", "unlink"),
     ("accounts/publication.py", "atomic_publish", "unlink"),
     ("accounts/store.py", "_delete_publication_pending", "unlink"),

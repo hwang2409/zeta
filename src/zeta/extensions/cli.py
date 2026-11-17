@@ -1,4 +1,4 @@
-"""command-line handlers for extension management."""
+"""Command-line handlers for extension management."""
 
 from __future__ import annotations
 
@@ -8,27 +8,27 @@ import sys
 from pathlib import Path
 
 from ..core.project_context import discover_repo_root
-from .trust import ExtensionTrustError, install, remove, trust, untrust, update
+from .store import ExtensionStore, ExtensionTrustError
 
 
 def handle(args: object, *, home: Path) -> int:
-    project_dir = discover_repo_root(os.getcwd())
+    store = ExtensionStore(home=home, project_dir=discover_repo_root(os.getcwd()))
     try:
         action = args.ext_action  # type: ignore[attr-defined]
         scope = args.scope  # type: ignore[attr-defined]
         if action == "install":
-            name, commit = install(args.source, home=home, project_dir=project_dir, scope=scope, accept=args.yes)  # type: ignore[attr-defined]
-            print(f"installed {name}" + (f" at {commit}" if commit else ""))
+            result = store.install(args.source, scope=scope, accept=args.yes)  # type: ignore[attr-defined]
+            print(f"installed {result.name}" + (f" at {result.commit}" if result.commit else ""))
         elif action == "update":
-            name, commit = update(args.name, home=home, project_dir=project_dir, scope=scope, accept=args.yes)  # type: ignore[attr-defined]
-            print(f"updated {name}" + (f" at {commit}" if commit else ""))
+            result = store.update(args.name, scope=scope, accept=args.yes)  # type: ignore[attr-defined]
+            print(f"updated {result.name}" + (f" at {result.commit}" if result.commit else ""))
         elif action == "remove":
-            remove(home=home, project_dir=project_dir, scope=scope, name=args.name)  # type: ignore[attr-defined]
+            store.remove(args.name, scope=scope)  # type: ignore[attr-defined]
         elif action == "trust":
-            trust(home=home, project_dir=project_dir, scope=scope, name=args.name, accept=args.yes)  # type: ignore[attr-defined]
+            store.trust(args.name, scope=scope, accept=args.yes)  # type: ignore[attr-defined]
         else:
-            untrust(home=home, project_dir=project_dir, scope=scope, name=args.name)  # type: ignore[attr-defined]
+            store.untrust(args.name, scope=scope)  # type: ignore[attr-defined]
         return 0
-    except (ExtensionTrustError, OSError, ValueError, subprocess.CalledProcessError) as exc:
+    except (ExtensionTrustError, subprocess.CalledProcessError) as exc:
         print(f"extension error: {exc}", file=sys.stderr)
         return 2

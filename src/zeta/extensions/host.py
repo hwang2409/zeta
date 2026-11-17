@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from ..runtime.execution import ToolHandler
     from ..tools.registry import ToolRegistry
     from .manifest import ExtensionManifest
+    from .store import InstalledExtension
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,8 +113,15 @@ class LoadedExtension:
 class PendingExtension:
     """A project-scope extension discovered but not yet trusted (not loaded)."""
 
-    manifest: ExtensionManifest
-    directory: Path
+    item: InstalledExtension
+
+    @property
+    def manifest(self) -> ExtensionManifest:
+        return self.item.manifest
+
+    @property
+    def directory(self) -> Path:
+        return self.item.directory
 
 
 _NAMESPACE = "_zeta_extensions"
