@@ -129,6 +129,11 @@ class PendingExtension:
 class ExtensionStatus:
     """Current public state of one discovered extension."""
 
+    # merge-resolution: src/zeta/extensions/host.py assignment ExtensionStatus.enabled -> s2 replaces mutable fields with immutable state projection
+    # merge-resolution: src/zeta/extensions/host.py assignment ExtensionStatus.trusted -> trust is derived from the immutable projection scope and state
+    # merge-resolution: src/zeta/extensions/host.py constant ExtensionStatus.loaded -> loaded is represented by immutable state == "loaded"
+    # merge-resolution: src/zeta/extensions/host.py assignment ExtensionStatus.error -> errors remain host-owned notices, not mutable projection state
+
     name: str
     version: str
     scope: str
@@ -316,6 +321,10 @@ class ExtensionHost:
     def record_error(self, name: str, scope: str, error: str) -> None:
         self._errors[(name, scope)] = error
 
+    # merge-resolution: src/zeta/extensions/host.py def ExtensionHost.add_status -> one owner reads and projects extension state; no mutable status table
+    # merge-resolution: src/zeta/extensions/host.py def ExtensionHost.mark_loaded -> loaded state is derived from the immutable projection
+    # merge-resolution: src/zeta/extensions/host.py def ExtensionHost.mark_error -> failures are retained as host-owned notices
+    # merge-resolution: src/zeta/extensions/host.py def ExtensionHost.mark_trusted -> trust is derived from scope and projection state
     def status_rows(self) -> list[dict[str, object]]:
         """Return the host-owned status projection for the serve surface."""
         rows: list[dict[str, object]] = []
