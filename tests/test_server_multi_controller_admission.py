@@ -280,7 +280,6 @@ async def test_ordinary_server_keeps_multi_controller_dormant(tmp_path: Path) ->
 _CANCEL_ROWS = (
     "reconnect_mcp_bindings_before", "reconnect_mcp_bindings_after",
     "controller_claimed_before", "controller_claimed_after",
-    "parking_claim_before", "parking_claim_after",
     "reattach_mcp_bindings_before", "reattach_mcp_bindings_after",
     "controller_ready_before", "controller_ready_after",
     "commit_hello_before", "commit_hello_after",
@@ -809,3 +808,207 @@ async def test_target_is_reserved_before_one_awaited_open(
                 await await_or_fail(first_request, what="cancel target acquisition")
         monkeypatch.undo()
         await _close_server(server, (first, second))
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.parametrize(
+    "row",
+    (
+        "live_owner_refusal",
+        "disconnected_resume",
+        "parked_resume",
+        "resident_setup_failure",
+        "resident_setup_cancel",
+        "unrelated_parked_hello",
+    ),
+)
+@pytest.mark.asyncio
+async def test_public_multi_controller_owner_state_table(
+    tmp_path: Path,
+    transport: Transport,
+    row: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    owner = await connect_replay(server, transport)
+    survivor = await connect_replay(server, transport)
+    newcomer = None
+    features = ("multi_controller", "session_park", "resume_attach")
+    try:
+        assert "result" in await negotiate(owner, replay=False, extra=features)
+        assert "result" in await negotiate(survivor, replay=False, extra=features)
+        target = await owner.request(2, "new_session", {})
+        target_id = target["result"]["session"]["session_id"]
+        old = await survivor.request(2, "new_session", {})
+        old_id = old["result"]["session"]["session_id"]
+        if row == "live_owner_refusal":
+            refused = await survivor.request(3, "resume", {"session_id": target_id})
+            owner_status = await owner.request(3, "status", {})
+            survivor_status = await survivor.request(4, "status", {})
+            assert refused["error"] == {
+                "code": -32014,
+                "message": "session is controlled by another client",
+                "data": {"code": "session_controlled", "session_id": target_id},
+            }
+            assert owner_status["result"]["session"]["session_id"] == target_id
+            assert survivor_status["result"]["session"]["session_id"] == old_id
+            return
+        await owner.close()
+
+        if row == "disconnected_resume":
+            resumed = await survivor.request(3, "resume", {"session_id": target_id})
+            status = await survivor.request(4, "status", {})
+            assert "result" in resumed, resumed
+            assert resumed["result"]["session"]["session_id"] == target_id
+            assert status["result"]["session"]["session_id"] == target_id
+            assert target_id != old_id
+        else:
+            record = next(
+                record
+                for record in server.controllers.records()
+                if record.runtime.opened is not None
+                and record.runtime.session_id == target_id
+            )
+            server.controllers.park(record)
+            if row == "resident_setup_failure":
+                async def fail_publish() -> None:
+                    raise RuntimeError("injected grant publication failure")
+
+                monkeypatch.setattr(
+                    record.control, "publish_session_grant_reset", fail_publish
+                )
+                failed = await survivor.request(3, "resume", {"session_id": target_id})
+                status = await survivor.request(4, "status", {})
+                assert failed["error"]["code"] == -32000
+                assert status["result"]["session"]["session_id"] == old_id
+                monkeypatch.undo()
+                retried = await survivor.request(5, "resume", {"session_id": target_id})
+                assert retried["result"]["session"]["session_id"] == target_id
+                return
+            if row == "resident_setup_cancel":
+                entered = asyncio.Event()
+                release = asyncio.Event()
+                original_publish = record.control.publish_session_grant_reset
+
+                async def hold_publish() -> None:
+                    entered.set()
+                    await await_or_fail(release.wait(), what="release grant publication")
+                    await original_publish()
+
+                monkeypatch.setattr(
+                    record.control, "publish_session_grant_reset", hold_publish
+                )
+                await survivor.send(3, "resume", {"session_id": target_id})
+                await await_or_fail(entered.wait(), what="grant publication entered")
+                physical = server.connections.clients()[0]
+                handler = physical._run_task
+                assert handler is not None
+                settled = asyncio.Event()
+                handler.add_done_callback(lambda _task: settled.set())
+                handler.cancel()
+                release.set()
+                await await_or_fail(settled.wait(), what="cancelled resume handler")
+                await survivor.close()
+                newcomer = await connect_replay(server, transport)
+                recovered = await newcomer.request(
+                    1,
+                    "hello",
+                    {
+                        "protocol_version": "1.1",
+                        "features": list(features),
+                        "session_id": old_id,
+                    },
+                )
+                assert "result" in recovered, recovered
+                status = await newcomer.request(2, "status", {})
+                assert status["result"]["session"]["session_id"] == old_id
+                monkeypatch.undo()
+                retried = await newcomer.request(
+                    3, "resume", {"session_id": target_id}
+                )
+                assert retried["result"]["session"]["session_id"] == target_id
+                return
+            if row == "parked_resume":
+                resumed = await survivor.request(3, "resume", {"session_id": target_id})
+                status = await survivor.request(4, "status", {})
+                assert resumed["result"]["session"]["session_id"] == target_id
+                assert status["result"]["session"]["session_id"] == target_id
+                assert target_id != old_id
+                return
+            newcomer = await connect_replay(server, transport)
+            hello = await negotiate(newcomer, replay=False, extra=("multi_controller",))
+            assert "result" in hello
+            status = await survivor.request(3, "status", {})
+            assert any(
+                parked["session_id"] == target_id
+                for parked in status["result"]["parked_sessions"]
+            )
+            assert not record.closing
+    finally:
+        await _close_server(
+            server,
+            tuple(client for client in (owner, survivor, newcomer) if client is not None),
+        )
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_public_multi_controller_shutdown_state_table(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.server.runtime import ServerRuntime
+
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    clients = [await connect_replay(server, transport) for _ in range(5)]
+    provisional_request = None
+    release = asyncio.Event()
+    try:
+        features = ("multi_controller", "session_park", "resume_attach")
+        for client in clients:
+            assert "result" in await negotiate(client, replay=False, extra=features)
+        for request_id, client in enumerate(clients[:4], 2):
+            assert "result" in await client.request(request_id, "new_session", {})
+
+        entered = asyncio.Event()
+        original_create = ServerRuntime.create_session
+
+        async def gated_create(runtime: ServerRuntime, *args: Any, **kwargs: Any):
+            entered.set()
+            await await_or_fail(release.wait(), what="release provisional create")
+            return await original_create(runtime, *args, **kwargs)
+
+        monkeypatch.setattr(ServerRuntime, "create_session", gated_create)
+        provisional_request = asyncio.create_task(clients[4].request(9, "new_session", {}))
+        await await_or_fail(entered.wait(), what="provisional create entered")
+        physical_clients = server.connections.clients()
+        records = server.controllers.records()
+        closes: dict[int, int] = {id(record.runtime): 0 for record in records}
+        for record in records:
+            original_close = record.runtime.close
+
+            async def counted_close(
+                *, _runtime=record.runtime, _close=original_close
+            ) -> None:
+                closes[id(_runtime)] += 1
+                await _close()
+
+            monkeypatch.setattr(record.runtime, "close", counted_close)
+
+        await await_or_fail(server.close(), what="four-controller server shutdown")
+        assert provisional_request.done()
+        assert all(client._run_task is None or client._run_task.done() for client in physical_clients)
+        assert server.controllers.records() == ()
+        assert set(closes.values()) == {1}
+    finally:
+        release.set()
+        if provisional_request is not None and not provisional_request.done():
+            provisional_request.cancel()
+        if provisional_request is not None:
+            with contextlib.suppress(BaseException):
+                await await_or_fail(provisional_request, what="provisional request settles")
+        for client in clients:
+            await client.close()
+        if server.connections is not None:
+            await server.close()

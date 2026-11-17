@@ -1587,7 +1587,7 @@ async def test_legacy_status_bytes_match_main_from_resident_state(
     try:
         await server.controllers.attached().control._event(_start_event(call))
         await _read_raw(reader)
-        assert server._client is not None
+        assert next(iter(server.connections.clients()), None) is not None
         monkeypatch.setattr(
             lifecycle, "session_snapshot", lambda client, controller: {"session_id": "fixed"}
         )
@@ -1689,7 +1689,7 @@ async def test_slash_and_named_settings_read_serve_control_not_store(
     try:
         await server.controllers.attached().control._event(_start_event(call))
         policy = server.controllers.attached().runtime.policy
-        assert policy is not None and server._client is not None
+        assert policy is not None and next(iter(server.connections.clients()), None) is not None
         monkeypatch.setattr(
             policy,
             "pending_requests",
@@ -1701,7 +1701,7 @@ async def test_slash_and_named_settings_read_serve_control_not_store(
         assert status.pending_approvals == ("call-1 (read)",)
         with pytest.raises(ProtocolError) as error:
             await registry.set_settings(
-                server._client,
+                next(iter(server.connections.clients()), None),
                 "set-settings",
                 {
                     "session_id": server.controllers.attached().runtime.session_id,

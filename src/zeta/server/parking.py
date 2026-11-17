@@ -54,6 +54,12 @@ class ParkedPairs:
         """``status.parked_sessions``."""
         return [control.parked_row() for control in self._controllers.parked_controls()]
 
+    def forget(self, record: SessionController) -> None:
+        """Forget the presentation state after an exact owner claims a record."""
+        self._controllers.unpark(record)
+        if record.runtime.opened is not None:
+            self._sent.pop(record.runtime.session_id, None)
+
     def unpark(self, incoming: ServeControl) -> bool:
         """Take ``incoming`` out of the parked set when it is parked."""
         session_id = incoming.runtime.session_id

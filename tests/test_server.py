@@ -937,7 +937,7 @@ async def test_protocol_1_1_client_receives_sub_agent_receipt_for_known_kinds(
             await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         )[-1]["result"]
         assert hello["protocol_version"] == "1.1"
-        assert server._client is not None
+        assert next(iter(server.connections.clients()), None) is not None
         for kind in NOTIFICATION_KINDS:
             await server.controllers.attached().control._event(
                 StreamEvent(
@@ -964,7 +964,7 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
             await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         )[-1]["result"]
         assert hello["protocol_version"] == "1.2"
-        assert server._client is not None
+        assert next(iter(server.connections.clients()), None) is not None
         for kind in (*NOTIFICATION_KINDS, "future_kind"):
             data = {"kind": kind}
             if kind == "child_question":
@@ -999,7 +999,7 @@ async def test_child_message_delivered_event_maps_from_background_run(
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
-        assert server._client is not None
+        assert next(iter(server.connections.clients()), None) is not None
         await server.controllers.attached().control._event(
             StreamEvent(
                 StreamEventType.CHILD_MESSAGE_DELIVERED,
@@ -2016,7 +2016,7 @@ async def test_session_history_records_controller_disconnect_approval_abort(
         # The approval aborts first; the old controller releases only after
         # its turn is canceled. Reconnect after the release, as a client must.
         for _ in range(500):
-            if not server._client_active:
+            if not (server.connections is not None and next(iter(server.connections.clients()), None) is not None):
                 break
             await asyncio.sleep(0.01)
         else:
@@ -2399,8 +2399,8 @@ async def test_client_close_emits_approval_end_once(tmp_path: Path) -> None:
     try:
         await _request(reader, writer, 3, "send", {"text": "read it"})
         approval = await _event(reader, "approval_request")
-        assert server._client is not None
-        closing = asyncio.create_task(server._client.close())
+        assert next(iter(server.connections.clients()), None) is not None
+        closing = asyncio.create_task(next(iter(server.connections.clients()), None).close())
         frames = await _frames_until_eof(reader)
         await closing
         ends = _named_events(frames, "approval_end")
@@ -3359,7 +3359,7 @@ async def test_lifecycle_prunes_ended_approvals(
             await _frames_until_event(reader, "tool_end")
             await _frames_until_event(reader, "agent_end")
 
-        assert server._client is not None
+        assert next(iter(server.connections.clients()), None) is not None
         assert server.controllers.attached().control._approvals.state.records == {}
     finally:
         await close_serve(server, writer)
@@ -3795,7 +3795,7 @@ async def test_foreground_abort_only_ends_foreground_approval(
         server.controllers.attached().runtime.loop._background_owner.register(
             "background-child", child_task.cancel, child_task
         )
-        assert server._client is not None
+        assert next(iter(server.connections.clients()), None) is not None
         server.controllers.attached().control._approvals.observe(delegated_request)
 
         await _request(reader, writer, 4, "abort", {"scope": "foreground"})
@@ -5128,7 +5128,7 @@ async def test_session_switch_clears_delegated_mappings(tmp_path: Path) -> None:
     reader, writer = await _ready(server)
     first_session = server.controllers.attached().runtime.session_id
     try:
-        assert server._client is not None
+        assert next(iter(server.connections.clients()), None) is not None
         approvals = server.controllers.attached().control._approvals
         first_wire = approvals.wire_id(("child-a", "same"))
         await _request(reader, writer, 3, "new_session", {"provider": "codex"})
@@ -6293,7 +6293,7 @@ async def test_notification_receipt_is_not_republished_after_canceled_turn(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer, session_id = await _ready_extensions(server)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     published = asyncio.Event()
     release_publication = asyncio.Event()
@@ -10228,7 +10228,7 @@ async def test_slash_status_transcript_work_does_not_block_serve(
         await writer.drain()
         assert await asyncio.to_thread(entered.wait, 10)
 
-        client = server._client
+        client = next(iter(server.connections.clients()), None)
         assert client is not None
         request_task = client._run_task
         assert request_task is not None
@@ -10340,7 +10340,7 @@ async def test_serve_close_settles_slash_status_read(
         await await_or_fail(slash_read_queued.wait(), what="/status read submission")
         if read_state == "running":
             assert await asyncio.to_thread(status_entered.wait, 10)
-        client = server._client
+        client = next(iter(server.connections.clients()), None)
         assert client is not None
         request_task = client._run_task
         assert request_task is not None
@@ -11825,7 +11825,7 @@ async def test_disconnected_wake_turn_reuses_durable_notification_input(
         writer.close()
         await writer.wait_closed()
         for _ in range(10000):
-            if not server._client_active:
+            if not (server.connections is not None and next(iter(server.connections.clients()), None) is not None):
                 break
             await asyncio.sleep(0)
         assert len(store.agent_notifications()) == 1
@@ -11880,7 +11880,7 @@ async def test_send_immediately_after_reconnect_does_not_steal_wake_turn(
         assert rejected[-1]["error"]["code"] == -32004
         await _frames_until_event(reader, "agent_end")
         async with asyncio.timeout(TIMEOUT):
-            while server._client is not None and server.controllers.attached().control.turn_busy():
+            while next(iter(server.connections.clients()), None) is not None and server.controllers.attached().control.turn_busy():
                 await asyncio.sleep(0)
 
         await _request(reader, writer, 6, "send", {"text": "user now"})
@@ -12738,8 +12738,8 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
 
     async def run() -> None:
         reader, writer, sid = await _ready_extensions(server)
-        assert server._client is not None and server.controllers.attached().runtime.loop is not None
-        first_client = server._client
+        assert next(iter(server.connections.clients()), None) is not None and server.controllers.attached().runtime.loop is not None
+        first_client = next(iter(server.connections.clients()), None)
         second_client = _Client(server, asyncio.StreamReader(), writer)
         # an observer-free second connection past hello, as a real one would be
         second_client.handshaken = True
@@ -12904,7 +12904,7 @@ async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
     )
     try:
         assert await asyncio.to_thread(commit_entered.wait, 10)
-        client = server._client
+        client = next(iter(server.connections.clients()), None)
         assert client is not None and client._account_switch_task is not None
         await asyncio.wait_for(server.close(), 10)
         assert client._account_switch_task is None

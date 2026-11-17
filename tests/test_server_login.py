@@ -87,7 +87,7 @@ async def test_login_is_hidden_and_rejected_for_legacy_protocol(tmp_path, server
         for method in LOGIN_REQUESTS:
             result = await rpc(reader, writer, method, provider="claude")
             assert result["error"]["code"] == -32601
-        assert not server._client.logins.tasks
+        assert not next(iter(server.connections.clients()), None).logins.tasks
     finally:
         await close_serve(server, writer)
 
@@ -128,7 +128,7 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert (await rpc(reader, writer, "login_start", provider=other))["result"]["state"] == "pending"
         assert (await rpc(reader, writer, "login_cancel", provider=other))["result"]["state"] == "cancelled"
         assert await callback(captured["redirect"], {"code": "synthetic-code", "state": captured["state"]}) == 200
-        await asyncio.wait_for(server._client.logins.tasks[provider], 3)
+        await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks[provider], 3)
         assert (await rpc(reader, writer, "login_status", provider=provider))["result"] == {"state": "succeeded"}
         saved = await asyncio.to_thread(credential_store, provider, home=server.home)
         assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) == expected
@@ -188,7 +188,7 @@ async def test_login_refused_by_unloaded_registry_reports_the_cause(tmp_path, mo
         if orphan_appears == "during_browser":
             assert result["state"] == "pending"
             assert await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]}) == 200
-            await asyncio.wait_for(server._client.logins.tasks["claude"], 10)
+            await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks["claude"], 10)
             result = (await rpc(reader, writer, "login_status", provider="claude"))["result"]
         assert result == expected
         if orphan_appears == "before_start":
@@ -219,7 +219,7 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
     monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
     monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
     server, reader, writer, _ = await connect(tmp_path)
-    manager = server._client.logins
+    manager = next(iter(server.connections.clients()), None).logins
     if outcome in {"timeout", "exchange_timeout"}:
         manager.timeout = 0.3
     try:
@@ -370,7 +370,7 @@ async def test_serve_login_decision_expiry_reports_failure_and_releases_locks(
             captured["redirect"],
             {"code": "synthetic", "state": captured["state"]},
         )
-        result = await asyncio.wait_for(server._client.logins.tasks["claude"], 3)
+        result = await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks["claude"], 3)
 
         assert result == {
             "state": "failed",
@@ -592,7 +592,7 @@ async def test_cancel_during_provider_lock_release_reports_success(
         await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]})
         assert await asyncio.to_thread(release_entered.wait, 3)
 
-        task = server._client.logins.tasks["claude"]
+        task = next(iter(server.connections.clients()), None).logins.tasks["claude"]
         task.cancel()
         task.cancel()
         release_exit.set()
@@ -648,7 +648,7 @@ async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, m
         await rpc(reader, writer, "login_start", provider="claude")
         await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]})
         await asyncio.wait_for(entered.wait(), 10)
-        task = server._client.logins.tasks["claude"]
+        task = next(iter(server.connections.clients()), None).logins.tasks["claude"]
         # publication already committed, so cancellation cannot report that
         # credentials were left unchanged.
         task.cancel()

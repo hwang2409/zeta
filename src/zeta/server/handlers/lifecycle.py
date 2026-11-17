@@ -17,6 +17,7 @@ from ...mcp.config import (
     load_mcp_config_overlay,
 )
 from ...protocol.types import StreamEvent, StreamEventType
+from .. import control as control_module
 from .. import model_selection
 from ..host_commands import SessionHostCommands
 from ..protocol import MAX_FRAME_BYTES, ErrorDescriptor, ProtocolError
@@ -24,7 +25,8 @@ from . import validation
 
 if TYPE_CHECKING:
     from ...runtime.loop import AgentLoop
-    from ..session_controllers import SessionController, SessionUse
+    from ..control import ServeControl
+    from ..session_controllers import SessionAcquisition, SessionController, SessionUse
 
 
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
@@ -117,6 +119,37 @@ async def _setup(self, body: Any, params: dict[str, Any], controller: SessionUse
     return await controller.run(setup())
 
 
+async def _settle_controller_release(
+    self: _Client, control: ServeControl
+) -> bool:
+    """Finish one semantic release and report deferred caller cancellation."""
+    release = control.begin_controller_release(
+        reconnect="approval_reconnect" in self.features,
+        keep_turn="turn_reconnect" in self.features,
+    )
+    cancelled = False
+    while True:
+        try:
+            await asyncio.shield(release)
+            return cancelled
+        except asyncio.CancelledError:
+            if release.cancelled():
+                raise
+            cancelled = True
+
+
+async def _release_previous(
+    self: _Client, acquisition: SessionAcquisition
+) -> None:
+    previous = acquisition.previous
+    if previous is None or previous is acquisition.target:
+        return
+    cancelled = await _settle_controller_release(self, previous.control)
+    self.server.parking.leave(previous.control)
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 async def _new_session(
     self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
@@ -184,11 +217,7 @@ async def _new_session(
             snapshot = {"session": session_snapshot(self, controller)}
             if acquisition is not None:
                 self.server.controllers.commit_session(acquisition).release()
-                if (
-                    acquisition.previous is not None
-                    and acquisition.previous is not acquisition.target
-                ):
-                    self.server.parking.leave(acquisition.previous.control)
+                await _release_previous(self, acquisition)
             return snapshot
     except BaseException:
         if acquisition is not None:
@@ -209,21 +238,48 @@ async def _resume(
 ) -> dict[str, object]:
     acquisition = None
     target_use = None
+    resident_claimed = False
     try:
         bindings = await mcp_bindings(self, params, controller)
         state = controller.runtime.state
         previous_session_id = state.metadata.session_id if state is not None else None
         candidate = host_commands(self, params)
-        attached, park = await _resume_live_or_parked(
-            self, params, bindings, candidate, "session_park" in self.features, controller
-        )
-        if attached is not None:
-            return attached
-        async with _session_swap(self, park, controller) as incoming:
+        park = "session_park" in self.features
+        multi = self.server.controllers.controller_mode == "multi"
+        session_id = None
+        if multi:
             session_id = await _resolve_session_id(self, params, controller)
             await self.server.controllers.wait_closed(session_id)
+            resident = self.server.controllers.resident(session_id)
+            if "resume_attach" in self.features and resident is not None and not resident.control.unhealthy():
+                acquisition = self.server.controllers.reserve_existing(self, session_id)
+                target_use = self.server.controllers.use_acquisition(acquisition)
+                if acquisition.previous is not acquisition.target:
+                    resident_claimed = await target_use.control.controller_claimed(
+                        reconnect="approval_reconnect" in self.features,
+                        require_host_binding="session_host_commands" in self.features,
+                        deadline=control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS,
+                    )
+                attached = await _attach_live_turn(
+                    self, bindings, candidate, controller=target_use
+                )
+                if acquisition.previous is not acquisition.target:
+                    await target_use.control.publish_session_grant_reset()
+                self.server.controllers.commit_session(acquisition).release()
+                self.server.parking.forget(acquisition.target)
+                await _release_previous(self, acquisition)
+                return attached
+        else:
+            attached, park = await _resume_live_or_parked(
+                self, params, bindings, candidate, park, controller
+            )
+            if attached is not None:
+                return attached
+        async with _session_swap(self, park, controller) as incoming:
+            if session_id is None:
+                session_id = await _resolve_session_id(self, params, controller)
+            await self.server.controllers.wait_closed(session_id)
             acquisition = None
-            multi = self.server.controllers.controller_mode == "multi"
             if multi:
                 candidate = incoming or controller.record
                 acquisition = self.server.controllers.reserve_session(
@@ -296,13 +352,15 @@ async def _resume(
             snapshot = {"session": session_snapshot(self, controller)}
             if acquisition is not None:
                 self.server.controllers.commit_session(acquisition).release()
-                if (
-                    acquisition.previous is not None
-                    and acquisition.previous is not acquisition.target
-                ):
-                    self.server.parking.leave(acquisition.previous.control)
+                self.server.parking.forget(acquisition.target)
+                await _release_previous(self, acquisition)
             return snapshot
     except BaseException:
+        deferred_cancel = False
+        if resident_claimed and acquisition is not None:
+            deferred_cancel = await _settle_controller_release(
+                self, acquisition.target.control
+            )
         if acquisition is not None:
             closed = self.server.controllers.abort_session(acquisition)
             if closed is not None:
@@ -310,6 +368,8 @@ async def _resume(
         if controller.runtime.state is None:
             controller.control._active_host_commands = None
             controller.control._host_binding_required = False
+        if deferred_cancel:
+            raise asyncio.CancelledError
         raise
     finally:
         if target_use is not None:
@@ -418,21 +478,21 @@ async def _attach_live_turn(
     previous = (control._active_host_commands, control._host_binding_required)
     control._active_host_commands = candidate
     control._host_binding_required = "session_host_commands" in self.features
-    if reattach is not None:
-        try:
+    try:
+        if reattach is not None:
             await control.reattach_mcp_bindings(*reattach)
-        except BaseException:
-            control._active_host_commands, control._host_binding_required = previous
-            raise
-    if parked is not None:
-        # the attached session changed, as on any resume
-        await control.publish_session_grant_reset()
-    if not control.state_change_busy():
-        # the turn ended during the rebind, or a parked pair only held background
-        # work: this is a plain resume of an idle session
-        await control.controller_ready()
-        return {"session": session_snapshot(self, controller)}
-    return {"session": session_snapshot(self, controller), "attached": "live_turn"}
+        if parked is not None:
+            # the attached session changed, as on any resume
+            await control.publish_session_grant_reset()
+        if not control.state_change_busy():
+            # the turn ended during the rebind, or a parked pair only held background
+            # work: this is a plain resume of an idle session
+            await control.controller_ready()
+            return {"session": session_snapshot(self, controller)}
+        return {"session": session_snapshot(self, controller), "attached": "live_turn"}
+    except BaseException:
+        control._active_host_commands, control._host_binding_required = previous
+        raise
 
 
 async def mcp_bindings(

@@ -225,6 +225,10 @@ class ConnectionRegistry(ReplayOutput):
     def _primary_controller(self) -> _Connection | None:
         return self._controllers[0] if self._controllers else None
 
+    def clients(self) -> tuple[Any, ...]:
+        """The physical clients currently owned by this registry."""
+        return tuple(state.connection for state in self._connections.values())
+
     def register(self, connection: Any) -> None:
         if self._closed:
             raise RuntimeError("connection registry is closed")

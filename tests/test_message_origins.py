@@ -548,7 +548,7 @@ async def _audit_server_row(path: str, tmp_path: Path) -> dict[str, object]:
         else:
             raise AssertionError(path)
         if path != "serve steer":
-            assert server._client is not None and server.controllers.attached().control._turn_task is not None
+            assert next(iter(server.connections.clients()), None) is not None and server.controllers.attached().control._turn_task is not None
             await asyncio.wait_for(server.controllers.attached().control._turn_task, 10)
         if input_id is not None:
             reused = await _request(reader, writer, 5, "send", {"input_id": input_id})

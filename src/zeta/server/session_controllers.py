@@ -138,6 +138,7 @@ class SessionControllers:
         # safe when a failed connection races a later hello.
         self._controller_mode: Literal["empty", "legacy", "multi"] = "empty"
         self._controller_members: dict[Any, int] = {}
+        self._hello_records: dict[Any, SessionController] = {}
         self._hello_generations = itertools.count(1)
         # a reconnect grace keeps the negotiated mode alive after its member
         # closes.  admission state follows one table: tokens (provisional or
@@ -209,9 +210,36 @@ class SessionControllers:
         del self._controller_members[admission.connection]
         self._refresh_controller_mode()
 
+    def is_controller(self, connection: Any) -> bool:
+        return connection in self._controller_members
+
+    def controller_for(self, connection: Any) -> SessionController | None:
+        """Return the exact committed or provisional record for ``connection``."""
+        record = self._by_connection.get(connection)
+        if record is not None:
+            return record
+        record = self._hello_records.get(connection)
+        if record is not None:
+            return record
+        return next((
+            owner.target for owner in self._by_session.values()
+            if isinstance(owner, SessionAcquisition) and owner.connection is connection
+        ), None)
+
+    async def begin_controller_release(
+        self, connection: Any, *, reconnect: bool, keep_turn: bool
+    ) -> None:
+        """Release only this connection's semantic controller state."""
+        record = self.controller_for(connection)
+        if record is not None:
+            await record.control.begin_controller_release(
+                reconnect=reconnect, keep_turn=keep_turn
+            )
+
     def release_connection(self, connection: Any, reason: str = "eof") -> None:
         del reason
         previous = self._by_connection.get(connection)
+        self._hello_records.pop(connection, None)
         generation = self._controller_members.pop(connection, None)
         if generation is None:
             self._refresh_controller_mode()
@@ -258,6 +286,8 @@ class SessionControllers:
             acquisition = self.reserve_existing(connection, session_id)
             return self._use(acquisition.target, acquisition)
         record = self._by_connection.get(connection, self._attached)
+        if self._controller_mode == "multi" and connection not in self._by_connection:
+            self._hello_records[connection] = record
         if record.closing:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         return self._use(record)
@@ -298,16 +328,26 @@ class SessionControllers:
             raise unattached_error
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
 
+    def resident(self, session_id: str) -> SessionController | None:
+        """Return the live record for ``session_id`` without changing ownership."""
+        owner = self._by_session.get(session_id)
+        if isinstance(owner, SessionAcquisition):
+            return owner.target
+        if owner is not None and not owner.closing:
+            return owner
+        parked = self._parked.get(session_id)
+        if parked is not None and not parked.closing:
+            return parked
+        return next((
+            record for record in self._records.values()
+            if record.runtime.opened is not None
+            and record.runtime.session_id == session_id
+            and not record.closing
+        ), None)
+
     def reserve_existing(self, connection: Any, session_id: str) -> SessionAcquisition:
         """Reserve an existing resident session for an exact reconnect."""
-        record = self._by_session.get(session_id)
-        if isinstance(record, SessionAcquisition):
-            record = record.target
-        if record is None:
-            record = next((
-                candidate for candidate in self._records.values()
-                if candidate.runtime.session_id == session_id and not candidate.closing
-            ), None)
+        record = self.resident(session_id)
         if record is None or record.closing:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         return self.reserve_session(connection, session_id, record)
@@ -347,6 +387,8 @@ class SessionControllers:
             raise RuntimeError("session acquisition is no longer current")
         self._by_session[acquisition.session_id] = acquisition.target
         self._by_connection[acquisition.connection] = acquisition.target
+        self._hello_records.pop(acquisition.connection, None)
+        self._parked.pop(acquisition.session_id, None)
         return self._use(acquisition.target)
 
     def abort_session(self, acquisition: SessionAcquisition) -> asyncio.Task[None] | None:
