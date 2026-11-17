@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -112,7 +113,16 @@ async def _traced_execute(
         result = await registry.execute(tool_call, _span=span, **options)
         if result.get("isError"):
             span.fail(None)
+        if loop.telemetry.enabled():
+            span.set_sizes(
+                argument_bytes=_json_bytes(tool_call.arguments),
+                result_bytes=_json_bytes(result.get("content")),
+            )
         return result
+
+
+def _json_bytes(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str).encode())
 
 
 async def dispatch_tool_calls(

@@ -259,7 +259,7 @@ def test_each_tool_and_child_span_ends_once_under_its_parent(tmp_path, traced, c
             asyncio.run(scenario())
     spans = memory.get_finished_spans()
     assert _tree(spans) == sorted(expected)
-    # one owner: every started span ended exactly once, and the SDK saw no second end
+    # one owner: every started span ended exactly once, and nothing wrote to a span after it ended
     assert lifecycle.started == lifecycle.ended == {span.context.span_id: 1 for span in spans}
     assert [record.getMessage() for record in caplog.records] == []
     for span in spans:
@@ -271,6 +271,13 @@ def test_each_tool_and_child_span_ends_once_under_its_parent(tmp_path, traced, c
         assert span.attributes["zeta.tool.type"] == ("agent" if span.name == "execute_tool agent" else "function")
         assert span.attributes["zeta.agent.name"] == "zeta"
         assert span.attributes["gen_ai.conversation.id"] == loop.store.session_id
+        if span.attributes.get("error.type") != "CancelledError":  # a cancelled call has no result to size
+            assert span.attributes["zeta.tool.call.arguments.size"] > 0
+    probes = [span for span in tools if span.name == "execute_tool probe"]
+    for span in probes:
+        # sizes only: {"text": SECRET} and the one "ok" text block, never the text itself
+        assert span.attributes["zeta.tool.call.arguments.size"] == len(f'{{"text": "{SECRET}"}}')
+        assert span.attributes["zeta.tool.call.result.size"] > len("ok")
     approvals = [(event.name, dict(event.attributes)) for span in tools for event in span.events]
     for _name, attributes in approvals:
         assert type(attributes.pop("duration", 0)) is int
