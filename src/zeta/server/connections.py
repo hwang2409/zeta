@@ -280,6 +280,10 @@ class ConnectionRegistry(ReplayOutput):
         connection.role = role
         return role
 
+    def log_controller_refusal(self, refused: Any) -> None:
+        """Record the physical diagnostic for a semantic controller refusal."""
+        self._log_controller_refusal(refused)
+
     def _log_controller_refusal(self, refused: Any) -> None:
         """Name the holder and the refused connection on a -32001 slot refusal.
 

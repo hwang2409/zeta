@@ -1026,13 +1026,18 @@ class _Client:
         role_name = params.get("role", "controller")
         admission = None
         if role_name == "controller":
-            admission = self.server.controllers.admit_hello(
-                self,
-                negotiated_multi="multi_controller" in self.features,
-                reconnect_session_id=params.get("session_id")
-                if isinstance(params.get("session_id"), str)
-                else None,
-            )
+            try:
+                admission = self.server.controllers.admit_hello(
+                    self,
+                    negotiated_multi="multi_controller" in self.features,
+                    reconnect_session_id=params.get("session_id")
+                    if isinstance(params.get("session_id"), str)
+                    else None,
+                )
+            except ProtocolError as exc:
+                if exc.code == ErrorDescriptor.CONNECTION_CAPACITY.code:
+                    self.server.connections.log_controller_refusal(self)
+                raise
         try:
             role = self.server.connections.negotiate_role(
                 self, role_name, self.protocol_version, self.features, max_role=self.max_role
