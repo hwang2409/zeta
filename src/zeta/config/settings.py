@@ -725,9 +725,6 @@ def _validated_computer(
     if default not in {"allow", "deny"}:
         notices.append("settings · ignored computer.default_app_access: expected 'allow' or 'deny'")
         default = "deny"
-    elif default == "allow":
-        notices.append("settings · computer.default_app_access=allow is not supported; using deny")
-        default = "deny"
     macos = table.get("macos", {})
     bundles: dict[str, Literal["allow", "deny"]] = {}
     bundle_ids_table_present = False
