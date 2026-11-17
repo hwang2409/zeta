@@ -743,11 +743,8 @@ def _validated_computer(
     if kill_switch is False:
         notices.append("settings · computer.kill_switch=false is not supported; using true")
     default = table.get("default_app_access", "deny")
-    if default not in {"allow", "deny"}:
+    if not isinstance(default, str) or default not in {"allow", "deny"}:
         notices.append("settings · ignored computer.default_app_access: expected 'allow' or 'deny'")
-        default = "deny"
-    elif default == "allow":
-        notices.append("settings · computer.default_app_access=allow is not supported; using deny")
         default = "deny"
     macos = table.get("macos", {})
     bundles: dict[str, Literal["allow", "deny"]] = {}
