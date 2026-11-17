@@ -429,7 +429,7 @@ class ProjectRegistry(
         canonical_integration_root = _validate_root(canonical_integration_root)
         if memory_profile is not None:
             self._ensure_entry_memory_capabilities()
-        with self._identity_write() as root_fd:
+        with self._identity_write(operation="create_project") as root_fd:
             projects = self._list_locked(root_fd)
             if len(projects) >= MAX_PROJECTS:
                 raise ProjectRegistryError("project limit exceeded")
