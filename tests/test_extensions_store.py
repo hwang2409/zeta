@@ -68,6 +68,18 @@ class _SecondAcquisitionFailureStore(ExtensionStore):
                 raise _Stop(name)
 
 
+class _TrustPublicationFailureStore(ExtensionStore):
+    fail_after_replace = False
+
+    def _change_trust(
+        self, trust: dict[str, str], scope: str, name: str, digest: str | None,
+    ) -> None:
+        if not self.fail_after_replace:
+            raise ExtensionTrustError("injected trust publication failure")
+        super()._change_trust(trust, scope, name, digest)
+        raise ExtensionTrustError("injected trust publication failure")
+
+
 @pytest.mark.parametrize(
     ("case", "action", "confirmation", "checkpoint", "error", "installed", "trusted"),
     [
@@ -287,7 +299,53 @@ def test_remove_stop_is_hidden_and_repeat_cleans_residue(tmp_path: Path, checkpo
     assert not list((home / "extensions" / ".zeta-extension-store").glob("remove-*"))
 
 
-def test_malformed_update_suppresses_only_affected_scope(tmp_path: Path) -> None:
+@pytest.mark.parametrize("fail_after_replace", [False, True])
+def test_update_recovers_trust_publication_failure(
+    tmp_path: Path, fail_after_replace: bool,
+) -> None:
+    home = tmp_path / "home"
+    repository, _commit = _git_extension(tmp_path / "repo")
+    store = ExtensionStore(home=home, project_dir=None)
+    old = store.install(f"git+{repository}@HEAD", scope="user", accept=True)
+    (repository / "mod.py").write_text("# new\ndef activate(zx):\n    pass\n")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "update"],
+        check=True,
+    )
+    broken = _TrustPublicationFailureStore(home=home, project_dir=None)
+    broken.fail_after_replace = fail_after_replace
+
+    if fail_after_replace:
+        broken.update("demo", scope="user", accept=True)
+    else:
+        with pytest.raises(ExtensionTrustError, match="injected trust publication failure"):
+            broken.update("demo", scope="user", accept=True)
+
+    recovered = ExtensionStore(home=home, project_dir=None).discover("user")
+    assert len(recovered.extensions) == 1
+    final = recovered.extensions[0]
+    if fail_after_replace:
+        assert final.digest != old.digest
+    else:
+        assert final.digest == old.digest
+    assert final.trusted
+    assert not list((home / "extensions" / ".zeta-extension-store").glob("update-*"))
+
+
+@pytest.mark.parametrize(
+    "owner_text",
+    [
+        "{}",
+        '{"version":2}',
+        '{"version":1,"scope":"user","name":"../bad"}',
+        '{"version":1,"scope":"user","name":"demo","old_digest":1}',
+        '{"version":1,"version":1}',
+    ],
+)
+def test_malformed_update_suppresses_only_affected_scope(
+    tmp_path: Path, owner_text: str,
+) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
     store = ExtensionStore(home=home, project_dir=project)
@@ -295,7 +353,9 @@ def test_malformed_update_suppresses_only_affected_scope(tmp_path: Path) -> None
     store.install(str(_extension(tmp_path / "project-source", name="project-good")), scope="project", accept=True)
     bad = home / "extensions" / ".zeta-extension-store" / "update-bad"
     bad.mkdir()
-    (bad / "owner.json").write_text("{}")
+    shutil.copytree(home / "extensions" / "user-good", bad / "tree")
+    shutil.copytree(home / "extensions" / "user-good", bad / "backup")
+    (bad / "owner.json").write_text(owner_text)
     before = sorted(str(path.relative_to(home)) for path in home.rglob("*"))
     user = store.discover("user")
     project_result = store.discover("project")
@@ -303,6 +363,32 @@ def test_malformed_update_suppresses_only_affected_scope(tmp_path: Path) -> None
     assert user.notices == ("extension loading disabled for user scope: update recovery requires attention",)
     assert [item.name for item in project_result.extensions] == ["project-good"]
     assert sorted(str(path.relative_to(home)) for path in home.rglob("*")) == before
+
+
+@pytest.mark.parametrize("nonempty", [False, True])
+def test_ownerless_update_recovery_is_conservative(
+    tmp_path: Path, nonempty: bool,
+) -> None:
+    home = tmp_path / "home"
+    store = ExtensionStore(home=home, project_dir=None)
+    store.install(str(_extension(tmp_path / "source")), scope="user", accept=True)
+    transaction = home / "extensions" / ".zeta-extension-store" / "update-ownerless"
+    transaction.mkdir()
+    if nonempty:
+        (transaction / "unknown").write_text("preserve")
+
+    result = store.discover("user")
+
+    if nonempty:
+        assert result.extensions == ()
+        assert result.notices == (
+            "extension loading disabled for user scope: update recovery requires attention",
+        )
+        assert transaction.exists()
+    else:
+        assert [item.name for item in result.extensions] == ["demo"]
+        assert result.notices == ()
+        assert not transaction.exists()
 
 
 def _lock_holder(home: str, entered: Any, release: Any) -> None:
@@ -487,6 +573,26 @@ def test_anonymous_stage_is_ignored_and_never_loaded(tmp_path: Path) -> None:
     assert staged.is_dir()
     assert sorted(path.relative_to(staged) for path in staged.rglob("*")) == before
 
+
+
+def test_trust_rejects_target_changed_during_confirmation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    source = _extension(tmp_path / "source")
+    store = ExtensionStore(home=home, project_dir=project)
+    store.install(str(source), scope="project", accept=True)
+    store.untrust("demo", scope="project")
+
+    def mutate_during_review(_review: str) -> str:
+        (project / ".zeta" / "extensions" / "demo" / "mod.py").write_text("VALUE = 2\n")
+        return "y"
+
+    with pytest.raises(
+        ExtensionTrustError,
+        match="extension changed since review: demo",
+    ):
+        store.trust("demo", scope="project", confirm=mutate_during_review)
+    assert not store.discover("project").extensions[0].trusted
 
 
 def test_extension_store_is_the_only_management_route() -> None:
