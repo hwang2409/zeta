@@ -27,6 +27,8 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from .api import EXTENSION_API_VERSION, ExtensionAPI
@@ -54,6 +56,7 @@ def apply_extensions(
     project_dir: str | Path | None,
     builtin_names: frozenset[str],
     disabled: tuple[str, ...] = (),
+    clock: Callable[[], float] = time.monotonic,
 ) -> ExtensionHost:
     """Load user extensions into ``registry`` and stage project extensions.
 
@@ -68,20 +71,29 @@ def apply_extensions(
         home=_as_path(home),
         project_dir=_as_path(project_dir),
         builtin_names=builtin_names,
+        clock=clock,
     )
     disabled_set = frozenset(disabled)
     user_dir = _scope_dir(home, "")
     project_scope_dir = _scope_dir(project_dir, ".zeta")
     for directory in _extension_dirs(user_dir):
         manifest = _manifest_or_notice(host, directory, USER_SCOPE)
-        if manifest is None or _skip(host, manifest, directory, disabled_set):
+        if manifest is None:
+            continue
+        enabled = not _skip(host, manifest, directory, disabled_set)
+        host.add_status(manifest, USER_SCOPE, enabled=enabled)
+        if not enabled:
             continue
         _load_one(host, directory, manifest, USER_SCOPE)
     if project_scope_dir is not None and project_scope_dir != user_dir:
         pending_names: list[str] = []
         for directory in _extension_dirs(project_scope_dir):
             manifest = _manifest_or_notice(host, directory, PROJECT_SCOPE)
-            if manifest is None or _skip(host, manifest, directory, disabled_set):
+            if manifest is None:
+                continue
+            enabled = not _skip(host, manifest, directory, disabled_set)
+            host.add_status(manifest, PROJECT_SCOPE, enabled=enabled)
+            if not enabled:
                 continue
             host.pending_project.append(PendingExtension(manifest, directory))
             pending_names.append(manifest.name)
@@ -104,6 +116,7 @@ def trust_project_extensions(host: ExtensionHost) -> None:
     pending = list(host.pending_project)
     host.pending_project.clear()
     for item in pending:
+        host.mark_trusted(item.manifest.name, PROJECT_SCOPE)
         _load_one(host, item.directory, item.manifest, PROJECT_SCOPE)
 
 
@@ -136,17 +149,19 @@ def _load_one(
     try:
         module = _import_entry(directory, manifest, host=host)
     except Exception as exc:  # noqa: BLE001 - loading must fail open
+        error = f"import failed: {_short(exc)}"
+        host.mark_error(manifest.name, error, scope)
         host.notices.append(
-            f"extensions · ignored {scope} extension {manifest.name} ({display}): "
-            f"import failed: {_short(exc)}"
+            f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
         return
     entry = getattr(module, manifest.entry_function, None)
     if not callable(entry):
         host.remove_package_for_directory(directory)
+        error = f"no callable {manifest.entry_function}(zx)"
+        host.mark_error(manifest.name, error, scope)
         host.notices.append(
-            f"extensions · ignored {scope} extension {manifest.name} ({display}): "
-            f"no callable {manifest.entry_function}(zx)"
+            f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
         return
     loading = LoadingExtension(manifest, scope, directory)
@@ -155,18 +170,20 @@ def _load_one(
         result = entry(api)
     except Exception as exc:  # noqa: BLE001 - a broken activate must not break the session
         host.remove_package_for_directory(directory)
+        error = f"activate raised: {_short(exc)}"
+        host.mark_error(manifest.name, error, scope)
         host.notices.append(
-            f"extensions · ignored {scope} extension {manifest.name} ({display}): "
-            f"activate raised: {_short(exc)}"
+            f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
         return
     if inspect.isawaitable(result):
         if inspect.iscoroutine(result):
             result.close()
         host.remove_package_for_directory(directory)
+        error = "activate must be synchronous"
+        host.mark_error(manifest.name, error, scope)
         host.notices.append(
-            f"extensions · ignored {scope} extension {manifest.name} ({display}): "
-            "activate must be synchronous"
+            f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
         return
     host.commit(loading)
