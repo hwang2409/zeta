@@ -1140,6 +1140,148 @@ async def test_stdio_stderr_lock_timeout_drops_output_and_close_joins_writer(
 
 
 @pytest.mark.asyncio
+async def test_stdio_stderr_log_keeps_loss_marker_and_data_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert stderr_log_module is not None
+    marker = b"[zeta: dropped 1 bytes of stderr]\n"
+    cap = len(stderr_log_module._loss_marker(10**20 - 1)) + 1
+    monkeypatch.setattr(stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", cap)
+    log = await stderr_log_module.RotatingStderrLog.prepare(
+        tmp_path / "mcp-logs" / "boundaries.log"
+    )
+    try:
+        assert await asyncio.to_thread(log._append, b"x", 1) == 1
+    finally:
+        await log.close()
+    assert (tmp_path / "mcp-logs" / "boundaries.log").read_bytes() == marker + b"x"
+
+    cap = len(stderr_log_module._loss_marker(10**20 - 1)) + 4
+    monkeypatch.setattr(stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", cap)
+    log = await stderr_log_module.RotatingStderrLog.prepare(
+        tmp_path / "mcp-logs" / "utf8.log"
+    )
+    try:
+        assert await asyncio.to_thread(log._append, b"a" * (cap - 4)) == cap - 4
+        assert await asyncio.to_thread(log._append, "€x\n".encode()) == 3
+    finally:
+        await log.close()
+    assert (tmp_path / "mcp-logs" / "utf8.log").read_bytes().endswith("€\n".encode())
+
+    cap = len(stderr_log_module._loss_marker(10**20 - 1)) + 4
+    monkeypatch.setattr(stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", cap)
+    log = await stderr_log_module.RotatingStderrLog.prepare(
+        tmp_path / "mcp-logs" / "lines.log"
+    )
+    try:
+        assert await asyncio.to_thread(log._append, b"a" * (cap - 5)) == cap - 5
+        assert await asyncio.to_thread(log._append, b"abc\ndef") == 4
+    finally:
+        await log.close()
+    assert (tmp_path / "mcp-logs" / "lines.log").read_bytes().endswith(b"abc\n")
+
+
+@pytest.mark.asyncio
+async def test_stdio_stderr_log_terminates_partial_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert stderr_log_module is not None
+    cap = len(stderr_log_module._loss_marker(10**20 - 1)) + 3
+    monkeypatch.setattr(stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", cap)
+    log = await stderr_log_module.RotatingStderrLog.prepare(
+        tmp_path / "mcp-logs" / "partial.log"
+    )
+    try:
+        assert await asyncio.to_thread(log._append, b"abcdef\n", 10**20 - 1) == 2
+    finally:
+        await log.close()
+    assert (tmp_path / "mcp-logs" / "partial.log").read_bytes().endswith(b"ab\n")
+
+    cap = len(stderr_log_module._loss_marker(10**20 - 1)) + 37
+    monkeypatch.setattr(stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", cap)
+    log = await stderr_log_module.RotatingStderrLog.prepare(
+        tmp_path / "mcp-logs" / "long-line.log"
+    )
+    try:
+        assert await asyncio.to_thread(log._append, b"x" * 100, 10**20 - 1) == 36
+    finally:
+        await log.close()
+    assert (tmp_path / "mcp-logs" / "long-line.log").read_bytes().endswith(b"\n")
+
+
+@pytest.mark.asyncio
+async def test_stdio_stderr_log_validates_widest_loss_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert stderr_log_module is not None
+    cap = len(stderr_log_module._loss_marker(10**20 - 1))
+    monkeypatch.setattr(stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", cap - 1)
+    with pytest.raises(ValueError, match="smaller than its loss marker"):
+        await stderr_log_module.RotatingStderrLog.prepare(
+            tmp_path / "mcp-logs" / "marker-boundary.log"
+        )
+    monkeypatch.setattr(stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", cap)
+    log = await stderr_log_module.RotatingStderrLog.prepare(
+        tmp_path / "mcp-logs" / "marker-boundary.log"
+    )
+    await log.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_stderr_log_counts_loss_across_rotations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert stderr_log_module is not None
+    cap = len(stderr_log_module._loss_marker(10**20 - 1)) + 3
+    monkeypatch.setattr(stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", cap)
+    log = await stderr_log_module.RotatingStderrLog.prepare(
+        tmp_path / "mcp-logs" / "rotations.log"
+    )
+
+    class Chunks:
+        def __init__(self) -> None:
+            self.chunks = [b"a" * 100, b"ghij"]
+
+        async def read(self, _size: int) -> bytes:
+            return self.chunks.pop(0) if self.chunks else b""
+
+    try:
+        await log.drain(Chunks())
+    finally:
+        await log.close()
+    payload = b"".join(
+        path.read_bytes()
+        for path in sorted((tmp_path / "mcp-logs").glob("rotations.log*"))
+    )
+    assert re.findall(rb"dropped (\d+) bytes", payload) == [b"45"]
+    assert all(
+        path.stat().st_size <= cap
+        for path in (tmp_path / "mcp-logs").glob("rotations.log*")
+    )
+
+
+@pytest.mark.asyncio
+async def test_stdio_stderr_log_truncates_marker_payload_to_file_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert stderr_log_module is not None
+    cap = 1024
+    monkeypatch.setattr(stderr_log_module, "MCP_STDERR_LOG_FILE_BYTES", cap)
+    log = await stderr_log_module.RotatingStderrLog.prepare(
+        tmp_path / "mcp-logs" / "overflow.log"
+    )
+    try:
+        assert await asyncio.to_thread(log._append, b"x" * cap, 1)
+    finally:
+        await log.close()
+
+    path = tmp_path / "mcp-logs" / "overflow.log"
+    payload = path.read_bytes()
+    assert len(payload) == cap
+    assert payload.startswith(b"[zeta: dropped 1 bytes of stderr]\n")
+
+
+@pytest.mark.asyncio
 async def test_stdio_stderr_queue_overload_writes_one_bounded_loss_marker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

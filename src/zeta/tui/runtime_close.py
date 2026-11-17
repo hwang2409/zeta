@@ -17,6 +17,7 @@ class RuntimeCloseMixin:
 
     def _init_runtime_close(self) -> None:
         self._closed = False
+        self._closing = False
         self._close_task: asyncio.Task[None] | None = None
 
     async def close(self) -> None:
@@ -33,7 +34,18 @@ class RuntimeCloseMixin:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
+    async def _cancel_model_catalog_load(self) -> None:
+        self._model_catalog_refresh_requested = False
+        task = getattr(self, "_model_catalog_task", None)
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True), timeout=10
+        )
+
     async def _close_runtime(self) -> None:
+        self._closing = True
         first_error: BaseException | None = None
 
         def attempt(action: Callable[[], object]) -> object | None:
@@ -59,6 +71,7 @@ class RuntimeCloseMixin:
             attempt(self._cancel_background_invalidation)
             await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)
+            await attempt_async(self._cancel_model_catalog_load)
             prepare_ui_session_change = getattr(
                 self, "_prepare_ui_session_change", None
             )

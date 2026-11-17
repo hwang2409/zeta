@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import threading
+import weakref
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.input import DummyInput
 from prompt_toolkit.output import DummyOutput
 
+from tests.support.fake_backend import FakeBackend
 from zeta.cli.main import build_parser, main
 from zeta.core.checkpoints.workspace import (
     WorkspaceSnapshotError,
@@ -162,7 +164,62 @@ def test_entrypoint_shutdown_releases_every_lease(
 
 
 @pytest.mark.usefixtures("no_gc")
+@pytest.mark.asyncio
+async def test_closing_app_cancels_pending_model_catalog_refresh(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    calls: list[str] = []
+
+    def load_catalog(provider: str) -> frozenset[str] | None:
+        calls.append(provider)
+        started.set()
+        assert release.wait(10)
+        finished.set()
+        return None
+
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="claude",
+        model="claude-sonnet-4-6",
+        on_model_change=lambda model: None,
+        model_catalog_loader=load_catalog,
+    )
+    refreshes = 0
+
+    def refresh_model_picker() -> None:
+        nonlocal refreshes
+        refreshes += 1
+
+    app.refresh_model_picker = refresh_model_picker
+    app._start_model_catalog_load()
+    await asyncio.to_thread(started.wait, 10)
+    app._start_model_catalog_load()
+    app_ref = weakref.ref(app)
+
+    await app.close()
+    assert app._model_catalog_task is None
+    assert calls == ["claude"]
+    assert refreshes == 0
+
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 10)
+    assert calls == ["claude"]
+    assert refreshes == 0
+    del app
+    gc.collect()
+    assert app_ref() is None
+
+
+@pytest.mark.usefixtures("no_gc")
 @pytest.mark.parametrize("opened_snapshots", [False, True])
+@pytest.mark.asyncio
 async def test_closed_app_rejects_snapshot_access(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, opened_snapshots: bool,
 ) -> None:
@@ -465,6 +522,81 @@ async def test_closed_tui_drops_callbacks_without_gc(
     await app.close()
     del app
     assert reference() is None
+    SessionManager(tmp_path / "home").delete(loop.store.session_id)
+
+
+@pytest.mark.usefixtures("no_gc")
+async def test_closed_tui_freed_while_update_notice_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A closed TUI is freed even while its update-notice subscriber is published.
+
+    ProcessUpdateMonitor._publish binds a strong local (`callback = reference()`)
+    to each subscriber while it awaits it. If handle_update strong-captures the
+    app, that local keeps a closed app alive past refcount cleanup. Pinning the
+    subscriber the way _publish does reproduces the flake deterministically.
+    """
+    import weakref
+
+    import zeta
+    from zeta.runtime import update_notice
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+    app._snapshots()
+    loop = app.loop
+    monitor = update_notice.process_update_monitor(zeta.__file__ or "")
+    pinned = next(
+        reference()
+        for reference in tuple(monitor._subscribers)
+        if reference() is app._update_notice_callback
+    )
+    assert pinned is not None
+    reference = weakref.ref(app)
+    await app.close()
+    del app
+    assert reference() is None
+    del pinned
+    assert reference() is None
+    SessionManager(tmp_path / "home").delete(loop.store.session_id)
+
+
+@pytest.mark.usefixtures("no_gc")
+async def test_closed_tui_freed_while_update_notice_observer_waits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An update observer cannot keep a closed TUI alive while it waits."""
+    import weakref
+
+    import zeta
+    from zeta.runtime import update_notice
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    app = await asyncio.to_thread(create_app, build_parser().parse_args(["--provider", "codex"]))
+    app._snapshots()
+    loop = app.loop
+    monitor = update_notice.process_update_monitor(zeta.__file__ or "")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def publish_update(old_revision: str, new_revision: str) -> None:
+        del old_revision, new_revision
+        entered.set()
+        await asyncio.wait_for(release.wait(), 10)
+
+    monkeypatch.setattr(app.observer_host, "publish_update", publish_update)
+    publishing = asyncio.create_task(monitor._publish("old", "new"))
+    reference = weakref.ref(app)
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        await app.close()
+        del app
+        assert reference() is None
+    finally:
+        release.set()
+        await asyncio.wait_for(publishing, 10)
     SessionManager(tmp_path / "home").delete(loop.store.session_id)
 
 

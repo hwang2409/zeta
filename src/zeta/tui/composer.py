@@ -468,6 +468,10 @@ class ComposerAttachmentMixin:
     """Attachment behavior shared by the TUI composition root."""
 
     def abort_active(self, submission_id: int | None = None) -> None:
+        if submission_id is None and self._picker_loading is not None:
+            # A picker's rows load outside the pipeline; ctrl+c stops the load
+            # as it stopped the slash command that loaded them.
+            self._stop_picker_load()
         if submission_id is None and not self._submissions.active:
             task = self._active_task
             if task is None or task.done():

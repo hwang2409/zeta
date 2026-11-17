@@ -9,6 +9,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import queue
 import re
 import shlex
 import signal
@@ -803,6 +804,82 @@ def test_serve_maps_account_state_unknown() -> None:
         STREAM_EVENT_WIRE_EVENTS[StreamEventType.ACCOUNT_STATE_UNKNOWN]
         == "account_state_unknown"
     )
+
+
+@pytest.mark.asyncio
+async def test_serve_maps_real_list_attention_tool_result(tmp_path: Path) -> None:
+    def prepare():
+        manager = SessionManager(tmp_path)
+        project = manager.project_registry.create_project("alpha", "Alpha")
+        current = manager.create(
+            provider="codex", model="fake", project_id=project.project_id
+        )
+        predecessor = manager.create(
+            provider="codex", model="fake", project_id=project.project_id
+        )
+        record = AttentionStore(
+            predecessor.store.session_dir, writer_epoch=5
+        ).request(
+            session_id=predecessor.store.session_id,
+            project_id=project.project_id,
+            entry_id=None,
+            entry_seq=None,
+            title="Choose a path",
+            why="The predecessor stopped.",
+        )
+        predecessor.store.close()
+        return manager, project, current, predecessor.store.session_id, record
+
+    manager, project, current, predecessor_id, record = await asyncio.to_thread(
+        prepare
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        current.store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=project.project_id,
+        project_registry=manager.project_registry,
+    )
+    call = ToolCall("attention-list", "list_attention", {})
+    result = await loop.tool_registry.execute(call)
+    policy_store = ConversationStore(tmp_path / "serve")
+    policy = ApprovalPolicy(store=policy_store)
+    client = ServeControl(
+        SimpleNamespace(),
+        SimpleNamespace(policy=policy, state=None),
+        ForegroundEventPublisher(),
+    )
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    client._notify = notify
+    await client._event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                result["content"][0]["text"],
+                structured_content=result["structuredContent"],
+            ),
+        ),
+        session_id=current.store.session_id,
+        background=True,
+    )
+
+    wire_result = notifications[0][1]["tool_result"]
+    item = wire_result["structured_content"]["items"][0]
+    assert item["id"] == record.id
+    assert item["owning_session"] == predecessor_id
+    await loop.close()
+    policy_store.close()
+    current.store.close()
 
 
 def test_agent_status_lost_reason_survives_serve_tool_mapping() -> None:
@@ -12049,6 +12126,7 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
     reader, writer, session_id = await _ready_extensions(server)
     path = server.runtime.opened.store.path
     await _request(reader, writer, 3, "new_session", {"provider": "codex"})
+    retained = path.read_bytes()
     with path.open("ab") as stream:
         stream.write(b'{"private":"must-not-leak"\n')
     damaged = path.read_bytes()
@@ -12110,7 +12188,7 @@ async def test_resume_corrupt_transcript_returns_bounded_structured_error(
             path.with_name(
                 f"conversation.quarantine.{quarantine_id}.jsonl"
             ).read_bytes()
-            == damaged
+            == damaged[len(retained) :]
         )
         resumed = (
             await _request(reader, writer, 7, "resume", {"session_id": session_id})
@@ -12689,31 +12767,53 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
         assert server._client is not None and server.runtime.loop is not None
         first_client = server._client
         second_client = _Client(server, asyncio.StreamReader(), writer)
+        # an observer-free second connection past hello, as a real one would be
+        second_client.handshaken = True
+        second_client.protocol_version = first_client.protocol_version
+        manager = server.runtime.manager
         original_commit = account_session_module.SessionAccountContext._commit_locked
+        metadata_lock = manager._metadata_lock
         event_loop = asyncio.get_running_loop()
         rename_tasks: list[asyncio.Task[object]] = []
+        switch_thread: list[int] = []
+        rename_waits_for_lock = threading.Event()
 
-        def commit_then_queue_rename(self: object, state: object, directory_fd: int):
+        @contextmanager
+        def observed_metadata_lock(*args: object, **kwargs: object):
+            if switch_thread and threading.get_ident() != switch_thread[0]:
+                rename_waits_for_lock.set()
+            with metadata_lock(*args, **kwargs) as directory_fd:
+                yield directory_fd
+
+        def commit_then_wait_for_rename(self: object, state: object, directory_fd: int):
             metadata = original_commit(self, state, directory_fd)
+            switch_thread.append(threading.get_ident())
 
             def start_rename() -> None:
                 rename_tasks.append(
                     asyncio.create_task(
-                        registry.rename_session(
+                        registry.dispatch(
                             second_client,
                             "rename-session",
+                            "rename_session",
                             {"session_id": sid, "name": "renamed during switch"},
                         )
                     )
                 )
 
             event_loop.call_soon_threadsafe(start_rename)
+            # worst order: the rename waits for the metadata lock this thread
+            # holds before the switch asks the loop to apply its result.
+            assert rename_waits_for_lock.wait(10), "rename never reached the lock"
             return metadata
 
+        # test-contract: seam force the rename to wait on the switch's metadata lock
+        manager._metadata_lock = observed_metadata_lock  # type: ignore[method-assign]
         account_session_module.SessionAccountContext._commit_locked = (  # type: ignore[method-assign]
-            commit_then_queue_rename
+            commit_then_wait_for_rename
         )
         try:
+            results.put("racing")  # type: ignore[attr-defined]
             response = await _request(
                 reader,
                 writer,
@@ -12722,25 +12822,32 @@ def _serve_switch_rename_race(home_value: str, results: object) -> None:
                 {"session_id": sid, "account": str(second)},
             )
             assert response[-1]["result"]["account"] == str(second)
-            assert rename_tasks
-            await rename_tasks[0]
+            assert rename_waits_for_lock.is_set() and rename_tasks
+            await await_or_fail(
+                rename_tasks[0],
+                timeout=10,
+                what="second-client rename during account switch",
+            )
             assert server.runtime.metadata.name == "renamed during switch"
         finally:
             account_session_module.SessionAccountContext._commit_locked = (  # type: ignore[method-assign]
                 original_commit
             )
+            manager._metadata_lock = metadata_lock  # type: ignore[method-assign]
             await first_client.close()
             await server.close()
 
     try:
         asyncio.run(run())
     except BaseException as exc:  # noqa: BLE001 - report child failure to parent
-        results.put(repr(exc))
+        results.put(repr(exc))  # type: ignore[attr-defined]
     else:
-        results.put(None)
+        results.put(None)  # type: ignore[attr-defined]
 
 
 def test_serve_switch_and_second_client_rename_do_not_deadlock(tmp_path: Path) -> None:
+    # a deadlock blocks the child's event loop, so only a process boundary can
+    # bound it; the limit starts once the child is set up, not at spawn.
     context = multiprocessing.get_context("spawn")
     results = context.Queue()
     process = context.Process(
@@ -12748,13 +12855,26 @@ def test_serve_switch_and_second_client_rename_do_not_deadlock(tmp_path: Path) -
         args=(str(tmp_path / "race-home"), results),
     )
     process.start()
-    process.join(timeout=5)
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=1)
-        pytest.fail("serve switch and second-client rename deadlocked")
+    outcome: object = "serve child did not report an outcome"
+    try:
+        try:
+            ready = results.get(timeout=120)
+        except queue.Empty:
+            pytest.fail("serve child never reached the switch")
+        assert ready == "racing", ready
+        try:
+            outcome = results.get(timeout=30)
+        except queue.Empty:
+            pytest.fail("serve switch and second-client rename deadlocked")
+    finally:
+        if process.is_alive():
+            process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        results.close()
+    assert outcome is None
     assert process.exitcode == 0
-    assert results.get(timeout=1) is None
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,9 @@ def child_instance_in_subtree(candidate: str, root: str) -> bool:
     return candidate == root or candidate.startswith(f"{root}:")
 
 
+ApprovalOrigin = Literal["automatic", "user"]
+
+
 class ApprovalDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
