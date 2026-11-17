@@ -403,7 +403,7 @@ async def test_agent_close_drains_receipt_extension_tasks(tmp_path: Path) -> Non
                 return
             assert event == "post_tool"
             self.started.set()
-            await self.release.wait()
+            await asyncio.wait_for(self.release.wait(), 10)
 
     loop = AgentLoop(
         FakeBackend([]),
