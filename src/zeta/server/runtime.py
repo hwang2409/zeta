@@ -51,6 +51,7 @@ from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_session_agents
+from ..telemetry import Telemetry
 from ..tools._shared.background_task_types import BackgroundTaskNotice
 from ..tools._shared.run_work import background_task_row
 from .protocol import EventDescriptor
@@ -227,6 +228,8 @@ class ServerRuntime:
         self.manager = SessionManager(self.home, owner_surface="serve")
         self._project_registry_probed = False
         self._state: SessionState | None = None
+        # an owning ZetaServer replaces this with its process telemetry in start()
+        self.telemetry = Telemetry.disabled()
         self._init_sinks()
 
     def _init_sinks(self) -> None:
@@ -306,6 +309,7 @@ class ServerRuntime:
         runtime.backend_factory = None
         runtime.manager = SessionManager(runtime.home, owner_surface="serve")
         runtime._project_registry_probed = True
+        runtime.telemetry = loop.telemetry
         runtime._init_sinks()
         runtime._state = SessionState(
             opened=opened,
@@ -861,6 +865,7 @@ class ServerRuntime:
             auto_project=False,
             project_id=project_id,
             on_plan_mode_change=persist_plan_mode,
+            telemetry=self.telemetry,
             require_selected_account=(
                 self.backend_factory is None and not self._test_scripted_provider
             ),

@@ -47,6 +47,7 @@ from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
+from ..telemetry import Telemetry
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import overlay, theme
 from .agent_card import (
@@ -213,6 +214,8 @@ class TUIApp(
         on_session_close: Callable[[], Awaitable[None]] | None = None,
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         observer_host: Any | None = None,
+        telemetry: Telemetry | None = None,
+        otel_endpoint: str | None = None,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
@@ -220,6 +223,8 @@ class TUIApp(
             foreground_event_publisher or ForegroundEventPublisher()
         )
         self.observer_host = observer_host
+        self.telemetry = telemetry or Telemetry.disabled()
+        self._otel_endpoint = otel_endpoint
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)

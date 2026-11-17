@@ -12,22 +12,21 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from urllib.parse import urlsplit
 
-from zeta.models.catalog import PROVIDER_MODELS
-
 from . import SpanHandle, TelemetryError, TelemetryStatus
-from .attributes import RESERVED_CONTENT_ATTRIBUTES
+from .attributes import GEN_AI_PROVIDER_NAMES, RESERVED_CONTENT_ATTRIBUTES
 
 _OPERATION_ATTRIBUTE_KEYS = {
     "agent": frozenset({"gen_ai.operation.name", "zeta.agent.name", "gen_ai.conversation.id", "gen_ai.request.model", "zeta.agent.depth", "zeta.background"}),
-    "turn": frozenset({"gen_ai.conversation.id", "zeta.turn.number", "zeta.notification", "zeta.tool.count"}),
+    "turn": frozenset({"gen_ai.conversation.id", "zeta.turn.number", "zeta.notification"}),
     "inference": frozenset({"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.conversation.id", "zeta.stream"}),
     "tool": frozenset({"gen_ai.operation.name", "zeta.tool.name", "zeta.tool.type", "zeta.tool.call.id", "zeta.agent.name", "gen_ai.conversation.id"}),
     "context": frozenset({"zeta.emergency", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count"}),
 }
 _EVENT_ATTRIBUTE_KEYS = {"gen_ai.client.retry": frozenset({"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after"}), "zeta.approval.requested": frozenset({"decision", "scope"}), "zeta.approval.resolved": frozenset({"decision", "scope", "duration"})}
-_ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size"})
+_ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.tool.count"})
 # Closed sets mirror repository values; tests/telemetry/test_telemetry.py checks each mirror against its source.
-_PROVIDERS = frozenset(PROVIDER_MODELS)
+# provider names are the GenAI values; the facade maps every catalog provider onto them.
+_PROVIDERS = frozenset(GEN_AI_PROVIDER_NAMES.values())
 _OPERATION_NAMES = frozenset({"invoke_agent", "chat", "execute_tool"})
 # zeta-owned tool families; no repository enum exists yet (slice 3a is the first caller).
 _TOOL_TYPES = frozenset({"function", "computer", "mcp", "agent"})
@@ -44,7 +43,8 @@ _APPROVAL_DECISIONS = frozenset({"allow", "deny", "ask", "approve"})
 # server.protocol.APPROVAL_SCOPES.
 _APPROVAL_SCOPES = frozenset({"once", "always_tool"})
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
-_SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
+# a session id, or a child agent instance id: the root session id plus ":<n>" per nesting level.
+_SESSION_ID = re.compile(r"[0-9a-f]{32}(?::[1-9][0-9]{0,8}){0,5}\Z")
 _TOOL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:__[A-Za-z0-9][A-Za-z0-9_-]{0,127})?\Z")
 _CALL_ID = re.compile(r"(?=.{1,128}\Z)(?:toolu_[A-Za-z0-9_-]+|call_[A-Za-z0-9_-]+|fc_[A-Za-z0-9_-]+|ollama-[0-9a-f-]+|inline-[0-9a-f-]+)\Z")
 # catalog ids and ollama names: [host/][namespace/]model[:tag], e.g. locally-created-model, qwen3:4b, hf.co/user/model:Q4_K_M.
@@ -75,7 +75,7 @@ def _field_value(key: str, value: object) -> object:
 
 
 def _safe_attributes(attributes: Mapping[str, object] | None, allowed_keys: frozenset[str]) -> dict[str, object]:
-    return {key: _field_value(key, value) if isinstance(value, (str, int, bool)) else "_invalid" for key, value in (attributes or {}).items() if key in allowed_keys}
+    return {key: _field_value(key, value) if isinstance(value, (str, int, bool)) else "_invalid" for key, value in (attributes or {}).items() if key in allowed_keys and value is not None}
 
 
 # This is the single owner of the loopback endpoint policy.
@@ -97,7 +97,7 @@ def validate_loopback_endpoint(endpoint: str) -> str:
             or parsed.fragment
         ):
             raise ValueError
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         raise TelemetryError("otel.endpoint must be an http(s) URL with a literal loopback host") from None
     return endpoint
 
@@ -143,9 +143,14 @@ class _SpanHandle(SpanHandle):
         self._set("gen_ai.usage.output_tokens", output_tokens)
         self._set("gen_ai.usage.total_tokens", total_tokens)
 
-    def set_response(self, *, model: str, finish_reason: str) -> None:
-        self._set("gen_ai.response.model", model)
-        self._set("gen_ai.response.finish_reasons", finish_reason)
+    def set_response(self, *, finish_reason: str | None = None, model: str | None = None) -> None:
+        if model is not None:
+            self._set("gen_ai.response.model", model)
+        if finish_reason is not None:
+            self._set("gen_ai.response.finish_reasons", finish_reason)
+
+    def set_tool_count(self, *, tool_count: int) -> None:
+        self._set("zeta.tool.count", tool_count)
 
     def set_sizes(self, *, argument_bytes: int, result_bytes: int) -> None:
         self._set("zeta.tool.call.arguments.size", argument_bytes)
@@ -157,14 +162,15 @@ class _SpanHandle(SpanHandle):
             "gen_ai.retry.delay": delay, "gen_ai.retry.after": after,
         }, _EVENT_ATTRIBUTE_KEYS["gen_ai.client.retry"]))
 
-    def approval_requested(self, *, decision: str, scope: str) -> None:
+    def approval_requested(self, *, decision: str, scope: str | None = None) -> None:
         self._span.add_event("zeta.approval.requested", attributes=_safe_attributes({"decision": decision, "scope": scope}, _EVENT_ATTRIBUTE_KEYS["zeta.approval.requested"]))
 
-    def approval_resolved(self, *, decision: str, scope: str, duration: int) -> None:
+    def approval_resolved(self, *, decision: str | None, duration: int, scope: str | None = None) -> None:
         self._span.add_event("zeta.approval.resolved", attributes=_safe_attributes({"decision": decision, "scope": scope, "duration": duration}, _EVENT_ATTRIBUTE_KEYS["zeta.approval.resolved"]))
 
-    def fail(self, exc: BaseException | type[BaseException]) -> None:
-        error_type = exc.__qualname__ if isinstance(exc, type) else type(exc).__qualname__
+    def fail(self, exc: BaseException | type[BaseException] | None) -> None:
+        # _OTHER is the semconv fallback when no exception class names the failure
+        error_type = "_OTHER" if exc is None else exc.__qualname__ if isinstance(exc, type) else type(exc).__qualname__
         self._set("error.type", _field_value("error.type", error_type))
         from opentelemetry.trace import Status, StatusCode
 

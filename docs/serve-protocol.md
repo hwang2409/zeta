@@ -1947,7 +1947,7 @@ error code and message. Provider status and origin remain internal.
   catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
-- `session_settings`: returns `model`, `approval_mode`, and `plan_mode`.
+- `session_settings`: returns `model`, `approval_mode`, and `plan_mode`. with the negotiated `otel` feature it also returns `telemetry` (`enabled`, `state`, and `reason`); endpoint and exporter details are never returned.
 - `account_list`: takes `session_id` and returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and
   `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
@@ -2169,6 +2169,7 @@ negotiate a feature sees the behavior from before the feature existed.
 
 | feature | effect |
 | --- | --- |
+| `otel` | `session_settings` adds `telemetry` with enabled, state, and reason |
 | `session_cwd` | `new_session` accepts `cwd` |
 | `new_session_settings` | `new_session` accepts `approval_mode` (with `model`) as an initial setting |
 | `user_message_event` | `send`, `steer`, and `send_images` emit `user_message` |

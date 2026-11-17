@@ -138,6 +138,8 @@ class RuntimeCloseMixin:
             self._draft_session = None
             self._session = None
             self._closed = True
+            # last, so every close step above can still export; off the loop, idempotent
+            await attempt_async(lambda: asyncio.to_thread(self.telemetry.shutdown))
         restore_closed_history = getattr(self, "_restore_closed_history", None)
         if restore_closed_history is not None:
             attempt(restore_closed_history)

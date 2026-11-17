@@ -27,6 +27,7 @@ from ..storage_format import (
     feature_enabled,
     pending_releases,
 )
+from ..telemetry import Telemetry, TelemetryError
 from . import (
     accounts,
     login,
@@ -212,6 +213,7 @@ class ZetaServer:
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         max_role: str = "controller",
         prebound_socket: socket.socket | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
             raise ValueError("choose socket_path or port, not both")
@@ -239,6 +241,8 @@ class ZetaServer:
         # after the cancel, log the stuck-holder task dump at this interval.
         self.lost_request_cancel_bound = 1.0
         self._borrowed = runtime is not None
+        # a borrowed server shows its host's telemetry; an owning server configures its own in start()
+        self.telemetry = telemetry or Telemetry.disabled()
         runtime = runtime or ServerRuntime(
             self.home,
             cwd=cwd,
@@ -399,7 +403,16 @@ class ZetaServer:
         return str(self.socket_path)
 
     async def start(self) -> None:
+        if not self._borrowed and not self.telemetry.enabled():
+            try:
+                self.telemetry = await asyncio.to_thread(
+                    lambda: Telemetry.configure(load_settings(home=self.home).settings)
+                )
+            except TelemetryError as exc:
+                raise SessionError(str(exc)) from None
         if not self._borrowed:
+            # sessions this server opens trace through its process telemetry
+            self.runtime.telemetry = self.telemetry
             await self.runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(
@@ -501,6 +514,9 @@ class ZetaServer:
                 finally:
                     self._server = None
                     self._unix_listener = None
+                    if not self._borrowed:
+                        # last, so every close step can still export; idempotent for a second close
+                        await asyncio.to_thread(self.telemetry.shutdown)
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
