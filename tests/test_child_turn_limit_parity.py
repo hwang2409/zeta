@@ -336,6 +336,7 @@ async def test_child_without_max_turns_matches_origin_main_snapshot(
             "tool_calls": 0,
             "turns_used": 6,
         },
-        "tui_sha256": "ec0e0e2a3956aab826a0ed5026da33ec665b4030182a8577ee290421e9a1dfcc",
+        # receipt rendering now separates the wrapped markdown answer from its header.
+        "tui_sha256": "855b16d15cd5e2ab4961d225aeef95bb0c62043265cab0ea89a62adaae9f5c99",
     }
     assert snapshot == expected
