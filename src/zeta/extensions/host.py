@@ -40,7 +40,11 @@ if TYPE_CHECKING:
 
 from .api import ExtensionError
 from .hooks import (
-    CompositeToolHook, ExtensionHook, TaskOwner, _missing_task_owner, run_extension_hooks,
+    CompositeToolHook,
+    ExtensionHook,
+    TaskOwner,
+    _missing_task_owner,
+    run_extension_hooks,
 )
 
 
