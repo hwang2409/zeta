@@ -183,6 +183,7 @@ class SessionExecutionLease:
         session_id: str,
         owner: OwnerHint,
         recovery: bool = False,
+        require_unowned: bool = False,
         home: Path | None = None,
     ) -> SessionExecutionLease:
         """Acquire immediately or raise a typed refusal without mutating the session."""
@@ -198,7 +199,7 @@ class SessionExecutionLease:
                 del _REGISTRY[identity]
                 local = None
             if local is not None:
-                if local.state not in {"owned", "recovery"}:
+                if local.state not in {"owned", "recovery"} or require_unowned:
                     raise SessionOwnedError(session_id)
                 local.refs += 1
                 return cls(local, local.epoch)

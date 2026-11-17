@@ -14,10 +14,11 @@ from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
-from tests.support.server_client import event, request
+from tests.support.server_client import approve_and_collect_grant, event, request
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.agent.receipt import build_agent_receipt
 from zeta.agent.turn_limit import ChildTurnControl, build_turn_limit_result
+from zeta.core.approval import ApprovalDecision
 from zeta.protocol.types import (
     CompletionBackend,
     Message,
@@ -370,7 +371,11 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
     server, reader, writer, session_id = await _open(
         tmp_path,
         backend,
-        features=["session_history_fidelity", "served_turn_end"],
+        features=[
+            "session_history_fidelity",
+            "served_turn_end",
+            "tool_approval_origin",
+        ],
     )
     try:
         status = (await request(reader, writer, 2, "status"))[-1]["result"]
@@ -386,6 +391,8 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
             "approve",
             {"request_id": "read-segment", "scope": "once"},
         )
+        tool_start = await event(reader, "tool_start")
+        assert tool_start["tool_call"]["approval_origin"] == "user"
         provider_end = await event(reader, "turn_end")
         assert set(provider_end["data"]) >= {"turn", "tool_calls"}
         assert "reason" not in provider_end["data"]
@@ -397,6 +404,14 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
         rows = await _history(reader, writer, session_id)
         served = [row for row in rows if row.get("event") == "served_turn_end"]
         assert len(served) == 1
+        replayed_call = next(
+            block["tool_call"]
+            for row in rows
+            for block in row.get("content", [])
+            if block.get("type") == "tool_use"
+            and block["tool_call"]["id"] == "read-segment"
+        )
+        assert replayed_call["approval_origin"] == "user"
         live_turn_id = first_start["data"].get("turn_id")
         assert isinstance(live_turn_id, str)
         assert second_start["data"].get("turn_id") == live_turn_id
@@ -418,6 +433,144 @@ async def test_served_turn_end_is_distinct_and_negotiated_over_socket(
         assert "served_turn_end" not in hello[-1]["result"]["capabilities"]["features"]
         rows = await _history(reader, writer, session_id)
         assert not any(row.get("event") == "served_turn_end" for row in rows)
+        replayed_call = next(
+            block["tool_call"]
+            for row in rows
+            for block in row.get("content", [])
+            if block.get("type") == "tool_use"
+            and block["tool_call"]["id"] == "read-segment"
+        )
+        assert "approval_origin" not in replayed_call
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_automatic_approval_origin_is_live_and_replayed_over_socket(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "automatic.txt"
+    target.write_text("ok")
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("automatic-read", "read", {"path": str(target)})]
+            ),
+            ScriptedTurn([TextContent("done")]),
+        ]
+    )
+    server, reader, writer, session_id = await _open(
+        tmp_path,
+        backend,
+        features=["session_history_fidelity", "tool_approval_origin"],
+    )
+    try:
+        policy = server.controllers.attached().runtime.loop.tool_registry.approval_policy
+        assert policy is not None
+        policy.default = ApprovalDecision.ALLOW
+        await request(reader, writer, 3, "send", {"text": "hello"})
+        started = await event(reader, "tool_start")
+        assert started["tool_call"]["approval_origin"] == "automatic"
+        assert "approval_origin" not in started["data"]
+        await event(reader, "agent_end")
+
+        store = server.controllers.attached().runtime.opened.store
+        old_call = ToolCall("old-call", "read", {"path": str(target)})
+        store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(old_call)]))
+        store.append_message(
+            Message(
+                MessageRole.TOOL_RESULT,
+                [TextContent("old")],
+                tool_result=ToolResult(old_call.id, "old"),
+            )
+        )
+
+        rows = await _history(reader, writer, session_id)
+        calls = {
+            block["tool_call"]["id"]: block["tool_call"]
+            for row in rows
+            for block in row.get("content", [])
+            if block.get("type") == "tool_use"
+        }
+        assert calls["automatic-read"]["approval_origin"] == "automatic"
+        assert "approval_origin" not in calls["old-call"]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_always_grant_is_user_then_automatic_over_socket(tmp_path: Path) -> None:
+    target = tmp_path / "grant.txt"
+    target.write_text("ok")
+    backend = FakeBackend(
+        [
+            ScriptedTurn(
+                tool_calls=[ToolCall("grant-first", "read", {"path": str(target)})]
+            ),
+            ScriptedTurn([TextContent("first done")]),
+            ScriptedTurn(
+                tool_calls=[ToolCall("grant-second", "read", {"path": str(target)})]
+            ),
+            ScriptedTurn([TextContent("second done")]),
+        ]
+    )
+    server, reader, writer, _session_id = await _open(
+        tmp_path,
+        backend,
+        features=[
+            "session_grants",
+            "session_history_fidelity",
+            "tool_approval_origin",
+        ],
+    )
+    try:
+        await request(reader, writer, 3, "send", {"text": "first"})
+        await event(reader, "approval_request")
+        await approve_and_collect_grant(
+            reader, writer, 4, "grant-first", "always_tool", ["read"]
+        )
+        first = await event(reader, "tool_start")
+        assert first["tool_call"]["approval_origin"] == "user"
+        await event(reader, "agent_end")
+
+        await request(reader, writer, 5, "send", {"text": "second"})
+        second = await event(reader, "tool_start")
+        assert second["tool_call"]["approval_origin"] == "automatic"
+        await event(reader, "agent_end")
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_denied_call_has_no_approval_origin_in_history(tmp_path: Path) -> None:
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[ToolCall("denied-read", "read", {"path": "x"})])]
+    )
+    server, reader, writer, session_id = await _open(
+        tmp_path,
+        backend,
+        features=["session_history_fidelity", "tool_approval_origin"],
+    )
+    try:
+        await request(reader, writer, 3, "send", {"text": "deny"})
+        approval = await event(reader, "approval_request")
+        await request(
+            reader,
+            writer,
+            4,
+            "deny",
+            {"request_id": approval["request_id"]},
+        )
+        await event(reader, "agent_end")
+        rows = await _history(reader, writer, session_id)
+        denied = next(
+            block["tool_call"]
+            for row in rows
+            for block in row.get("content", [])
+            if block.get("type") == "tool_use"
+            and block["tool_call"]["id"] == "denied-read"
+        )
+        assert "approval_origin" not in denied
     finally:
         await close_serve(server, writer)
 

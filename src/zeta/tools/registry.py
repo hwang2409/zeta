@@ -278,6 +278,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             self.abort_signal = abort_signal
             self._abort_registry = abort_signal.registry
         self.approval_policy = approval_policy
+        self._approval_origins: dict[str, str] = {}
         self._approval_gate = ApprovalGate(self.approval_policy, self.pre_execute_hook)
         if self.approval_policy is not None and approval_store is not None:
             self.approval_policy.bind_store(approval_store)
@@ -963,6 +964,8 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         _boundary_signal: ToolAbortSignal | None = None,
         _stream_sink: ToolStreamSink | None = None,
         _lifecycle_sink: ToolLifecycleSink | None = None,
+        _lifecycle_payload_sink: ToolLifecycleSink | None = None,
+        _retain_approval_origin: bool = False,
         _persist_approval: bool = True,
         _log_path: str | Path | None = None,
         _background: bool = False,
@@ -1049,7 +1052,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             else None
         )
         try:
-            gate_result, execution_signal = await self._approval_gate.run(
+            gate_outcome = await self._approval_gate.run(
                 tool_call,
                 arguments,
                 signal_state,
@@ -1066,6 +1069,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 persist_request=_persist_approval,
                 capability=capability,
             )
+            gate_result = gate_outcome.result
+            execution_signal = gate_outcome.signal
+            approval_origin = gate_outcome.origin
             approved_execution = None
             if self.approval_policy is not None:
                 approved_execution = self.approval_policy.consume_execution_binding(
@@ -1100,7 +1106,13 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             execution_signal = _scope_signal
             if execution_signal.is_set():
                 return await finalize(_legacy_result(_canceled_result(tool_call.id)))
-        if _lifecycle_sink is not None:
+        if _retain_approval_origin:
+            self._approval_origins[tool_call.id] = approval_origin
+        if _lifecycle_payload_sink is not None:
+            _lifecycle_payload_sink(
+                "execution_start", {"approval_origin": approval_origin}
+            )
+        elif _lifecycle_sink is not None:
             _lifecycle_sink("execution_start")
         stream_publisher = (
             _ToolCallStreamPublisher(tool_call, execution_signal, _stream_sink)
@@ -1162,6 +1174,12 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 kind="invalid_result",
             )
         return await finalize(normalized_result)
+
+    def peek_approval_origin(self, tool_call_id: str) -> str | None:
+        return self._approval_origins.get(tool_call_id)
+
+    def take_approval_origin(self, tool_call_id: str) -> str | None:
+        return self._approval_origins.pop(tool_call_id, None)
 
     async def abort_approval(
         self, tool_call: ToolCall
