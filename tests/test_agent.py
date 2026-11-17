@@ -38,6 +38,7 @@ from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, Scripte
 from tests.support.owned import await_or_fail
 from tests.support.processes import wait_for_path_command
 from zeta.accounts import AccountCredentialLockTimeoutError
+from zeta.agent.receipt import finalize_agent_results
 from zeta.agent._delivery_notifications import _notification_message
 from zeta.agent.adoption import adopt_agent_children
 from zeta.agent.background_lifecycle import (
@@ -388,6 +389,53 @@ def _approval_capability(name: str, arguments: dict[str, object]) -> ResolvedCap
         None,
         arguments,
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_close_drains_receipt_extension_tasks(tmp_path: Path) -> None:
+    class BlockingExtensions:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def emit(self, event: str, *_args: object) -> None:
+            if event == "stop":
+                return
+            assert event == "post_tool"
+            self.started.set()
+            await self.release.wait()
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    extensions = BlockingExtensions()
+    loop.extensions = extensions
+    tasks: list[asyncio.Task[object]] = []
+    original_create_task = loop._create_task
+
+    def track(coroutine: object) -> asyncio.Task[object]:
+        task = original_create_task(coroutine)  # type: ignore[arg-type]
+        tasks.append(task)
+        return task
+
+    loop._create_task = track  # type: ignore[method-assign]
+    try:
+        finalize_agent_results(
+            loop,
+            [ToolCall("receipt-task", "capture", {})],
+            [ToolResult("receipt-task", "done")],
+        )
+        await asyncio.wait_for(extensions.started.wait(), 10)
+        await loop.close()
+        assert tasks and tasks[0].done() and tasks[0].cancelled()
+    finally:
+        extensions.release.set()
+        if not loop._closed:
+            await loop.close()
+        loop.store.close()
 
 
 @pytest.mark.parametrize("error_event", [False, True])

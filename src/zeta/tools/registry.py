@@ -908,8 +908,12 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             _capability = replace(
                 _capability, subject_value=canonical, arguments=dict(arguments)
             )
-        elif _capability.binding is ApprovalBinding.CWD:
-            self.update_bash_cwd(os.path.realpath(self.bash_cwd))
+        if _capability.binding is ApprovalBinding.CWD:
+            canonical_cwd = os.path.realpath(self.bash_cwd)
+            self.bash_cwd = canonical_cwd
+            child_store = getattr(self.approval_policy, "child_store", None)
+            if child_store is not None:
+                child_store.bash_cwd = canonical_cwd
         capture_binding = getattr(self.approval_policy, "_capture_pending_binding", None)
         if callable(capture_binding):
             capture_binding(tool_call, _capability)
