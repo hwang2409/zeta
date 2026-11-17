@@ -5877,6 +5877,22 @@ def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> 
     assert "plan · task research" in rendered
 
 
+def test_tool_approval_origin_does_not_change_tui_rendering() -> None:
+    call = ToolCall("read-1", "read", {"path": "file.txt"})
+    plain = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    with_origin = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=call,
+            data={"approval_origin": "automatic"},
+        )
+    )
+
+    assert with_origin == plain
+
+
 def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
     child = ConversationStore(tmp_path / "agents", session_id="1")
     for index in range(25):
