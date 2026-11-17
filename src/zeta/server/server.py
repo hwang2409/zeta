@@ -322,7 +322,7 @@ class ZetaServer:
         control = ServeControl(self, runtime, self.foreground_event_publisher)
         # every pair shares this manager; sessionless reads use it with no record
         self.manager = runtime.manager
-        self.controllers = SessionControllers(control)
+        self.controllers = SessionControllers(control, owns_runtime=not self._borrowed)
         self._bind_pair(control)
         self.parking = ParkedPairs(lambda: self.connections, self.controllers)
 
@@ -482,7 +482,7 @@ class ZetaServer:
             self.parking.close_all(approval_settlement_timeout)
             try:
                 await self.controllers.close(
-                    approval_settlement_timeout, self._close_attached_runtime
+                    approval_settlement_timeout, self._close_foreground_events
                 )
             finally:
                 if self.connections is not None:
@@ -500,13 +500,6 @@ class ZetaServer:
                 finally:
                     self._server = None
                     self._unix_listener = None
-
-    async def _close_attached_runtime(self) -> None:
-        try:
-            await self._close_foreground_events()
-        finally:
-            if not self._borrowed:
-                await self.controllers.attached().runtime.close()
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

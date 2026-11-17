@@ -28,9 +28,6 @@ RESOLVER_ENTRIES = {
 }
 # `.owned`/`.selected` attributes that are not the resolvers
 OTHER_ATTRIBUTES = {("accounts.py", "snapshot.selected")}
-# `SessionControllers` is the one close coordinator: outside it, the only
-# control/runtime close is the attached runtime teardown shutdown hands to it
-RUNTIME_TEARDOWN = {"server.py:ZetaServer._close_attached_runtime"}
 # the only callers of `retire`, each through the owner
 RETIRE_CALLERS = {
     "parking.py:ParkedPairs.leave",
@@ -221,8 +218,8 @@ def test_use_and_completion_state_have_one_owner() -> None:
 
 
 def test_every_resident_close_goes_through_retire() -> None:
-    """No control or runtime closes outside ``SessionControllers`` except the
-    attached runtime teardown shutdown hands to it; every ``retire`` call goes
+    """No control or runtime closes outside ``SessionControllers``, the one
+    close coordinator; every ``retire`` call goes
     through the owner from a named caller; and no module outside the owner
     holds close state (closing flags, close tasks, closing maps)."""
     problems: list[str] = []
@@ -233,7 +230,7 @@ def test_every_resident_close_goes_through_retire() -> None:
             if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
                 continue
             text = ast.unparse(node.func)
-            if text.endswith(("control.close", "runtime.close")) and name not in RUNTIME_TEARDOWN:
+            if text.endswith(("control.close", "runtime.close")):
                 problems.append(f"{name}:{node.lineno}: {text} outside the close coordinator")
             if node.func.attr == "retire" and (
                 name not in RETIRE_CALLERS or not text.endswith("controllers.retire")

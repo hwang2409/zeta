@@ -25,6 +25,9 @@ class SessionController:
 
     control: ServeControl
     generation: int
+    # false for a runtime the server borrowed (an observer host's): its owner
+    # closes it, so the record's close never does
+    owns_runtime: bool = True
     uses: set[SessionUse] = field(default_factory=set)
     # set by ``retire``: no resolution, wake, or claim from here on, but the
     # record stays resident (and counts) until ``close_task`` ends
@@ -96,10 +99,10 @@ class SessionUse:
 class SessionControllers:
     """Own the attached record and the records available for selection."""
 
-    def __init__(self, control: ServeControl) -> None:
+    def __init__(self, control: ServeControl, *, owns_runtime: bool = True) -> None:
         self._generations = itertools.count(1)
         self._records: dict[ServeControl, SessionController] = {
-            control: SessionController(control, next(self._generations))
+            control: SessionController(control, next(self._generations), owns_runtime)
         }
         self._attached = self._records[control]
         self._parked: dict[str, SessionController] = {}
@@ -207,7 +210,7 @@ class SessionControllers:
         self,
         record: SessionController,
         settlement_timeout: float | None,
-        runtime_close: Callable[[], Awaitable[None]] | None,
+        before_runtime_close: Callable[[], Awaitable[None]] | None,
         *,
         report: bool = True,
     ) -> asyncio.Task[None]:
@@ -220,7 +223,7 @@ class SessionControllers:
         # by identity: a record whose setup failed has no session id
         self._parked = {key: item for key, item in self._parked.items() if item is not record}
         task = asyncio.create_task(
-            self._close(record, settlement_timeout, runtime_close or runtime.close)
+            self._close(record, settlement_timeout, before_runtime_close)
         )
         if report:
             task.add_done_callback(lambda done: _report_close(done, record.closing_session_id))
@@ -231,7 +234,7 @@ class SessionControllers:
         self,
         record: SessionController,
         settlement_timeout: float | None,
-        runtime_close: Callable[[], Awaitable[None]],
+        before_runtime_close: Callable[[], Awaitable[None]] | None,
     ) -> None:
         control = record.control
         try:
@@ -240,7 +243,12 @@ class SessionControllers:
                 await control.close()
             finally:
                 try:
-                    await runtime_close()
+                    try:
+                        if before_runtime_close is not None:
+                            await before_runtime_close()
+                    finally:
+                        if record.owns_runtime:
+                            await record.runtime.close()
                 finally:
                     await control.wait_for_approval_settlement(settlement_timeout)
         finally:
@@ -257,12 +265,13 @@ class SessionControllers:
     async def close(
         self,
         settlement_timeout: float | None,
-        attached_runtime_close: Callable[[], Awaitable[None]],
+        before_attached_runtime_close: Callable[[], Awaitable[None]],
     ) -> None:
         """Server shutdown: close every resident record and wait for every close.
-        The attached record's runtime ends through ``attached_runtime_close``
-        and its close error propagates; the others are logged by their close. A
-        cancel of the shutdown does not cancel a close."""
+        ``before_attached_runtime_close`` runs just before the attached record's
+        runtime would close (owned or not), and that close's error propagates;
+        the others are logged by their close. A cancel of the shutdown does not
+        cancel a close."""
         for record in tuple(self._parked.values()):
             self.retire(record, settlement_timeout)
         done = self._attached.close_task
@@ -275,7 +284,7 @@ class SessionControllers:
             return
         # its close error reaches the caller, so it is not logged as well
         attached = self._begin_close(
-            self._attached, settlement_timeout, attached_runtime_close, report=False
+            self._attached, settlement_timeout, before_attached_runtime_close, report=False
         )
         others = [
             record.close_task

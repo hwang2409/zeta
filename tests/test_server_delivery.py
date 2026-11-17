@@ -1680,7 +1680,7 @@ async def test_cancel_cleans_up_echo_and_runs_committed_work(method: str) -> Non
     control.echo_stalls = True
     requests = DeliveryRequests(control)
     request = asyncio.create_task(
-        _deliver(requests, method, 
+        _deliver(requests, method,
             {"text": "hello", "delivery_id": f"{method}-cancel"},
             frozenset({"delivery_id", "user_message_event"}),
         )
@@ -1710,7 +1710,7 @@ async def test_cancel_during_commit_runs_work_without_waiting_for_echo(method: s
 
     control.store.append_client_delivery_async = append_then_cancel
     request = asyncio.create_task(
-        _deliver(requests, method, 
+        _deliver(requests, method,
             {"text": "hello", "delivery_id": f"{method}-commit-cancel"},
             frozenset({"delivery_id", "user_message_event"}),
         )
