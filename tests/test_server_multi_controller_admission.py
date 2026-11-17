@@ -83,6 +83,15 @@ async def test_simultaneous_first_legacy_and_multi_have_one_serial_admission(
         )
 
     monkeypatch.setattr(server.controllers, "admit_hello", admit)
+    original_negotiate_role = server.connections.negotiate_role
+
+    def negotiate_role(*args, **kwargs):
+        assert len(admissions) == 1, (
+            "first semantic admission must be the sole mode winner before physical hello response"
+        )
+        return original_negotiate_role(*args, **kwargs)
+
+    monkeypatch.setattr(server.connections, "negotiate_role", negotiate_role)
     try:
         results = await asyncio.wait_for(
             asyncio.gather(
