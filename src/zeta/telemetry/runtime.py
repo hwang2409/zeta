@@ -155,6 +155,10 @@ class _SpanHandle(SpanHandle):
         self._set("zeta.tool.call.arguments.size", argument_bytes)
         self._set("zeta.tool.call.result.size", result_bytes)
 
+    def set_compaction(self, *, tokens_after: int, marker_count: int) -> None:
+        self._set("zeta.tokens.after", tokens_after)
+        self._set("zeta.marker.count", marker_count)
+
     def retry(self, *, attempt: int, reason: str, delay: int, after: bool) -> None:
         self._span.add_event("gen_ai.client.retry", attributes=_safe_attributes({
             "gen_ai.retry.attempt": attempt, "gen_ai.retry.reason": reason,

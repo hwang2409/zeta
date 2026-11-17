@@ -287,7 +287,7 @@ _ADVERSARIAL = {
     "unicode": "unicode-\u2603",
 }
 _HELPERS = ("agent_span", "turn_span", "inference_span", "tool_span", "context_span")
-_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "fail")
+_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "set_compaction", "fail")
 # where a shape-accepted value may appear: "<name>" is the span name.
 _SHAPE_FIELDS = {
     ("agent_span", "profile"): {"<name>"},
