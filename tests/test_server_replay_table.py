@@ -232,10 +232,10 @@ async def _history_read_race(tmp_path: Path, transport: Transport, monkeypatch: 
     entered, release = asyncio.Event(), asyncio.Event()
     original = server.connections.run_read
 
-    async def gated(connection: Any, callable: Callable[[], Any], controller: Any = None) -> Any:
+    async def gated(connection: Any, callable: Callable[[], Any], controller: Any = None, **kwargs: Any) -> Any:
         entered.set()
         await await_or_fail(release.wait(), what="release history read")
-        return await original(connection, callable, controller)
+        return await original(connection, callable, controller, **kwargs)
 
     monkeypatch.setattr(server.connections, "run_read", gated)
     try:
@@ -692,10 +692,10 @@ async def _replacement(
     entered, release = asyncio.Event(), asyncio.Event()
     original_read = server.connections.run_read
 
-    async def gated(connection: Any, callable: Callable[[], Any], controller: Any = None) -> Any:
+    async def gated(connection: Any, callable: Callable[[], Any], controller: Any = None, **kwargs: Any) -> Any:
         entered.set()
         await await_or_fail(release.wait(), what="release replacement history read")
-        return await original_read(connection, callable, controller)
+        return await original_read(connection, callable, controller, **kwargs)
 
     monkeypatch.setattr(server.connections, "run_read", gated)
     try:
@@ -935,7 +935,7 @@ async def _join_failure(tmp_path: Path, transport: Transport, monkeypatch: pytes
     assert server.connections is not None
     original = server.connections.run_read
 
-    async def fail(connection: Any, callable: Callable[[], Any], controller: Any = None) -> Any:
+    async def fail(connection: Any, callable: Callable[[], Any], controller: Any = None, **kwargs: Any) -> Any:
         del connection, callable, controller
         raise RuntimeError("history read failed")
 
@@ -1006,10 +1006,10 @@ async def _join_during_swap(
         await await_or_fail(resume.wait(), what="resume session swap")
         return result
 
-    async def gated_read(connection: Any, callable: Callable[[], Any], controller: Any = None) -> Any:
+    async def gated_read(connection: Any, callable: Callable[[], Any], controller: Any = None, **kwargs: Any) -> Any:
         read_entered.set()
         await await_or_fail(read_release.wait(), what="release swap join read")
-        return await original_read(connection, callable, controller)
+        return await original_read(connection, callable, controller, **kwargs)
 
     # test-contract: seam hold the swap after the runtime switched, before it finishes
     monkeypatch.setattr(server.controllers.attached().runtime, "create_session", gated_create)

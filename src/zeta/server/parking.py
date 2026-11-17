@@ -141,6 +141,7 @@ class ParkedPairs:
         async def close() -> None:
             try:
                 try:
+                    await self._controllers.drained(record)
                     await control.close()
                 finally:
                     try:

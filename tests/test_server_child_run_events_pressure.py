@@ -142,11 +142,11 @@ def _gate_history_read(server: ZetaServer, monkeypatch: pytest.MonkeyPatch) -> t
     entered, release = asyncio.Event(), asyncio.Event()
     original = server.connections.run_read
 
-    async def gated(connection: Any, read: Any, controller: Any = None) -> Any:
+    async def gated(connection: Any, read: Any, controller: Any = None, **kwargs: Any) -> Any:
         if not entered.is_set():
             entered.set()
             await await_or_fail(release.wait(), what="release join history read")
-        return await original(connection, read, controller)
+        return await original(connection, read, controller, **kwargs)
 
     # test-contract: seam hold the real fixed-worker history read of one join
     monkeypatch.setattr(server.connections, "run_read", gated)
@@ -522,10 +522,10 @@ async def test_global_pressure_evicts_by_bytes_then_records_then_creation_order(
         release = asyncio.Event()
         original = server.connections.run_read
 
-        async def gated(connection: Any, read: Any, controller: Any = None) -> Any:
+        async def gated(connection: Any, read: Any, controller: Any = None, **kwargs: Any) -> Any:
             next(event for event in arrivals if not event.is_set()).set()
             await await_or_fail(release.wait(), what="release child join reads")
-            return await original(connection, read, controller)
+            return await original(connection, read, controller, **kwargs)
 
         # test-contract: seam hold both real child join reads while pressure is applied
         monkeypatch.setattr(server.connections, "run_read", gated)

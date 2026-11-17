@@ -17,13 +17,13 @@ from ..protocol import (
     feature_error,
     protocol_error,
 )
-from ..session_controllers import SessionController
+from ..session_controllers import SessionUse
 from ..session_replay import join_history_and_subscribe
 from . import child_runs, lifecycle, path_completion, session, settings, validation
 from .run_work import cancel_background_task, list_run_work
 
 Handler = Callable[
-    [object, str | int, dict[str, Any], SessionController | None], Awaitable[object]
+    [object, str | int, dict[str, Any], SessionUse | None], Awaitable[object]
 ]
 
 
@@ -235,22 +235,22 @@ async def child_run_events(client, request_id, params, controller):
     connections = client.connections
     if set(params) != {"session_id", "run_id"} or not all(type(params.get(key)) is str for key in ("session_id", "run_id")):
         raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "session_id and run_id are required child event parameters")
-    controller = client.server.controllers.selected(client, params["session_id"])
-    if controller.runtime.session_id != params["session_id"]:
-        raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
-    try:
-        await connections.begin_replay_join(
-            client, ReplayScopeId.child(params["run_id"]), controller
-        )
-        history, frontier_seq, row = await connections.read_child_run_events(
-            client, params, controller
-        )
-        result = connections.finish_replay_join(client, history, frontier_seq, None)
-        current = connections.child_runs.current(params["run_id"])
-        return {**result, "child": current[0] if current is not None else row, "revision": current[1] if current is not None else 0}
-    except BaseException:
-        connections.invalidate_replay_connection(client, reason="rejoined")
-        raise
+    with client.server.controllers.selected(client, params["session_id"]) as selected:
+        if selected.runtime.session_id != params["session_id"]:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        try:
+            await connections.begin_replay_join(
+                client, ReplayScopeId.child(params["run_id"]), selected
+            )
+            history, frontier_seq, row = await connections.read_child_run_events(
+                client, params, selected
+            )
+            result = connections.finish_replay_join(client, history, frontier_seq, None)
+            current = connections.child_runs.current(params["run_id"])
+            return {**result, "child": current[0] if current is not None else row, "revision": current[1] if current is not None else 0}
+        except BaseException:
+            connections.invalidate_replay_connection(client, reason="rejoined")
+            raise
 
 
 async def _mutable_store(controller, params):
@@ -312,15 +312,15 @@ async def send_images(client, request_id, params, controller):
 
 
 async def path_complete(client, request_id, params, controller):
-    controller = client.server.controllers.selected(
+    with client.server.controllers.selected(
         client, validation.required_string(params, "session_id")
-    )
-    store = validation.active(controller.runtime, params)
-    return await path_completion.complete(
-        params,
-        base_dir=store.cwd,
-        run_blocking=controller.control._run_blocking,
-    )
+    ) as selected:
+        store = validation.active(selected.runtime, params)
+        return await path_completion.complete(
+            params,
+            base_dir=store.cwd,
+            run_blocking=selected.control._run_blocking,
+        )
 
 
 async def slash_list(client, request_id, params, controller):
@@ -467,13 +467,10 @@ async def revoke_session_grants(client, request_id, params, controller):
 
 
 async def child_run_list(client, request_id, params, controller):
-    return await child_runs.list_runs(
-        client,
-        params,
-        client.server.controllers.selected(
-            client, validation.required_string(params, "session_id")
-        ),
-    )
+    with client.server.controllers.selected(
+        client, validation.required_string(params, "session_id")
+    ) as selected:
+        return await child_runs.list_runs(client, params, selected)
 
 
 async def child_run_send(client, request_id, params, controller):
@@ -607,24 +604,20 @@ async def dispatch(
     policy = RESOLVE[descriptor]
     if policy is not Resolve.OWNED_FIRST:
         _require_negotiated(client, descriptor)
-    controller = (
-        client.server.controllers.owned(client)
-        if policy in {Resolve.OWNED_FIRST, Resolve.OWNED}
-        else None
-    )
-    if policy is Resolve.OWNED_FIRST:
-        # legacy order: a mutation's health error precedes its version/feature error
-        controller.control._reject_if_unhealthy()  # type: ignore[union-attr]
-        _require_negotiated(client, descriptor)
-    if descriptor.access is Access.DELIVERY:
-        assert controller is not None
-        _require_attached_session(controller.runtime, params)
-    if descriptor.access in {Access.SESSION_MUTATION, Access.CONTROLLER_WRITE}:
-        # a queued wake may not start its setup while a state change runs
-        assert controller is not None
-        with controller.control.hold_wake_start():  # type: ignore[attr-defined]
-            return await HANDLERS[descriptor](client, request_id, params, controller)
-    return await HANDLERS[descriptor](client, request_id, params, controller)
+    if policy not in {Resolve.OWNED_FIRST, Resolve.OWNED}:
+        return await HANDLERS[descriptor](client, request_id, params, None)
+    with client.server.controllers.owned(client) as controller:
+        if policy is Resolve.OWNED_FIRST:
+            # legacy order: a mutation's health error precedes its version/feature error
+            controller.control._reject_if_unhealthy()
+            _require_negotiated(client, descriptor)
+        if descriptor.access is Access.DELIVERY:
+            _require_attached_session(controller.runtime, params)
+        if descriptor.access in {Access.SESSION_MUTATION, Access.CONTROLLER_WRITE}:
+            # a queued wake may not start its setup while a state change runs
+            with controller.control.hold_wake_start():
+                return await HANDLERS[descriptor](client, request_id, params, controller)
+        return await HANDLERS[descriptor](client, request_id, params, controller)
 
 
 def _require_negotiated(client: object, descriptor: MethodDescriptor) -> None:

@@ -13,12 +13,15 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from zeta.core.thread_call import run_owned_thread_call
+from zeta.core.thread_call import ThreadCallWorkers, run_owned_thread_call
 from zeta.storage_format import drain_releases
+
+if TYPE_CHECKING:
+    from zeta.core.thread_call import ThreadCallHandle
 
 
 def _run_guarded_subprocess(source: str) -> subprocess.CompletedProcess[str]:
@@ -450,3 +453,151 @@ def test_every_loop_callback_goes_through_the_owned_handoff() -> None:
                 "_Handoff.schedule(loop, on_loop, dropped) so a dropped "
                 "callback runs its dropped action"
             )
+
+
+class _Pool:
+    """A one-worker ``ThreadCallWorkers`` on a real loop, with a gated call."""
+
+    def __init__(self) -> None:
+        self.loop = asyncio.new_event_loop()
+        self.workers = ThreadCallWorkers(self.loop, workers=1, name="test-read")
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def gated(self, *, fail: bool = False) -> Any:
+        def call() -> int:
+            self.started.set()
+            assert self.release.wait(10), "worker was not released"
+            try:
+                if fail:
+                    raise ValueError("read failed")
+                return 7
+            finally:
+                self.finished.set()
+
+        return call
+
+    def start(self, call: Any) -> ThreadCallHandle[Any]:
+        handle = self.workers.submit(call)
+        assert self.started.wait(10)
+        return handle
+
+    def step(self) -> None:
+        for _ in range(3):
+            self.loop.run_until_complete(asyncio.sleep(0))
+
+    def settle(self, handle: ThreadCallHandle[Any]) -> list[bool]:
+        """Wait for ``completed``; return whether the worker had finished when it
+        settled, once per settle."""
+        seen: list[bool] = []
+        handle.completed.add_done_callback(lambda _done: seen.append(self.finished.is_set()))
+        self.loop.run_until_complete(asyncio.wait_for(asyncio.shield(handle.completed), 10))
+        self.step()
+        return seen
+
+    def cleanup(self) -> None:
+        self.release.set()
+        self.workers.close()
+        for thread in self.workers.threads:
+            thread.join(10)
+        self.loop.close()
+
+
+def _pool_success(pool: _Pool) -> None:
+    pool.release.set()
+    handle = pool.workers.submit(pool.gated())
+    assert pool.loop.run_until_complete(asyncio.wait_for(handle.result, 10)) == 7
+    assert pool.settle(handle) == [True]
+
+
+def _pool_error(pool: _Pool) -> None:
+    pool.release.set()
+    handle = pool.workers.submit(pool.gated(fail=True))
+    with pytest.raises(ValueError):
+        pool.loop.run_until_complete(asyncio.wait_for(handle.result, 10))
+    assert pool.settle(handle) == [True]
+
+
+def _pool_cancel_before_dequeue(pool: _Pool) -> None:
+    running = pool.start(pool.gated())
+    ran: list[bool] = []
+    queued = pool.workers.submit(lambda: ran.append(True))
+    queued.result.cancel()
+    pool.step()
+    assert queued.completed.done() and not running.completed.done()
+    pool.release.set()
+    assert pool.settle(running) == [True]
+    assert ran == [], "a call cancelled before a worker took it ran"
+
+
+def _pool_cancel_while_running(pool: _Pool) -> None:
+    handle = pool.start(pool.gated())
+    handle.result.cancel()
+    pool.step()
+    assert not handle.completed.done(), "completed settled while the worker still ran"
+    pool.release.set()
+    assert pool.settle(handle) == [True]
+
+
+def _pool_close_while_queued_and_running(pool: _Pool) -> None:
+    running = pool.start(pool.gated())
+    queued = pool.workers.submit(lambda: None)
+    pool.workers.close()
+    pool.step()
+    assert queued.completed.done() and queued.result.cancelled()
+    assert running.result.cancelled()
+    assert not running.completed.done(), "close completed a call its worker still runs"
+    with pytest.raises(RuntimeError, match="reads are closed"):
+        pool.workers.submit(lambda: None)
+    pool.release.set()
+    assert pool.settle(running) == [True]
+
+
+def _pool_loop_handoff_dropped(pool: _Pool) -> None:
+    handle = pool.start(pool.gated())
+    pool.loop.close()
+    pool.release.set()
+    assert pool.finished.wait(10)
+    pool.workers.close()
+    for thread in pool.workers.threads:
+        thread.join(10)
+        assert not thread.is_alive()
+    assert not handle.completed.done()  # its loop is gone: nothing waits for it
+
+
+POOL_ROWS = {
+    "success": _pool_success,
+    "error": _pool_error,
+    "cancel_before_dequeue": _pool_cancel_before_dequeue,
+    "cancel_while_running": _pool_cancel_while_running,
+    "close_while_queued_and_running": _pool_close_while_queued_and_running,
+    "loop_handoff_dropped": _pool_loop_handoff_dropped,
+}
+
+
+@pytest.mark.parametrize("name", POOL_ROWS)
+def test_thread_call_workers_complete_once_after_the_worker(name: str) -> None:
+    pool = _Pool()
+    try:
+        POOL_ROWS[name](pool)
+    finally:
+        if not pool.loop.is_closed():
+            pool.cleanup()
+
+
+def test_cancelled_run_waiter_keeps_its_running_call_tracked() -> None:
+    """A waiter cancelled while its call runs must not drop the call: the pool
+    still owns it until the worker returns."""
+    pool = _Pool()
+    try:
+        task = pool.loop.create_task(pool.workers.run(pool.gated()))
+        pool.step()
+        assert pool.started.wait(10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            pool.loop.run_until_complete(task)
+        assert not pool.finished.is_set()
+        assert len(pool.workers._calls) == 1, "the cancelled waiter dropped its running call"
+    finally:
+        pool.cleanup()

@@ -6,7 +6,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .. import event_contract
 from ..handlers import lifecycle, validation
@@ -21,6 +21,9 @@ from . import (
     history_features,
     rows,
 )
+
+if TYPE_CHECKING:
+    from ..session_controllers import SessionUse
 
 logger = logging.getLogger(__name__)
 
@@ -197,9 +200,10 @@ class ReplayOutput:
         return None
 
     async def begin_replay_join(
-        self, connection: Any, scope: ReplayScopeId, controller: Any
+        self, connection: Any, scope: ReplayScopeId, controller: SessionUse
     ) -> None:
-        """Begin a join on ``controller``, the record the request selected."""
+        """Begin a join on ``controller``, the use the request selected; the
+        stream keeps its record, not the use."""
         if scope.kind == "child":
             store = self.child_runs.live_store(scope.value)
         else:
@@ -210,7 +214,7 @@ class ReplayOutput:
             scope,
             None if store is None else store.reset_generation(),
             {},
-            controller,
+            controller.record,
         )
         pending.status = await lifecycle.live_status_baseline(
             connection, controller
@@ -569,7 +573,7 @@ class ReplayOutput:
     async def read_replay_history(
         self,
         connection: Any,
-        controller: Any,
+        controller: SessionUse,
         session_id: str,
         history_validator: object | None = None,
     ) -> tuple[dict[str, object], int, str | None]:
@@ -595,7 +599,7 @@ class ReplayOutput:
             )
             return history, frontier_seq, frontier_row_id
 
-        result = await self.run_read(connection, read)
+        result = await self.run_read(connection, read, controller, fence=False)
         assert isinstance(result, tuple)
         history, *rest = result
         shaped = self._strip_restart_reason(connection, history)
