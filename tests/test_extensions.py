@@ -434,10 +434,10 @@ async def test_disabled_markers_keep_overlapping_hosts_changes(tmp_path: Path) -
     async with _open_registry(tmp_path) as tools:
         host_a = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names)
         host_b = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names)
-        await asyncio.gather(
+        await asyncio.wait_for(asyncio.gather(
             asyncio.to_thread(host_a.persist_disabled, "first", False),
             asyncio.to_thread(host_b.persist_disabled, "second", False),
-        )
+        ), 10)
         assert (home / "extensions-disabled" / "first").exists()
         assert (home / "extensions-disabled" / "second").exists()
         await asyncio.to_thread(host_a.persist_disabled, "first", True)
