@@ -135,8 +135,8 @@ another checkout.
   set -e
   OTEL_WORKTREE=/absolute/path/to/the/zeta-checkout
   OTEL_REVISION=663bc41baebf0aeb7e70a7605e75641240ee9abd
-  ZETA_HOME="$(mktemp -d "${TMPDIR:-/tmp}/zeta-otel-home.XXXXXX")"
-  VIEWER_HOME="$(mktemp -d "${TMPDIR:-/tmp}/otel-gui.XXXXXX")"
+  OWNED_ZETA_HOME="$(mktemp -d "${TMPDIR:-/tmp}/zeta-otel-home.XXXXXX")"
+  OWNED_VIEWER_HOME="$(mktemp -d "${TMPDIR:-/tmp}/otel-gui.XXXXXX")"
   VIEWER_URL=https://github.com/metafab/otel-gui/releases/download/v3.1.0/otel-gui-macos-arm64.tar.gz
   VIEWER_SHA256=2982fd3b3c44a459dd8a8ae973c7b6a835165ddaad4b500e414272122f3a281d
 
@@ -147,7 +147,7 @@ another checkout.
       kill "$VIEWER_PID" 2>/dev/null || true
       wait "$VIEWER_PID" 2>/dev/null || true
     fi
-    rm -rf "$ZETA_HOME" "$VIEWER_HOME"
+    rm -rf "$OWNED_ZETA_HOME" "$OWNED_VIEWER_HOME"
     exit "$status"
   }
   trap cleanup EXIT
@@ -159,21 +159,40 @@ another checkout.
   cd "$OTEL_WORKTREE"
   uv run --extra otel python -c 'import zeta; print(zeta.__file__)'
 
-  mkdir -p "$ZETA_HOME"
-  cat > "$ZETA_HOME/settings.toml" <<'EOF'
+  mkdir -p "$OWNED_ZETA_HOME"
+  cat > "$OWNED_ZETA_HOME/settings.toml" <<'EOF'
 [otel]
 endpoint = "http://127.0.0.1:4319/v1/traces"
 EOF
-  curl -fsSL "$VIEWER_URL" -o "$VIEWER_HOME/otel-gui.tar.gz"
-  printf '%s  %s\n' "$VIEWER_SHA256" "$VIEWER_HOME/otel-gui.tar.gz" | shasum -a 256 -c -
-  tar -xzf "$VIEWER_HOME/otel-gui.tar.gz" -C "$VIEWER_HOME"
-  VIEWER_BIN=$(find "$VIEWER_HOME" -type f -name otel-gui -perm -111 | head -1)
+  curl -fsSL "$VIEWER_URL" -o "$OWNED_VIEWER_HOME/otel-gui.tar.gz"
+  printf '%s  %s\n' "$VIEWER_SHA256" "$OWNED_VIEWER_HOME/otel-gui.tar.gz" | shasum -a 256 -c -
+  tar -xzf "$OWNED_VIEWER_HOME/otel-gui.tar.gz" -C "$OWNED_VIEWER_HOME"
+  VIEWER_BIN=$(find "$OWNED_VIEWER_HOME" -type f -name otel-gui -perm -111 | head -1)
+  test -n "$VIEWER_BIN"
   HOST=127.0.0.1 PORT=4319 "$VIEWER_BIN" &
   VIEWER_PID=$!
-  ZETA_HOME="$ZETA_HOME" uv run --extra otel zeta \
+  viewer_ready=false
+  for _ in $(seq 1 30); do
+    VIEWER_STATE=$(ps -p "$VIEWER_PID" -o state= 2>/dev/null || true)
+    case "$VIEWER_STATE" in
+      ''|Z*)
+        wait "$VIEWER_PID"
+        exit 1
+        ;;
+    esac
+    if curl -fsS --max-time 1 http://127.0.0.1:4319/ >/dev/null; then
+      viewer_ready=true
+      break
+    fi
+    sleep 1
+  done
+  test "$viewer_ready" = true
+  ZETA_HOME="$OWNED_ZETA_HOME" uv run --extra otel zeta \
     --provider ollama --model qwen3:4b --no-session --yolo --max-turns 8 \
     -p 'you must use the agent tool now: ask exactly one child agent to run a short check. after the child returns, use the bash tool to print exactly otel-proof. do not answer until both tool calls complete. report only success.'
   open http://127.0.0.1:4319
+  printf 'inspect the newest zeta trace in otel-gui, then press enter to finish: '
+  IFS= read -r _
 )
 ```
 
@@ -185,11 +204,6 @@ agent, and the child work. The viewer and OTLP endpoint above bind only to
 `127.0.0.1`; do not replace it with a wildcard or public address. Zeta keeps
 working after the viewer stops; `/status` shows `degraded` after the next
 batch.
-
-If you intentionally use a real home instead, set `ZETA_HOME="$HOME/.zeta"` and
-edit only the existing `[otel]` setting without replacing the file. Restore the
-setting and restart zeta processes after the proof. The disposable-home journey
-above is the safe default.
 
 ## joining traces from another program (achilles)
 
