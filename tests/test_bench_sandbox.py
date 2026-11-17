@@ -37,6 +37,36 @@ def _load_sandbox():
     return module
 
 
+def test_bench_store_probe_runs_on_synthetic_session(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env.update(HOME=str(tmp_path), ZETA_HOME=str(tmp_path / ".zeta"))
+    run = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/bench/bench.py"),
+            "--tree",
+            str(ROOT),
+            "--session",
+            "fresh",
+            "--probe",
+            "store",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert run.returncode == 0, run.stderr
+    result, _meta = json.JSONDecoder().raw_decode(run.stdout)
+    store = result["fresh"]["store"]
+    assert store["snapshot_rows"] == 0
+    assert "snapshot" in store
+    assert not {"replay", "messages", "rows_replayed", "messages_count"} & store.keys()
+
+
 def test_store_eviction_probe_runs_on_synthetic_session(tmp_path: Path) -> None:
     env = os.environ.copy()
     env.update(HOME=str(tmp_path), ZETA_HOME=str(tmp_path / ".zeta"))
