@@ -57,6 +57,7 @@ _OWNER_LEAK_BASELINE = _TEST_SITE_PACKAGES / "owner_leak_ratchet.txt"
 def reset_process_update_monitor(monkeypatch: pytest.MonkeyPatch) -> None:
     from zeta.runtime import update_notice
 
+    # test-contract: seam Reset process-global update state between tests.
     monkeypatch.setattr(update_notice, "_process_monitor", None)
 
 
