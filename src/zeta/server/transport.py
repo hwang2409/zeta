@@ -272,16 +272,19 @@ async def run_server(server: ZetaServer) -> None:
         except (NotImplementedError, RuntimeError):
             continue
         installed.append(signum)
-    await server.start()
-    monitor.start()
-    serving = asyncio.create_task(server.serve_forever())
+    serving: asyncio.Task[None] | None = None
     try:
+        await server.start()
+        monitor.start()
+        serving = asyncio.create_task(server.serve_forever())
         await stopped.wait()
     finally:
         unsubscribe()
+        # close also owns a failed start: it is the one shutdown point for telemetry
         await server.close()
-        serving.cancel()
-        await asyncio.gather(serving, return_exceptions=True)
+        if serving is not None:
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)
         await monitor.close()
         for signum in installed:
             loop.remove_signal_handler(signum)

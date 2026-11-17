@@ -47,6 +47,7 @@ from ..compaction import (
     SummaryInputTooLarge as _SummaryInputTooLarge,
 )
 from ..protocol.tool_batches import interrupted_tool_result, repair_tool_batches
+from ..telemetry import SpanHandle, Telemetry
 from ..protocol.types import (
     ASSISTANT_RESPONSE_COMPLETED,
     ASSISTANT_RESPONSE_STATE,
@@ -157,6 +158,8 @@ class ContextAssembler(ContextMarkerMixin):
             computer_screenshot_retention or ComputerScreenshotRetention()
         )
         self.last_compaction_telemetry: dict[str, Any] = {}
+        # the owning AgentLoop installs its process telemetry; disabled is a no-op
+        self.telemetry = Telemetry.disabled()
         self._descendant_usage = {
             "input_tokens": 0,
             "output_tokens": 0,
@@ -190,6 +193,7 @@ class ContextAssembler(ContextMarkerMixin):
                 messages, estimated_tokens=estimate
             ),
             backend=backend,
+            inference_span=self._summary_inference_span,
         )
         self.compaction_policy.backend = (
             self._request_admission if backend is not None else None
@@ -461,6 +465,50 @@ class ContextAssembler(ContextMarkerMixin):
             reserved_estimator_tokens=reserved_estimator_tokens,
             system_append=system_append,
         )
+        prepared_context = preparation.context
+        should_compact = preparation.should_compact
+        if not should_compact:
+            self.last_context = prepared_context
+            return prepared_context
+        # the one compaction span for automatic, forced retry, and manual /compact
+        # work; a branch-change retry inside _evict_context nests its own attempt
+        with self.telemetry.context_span(
+            emergency=emergency, tokens_before=prepared_context.token_count
+        ) as span:
+            context = await self._compact(
+                branch,
+                preparation,
+                assembly_budget,
+                backend=backend,
+                force=force,
+                bypass_eviction_hysteresis=bypass_eviction_hysteresis,
+                emergency=emergency,
+                reserved_estimator_tokens=reserved_estimator_tokens,
+            )
+            # telemetry only records values the code already has: no store reads here
+            span.set_compaction(tokens_after=context.token_count)
+        return context
+
+    def _summary_inference_span(self, backend: CompletionBackend) -> SpanHandle:
+        return self.telemetry.inference_span(
+            getattr(backend, "model", ""),
+            provider=getattr(backend, "provider", ""),
+            stream=True,
+            conversation_id=self.store.session_id,
+        )
+
+    async def _compact(
+        self,
+        branch: Sequence[ConversationEntry],
+        preparation: _AssemblyPreparation,
+        assembly_budget: int,
+        *,
+        backend: CompletionBackend | None,
+        force: bool,
+        bypass_eviction_hysteresis: bool,
+        emergency: bool,
+        reserved_estimator_tokens: int,
+    ) -> AssembledContext:
         branch_id = self._branch_id(branch)
         items = preparation.items
         result_seqs = preparation.result_seqs
@@ -471,11 +519,6 @@ class ContextAssembler(ContextMarkerMixin):
         committed_messages = preparation.committed_messages
         committed_tokens = preparation.committed_tokens
         all_messages = preparation.all_messages
-        prepared_context = preparation.context
-        should_compact = preparation.should_compact
-        if not should_compact:
-            self.last_context = prepared_context
-            return prepared_context
         adaptive_tail = preparation.adaptive_tail
         pinned_user = preparation.pinned_user
         prefix_has_uncompacted_items = preparation.prefix_has_uncompacted_items

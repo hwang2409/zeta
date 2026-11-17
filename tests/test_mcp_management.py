@@ -1110,8 +1110,8 @@ async def test_activate_starts_slow_mcp_mount_without_blocking_first_render(
     started = asyncio.Event()
     release = asyncio.Event()
 
-    async def slow_mount(registry, config=None, *, notice_sink=None, home=None):
-        del config, notice_sink
+    async def slow_mount(registry, config=None, *, notice_sink=None, home=None, telemetry=None):
+        del config, notice_sink, telemetry
         started.set()
         await asyncio.wait_for(release.wait(), 10)
         return MCPMount(registry, {}, {}, home=home)
