@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
+from ..config.settings import computer_allow_guidance
 from ..mcp.prompt_commands import SlashPromptError
 from ..model_input import ModelInputEnvelope
 from ..protocol.types import (
@@ -754,7 +755,7 @@ def _format_status(status: SlashStatus) -> str:
         f"compaction_marker_count: {status.compaction_marker_count}",
         f"checkpoint_count: {status.checkpoint_count}",
         "unavailable_accounts: " + (", ".join(status.unavailable_accounts) or "none"),
-        f"computer: {'enabled' if status.computer_enabled else 'disabled'}, allowed app count={status.computer_allowed_apps}" + ("; add [computer.apps] \\\"com.apple.Safari\\\" = \\\"allow\\\"" if status.computer_empty_allow_list else ""),
+        f"computer: {'enabled' if status.computer_enabled else 'disabled'}, allowed app count={status.computer_allowed_apps}" + (f"; the allow-list is empty, so every app is denied. {computer_allow_guidance('com.apple.Safari')}" if status.computer_empty_allow_list else ""),
         f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
         status.mcp_summary,
         "usage:",

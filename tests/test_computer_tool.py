@@ -13,6 +13,7 @@ from zeta.agent.tool_results import validated_tool_result
 from zeta.config.settings import (
     SETTINGS_FILENAME,
     ComputerUseConfig,
+    computer_allow_guidance,
     load_settings,
     resolve,
 )
@@ -364,8 +365,19 @@ async def test_denied_app_guidance_is_parseable_and_allows_app(tmp_path: Path) -
     async with _computer_registry(tmp_path, backend=backend) as registry:
         registry.computer_config = ComputerUseConfig(enabled=True)
         denied = await registry.execute(ToolCall("c", "computer", {"action": "screenshot"}))
-        assert '[computer.apps] "com.apple.Safari" = "allow"' in denied["content"][0]["text"]
-        registry.computer_config = ComputerUseConfig(enabled=True, bundle_ids={"com.apple.Safari": "allow"})
+        text = denied["content"][0]["text"]
+        assert text.startswith("screenshot failed: the computer allow-list is empty, so every app is denied.")
+        assert text.endswith(computer_allow_guidance("com.apple.Safari"))
+        home = tmp_path / "home"
+        _write_settings(home, "[computer]\nenabled = true\n" + text.split("settings.toml:\n", 1)[1] + "\n")
+        registry.computer_config = resolve(
+            load_settings(home=home).settings,
+            cli_provider="claude",
+            cli_model=None,
+            cli_yolo=None,
+            cli_token_budget=None,
+        ).computer
+        assert registry.computer_config.bundle_ids == {"com.apple.Safari": "allow"}
         allowed = await registry.execute(ToolCall("c", "computer", {"action": "screenshot"}))
     assert allowed["isError"] is False
 

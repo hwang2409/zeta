@@ -12,9 +12,13 @@ import pytest
 from zeta.config.settings import ComputerUseConfig, load_settings, resolve
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import SessionManager
+from zeta.core.slash import UsageTracker, build_slash_status
 from zeta.protocol.types import ToolCall
 from zeta.runtime.cleanup import close_session
 from zeta.runtime.composition import compose_runtime
+from zeta.runtime.status import capture_slash_status
+from zeta.server.runtime import ServerRuntime
+from zeta.server.slash_commands import run_command
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tools import ToolRegistry
@@ -22,6 +26,7 @@ from zeta.tools.computer import mac as mac_module
 from zeta.tools.computer.backend import Button, ComputerError, ScreenFrame, ScreenState
 from zeta.tools.computer.mac import MacBackend
 from zeta.tools.computer.scaling import ScreenGeometry
+from zeta.tui.app import _status_card_lines
 
 FAKE = Path(__file__).parent / "fixtures" / "computer_fake_helper.py"
 
@@ -30,12 +35,7 @@ def make_backend() -> MacBackend:
     return MacBackend([sys.executable, str(FAKE)])
 
 
-@pytest.mark.asyncio
-async def test_composition_closes_helper_on_session_shutdown(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    backend = make_backend()
-    monkeypatch.setattr(mac_module, "make_mac_backend", lambda _config=None: backend)
+def _compose(tmp_path: Path, computer: ComputerUseConfig):
     config = resolve(
         load_settings(home=tmp_path / "home").settings,
         cli_provider="codex",
@@ -43,13 +43,11 @@ async def test_composition_closes_helper_on_session_shutdown(
         cli_yolo=None,
         cli_token_budget=None,
     )
-    config = dataclasses.replace(config, computer=ComputerUseConfig(enabled=True, default_app_access="allow"))
-    runtime = await asyncio.to_thread(
-        compose_runtime,
+    return compose_runtime(
         home=tmp_path / "home",
         cwd=tmp_path,
         manager=SessionManager(tmp_path / "home"),
-        config=config,
+        config=dataclasses.replace(config, computer=computer),
         provider="codex",
         model="offline",
         project_context=ProjectContext("system", ()),
@@ -57,12 +55,63 @@ async def test_composition_closes_helper_on_session_shutdown(
         skill_catalog=SkillCatalog.empty(),
         agent_catalog=AgentCatalog.empty(),
     )
+
+
+@pytest.mark.asyncio
+async def test_composition_closes_helper_on_session_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend = make_backend()
+    monkeypatch.setattr(mac_module, "make_mac_backend", lambda _config=None: backend)
+    runtime = await asyncio.to_thread(
+        _compose, tmp_path, ComputerUseConfig(enabled=True, default_app_access="allow")
+    )
     try:
         await backend.state()
         assert backend._client._proc is not None
     finally:
         await close_session(runtime.loop)
     assert backend._client._proc is None
+
+
+@pytest.mark.asyncio
+async def test_status_names_empty_allow_list_with_working_settings_lines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(mac_module, "make_mac_backend", lambda _config=None: None)
+    runtime = await asyncio.to_thread(_compose, tmp_path, ComputerUseConfig(enabled=True))
+    try:
+        loop = runtime.loop
+        snapshot = capture_slash_status(
+            loop,
+            session_id=runtime.opened.metadata.session_id,
+            provider="codex",
+            model="offline",
+            context_files=(),
+            vim_mode=False,
+            pending_approvals=(),
+            usage_tracker=UsageTracker(loop.context_assembler, provider="codex"),
+            project_context_health=None,
+        )
+        tui_text = "\n".join(
+            "".join(text for _style, text in line)
+            for line in _status_card_lines(build_slash_status(snapshot))
+        )
+        serve = ServerRuntime.borrowed(
+            home=tmp_path / "home",
+            opened=runtime.opened,
+            loop=loop,
+            policy=runtime.policy,
+            project_dir=runtime.project_dir,
+            repo_root=runtime.repo_root,
+        )
+        result = await run_command(serve, "/status")
+    finally:
+        await close_session(runtime.loop)
+    assert result["kind"] == "output"
+    for text in (tui_text, result["text"]):
+        assert "computer: enabled, allowed app count=0; the allow-list is empty" in text
+        assert '[computer.macos.bundle_ids]\n"com.apple.Safari" = "allow"' in text
 
 
 @pytest.mark.asyncio

@@ -129,6 +129,12 @@ class ComputerUseConfig:
     )
 
 
+def computer_allow_guidance(bundle_id: str) -> str:
+    """The settings lines that allow one app; shared by the computer tool and /status."""
+
+    return f'add to your home settings.toml:\n[computer.macos.bundle_ids]\n"{bundle_id}" = "allow"'
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """Validated settings from the merged global+project files."""

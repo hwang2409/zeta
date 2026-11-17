@@ -7,6 +7,7 @@ import base64
 from dataclasses import replace
 from typing import Any
 
+from ...config.settings import computer_allow_guidance
 from ...media.image_normalization import normalize_image_bytes
 from ...protocol.types import StructuredToolResult
 from .._results import _error_result, text_block
@@ -68,7 +69,8 @@ async def _guard(registry: ToolRegistry, backend: ComputerBackend) -> ScreenStat
         raise _GuardError("secure_input", _REFUSAL_REASON["secure_input"], state)
     if not app_access(registry, state.frontmost_bundle_id):
         bundle = state.frontmost_bundle_id or "<unknown>"
-        raise _GuardError("not_allowed", f'frontmost app {bundle!r} is not allowed; add [computer.apps] "{bundle}" = "allow"', state)
+        reason = "the computer allow-list is empty, so every app is denied" if not registry.computer_config.bundle_ids else f"frontmost app {bundle!r} is not allowed"
+        raise _GuardError("not_allowed", f"{reason}. {computer_allow_guidance(bundle)}", state)
     return state
 
 
