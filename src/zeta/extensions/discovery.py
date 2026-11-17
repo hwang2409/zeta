@@ -152,7 +152,7 @@ def _load_one(
         module = _import_entry(directory, manifest, host=host)
     except Exception as exc:  # noqa: BLE001 - loading must fail open
         error = f"import failed: {_short(exc)}"
-        host.record_error(manifest.name, scope, error)
+        host.record_error(manifest.name, manifest.version, scope, error)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
@@ -161,7 +161,7 @@ def _load_one(
     if not callable(entry):
         host.remove_package_for_directory(directory)
         error = f"no callable {manifest.entry_function}(zx)"
-        host.record_error(manifest.name, scope, error)
+        host.record_error(manifest.name, manifest.version, scope, error)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
@@ -173,7 +173,7 @@ def _load_one(
     except Exception as exc:  # noqa: BLE001 - a broken activate must not break the session
         host.remove_package_for_directory(directory)
         error = f"activate raised: {_short(exc)}"
-        host.record_error(manifest.name, scope, error)
+        host.record_error(manifest.name, manifest.version, scope, error)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
@@ -183,7 +183,7 @@ def _load_one(
             result.close()
         host.remove_package_for_directory(directory)
         error = "activate must be synchronous"
-        host.record_error(manifest.name, scope, error)
+        host.record_error(manifest.name, manifest.version, scope, error)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )

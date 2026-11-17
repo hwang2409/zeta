@@ -133,8 +133,18 @@ class ExtensionStatus:
     version: str
     scope: str
     state: str
+    trusted: bool
     tool_names: tuple[str, ...] = ()
     command_names: tuple[str, ...] = ()
+    error: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.state not in {"disabled_in_settings", "disabled_next_session"}
+
+    @property
+    def loaded(self) -> bool:
+        return self.state == "loaded"
 
 
 _NAMESPACE = "_zeta_extensions"
@@ -176,7 +186,7 @@ class ExtensionHost:
         self._disabled: set[str] = set()
         self._settings_disabled: set[str] = set()
         self.disabled_inventory: list[PendingExtension] = []
-        self._errors: dict[tuple[str, str], str] = {}
+        self._errors: dict[tuple[str, str], tuple[str, str]] = {}
         self._closed = False
 
     def new_package(self, directory: Path, extension_name: str) -> tuple[str, types.ModuleType]:
@@ -313,41 +323,18 @@ class ExtensionHost:
             return
         self._event_loop.call_soon(self._send, event)
 
-    def record_error(self, name: str, scope: str, error: str) -> None:
-        self._errors[(name, scope)] = error
+    def record_error(
+        self, name: str, version: str, scope: str, error: str,
+    ) -> None:
+        self._errors[(name, scope)] = (version, error)
 
     def status_rows(self) -> list[dict[str, object]]:
-        """Return the host-owned status projection for the serve surface."""
-        rows: list[dict[str, object]] = []
-        seen: set[tuple[str, str]] = set()
-        for item in self.loaded:
-            key = (item.name, item.scope)
-            seen.add(key)
-            rows.append({
-                "name": item.name, "scope": item.scope, "version": item.version,
-                "enabled": True, "trusted": item.scope == USER_SCOPE,
-                "loaded": True, "error": self._errors.get(key),
-            })
-        for item in (*self.disabled_inventory, *self.pending_project):
-            key = (item.manifest.name, item.scope)
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append({
-                "name": item.manifest.name, "scope": item.scope,
-                "version": item.manifest.version,
-                "enabled": item.manifest.name not in self._disabled,
-                "trusted": item.scope == USER_SCOPE, "loaded": False,
-                "error": self._errors.get(key),
-            })
-        for (name, scope), error in self._errors.items():
-            if (name, scope) not in seen:
-                rows.append({
-                    "name": name, "scope": scope, "version": "",
-                    "enabled": True, "trusted": scope == USER_SCOPE,
-                    "loaded": False, "error": error,
-                })
-        return rows
+        """Adapt the host-owned status records for the serve surface."""
+        return [{
+            "name": item.name, "scope": item.scope, "version": item.version,
+            "enabled": item.enabled, "trusted": item.trusted,
+            "loaded": item.loaded, "error": item.error,
+        } for item in self.statuses()]
 
     def commit(self, extension: LoadingExtension) -> None:
         """Register a successfully activated extension's tools."""
@@ -445,17 +432,27 @@ class ExtensionHost:
         return True
 
     def statuses(self) -> tuple[ExtensionStatus, ...]:
-        """Project current loading state into one record per discovered name."""
+        """Project current loading state into immutable public records."""
         records: list[ExtensionStatus] = []
-        seen: set[str] = set()
+        seen: set[tuple[str, str]] = set()
         for item in self.loaded:
-            if item.name not in seen:
-                seen.add(item.name)
+            key = (item.name, item.scope)
+            if key not in seen:
+                seen.add(key)
                 records.append(self._loaded_status(item))
         for item in (*self.disabled_inventory, *self.pending_project):
-            if item.manifest.name not in seen:
-                seen.add(item.manifest.name)
+            key = (item.manifest.name, item.scope)
+            if key not in seen:
+                seen.add(key)
                 records.append(self._pending_status(item))
+        for (name, scope), (version, error) in self._errors.items():
+            if (name, scope) not in seen:
+                state = self._state(name, loaded=False)
+                records.append(ExtensionStatus(
+                    name=name, version=version, scope=scope,
+                    state="error" if state == "pending" else state,
+                    trusted=True, error=error,
+                ))
         return tuple(records)
 
     def status(self, name: str) -> ExtensionStatus | None:
@@ -464,7 +461,7 @@ class ExtensionHost:
     def _loaded_status(self, item: LoadedExtension) -> ExtensionStatus:
         return ExtensionStatus(
             name=item.name, version=item.version, scope=item.scope,
-            state=self._state(item.name, loaded=True),
+            state=self._state(item.name, loaded=True), trusted=True,
             tool_names=item.tool_names, command_names=item.command_names,
         )
 
@@ -476,6 +473,7 @@ class ExtensionHost:
                 loaded=False,
                 disabled_inventory=item in self.disabled_inventory,
             ),
+            trusted=item.scope == USER_SCOPE,
         )
 
     def _state(self, name: str, *, loaded: bool, disabled_inventory: bool = False) -> str:
