@@ -49,18 +49,44 @@ async def test_legacy_grace_rejects_multi_and_allows_legacy_reconnect(
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
 @pytest.mark.asyncio
-async def test_unattached_multi_member_blocks_legacy(tmp_path: Path, transport: Transport) -> None:
+async def test_unattached_multi_close_releases_mode_for_legacy(
+    tmp_path: Path, transport: Transport
+) -> None:
     server = replay_server(tmp_path, transport, _backend_factory)
     await server.start()
     first = await connect_replay(server, transport)
     second = await connect_replay(server, transport)
     try:
-        await negotiate(first, replay=False, extra=("multi_controller",))
-        assert len(server.controllers._controller_members) == 1, (
-            "an unattached negotiated multi connection must be a semantic member"
-        )
+        admitted = await negotiate(first, replay=False, extra=("multi_controller",))
+        assert "result" in admitted
         refused = await negotiate(second, replay=False)
         assert refused["error"]["code"] == -32001
+        await first.close()
+        recovered_client = await connect_replay(server, transport)
+        try:
+            recovered = await negotiate(recovered_client, replay=False)
+            assert "result" in recovered
+        finally:
+            await recovered_client.close()
+    finally:
+        await _close_server(server, (first, second))
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_unattached_multi_close_releases_mode_for_fresh_multi(
+    tmp_path: Path, transport: Transport
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    first = await connect_replay(server, transport)
+    second = await connect_replay(server, transport)
+    try:
+        admitted = await negotiate(first, replay=False, extra=("multi_controller",))
+        assert "result" in admitted
+        await first.close()
+        recovered = await negotiate(second, replay=False, extra=("multi_controller",))
+        assert "result" in recovered
     finally:
         await _close_server(server, (first, second))
 

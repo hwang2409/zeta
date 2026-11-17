@@ -118,7 +118,11 @@ class SessionControllers:
         self._controller_mode: Literal["empty", "legacy", "multi"] = "empty"
         self._controller_members: dict[Any, int] = {}
         self._hello_generations = itertools.count(1)
+        # a reconnect grace keeps the negotiated mode alive after its member
+        # closes.  admission state follows one table: tokens (provisional or
+        # committed) keep the mode; then exact grace does; otherwise it is empty.
         self._grace_session_id: str | None = None
+        self._grace_generation: int | None = None
         # close waiters per record, woken when its last use settles
         self._drains: dict[SessionController, list[asyncio.Future[None]]] = {}
 
@@ -162,6 +166,18 @@ class SessionControllers:
         self._controller_members[connection] = generation
         return HelloAdmission(connection, requested, generation)
 
+    def _refresh_controller_mode(self) -> None:
+        """Apply the admission state table after every token or release change.
+
+        ``tokens`` includes both provisional and committed hello reservations.
+        An exact reconnect grace is the only state that survives without one.
+        Resident and closing records are session state, not controller tokens;
+        they do not keep an unattached mode alive.
+        """
+        if self._controller_members or self._grace_generation is not None:
+            return
+        self._controller_mode = "empty"
+
     def commit_hello(self, admission: HelloAdmission) -> None:
         if self._controller_members.get(admission.connection) != admission.generation:
             raise RuntimeError("hello admission is no longer current")
@@ -170,18 +186,27 @@ class SessionControllers:
         if self._controller_members.get(admission.connection) != admission.generation:
             return
         del self._controller_members[admission.connection]
-        if not self._controller_members and self._grace_session_id is None:
-            self._controller_mode = "empty"
+        self._refresh_controller_mode()
 
     def release_connection(self, connection: Any, reason: str = "eof") -> None:
         del reason
-        self._controller_members.pop(connection, None)
+        generation = self._controller_members.pop(connection, None)
+        if generation is None:
+            self._refresh_controller_mode()
+            return
         if not self._controller_members:
-            self._grace_session_id = (
+            session_id = (
                 self._attached.runtime.session_id
                 if self._attached.runtime.opened is not None
                 else None
             )
+            self._grace_session_id = session_id
+            # legacy has a reconnect grace without a session id; dormant multi
+            # does not. the mode selected by the released token distinguishes them.
+            self._grace_generation = (
+                generation if self._controller_mode == "legacy" or session_id is not None else None
+            )
+        self._refresh_controller_mode()
 
     def records(self) -> tuple[SessionController, ...]:
         return tuple(self._records.values())
