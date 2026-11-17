@@ -34,6 +34,7 @@ from ..providers.completion import CompletionRetryBudget
 from ..skills import SkillCatalog
 from ..skills.agent_catalog import AgentCatalog
 from ..storage_format import open_writer
+from ..telemetry import Telemetry
 from ..tools._shared.user_discovery import ExternalToolDiscovery, apply_external_tools
 from ..tools.registry import ToolRegistry
 from .loop import AgentLoop
@@ -100,6 +101,7 @@ def compose_runtime(
     project_discovery: ProjectDiscovery | None = None,
     memory_notice: Callable[[str], None] | None = None,
     require_selected_account: bool = True,
+    telemetry: Telemetry | None = None,
 ) -> RuntimeComposition:
     """Build one session, policy, loop, and tool registry for any frontend."""
 
@@ -319,6 +321,7 @@ def compose_runtime(
             parent_session_id=metadata.parent_session_id,
             project_registry=project_registry,
             max_agent_depth=config.agents_max_depth,
+            telemetry=telemetry,
             **loop_kwargs,
         )
         loop.explicit_finish = config.agents_explicit_finish

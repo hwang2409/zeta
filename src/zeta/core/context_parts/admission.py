@@ -5,9 +5,18 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ...protocol.types import CompletionBackend, Message, StreamEvent
+from ...protocol.types import (
+    CompletionBackend,
+    ErrorInfo,
+    Message,
+    StreamEvent,
+    StreamEventType,
+)
+
+if TYPE_CHECKING:
+    from ...telemetry import SpanHandle
 
 
 class RequestBudgetExceeded(RuntimeError):
@@ -55,8 +64,10 @@ class SessionRequestAdmission:
         budget: Callable[[], int],
         begin_attempt: Callable[[Sequence[Message], int], None],
         backend: CompletionBackend,
+        inference_span: Callable[[CompletionBackend], SpanHandle],
     ) -> None:
         self._estimate = estimate
+        self._inference_span = inference_span
         self._budget = budget
         self._begin_attempt = begin_attempt
         self._backend = backend
@@ -114,12 +125,28 @@ class SessionRequestAdmission:
     ) -> AsyncIterator[StreamEvent]:
         """Admit and dispatch one compaction request through this object."""
 
+        # the agent loop's one-owner inference span, shared so a summary call is
+        # a child of the compaction span that is current here
+        from ...runtime.loop._completion import InferenceObservation
+
         request = await self.admit(messages, tool_schemas)
-        completion = self.dispatch(self._backend, request, control=control)
-        try:
-            async for event in completion:
-                yield event
-        finally:
-            close = getattr(completion, "aclose", None)
-            if close is not None:
-                await close()
+        with InferenceObservation() as inference:
+            inference.start(self._inference_span(self._backend))
+            completion = self.dispatch(self._backend, request, control=control)
+            try:
+                async for event in completion:
+                    inference.observe(event)
+                    if event.type is StreamEventType.ERROR:
+                        inference.error = event.error or ErrorInfo("backend_error", "")
+                    try:
+                        yield event
+                    except GeneratorExit:
+                        # the summarizer stops reading at an ERROR it raises; that
+                        # error, not the close, is the span's failure
+                        if inference.error is None:
+                            raise
+                        return
+            finally:
+                close = getattr(completion, "aclose", None)
+                if close is not None:
+                    await close()
