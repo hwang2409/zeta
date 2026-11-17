@@ -20,6 +20,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from ...config.settings import ComputerUseConfig
 from .backend import Button, ComputerError, ScreenFrame, ScreenState
 from .helper_client import HelperClient, HelperError, HelperProtocolError, HelperTimeout
 
@@ -41,7 +42,7 @@ def helper_path() -> Path | None:
     return path if path.is_file() else None
 
 
-def make_mac_backend() -> MacBackend | None:
+def make_mac_backend(config: ComputerUseConfig | None = None) -> MacBackend | None:
     if sys.platform != "darwin":
         return None
     path = helper_path()

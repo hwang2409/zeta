@@ -269,7 +269,7 @@ def compose_runtime(
             project_id=metadata.project_id,
             project_registry=project_registry,
             inbox_enabled=config.inbox_enabled and project_registry is not None,
-            computer_enabled=config.computer_enabled,
+            computer=config.computer,
             command_niceness=config.command_niceness,
             tool_allow=tool_policy.allow,
             tool_deny=tool_policy.deny,
@@ -294,10 +294,10 @@ def compose_runtime(
         if project_registry is None:
             registry.unregister("project")
             registry.unregister("inbox")
-        if config.computer_enabled:
+        if config.computer.enabled:
             from ..tools.computer.mac import make_mac_backend
 
-            computer_backend = make_mac_backend()
+            computer_backend = make_mac_backend(config.computer)
             if computer_backend is not None:
                 registry.computer_backend = computer_backend
                 async def close_computer_backend() -> None:

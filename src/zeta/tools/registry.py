@@ -110,6 +110,7 @@ if TYPE_CHECKING:
 AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
+ValidationErrorResult = Callable[[Mapping[str, object], str], StructuredToolResult]
 HandlerBinding = Literal["loop", "shared"]
 def _bind_handler(handler: ToolHandler, registry: ToolRegistry) -> ToolHandler:
     return partial(handler, registry)
@@ -162,6 +163,7 @@ class ToolDefinition:
     handler_factory: ToolHandlerFactory | None = None
     parallel_safe: bool = False
     validate_arguments: bool = True
+    validation_error_result: ValidationErrorResult | None = None
     requires_approval: bool = True
     # Argument that ``tool(pattern)`` approval rules match against (ZETA-86).
     approval_subject: str | None = None
@@ -224,7 +226,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         project_id: str | None = None,
         project_registry: Any = None,
         inbox_enabled: bool = True,
-        computer_enabled: bool = False,
+        computer: Any = None,
         tool_allow: Sequence[str] | None = None,
         tool_deny: Sequence[str] = (),
         tool_allow_layers: Sequence[Sequence[str]] = (),
@@ -263,7 +265,11 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         self.project_registry_state: ProjectRegistryState | None = None
         self.inbox_enabled = inbox_enabled
         self.inbox_target_ids: frozenset[str] | None = None
-        self.computer_enabled = computer_enabled
+        if computer is None:
+            from ..config.settings import ComputerUseConfig
+            computer = ComputerUseConfig()
+        self.computer_config = computer
+        self.computer_enabled = self.computer_config.enabled
         # The one OS seam for the computer tool; set by composition when a real
         # backend exists, or by tests injecting a FakeBackend. None means the
         # enabled tool reports that no backend is available on this machine.
@@ -467,6 +473,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         schema: Mapping[str, Any] | None = None,
         parallel_safe: bool = False,
         validate_arguments: bool = True,
+        validation_error_result: ValidationErrorResult | None = None,
         requires_approval: bool = True,
         actions: Mapping[str, ToolAction] | None = None,
         handler_factory: ToolHandlerFactory | None = None,
@@ -543,6 +550,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             handler_factory=handler_factory,
             parallel_safe=parallel_safe,
             validate_arguments=validate_arguments,
+            validation_error_result=validation_error_result,
             requires_approval=requires_approval,
             approval_subject=approval_subject,
             approval_subject_resolver=approval_subject_resolver,
@@ -964,7 +972,10 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 else _coerce_arguments(dict(capability.arguments))
             )
         except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            return _error_result(f"invalid arguments: {exc}", kind="invalid_arguments")
+            message = f"invalid arguments: {exc}"
+            if definition.validation_error_result is not None:
+                return definition.validation_error_result(capability.arguments, message)
+            return _error_result(message, kind="invalid_arguments")
         return definition, capability, arguments
 
     async def execute(
