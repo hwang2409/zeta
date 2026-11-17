@@ -11,6 +11,7 @@ from rich.text import Text
 
 from ...core.session import env_home
 from ...diagnostics.tui_stalls import start_tui_stall_watchdog
+from ...protocol.types import StreamEvent
 from .. import theme
 from ..composer import FullScreenPromptSession
 from ..fork_session import RuntimeResult
@@ -131,18 +132,27 @@ class PromptRuntimeMixin:
         if self.extensions is not None and not getattr(
             self, "_extension_notice_sink_bound", False
         ):
-            extension_notice_sink = lambda event: self._handle_background_event(event)
             extension_notice_loop = asyncio.get_running_loop()
+
+            def extension_notice_sink(event: StreamEvent) -> None:
+                if getattr(self, "_extension_notice_first_paint_draining", False):
+                    self._handle_background_event_now(event)
+                else:
+                    self._handle_background_event(event)
 
             def bind_extension_notice_sink(application: object) -> None:
                 nonlocal extension_notice_pending
                 if extension_notice_pending:
                     session.app.after_render.remove_handler(extension_notice_handler)
                     extension_notice_pending = False
-                self.extensions.set_event_sink(
-                    extension_notice_sink, extension_notice_loop
-                )
-                self._extension_notice_sink_bound = True
+                self._extension_notice_first_paint_draining = True
+                try:
+                    self.extensions.set_event_sink(
+                        extension_notice_sink, extension_notice_loop
+                    )
+                    self._extension_notice_sink_bound = True
+                finally:
+                    self._extension_notice_first_paint_draining = False
 
             extension_notice_after_render = bind_extension_notice_sink
         set_notice_loop = getattr(self._draft, "set_notice_loop", None)

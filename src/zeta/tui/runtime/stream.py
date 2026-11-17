@@ -102,7 +102,10 @@ class StreamEventMixin:
             event.type is StreamEventType.AGENT_NOTIFICATION
             and event.data.get("kind") == "extension"
         ):
-            self._presenter.print_transient(rendered)
+            if getattr(self, "_extension_notice_first_paint_draining", False):
+                self._presenter.print(rendered)
+            else:
+                self._presenter.print_transient(rendered)
         else:
             self._print_unit(rendered)
 

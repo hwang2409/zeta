@@ -25,7 +25,7 @@ from zeta.extensions import (
     trust_project_extensions,
 )
 from zeta.extensions.host import USER_SCOPE
-from zeta.protocol.types import StreamEventType
+from zeta.protocol.types import StreamEvent, StreamEventType
 from zeta.skills import SkillCatalog
 from zeta.testing.extensions import load_extension
 from zeta.tools import ToolRegistry
@@ -132,6 +132,41 @@ def activate(zx):
             "name": "notify-ext", "scope": "user", "version": "0.1.0",
             "enabled": True, "trusted": True, "loaded": True, "error": None,
         }]
+
+
+@pytest.mark.asyncio
+async def test_sink_binding_drains_detached_fifo_without_recursion(
+    tmp_path: Path,
+) -> None:
+    source = """
+def activate(zx):
+    zx.ui.notify("first")
+    zx.ui.notify("second")
+"""
+    home = tmp_path / "home"
+    _write_extension(home / "extensions", "notify-ext", source=source)
+    async with _open_registry(tmp_path) as registry:
+        host = apply_extensions(
+            registry,
+            home=home,
+            project_dir=None,
+            builtin_names=registry.registered_names,
+        )
+        delivered: list[str] = []
+        nested_delivered = asyncio.Event()
+
+        def sink(event: StreamEvent) -> None:
+            text = event.data["text"]
+            delivered.append(text)
+            if text == "first":
+                host.notify("notify-ext", "nested", "info")
+            elif text == "nested":
+                nested_delivered.set()
+
+        host.set_event_sink(sink, asyncio.get_running_loop())
+        assert delivered == ["first", "second"]
+        await asyncio.wait_for(nested_delivered.wait(), 10)
+        assert delivered == ["first", "second", "nested"]
 
 
 @pytest.mark.asyncio
