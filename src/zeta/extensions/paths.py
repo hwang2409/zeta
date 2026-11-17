@@ -62,9 +62,15 @@ def extension_root(
     return root
 
 
+def validate_extension_directory(directory: str | Path) -> None:
+    """Require an extension candidate to be a real directory."""
+    _directory(Path(directory))
+
+
 def validate_extension_identity(directory: str | Path, manifest_name: str) -> None:
     """Require the manifest name to match its containing directory name."""
     path = Path(directory)
+    validate_extension_directory(path)
     if path.name != manifest_name:
         raise ExtensionTrustError(
             f"extension manifest name {manifest_name!r} does not match folder "

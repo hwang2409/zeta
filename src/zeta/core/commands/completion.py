@@ -128,7 +128,8 @@ _zeta() {
                 ext)
                     case ${original_words[command_index+1]} in
                         install) _arguments '--scope=[installation scope]:scope:(user project)' '--yes[skip review prompt]' '1:source:' ;;
-                        remove|trust|untrust) _arguments '--scope=[installation scope]:scope:(user project)' '1:name:' ;;
+                        remove|untrust) _arguments '--scope=[installation scope]:scope:(user project)' '1:name:' ;;
+                        trust) _arguments '--scope=[installation scope]:scope:(user project)' '--yes[skip review prompt]' '1:name:' ;;
                         update) _arguments '--scope=[installation scope]:scope:(user project)' '--yes[skip review prompt]' '1:name:' ;;
                         *) _describe 'verb' ext_verbs ;;
                     esac
@@ -267,8 +268,8 @@ def bash_script() -> str:
                 COMPREPLY=( $(compgen -W "install remove update trust untrust" -- "$cur") )
             else
                 case "$verb" in
-                    install|update) COMPREPLY=( $(compgen -W "--scope --yes" -- "$cur") ) ;;
-                    remove|trust|untrust) COMPREPLY=( $(compgen -W "--scope" -- "$cur") ) ;;
+                    install|update|trust) COMPREPLY=( $(compgen -W "--scope --yes" -- "$cur") ) ;;
+                    remove|untrust) COMPREPLY=( $(compgen -W "--scope" -- "$cur") ) ;;
                 esac
             fi
             ;;

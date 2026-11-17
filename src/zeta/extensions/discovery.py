@@ -47,6 +47,7 @@ from .manifest import (
 from .paths import (
     ExtensionTrustError,
     extension_root,
+    validate_extension_directory,
     validate_extension_identity,
 )
 from .trust import is_trusted
@@ -80,22 +81,16 @@ def apply_extensions(
     user_dir = _scope_dir(home, "")
     project_scope_dir = _scope_dir(project_dir, ".zeta")
     for directory in _extension_dirs(user_dir):
-        manifest = _manifest_or_notice(host, directory, USER_SCOPE)
-        if manifest is None or not _identity_or_notice(host, directory, manifest, USER_SCOPE):
-            continue
-        if _skip(host, manifest, directory, disabled_set):
-            continue
-        _load_one(host, directory, manifest, USER_SCOPE)
+        manifest = _classify_directory(host, directory, USER_SCOPE, disabled_set)
+        if manifest is not None:
+            _load_one(host, directory, manifest, USER_SCOPE)
     if project_scope_dir is not None and project_scope_dir != user_dir:
         pending_names: list[str] = []
         for directory in _extension_dirs(project_scope_dir):
-            manifest = _manifest_or_notice(host, directory, PROJECT_SCOPE)
-            if manifest is None or not _identity_or_notice(host, directory, manifest, PROJECT_SCOPE):
+            manifest = _classify_directory(host, directory, PROJECT_SCOPE, disabled_set)
+            if manifest is None:
                 continue
-            if _skip(host, manifest, directory, disabled_set):
-                continue
-            trusted = _project_trusted(host, manifest, directory)
-            if trusted:
+            if _project_trusted(host, manifest, directory):
                 _load_one(host, directory, manifest, PROJECT_SCOPE)
             else:
                 host.pending_project.append(PendingExtension(manifest, directory))
@@ -264,20 +259,32 @@ def _manifest_or_notice(
         return None
 
 
-def _identity_or_notice(
+def _classify_directory(
     host: ExtensionHost,
     directory: Path,
-    manifest: ExtensionManifest,
     scope: str,
-) -> bool:
+    disabled: frozenset[str],
+) -> ExtensionManifest | None:
+    try:
+        validate_extension_directory(directory)
+    except ExtensionTrustError as exc:
+        host.notices.append(
+            f"extensions · ignored {scope} extension {_display(directory)}: {exc}"
+        )
+        return None
+    manifest = _manifest_or_notice(host, directory, scope)
+    if manifest is None:
+        return None
     try:
         validate_extension_identity(directory, manifest.name)
     except ExtensionTrustError as exc:
         host.notices.append(
             f"extensions · ignored {scope} extension {_display(directory)}: {exc}"
         )
-        return False
-    return True
+        return None
+    if _skip(host, manifest, directory, disabled):
+        return None
+    return manifest
 
 
 def _extension_dirs(base: Path | None) -> list[Path]:

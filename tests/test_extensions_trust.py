@@ -204,6 +204,36 @@ def test_fingerprint_rejects_symlink_and_size_bound(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("shape", "expected_notice"),
+    [("match", False), ("mismatch", True), ("named_symlink", True)],
+)
+async def test_public_discovery_identity_table(
+    tmp_path: Path, shape: str, expected_notice: bool
+) -> None:
+    home = tmp_path / "home"
+    root = home / "extensions"
+    extension = _extension(root / "demo", name="bar" if shape == "mismatch" else "demo")
+    if shape == "named_symlink":
+        extension.rename(root / "real")
+        try:
+            (root / "demo").symlink_to(root / "real", target_is_directory=True)
+        except OSError:
+            pytest.skip("symlinks unavailable")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    registry = ToolRegistry(cwd, skill_catalog=SkillCatalog.empty())
+    try:
+        host = apply_extensions(
+            registry, home=home, project_dir=None, builtin_names=registry.registered_names
+        )
+        assert bool(host.loaded) is (shape == "match")
+        assert any("rename the folder" in notice or "real directory" in notice for notice in host.notices) is expected_notice
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_trust_rejects_mismatched_directory_before_review_and_discovery(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
