@@ -473,10 +473,11 @@ class TUIApp(
             self._model_catalog_loaded = True
             self._model_catalog_task = None
             self._model_catalog_load_finished.set()
-            self.refresh_model_picker()
-            if self._model_catalog_refresh_requested:
-                self._model_catalog_refresh_requested = False
-                self._start_model_catalog_load()
+            if not (self._closing or self._closed):
+                self.refresh_model_picker()
+                if self._model_catalog_refresh_requested:
+                    self._model_catalog_refresh_requested = False
+                    self._start_model_catalog_load()
 
     def _prompt_style(self) -> Style:
         focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
