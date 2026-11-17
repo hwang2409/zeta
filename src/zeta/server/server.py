@@ -475,6 +475,9 @@ class ZetaServer:
             self._idle_drain = None
         try:
             if self._client is not None:
+                handler = self._client._run_task
+                if handler is not None and not handler.done():
+                    handler.cancel()
                 await self._client.close(graceful=True)
         finally:
             self._client = None
@@ -887,9 +890,6 @@ class _Client:
             await accounts.cancel_owned_switch(self)
             await self.logins.close()
             if graceful:
-                handler = self._run_task
-                if handler is not None and not handler.done() and handler is not asyncio.current_task():
-                    handler.cancel()
                 await self.connections.flush(self)
             self._local_close = True
             self.writer.close()
