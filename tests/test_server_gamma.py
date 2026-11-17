@@ -393,7 +393,7 @@ def activate(zx):
         host = server.runtime.extensions
         loop = server.runtime.loop
         assert host is not None and loop is not None
-        host._hooks[0].timeout_seconds = 0.001
+        host._hooks[0].timeout_seconds = 0.001 if failure == "timeout" else 10
 
         for index in range(2):
             result = await loop.tool_registry.execute(
