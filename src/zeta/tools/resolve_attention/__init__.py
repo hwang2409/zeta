@@ -8,12 +8,21 @@ from typing import TypedDict
 
 from ...attention_decisions import _top_level_sessions
 from ...attention_forks import validate_attention_fork
-from ...attention_records import AttentionStore, observed_epoch_for_session
-from ...attention_replies import AttentionReplies
+from ...attention_records import (
+    AttentionRecord,
+    AttentionStore,
+    observed_epoch_for_session,
+)
+from ...attention_replies import AttentionReplies, ReplyOutcome
+from ...core.session_execution import (
+    OwnerHint,
+    SessionExecutionLease,
+    SessionOwnedError,
+)
+from ...core.session_files import child_directory, session_root
 from ...project_inbox import AGENT_ORIGIN
 from ...protocol.types import StructuredToolResult
 from ...runtime.project_registry_state import ProjectRegistryState
-from ...session_liveness import session_is_live
 from .._results import _success_result, text_block
 from ..registry import ToolRegistry
 
@@ -27,13 +36,44 @@ class CloseAttentionArguments(TypedDict):
     decision: str
 
 
-def _owner_for_close(registry: ToolRegistry, attention_id: str) -> tuple[str, Path]:
+def _foreign_matches(
+    registry: ToolRegistry, attention_id: str
+) -> tuple[tuple[str, Path], ...]:
+    store = registry.session_store
+    if registry.project_id is None:
+        raise ValueError("attention record ownership does not match the current project")
+    matches: list[tuple[str, Path]] = []
+    for session_id, session_dir in _top_level_sessions(
+        store.session_dir.parent.parent, registry.project_id
+    ):
+        if session_id == store.session_id:
+            continue
+        try:
+            record = AttentionStore(
+                session_dir, writer_epoch=observed_epoch_for_session(session_dir)
+            ).get(attention_id)
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"attention record {attention_id} in session {session_id} is broken"
+            ) from exc
+        if record.project_id != registry.project_id or record.session_id != session_id:
+            raise ValueError("attention record ownership does not match its project")
+        matches.append((session_id, session_dir))
+    return tuple(matches)
+
+
+def _close_attention_sync(
+    registry: ToolRegistry, attention_id: str, decision: str
+) -> tuple[ReplyOutcome, AttentionRecord]:
     store = registry.session_store
     home = store.session_dir.parent.parent
+    own_store = AttentionStore(
+        store.session_dir, writer_epoch=store.observed_storage_epoch
+    )
     try:
-        own = AttentionStore(
-            store.session_dir, writer_epoch=store.observed_storage_epoch
-        ).get(attention_id)
+        own = own_store.get(attention_id)
     except FileNotFoundError:
         own = None
     except (OSError, ValueError) as exc:
@@ -43,24 +83,47 @@ def _owner_for_close(registry: ToolRegistry, attention_id: str) -> tuple[str, Pa
             registry.project_id is not None and own.project_id != registry.project_id
         ):
             raise ValueError("attention record ownership does not match the current project")
-        return store.session_id, store.session_dir
-    if registry.project_id is None:
-        raise ValueError("attention record ownership does not match the current project")
-    for session_id, session_dir in _top_level_sessions(home, registry.project_id):
-        if session_id == store.session_id:
-            continue
+        outcome = AttentionReplies(
+            home, store.session_id, registry_state=registry.project_registry_state
+        ).resolve_local(attention_id, decision)
+        return outcome, own_store.get(attention_id)
+
+    matches = _foreign_matches(registry, attention_id)
+    if not matches:
+        raise ValueError("attention item was not found in a dead predecessor session")
+    if len(matches) > 1:
+        owners = ", ".join(session_id for session_id, _ in matches)
+        raise ValueError(
+            f"attention item is ambiguous across predecessor sessions: {owners}"
+        )
+    owner_id, owner_dir = matches[0]
+    with session_root(owner_dir.parent) as root_fd, child_directory(
+        root_fd, owner_id
+    ) as directory_fd:
         try:
+            lease = SessionExecutionLease.acquire(
+                directory_fd,
+                session_id=owner_id,
+                owner=OwnerHint("headless"),
+                recovery=True,
+                require_unowned=True,
+                home=home,
+            )
+        except SessionOwnedError as exc:
+            raise ValueError(
+                "cannot resolve an attention item owned by a live session"
+            ) from exc
+        try:
+            replies = AttentionReplies(
+                home, owner_id, registry_state=registry.project_registry_state
+            )
+            outcome = replies.resolve_local(attention_id, decision)
             record = AttentionStore(
-                session_dir, writer_epoch=observed_epoch_for_session(session_dir)
+                owner_dir, writer_epoch=observed_epoch_for_session(owner_dir)
             ).get(attention_id)
-        except (FileNotFoundError, OSError, ValueError):
-            continue
-        if record.project_id != registry.project_id or record.session_id != session_id:
-            raise ValueError("attention record ownership does not match its project")
-        if session_is_live(session_dir):
-            raise ValueError("cannot resolve an attention item owned by a live session")
-        return session_id, session_dir
-    raise ValueError("attention item was not found in a dead predecessor session")
+            return outcome, record
+        finally:
+            lease.close()
 
 
 async def _resolve_attention(
@@ -123,23 +186,11 @@ async def _resolve_attention(
 async def _close_attention(
     registry: ToolRegistry, arguments: CloseAttentionArguments
 ) -> StructuredToolResult:
-    store = registry.session_store
-    home = store.session_dir.parent.parent
-    owner_id, owner_dir = await asyncio.to_thread(
-        _owner_for_close, registry, arguments["attention_id"]
-    )
-    outcome = await asyncio.to_thread(
-        AttentionReplies(
-            home, owner_id, registry_state=registry.project_registry_state
-        ).resolve_local,
+    outcome, record = await asyncio.to_thread(
+        _close_attention_sync,
+        registry,
         arguments["attention_id"],
         arguments["decision"],
-    )
-    record = await asyncio.to_thread(
-        AttentionStore(
-            owner_dir, writer_epoch=observed_epoch_for_session(owner_dir)
-        ).get,
-        arguments["attention_id"],
     )
     if outcome.already_resolved:
         return _success_result(
