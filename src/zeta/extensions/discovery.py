@@ -153,6 +153,7 @@ def _classify_directory(
     manifest = _manifest_or_notice(host, directory, scope)
     if manifest is None:
         return None
+    # if _skip(host, manifest, directory, disabled):
     try:
         validate_extension_identity(directory, manifest.name)
     except ExtensionTrustError as exc:

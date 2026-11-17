@@ -182,6 +182,7 @@ class ExtensionHost:
         self._notification_clock = clock
         self._notification_buckets: dict[str, tuple[float, float, int]] = {}
         self._packages: dict[str, Path] = {}
+        self._finders: dict[str, _ExtensionFinder] = {}
         self._closed = False
 
     def new_package(self, directory: Path, extension_name: str) -> tuple[str, types.ModuleType]:
@@ -196,6 +197,9 @@ class ExtensionHost:
         module.__package__ = package
         sys.modules[package] = module
         self._packages[package] = directory
+        finder = _ExtensionFinder(package, directory)
+        self._finders[package] = finder
+        sys.meta_path.insert(0, finder)
         return package, module
 
     def remove_package_for_directory(self, directory: Path) -> None:
@@ -205,6 +209,9 @@ class ExtensionHost:
 
     def remove_package(self, package: str) -> None:
         self._packages.pop(package, None)
+        finder = self._finders.pop(package, None)
+        if finder is not None and finder in sys.meta_path:
+            sys.meta_path.remove(finder)
         for name in tuple(sys.modules):
             if name == package or name.startswith(package + "."):
                 del sys.modules[name]
