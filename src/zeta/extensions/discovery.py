@@ -44,6 +44,7 @@ from .manifest import (
     ExtensionManifestError,
     parse_manifest,
 )
+from .paths import ExtensionTrustError, extension_root
 from .trust import is_trusted
 
 EXTENSIONS_DIRNAME = "extensions"
@@ -269,10 +270,14 @@ def _extension_dirs(base: Path | None) -> list[Path]:
 
 
 def _scope_dir(base: str | Path | None, nested: str) -> Path | None:
-    resolved = _as_path(base)
-    if resolved is None:
+    if base is None:
         return None
-    candidate = resolved / nested / EXTENSIONS_DIRNAME if nested else resolved / EXTENSIONS_DIRNAME
+    resolved = Path(base).expanduser()
+    scope = "project" if nested else "user"
+    try:
+        candidate = extension_root(resolved, resolved if nested else None, scope)
+    except ExtensionTrustError:
+        return None
     return candidate if candidate.is_dir() else None
 
 

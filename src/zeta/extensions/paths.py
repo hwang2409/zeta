@@ -28,17 +28,14 @@ def _directory(path: Path, *, missing_ok: bool = False) -> Path:
     return path
 
 
-def extension_path(
+def extension_root(
     home: str | Path,
     project_dir: str | Path | None,
     scope: str,
-    name: str,
     *,
     create: bool = False,
 ) -> Path:
-    """Return a checked management path for one extension."""
-    if not _NAME_RE.fullmatch(name):
-        raise ExtensionTrustError(f"invalid extension name: {name}")
+    """Return the checked root for one extension scope."""
     if scope == "user":
         home_path = Path(home).expanduser()
         if create and not home_path.exists():
@@ -62,4 +59,19 @@ def extension_path(
         _directory(root)
     else:
         raise ExtensionTrustError("project scope requires a repository")
+    return root
+
+
+def extension_path(
+    home: str | Path,
+    project_dir: str | Path | None,
+    scope: str,
+    name: str,
+    *,
+    create: bool = False,
+) -> Path:
+    """Return a checked management path for one extension."""
+    if not _NAME_RE.fullmatch(name):
+        raise ExtensionTrustError(f"invalid extension name: {name}")
+    root = extension_root(home, project_dir, scope, create=create)
     return _directory(root / name, missing_ok=create)
