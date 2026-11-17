@@ -126,8 +126,8 @@ async def test_stuck_lost_holder_is_logged_with_dump(
             await await_or_fail(entered.wait(), what="holder enters its request")
             await holder.close()
             await _poll(
-                lambda: registry_connections._controller is not None
-                and registry_connections._controller.connection.peer_closed(),
+                lambda: registry_connections._primary_controller is not None
+                and registry_connections._primary_controller.connection.peer_closed(),
                 what="serve sees the holder connection close",
             )
 
@@ -159,7 +159,7 @@ async def test_stuck_lost_holder_is_logged_with_dump(
             if server.connections is not None:
                 await _poll(
                     lambda: server.connections is None
-                    or server.connections._controller is None,
+                    or server.connections._primary_controller is None,
                     what="holder released after the gate opens",
                 )
 
