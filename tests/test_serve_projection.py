@@ -1,5 +1,8 @@
+import asyncio
 import json
 from types import SimpleNamespace
+
+import pytest
 
 from zeta.core.retention.computer import ComputerScreenshotRetention
 from zeta.core.store import ConversationStore
@@ -8,9 +11,12 @@ from zeta.protocol.types import (
     MessageRole,
     StreamEvent,
     StreamEventType,
+    TextContent,
     ToolCall,
     ToolResult,
+    ToolUseContent,
 )
+from zeta.server.connections import ConnectionRegistry
 from zeta.server.event_contract import (
     assistant_message,
     tool_end,
@@ -18,7 +24,9 @@ from zeta.server.event_contract import (
     tool_start,
 )
 from zeta.server.handlers.history_projection import _history_entry_rows
+from zeta.server.handlers.registry import session_history
 from zeta.server.protocol import EventDescriptor, FrameCodec
+from zeta.server.session_replay.in_flight import InFlightReply
 
 
 def _params(event: str, fields: dict[str, object]) -> bytes:
@@ -265,22 +273,73 @@ def test_computer_history_matches_live_state_and_stubs_images() -> None:
     assert "private result" not in history_wire
 
 
-def test_child_history_does_not_inherit_parent_computer_state() -> None:
-    child = SimpleNamespace(
-        id="child-entry",
-        type="message",
-        data={"message": {"role": "assistant", "content": [{"type": "text", "text": "child only"}]}},
+@pytest.mark.asyncio
+async def test_child_history_does_not_inherit_parent_computer_state(tmp_path) -> None:
+    parent = ConversationStore(tmp_path, session_id="parent")
+    child = ConversationStore(tmp_path, session_id="child")
+    call = ToolCall("parent-computer", "computer", {"action": "screenshot"})
+    parent.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+    parent.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [],
+            tool_result=ToolResult(
+                call.id,
+                "parent private result",
+                structured_content={
+                    "computer": {
+                        "action": "screenshot",
+                        "control": "denied",
+                        "frontmost_bundle_id": "com.parent.secret",
+                    }
+                },
+            ),
+        )
     )
-    rows = _history_entry_rows(
-        child,
-        {},
-        {},
-        include_delivery_id=False,
-        fidelity=True,
-        content_read=False,
-        approval_origin=False,
+    child.append_message(
+        Message(MessageRole.ASSISTANT, [TextContent("child-only content")])
     )
-    assert "computer" not in json.dumps(rows)
+
+    class Connection:
+        def __init__(self) -> None:
+            self.server = SimpleNamespace(
+                runtime=SimpleNamespace(
+                    session_id=child.session_id,
+                    opened=SimpleNamespace(store=child),
+                )
+            )
+
+        async def close(self) -> None:
+            return None
+
+    connection = Connection()
+    connections = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    connections.register(connection)
+    try:
+        connections.negotiate_role(
+            connection,
+            "controller",
+            "1.0",
+            frozenset({"session_history_fidelity"}),
+        )
+        connection.connections = connections
+        result = await session_history(
+            connection,
+            "child-history",
+            {"session_id": child.session_id},
+        )
+        response = json.loads(FrameCodec().response("child-history", result))
+    finally:
+        await connections.aclose()
+        parent.close()
+        child.close()
+
+    wire = json.dumps(response)
+    assert "child-only content" in wire
+    assert "computer" not in wire
+    assert "denied" not in wire
+    assert "com.parent.secret" not in wire
+    assert "parent private result" not in wire
 
 
 def test_bounded_tool_output_golden_matches_origin_main() -> None:
