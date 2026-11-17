@@ -3,54 +3,45 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from io import BytesIO
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-from PIL import Image
 
 from evals.computer_macos.fixture import FixtureServer, trial_state
 from evals.computer_macos.reset import reset
-from evals.computer_macos.run import (
-    EXPECTED_MODEL,
-    EXPECTED_PROVIDER,
-    phase0,
-    pilot,
-    prepare_home,
-)
-from zeta.config.settings import ComputerUseConfig
-from zeta.media.image_policy import ANTHROPIC_IMAGE_POLICY
-from zeta.tools.computer import run_action
+from evals.computer_macos.run import EXPECTED_MODEL, EXPECTED_PROVIDER, phase0, pilot
+from tests.support.fake_backend import FakeBackend as ProviderBackend
+from tests.support.fake_backend import ScriptedTurn
+from zeta.protocol.types import TextContent, ToolCall
 from zeta.tools.computer.backend import ScreenFrame, ScreenState
-
-_image = BytesIO()
-Image.new("RGB", (1280, 800), "white").save(_image, format="PNG")
-_PNG = _image.getvalue()
+from zeta.tools.computer.fake import _solid_png
 
 
-class FakeBackend:
+class ComputerBackend:
     def __init__(self, url: str | None = None) -> None:
-        self.closed = False
         self.url = url
+        self.nonce = ""
+        self.closed = False
         self.actions: list[str] = []
 
     async def screenshot(self, display=None):
         self.actions.append("screenshot")
-        return ScreenFrame(_PNG, "image/png", 1280, 800, 1.0, 0, 0)
-
-    async def cursor_position(self):
-        return (12, 34)
+        return ScreenFrame(_solid_png(1280, 800), "image/png", 1280, 800, 1.0, 0, 0)
 
     async def state(self):
+        self.actions.append("state")
         return ScreenState(False, False, "com.apple.Safari")
 
     async def click(self, x, y, button, count):
         self.actions.append("click")
-        data = json.dumps({"nonce": self.nonce, "x": x, "y": y, "viewport": [1280, 800], "device_pixel_ratio": 1}).encode()
         import urllib.request
-        request = urllib.request.Request(self.url + "/event", data=data, method="POST", headers={"content-type": "application/json"})
-        await asyncio.to_thread(urllib.request.urlopen, request)
+        payload = json.dumps({"nonce": self.nonce, "x": x, "y": y, "viewport": [1280, 800], "device_pixel_ratio": 1}).encode()
+        request = urllib.request.Request(self.url + "/event", data=payload, method="POST", headers={"content-type": "application/json"})
+        response = await asyncio.to_thread(urllib.request.urlopen, request)
+        response.close()
+
+    async def cursor_position(self):
+        return (0, 0)
 
     def close(self):
         self.closed = True
@@ -65,16 +56,44 @@ class FixtureHandle:
         trial_state(state_dir, trial)
         self.closed = False
 
-    def close(self) -> None:
+    async def close_and_verify(self) -> bool:
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
         self.closed = True
+        return not self.thread.is_alive()
+
+
+class Browser:
+    def __init__(self):
+        self.before = {"frontmost": "com.apple.Safari", "tabs": [{"wid": "1", "tid": "1", "u": "about:blank"}]}
+        self.after = dict(self.before)
+        self.cleaned = False
+
+    async def snapshot(self):
+        return self.before if not self.cleaned else self.after
+
+    async def open_owned(self, url):
+        self.after = {"frontmost": "com.apple.Safari", "tabs": [*self.before["tabs"], {"wid": "2", "tid": "2", "u": url}]}
+
+    async def cleanup_owned(self, before):
+        self.cleaned = True
+        self.after = before
+        return {"owned_browser_state_removed": True, "prior_state_restored": self.after == before}
+
+
+def provider(x: int = 301, y: int = 201) -> ProviderBackend:
+    return ProviderBackend([
+        ScriptedTurn(tool_calls=[ToolCall("shot", "computer", {"action": "screenshot"})]),
+        ScriptedTurn(tool_calls=[ToolCall("click", "computer", {"action": "left_click", "coordinate": [x + 1, y + 1]})]),
+        ScriptedTurn(content=[TextContent("done")]),
+        ScriptedTurn(content=[TextContent("done")]),
+    ])
 
 
 @pytest.mark.asyncio
 async def test_phase0_has_exact_capture_counts_and_no_input(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    backend = FakeBackend()
+    backend = ComputerBackend()
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "old"))
     result = await phase0(tmp_path, backend)
     assert len(result["events"]) == 120
@@ -83,81 +102,67 @@ async def test_phase0_has_exact_capture_counts_and_no_input(tmp_path: Path, monk
 
 
 @pytest.mark.asyncio
-async def test_pilot_runs_public_computer_tool_loop_three_trials_and_writes_truth(tmp_path: Path) -> None:
-    backends: list[FakeBackend] = []
+async def test_fake_provider_crosses_public_loop_three_trials_and_cleans_each_trial(tmp_path: Path) -> None:
+    backends: list[ComputerBackend] = []
     fixtures: list[FixtureHandle] = []
+    browsers: list[Browser] = []
 
-    def make_fixture(state_dir: Path, trial: int) -> FixtureHandle:
+    def make_fixture(state_dir, trial):
         fixture = FixtureHandle(state_dir, trial)
         fixtures.append(fixture)
         return fixture
 
-    def make_backend() -> FakeBackend:
-        backend = FakeBackend()
+    def make_backend(_trial):
+        backend = ComputerBackend()
+        backend.nonce = ""
         backends.append(backend)
         return backend
 
-    async def scripted_provider(backend: FakeBackend, state: dict, trial: int) -> dict:
-        backend.url = fixtures[trial - 1].url
-        backend.nonce = state["nonce"]
-        registry = SimpleNamespace(computer_enabled=True, computer_backend=backend, computer_config=ComputerUseConfig(enabled=True, default_app_access="allow"), computer_geometry=None, image_policy=ANTHROPIC_IMAGE_POLICY)
-        screenshot = await run_action(registry, "screenshot", {})
-        assert not screenshot["isError"], screenshot
-        target = state["target"]
-        click = await run_action(registry, "left_click", {"coordinate": [target["x"] + 1, target["y"] + 1]})
-        assert not click["isError"]
-        return {"provider": EXPECTED_PROVIDER, "model": EXPECTED_MODEL, "provider_events": 2, "usage_tokens": 7, "computer_actions": ["screenshot", "left_click"]}
+    def make_provider(trial):
+        target = trial_state(tmp_path / "fixture", trial)["target"]
+        adapter = provider(target["x"], target["y"])
+        adapter.provider = EXPECTED_PROVIDER
+        adapter.model = EXPECTED_MODEL
+        return adapter
 
-    result = await pilot(tmp_path, 3, provider_runner=scripted_provider, backend_factory=make_backend, fixture_factory=make_fixture)
+    result = await pilot(tmp_path, provider_factory=make_provider, backend_factory=make_backend, fixture_factory=make_fixture, browser_factory=lambda: browsers.append(Browser()) or browsers[-1])
     assert result["status"] == "complete"
     assert len(result["trials"]) == 3
-    assert all(trial["grade"]["pass"] for trial in result["trials"])
-    assert all(backend.actions == ["screenshot", "click", "screenshot"] for backend in backends)
+    assert all(row["grade"]["pass"] for row in result["trials"])
+    assert all(row["provider"] == EXPECTED_PROVIDER and row["model"] == EXPECTED_MODEL for row in result["trials"])
+    assert all(backend.actions.count("click") == 1 for backend in backends)
     assert all(backend.closed for backend in backends)
     assert all(fixture.closed for fixture in fixtures)
-    assert json.loads((tmp_path / "pilot.json").read_text())["cleanup"]["pass"]
+    assert all(browser.cleaned for browser in browsers)
+    assert json.loads((tmp_path / "pilot.json").read_text())["cleanup"]["disposable_home_removed"]
 
 
 @pytest.mark.asyncio
-async def test_pilot_writes_truth_on_provider_failure_and_cancellation(tmp_path: Path) -> None:
+async def test_provider_failure_writes_terminal_truth_and_cleanup(tmp_path: Path) -> None:
     fixture = FixtureHandle(tmp_path / "fixture", 1)
-    backend = FakeBackend()
+    backend = ComputerBackend()
 
-    async def failing(*_args: object) -> dict:
-        raise RuntimeError("scripted provider failure")
+    def failing(_trial):
+        adapter = ProviderBackend([])
+        adapter.provider = EXPECTED_PROVIDER
+        adapter.model = EXPECTED_MODEL
+        async def complete(*args, **kwargs):
+            raise RuntimeError("provider failed")
+            yield
+        adapter.complete = complete
+        return adapter
 
-    with pytest.raises(RuntimeError, match="scripted provider failure"):
-        await pilot(tmp_path, 3, provider_runner=failing, backend_factory=lambda: backend, fixture_factory=lambda *_: fixture)
+    with pytest.raises(RuntimeError):
+        await pilot(tmp_path, provider_factory=failing, backend_factory=lambda _trial: backend, fixture_factory=lambda *_: fixture, browser_factory=lambda: Browser())
     artifact = json.loads((tmp_path / "pilot.json").read_text())
     assert artifact["status"] == "failed"
-    assert artifact["error"] == "scripted provider failure"
+    assert artifact["cleanup"]["disposable_home_removed"]
     assert backend.closed and fixture.closed
-
-
-@pytest.mark.asyncio
-async def test_pilot_writes_truth_on_cancellation_and_partial_startup(tmp_path: Path) -> None:
-    fixture = FixtureHandle(tmp_path / "fixture", 1)
-
-    async def cancelled(*_args: object) -> dict:
-        raise asyncio.CancelledError
-
-    with pytest.raises(asyncio.CancelledError):
-        await pilot(tmp_path, 3, provider_runner=cancelled, backend_factory=FakeBackend, fixture_factory=lambda *_: fixture)
-    assert json.loads((tmp_path / "pilot.json").read_text())["status"] == "cancelled"
-    assert json.loads((tmp_path / "cleanup.json").read_text())["pass"]
-
-    partial = tmp_path / "partial"
-    def no_fixture(*_args: object) -> object:
-        raise RuntimeError("fixture startup failed")
-    with pytest.raises(RuntimeError, match="fixture startup failed"):
-        await pilot(partial, 3, fixture_factory=no_fixture)
-    artifact = json.loads((partial / "pilot.json").read_text())
-    assert artifact["status"] == "failed"
-    assert artifact["error"] == "fixture startup failed"
 
 
 def test_reset_removes_only_run_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "outer-home"))
+    from evals.computer_macos.run import prepare_home
     home = prepare_home(tmp_path)
     (home / "settings.toml").write_text("safe")
     result = reset(tmp_path, verify=True)

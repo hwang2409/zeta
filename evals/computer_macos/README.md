@@ -19,3 +19,5 @@ env ZETA_HOME="$RUN/zeta-home" ZETA_ACCOUNT_HOME="$HOME/.zeta" \
 ```
 
 phase 0 does not call a provider and does not send input events. it records 20 screenshots and 100 cursor-position calls. stop on any screen-recording, accessibility, or other tcc prompt. all pilot failures still write a truthful atomic `pilot.json` and cleanup artifact. artifacts remain below `RUN`; do not commit them.
+
+`pilot()` makes exactly three sequential `run_trial()` calls. each trial owns its fixture, browser state, backend, and zeta session. production uses the Codex `codex`/`gpt-5.6-luna` completion adapter and `MacBackend`; no-desktop tests inject a scripted completion adapter and fake computer backend into the same `AgentLoop.run_turn()` and tool dispatcher. there is no provider subprocess or headless event parser.
