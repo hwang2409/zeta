@@ -141,9 +141,10 @@ class ExtensionHost:
         self._event_sink: Callable[[StreamEvent], None] | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self.notify_dropped = 0
-        self._pending_notifications: deque[StreamEvent] = deque(maxlen=32)
-        self._notification_lock = threading.Lock()
-        self._notifications_outstanding = 0
+        self._pending_notifications: deque[StreamEvent] = deque()
+        self._pending_notification_drops: dict[str, int] = {}
+        self._event_thread_id: int | None = None
+        self._foreign_thread_warnings: set[str] = set()
         self._notification_clock = clock
         self._notification_buckets: dict[str, tuple[float, float, int]] = {}
         self._packages: dict[str, Path] = {}
@@ -181,8 +182,8 @@ class ExtensionHost:
         self._closed = True
         self._event_sink = None
         self._event_loop = None
-        with self._notification_lock:
-            self._pending_notifications.clear()
+        self._pending_notifications.clear()
+        self._pending_notification_drops.clear()
 
         for package in tuple(self._packages):
             self.remove_package(package)
@@ -191,32 +192,43 @@ class ExtensionHost:
         self, sink: Callable[[StreamEvent], None] | None,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
-        with self._notification_lock:
-            self._event_sink = sink
+        self._event_sink = sink
+        if sink is None or loop is None:
+            return
+        if self._event_loop is None:
             self._event_loop = loop
-            pending = tuple(self._pending_notifications)
-            self._pending_notifications.clear()
-        if sink is not None and loop is not None and pending:
-
-            def flush() -> None:
-                for event in pending:
-                    self._send(event)
-
-            loop.call_soon_threadsafe(flush)
+            self._event_thread_id = threading.get_ident()
+        if self._event_loop is not loop:
+            return
+        pending = tuple(self._pending_notifications)
+        self._pending_notifications.clear()
+        drops = tuple(self._pending_notification_drops.items())
+        self._pending_notification_drops.clear()
+        for event in pending:
+            loop.call_soon(self._send, event)
+        for extension, count in drops:
+            loop.call_soon(
+                self._send,
+                StreamEvent(
+                    StreamEventType.AGENT_NOTIFICATION,
+                    data={
+                        "kind": "extension",
+                        "extension": extension,
+                        "text": f"{count} extension notices dropped",
+                        "level": "warning",
+                    },
+                ),
+            )
 
     def _send(self, event: StreamEvent) -> None:
+        sink = self._event_sink
+        if self._closed or sink is None:
+            self.notify_dropped += 1
+            return
         try:
-            sink = self._event_sink
-            if self._closed or sink is None:
-                self.notify_dropped += 1
-                return
-            try:
-                sink(event)
-            except Exception:  # noqa: BLE001 - extension notices must not break a session
-                self.notify_dropped += 1
-        finally:
-            with self._notification_lock:
-                self._notifications_outstanding -= 1
+            sink(event)
+        except Exception:  # noqa: BLE001 - extension notices must not break a session
+            self.notify_dropped += 1
 
     def notify(self, extension: str, text: str, level: str) -> None:
         if type(text) is not str or level not in {"info", "warning", "error"}:
@@ -231,39 +243,42 @@ class ExtensionHost:
         if self._closed:
             self.notify_dropped += 1
             return
-        with self._notification_lock:
-            now = self._notification_clock()
-            last, tokens, dropped = self._notification_buckets.get(extension, (now, 20.0, 0))
-            tokens = min(20.0, tokens + max(0.0, now - last) * 10.0)
-            if tokens < 1.0:
-                self._notification_buckets[extension] = (now, tokens, dropped + 1)
+        if self._event_loop is not None and threading.get_ident() != self._event_thread_id:
+            self.notify_dropped += 1
+            if extension not in self._foreign_thread_warnings:
+                self._foreign_thread_warnings.add(extension)
+                self.warnings.append(
+                    f"extension {extension} notification dropped from a foreign thread"
+                )
+            return
+        now = self._notification_clock()
+        last, tokens, dropped = self._notification_buckets.get(extension, (now, 20.0, 0))
+        tokens = min(20.0, tokens + max(0.0, now - last) * 10.0)
+        if tokens < 1.0:
+            self._notification_buckets[extension] = (now, tokens, dropped + 1)
+            self.notify_dropped += 1
+            return
+        tokens -= 1.0
+        if dropped:
+            event = StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "kind": "extension", "extension": extension,
+                    "text": f"{dropped} extension notices dropped", "level": "warning",
+                },
+            )
+            dropped = 0
+        self._notification_buckets[extension] = (now, tokens, dropped)
+        if self._event_sink is None or self._event_loop is None:
+            if len(self._pending_notifications) < 32:
+                self._pending_notifications.append(event)
+            else:
+                self._pending_notification_drops[extension] = (
+                    self._pending_notification_drops.get(extension, 0) + 1
+                )
                 self.notify_dropped += 1
-                return
-            tokens -= 1.0
-            events = [event]
-            if dropped:
-                events = [StreamEvent(
-                    StreamEventType.AGENT_NOTIFICATION,
-                    data={"kind": "extension", "extension": extension,
-                          "text": f"{dropped} extension notices dropped", "level": "warning"},
-                )]
-                dropped = 0
-            self._notification_buckets[extension] = (now, tokens, dropped)
-            if self._notifications_outstanding + len(events) > 32:
-                self.notify_dropped += 1
-                return
-            self._notifications_outstanding += len(events)
-            if self._event_sink is None or self._event_loop is None:
-                self._pending_notifications.extend(events)
-                return
-            loop = self._event_loop
-        try:
-            for queued in events:
-                loop.call_soon_threadsafe(self._send, queued)
-        except RuntimeError:
-            with self._notification_lock:
-                self._notifications_outstanding -= len(events)
-            self.notify_dropped += len(events)
+            return
+        self._event_loop.call_soon(self._send, event)
 
     def add_status(self, manifest: ExtensionManifest, scope: str, *, enabled: bool) -> None:
         self.statuses[(manifest.name, scope)] = ExtensionStatus(

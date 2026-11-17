@@ -175,9 +175,12 @@ async def test_notify_from_foreign_thread_after_loop_binding(tmp_path: Path) -> 
         host.set_event_sink(events.append, asyncio.get_running_loop())
         thread = threading.Thread(target=host.notify, args=("thread-ext", "hello", "info"))
         thread.start()
-        await asyncio.to_thread(thread.join)
+        await asyncio.to_thread(thread.join, 10)
+        assert not thread.is_alive(), "notification thread did not finish"
         await asyncio.sleep(0)
-        assert events[0].data["text"] == "hello"
+        assert events == []
+        assert host.notify_dropped == 1
+        assert any("foreign thread" in warning for warning in host.warnings)
 
 
 @pytest.mark.asyncio
@@ -191,19 +194,14 @@ async def test_notify_flood_bounds_scheduled_callbacks(tmp_path: Path) -> None:
         )
         delivered = []
 
-        class Loop:
-            def call_soon_threadsafe(self, callback: object, event: object) -> None:
-                callback(event)  # type: ignore[operator]
-
-        host.set_event_sink(delivered.append, Loop())  # type: ignore[arg-type]
-        thread = threading.Thread(
-            target=lambda: [host.notify("thread-ext", str(index), "info") for index in range(10_000)]
-        )
-        thread.start()
-        await asyncio.to_thread(thread.join)
-
-        assert len(delivered) <= 620
+        for index in range(10_000):
+            host.notify("thread-ext", str(index), "info")
+        assert len(host._pending_notifications) == 32
         assert host.notify_dropped > 9_000
+        host.set_event_sink(delivered.append, asyncio.get_running_loop())
+        await asyncio.sleep(0)
+        assert len(delivered) == 33
+        assert delivered[-1].data["text"].endswith("extension notices dropped")
 
 
 @pytest.mark.asyncio

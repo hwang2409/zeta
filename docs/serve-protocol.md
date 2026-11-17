@@ -2209,10 +2209,10 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_retention` | enables negotiated live `session_retention` events; durable retention history remains available through `/retention` after reconnect |
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 | `extensions` | adds read-only `extensions_list` and gated transient `extension_notice` events |
-| `in_flight_replay` | enables replay of events already in flight |
-| `resume_attach` | enables reconnecting to an existing session |
-| `session_park` | enables parking a session |
-| `turn_reconnect` | enables reconnecting to a running turn |
+| `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
+| `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
+| `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 are parked or closing (`-32004` with `data.reason: "parked_limit"`), `status` adds `parked_sessions`, and the controller gets `parked_session_changed` events (see "parking a busy session") |
+| `in_flight_replay` | requires `session_replay_seq`; a `session_history_and_subscribe` join during a reply starts its stream with the reply text, thinking, and running-tool output streamed so far, as ordinary `assistant_delta` and `tool_output` events (see "joining during a reply") |
 
 ### `extensions_list`
 

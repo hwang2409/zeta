@@ -97,17 +97,22 @@ class StreamEventMixin:
         if not self._defer_startup_runtime_event(event):
             self._handle_background_event_now(event)
 
+    def _print_background_rendered(self, event: StreamEvent, rendered: object) -> None:
+        if (
+            event.type is StreamEventType.AGENT_NOTIFICATION
+            and event.data.get("kind") == "extension"
+        ):
+            self._presenter.print_transient(rendered)
+        else:
+            self._print_unit(rendered)
+
     def _handle_background_event_now(self, event: StreamEvent) -> None:
         """Render child progress while keeping completion notices at turn boundaries."""
         self._refresh_decisions_for_event(event)
         if event.type in render.BACKGROUND_EVENTS_RENDERED_IMMEDIATELY:
             rendered = self._presenter.render_event(event)
             if rendered is not None:
-                if (event.type is StreamEventType.AGENT_NOTIFICATION
-                        and event.data.get("kind") == "extension"):
-                    self._presenter.print_transient(rendered)
-                else:
-                    self._print_unit(rendered)
+                self._print_background_rendered(event, rendered)
                 self._invalidate_background_prompt()
             return
         if event.type in {
