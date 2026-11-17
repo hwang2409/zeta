@@ -16,10 +16,11 @@ from contextlib import asynccontextmanager
 from io import StringIO
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 
-import pytest
-
+from tests.support.fake_backend import FakeBackend
+from zeta.core.store import ConversationStore
 from zeta.extensions import (
     EXTENSION_API_VERSION,
     ExtensionManifestError,
@@ -27,13 +28,11 @@ from zeta.extensions import (
     parse_manifest,
     trust_project_extensions,
 )
-from tests.support.fake_backend import FakeBackend
-from zeta.core.store import ConversationStore
 from zeta.extensions.host import USER_SCOPE
 from zeta.protocol.types import StreamEventType
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.testing.extensions import load_extension
-from zeta.runtime.loop import AgentLoop
 from zeta.tools import ToolRegistry
 from zeta.tui.app import TUIApp
 from zeta.tui.render import render_event
