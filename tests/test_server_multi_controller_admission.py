@@ -71,8 +71,14 @@ async def test_simultaneous_first_multi_hellos_have_one_serial_admission(
     await server.start()
     clients = [await connect_replay(server, transport) for _ in range(2)]
     try:
-        results = await asyncio.gather(
-            *(negotiate(client, replay=False, extra=("multi_controller",)) for client in clients)
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    negotiate(client, replay=False, extra=("multi_controller",))
+                    for client in clients
+                )
+            ),
+            10,
         )
         assert all("result" in result for result in results)
         assert server.controllers.controller_mode == "multi"
