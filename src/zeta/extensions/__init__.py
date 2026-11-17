@@ -13,6 +13,7 @@ from .discovery import apply_extensions, trust_project_extensions
 from .hooks import CompositeToolHook, ExtensionHook
 from .host import (
     ExtensionHost,
+    ExtensionStatus,
     LoadedExtension,
     PendingExtension,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "ExtensionHost",
     "ExtensionManifest",
     "ExtensionManifestError",
+    "ExtensionStatus",
     "LoadedExtension",
     "PendingExtension",
     "apply_extensions",

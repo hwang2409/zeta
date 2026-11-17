@@ -179,6 +179,7 @@ NOT_PUBLISHED = frozenset(
         EventDescriptor.REPLAY_STREAM_ENDED,
         EventDescriptor.CHILD_HOLD,
         EventDescriptor.PROJECT_INBOX_HEALTH,
+        EventDescriptor.EXTENSION_NOTICE,
     }
 )
 _LIVE_KINDS = (

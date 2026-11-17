@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..runtime.execution import ToolHandler
     from .host import ExtensionHost, LoadingExtension
+    from .ui import ExtensionUI
 
 # Host capability version. Bump when the ExtensionAPI grows a surface. A
 # manifest whose ``api_version`` is greater than this is refused at load.
@@ -39,6 +40,12 @@ class ExtensionAPI:
     @property
     def name(self) -> str:
         return self._extension.manifest.name
+
+    @property
+    def ui(self) -> ExtensionUI:
+        from .ui import ExtensionUI
+
+        return ExtensionUI(self._host, self.name)
 
     @property
     def scope(self) -> str:

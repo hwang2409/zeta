@@ -341,6 +341,10 @@ class ServerRuntime:
         return self._state.opened if self._state is not None else None
 
     @property
+    def extensions(self) -> ExtensionHost | None:
+        return self._state.extensions if self._state is not None else None
+
+    @property
     def loop(self) -> AgentLoop | None:
         return self._state.loop if self._state is not None else None
 
@@ -804,6 +808,11 @@ class ServerRuntime:
             )
         registry.set_exit_delivery_settled_sink(self._work_changed_sink)
         sink = self._background_event_sink
+        if state.extensions is not None:
+            state.extensions.set_event_sink(
+                lambda event: sink(state.session_id, event) if sink is not None else None,
+                asyncio.get_running_loop(),
+            )
         wake_sink = self._background_wake_sink
         if sink is None:
             state.loop.set_background_event_sink(None)

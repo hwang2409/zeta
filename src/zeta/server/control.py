@@ -64,16 +64,11 @@ if TYPE_CHECKING:
     from ..mcp import MCPServerConfig
     from .runtime import ServerRuntime
     from .server import ZetaServer
-
 USER_MESSAGE_MAX_BYTES = 262_144
 CONTROLLER_HANDOFF_DEADLINE_SECONDS = 10.0
-
 NotificationSender = Callable[..., Awaitable[bool]]
-
-
 class NotificationPresentation:
     """Publish each durable notification at most once per serve session."""
-
     def __init__(self) -> None:
         self._presented: set[tuple[str, str]] = set()
 
@@ -1038,7 +1033,6 @@ class ServeControl:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
         if outcome is TurnOutcome.COMPLETED:
             await self.deliveries.continue_after_turn(session_id, state)
-
     async def _attach_pending_notifications(self) -> None:
         runtime = self.runtime
         loop = runtime.loop
@@ -1046,7 +1040,6 @@ class ServeControl:
             return
         if loop.notification_system_message() is not None:
             self._schedule_background_wake(runtime.session_id)
-
     async def _resume_tool(
         self,
         request_id: str,
@@ -1061,7 +1054,6 @@ class ServeControl:
         session_id = state.session_id
         event_tasks: list[asyncio.Task[None]] = []
         agent_end: StreamEvent | None = None
-
         def emit(event: StreamEvent) -> None:
             nonlocal agent_end
             if event.type is StreamEventType.AGENT_END:
@@ -1072,7 +1064,6 @@ class ServeControl:
                         self._event(event, session_id=session_id, turn_id=turn_id)
                     )
                 )
-
         outcome = TurnOutcome.COMPLETED
         try:
             await loop.resume_pending_tool(
@@ -1250,6 +1241,11 @@ class ServeControl:
             if foreground:
                 state.tool_started()
             await self._start_approval(event, session_id, wire_event)
+            return
+        if kind is StreamEventType.AGENT_NOTIFICATION and event.data.get("kind") == "extension":
+            connections = self.server.connections
+            if connections is not None:
+                await connections.publish_feature_event("extensions", EventDescriptor.EXTENSION_NOTICE, session_id, data=dict(event.data))
             return
         if kind is StreamEventType.AGENT_NOTIFICATION:
             await self.server.notification_presentations.publish(

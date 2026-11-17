@@ -207,6 +207,7 @@ class EventDescriptor(StrEnum):
     TOOL_OUTPUT = "tool_output"
     TOOL_END = "tool_end"
     SUB_AGENT_RECEIPT = "sub_agent_receipt"
+    EXTENSION_NOTICE = "extension_notice"
     CHILD_IDLE = "child_idle"
     CHILD_HOLD = "child_hold"
     TASK_EXIT_NOTIFICATION = "task_exit_notification"
@@ -281,6 +282,7 @@ FEATURES = (
     "approval_restart_reason",
     "session_retention",
     "mcp_refresh_tools",
+    "extensions",
     "resume_attach",
     "turn_reconnect",
     "in_flight_replay",
@@ -379,6 +381,7 @@ class MethodDescriptor(Enum):
     )
     CHILD_RUN_LIST = ("child_run_list", None, "child_runs", Access.READ)
     CHILD_RUN_SEND = ("child_run_send", None, "child_runs", Access.CONTROLLER_WRITE)
+    EXTENSIONS_LIST = ("extensions_list", "1.1", "extensions", Access.READ)
     MCP_REFRESH_TOOLS = (
         "mcp_refresh_tools",
         None,
