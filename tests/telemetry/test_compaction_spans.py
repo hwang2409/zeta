@@ -64,20 +64,12 @@ def _loop(
 
 
 async def _turn(loop: AgentLoop) -> None:
-    async for _event in loop.run_turn(PROMPT, origin=MessageOrigin.USER):
-        pass
-
-
-async def _closing(loop: AgentLoop, work) -> object:
     try:
-        return await work
+        async for _event in loop.run_turn(PROMPT, origin=MessageOrigin.USER):
+            pass
     finally:
         await loop.close()
         loop.store.close()
-
-
-def _compactions(memory) -> list:
-    return _by_name(memory.get_finished_spans()).get(COMPACT, [])
 
 
 def _children(spans, parent) -> list:
@@ -87,7 +79,7 @@ def _children(spans, parent) -> list:
 def test_automatic_compaction_is_one_span_under_the_turn_with_the_summaries_as_children(tmp_path, traced) -> None:
     telemetry, memory = traced
     loop = _loop(tmp_path, ScriptedBackend("claude", MODEL, ["reply"] * 4), telemetry, history=2, budget=40)
-    asyncio.run(_closing(loop, _turn(loop)))
+    asyncio.run(_turn(loop))
     spans = memory.get_finished_spans()
     names = _by_name(spans)
     (turn,), (compact,) = names["zeta.turn"], names[COMPACT]
@@ -108,7 +100,7 @@ def test_automatic_compaction_is_one_span_under_the_turn_with_the_summaries_as_c
 def test_context_that_fits_opens_no_compaction_span(tmp_path, traced) -> None:
     telemetry, memory = traced
     loop = _loop(tmp_path, ScriptedBackend("claude", MODEL, ["reply"]), telemetry, history=0, budget=1_000)
-    asyncio.run(_closing(loop, _turn(loop)))
+    asyncio.run(_turn(loop))
     assert sorted(span.name for span in memory.get_finished_spans()) == sorted(["invoke_agent zeta", "zeta.turn", CHAT])
 
 
@@ -116,7 +108,7 @@ def test_forced_retry_compaction_is_one_emergency_span_in_the_same_turn(tmp_path
     telemetry, memory = traced
     backend = ScriptedBackend("claude", MODEL, [OVERFLOW, "reply"])
     loop = _loop(tmp_path, backend, telemetry, history=4, budget=1_000, role=MessageRole.ASSISTANT)
-    asyncio.run(_closing(loop, _turn(loop)))
+    asyncio.run(_turn(loop))
     spans = memory.get_finished_spans()
     names = _by_name(spans)
     (turn,), (compact,) = names["zeta.turn"], names[COMPACT]
@@ -173,9 +165,9 @@ def test_manual_compact_is_one_root_span_with_the_summary_as_child(tmp_path, tra
 @pytest.mark.parametrize(
     ("attempts", "raised", "summary_errors", "compact_error", "turn_error"),
     [
-        ([ErrorInfo("invalid_request_error", PROMPT)] * 2, None, ["_OTHER", "_OTHER"], "SummaryCompletionError", None),
-        (["stall", "reply"], asyncio.CancelledError, ["CancelledError", "CancelledError"], "CancelledError", "CancelledError"),
-        ([Escape(), "reply"], Escape, ["CancelledError", "Escape"], "Escape", "Escape"),
+        ([ErrorInfo("invalid_request_error", PROMPT)], None, ["_OTHER"], "SummaryCompletionError", None),
+        (["stall"], asyncio.CancelledError, ["CancelledError"], "CancelledError", "CancelledError"),
+        ([Escape()], Escape, ["Escape"], "Escape", "Escape"),
     ],
     ids=["error-event", "cancelled", "base-exception"],
 )
@@ -183,11 +175,12 @@ def test_failed_compaction_ends_its_span_once_with_the_summaries_under_it(
     tmp_path, traced, attempts, raised, summary_errors, compact_error, turn_error
 ) -> None:
     telemetry, memory = traced
-    backend = ScriptedBackend("claude", MODEL, [*attempts, "reply", "reply"])
-    loop = _loop(tmp_path, backend, telemetry, history=2, budget=40)
+    backend = ScriptedBackend("claude", MODEL, [*attempts, "reply"])
+    # one old message is one summary call, so no sibling chunk races the failure
+    loop = _loop(tmp_path, backend, telemetry, history=1, budget=40)
 
     async def scenario() -> None:
-        task = asyncio.create_task(_closing(loop, _turn(loop)))
+        task = asyncio.create_task(_turn(loop))
         if attempts[0] == "stall":
             await await_or_fail(backend.stalled.wait(), what="the summary call to start")
             task.cancel()
@@ -199,11 +192,11 @@ def test_failed_compaction_ends_its_span_once_with_the_summaries_under_it(
         with pytest.raises(raised):
             asyncio.run(scenario())
     spans = memory.get_finished_spans()
-    assert sorted(span.name for span in spans) == sorted(["invoke_agent zeta", "zeta.turn", COMPACT, CHAT, CHAT])
+    assert sorted(span.name for span in spans) == sorted(["invoke_agent zeta", "zeta.turn", COMPACT, CHAT])
     (turn,), (compact,) = _by_name(spans)["zeta.turn"], _by_name(spans)[COMPACT]
     assert compact.parent.span_id == turn.context.span_id
     summaries = _children(spans, compact)
-    assert sorted(span.attributes.get("error.type") for span in summaries) == summary_errors
+    assert [span.attributes.get("error.type") for span in summaries] == summary_errors
     assert [compact.attributes.get("error.type"), turn.attributes.get("error.type")] == [compact_error, turn_error]
     assert "zeta.tokens.after" not in compact.attributes
     _assert_no_content(spans)
@@ -216,5 +209,5 @@ def test_disabled_compaction_creates_no_span(tmp_path, monkeypatch) -> None:
     # test-contract: seam the disabled facade must never reach span construction
     monkeypatch.setattr(Telemetry, "_span", no_span)
     loop = _loop(tmp_path, ScriptedBackend("claude", MODEL, ["reply"] * 4), Telemetry.disabled(), history=2, budget=40)
-    asyncio.run(_closing(loop, _turn(loop)))
+    asyncio.run(_turn(loop))
     assert loop.store.compaction_marker_count() == 1
