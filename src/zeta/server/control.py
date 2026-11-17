@@ -1223,7 +1223,10 @@ class ServeControl:
                 **event_contract.tool_start(
                     event,
                     fidelity=fidelity,
-                    approval_origin="tool_approval_origin" in controller.features,
+                    approval_origin=(
+                        controller is not None
+                        and "tool_approval_origin" in controller.features
+                    ),
                 ),
             )
             return
