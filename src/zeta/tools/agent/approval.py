@@ -17,7 +17,6 @@ from ...core.approval import (
     ApprovedCwdExecution,
     ApprovedExecution,
     ApprovedPathExecution,
-    AuthorizationOutcome,
     _poll_approval_resolution,
 )
 from ...core.store import ConversationStore
@@ -362,24 +361,6 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
                 capability=capability,
             ),
         )
-
-    async def authorize_with_origin(
-        self,
-        tool_call: ToolCall,
-        abort_signal: AbortSignal,
-        *,
-        execution_token: str | None = None,
-        capability: ApprovalCapability,
-    ) -> AuthorizationOutcome:
-        state = self.child_store.approval_state_now(tool_call.id)
-        asked = state is not None or self.decide(capability) is ApprovalDecision.ASK
-        decision = await self.authorize(
-            tool_call,
-            abort_signal,
-            execution_token=execution_token,
-            capability=capability,
-        )
-        return AuthorizationOutcome(decision, "user" if asked else "automatic")
 
     def _consume_allow_binding(
         self,

@@ -1162,8 +1162,10 @@ the committed message object with `role` and `content`.
 {"jsonrpc":"2.0","method":"event","params":{"event":"assistant_message","session_id":"abc123","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}}}
 ```
 
-`tool_start` and `tool_end` carry `tool_call` (`id`, `name`, `arguments`). clients that negotiate `tool_approval_origin` also receive `approval_origin: "automatic" | "user"` on tool calls; history `tool_use` rows carry the same field. and
-`data`. `tool_end` also carries `tool_result` (`tool_call_id`, `content`,
+`tool_start` and `tool_end` carry `tool_call` (`id`, `name`, `arguments`) and
+`data`. Clients that negotiate `tool_approval_origin` also receive
+`approval_origin: "automatic" | "user"` on `tool_start` calls and history
+`tool_use` rows. `tool_end` also carries `tool_result` (`tool_call_id`, `content`,
 `is_error`, and optional result fields). `tool_output` carries the same
 `tool_call`, bounded `output`, and `data`.
 

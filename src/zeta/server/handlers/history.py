@@ -357,7 +357,7 @@ def page_history(
             content_read=content_read,
             first_page=first_page,
             child_runs=child_runs,
-        approval_origin=approval_origin,
+            approval_origin=approval_origin,
         )
     return _forward_page_history(
         projection,
@@ -391,7 +391,7 @@ def _publish_projected_page(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
-        approval_origin=approval_origin,
+            approval_origin=approval_origin,
         )
         if (
             cached is not None
@@ -405,7 +405,7 @@ def _publish_projected_page(
                 content_read=content_read,
                 served_turn_end=served_turn_end,
                 child_runs=child_runs,
-        approval_origin=approval_origin,
+                approval_origin=approval_origin,
                 cached=_CachedProjection(generation, expanded, cached.closed),
             )
     return result
@@ -495,7 +495,7 @@ def replay_history(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
-        approval_origin=approval_origin,
+            approval_origin=approval_origin,
             supplied_validator=supplied_validator,
         ),
         has_end=supplied_validator is not _MISSING_VALIDATOR,
@@ -641,7 +641,7 @@ def _backward_history_request(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
-        approval_origin=approval_origin,
+            approval_origin=approval_origin,
         )
     validator = history_validator(
         (page.total, page.endpoint, page.repair_generation),
@@ -661,6 +661,7 @@ def _backward_history_request(
         fidelity=fidelity,
         content_read=content_read,
         first_page=before is None,
+        approval_origin=approval_origin,
         snapshot_checked=True,
     )
     boundary = result["next_before"]
@@ -698,7 +699,7 @@ def _forward_history_request(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
-        approval_origin=approval_origin,
+            approval_origin=approval_origin,
         )
     projection = history_projection_from_groups(
         page.groups, page.approval_calls, served_turn_end=served_turn_end
@@ -709,6 +710,7 @@ def _forward_history_request(
         include_delivery_id=include_delivery_id,
         fidelity=fidelity,
         content_read=content_read,
+        approval_origin=approval_origin,
     )
     local_next = result["next_offset"]
     consumed = len(page.groups) if local_next is None else local_next
@@ -775,7 +777,7 @@ def history(
                 content_read=content_read,
                 served_turn_end=served_turn_end,
                 child_runs=child_runs,
-        approval_origin=approval_origin,
+                approval_origin=approval_origin,
             ),
             has_end=params["before"] is not None,
         )
@@ -798,7 +800,7 @@ def history(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
-        approval_origin=approval_origin,
+            approval_origin=approval_origin,
         ),
         has_end=False,
     )

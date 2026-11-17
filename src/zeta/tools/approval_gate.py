@@ -82,9 +82,7 @@ class ApprovalGate:
                     lifecycle("approval_start")
 
             try:
-                authorize = getattr(
-                    self.policy, "authorize_with_origin", self.policy.authorize
-                )
+                authorize = self.policy.authorize
                 parameters = inspect.signature(authorize).parameters
                 kwargs: dict[str, object] = {}
                 if not persist_request and "persist_request" in parameters:
@@ -93,12 +91,13 @@ class ApprovalGate:
                     kwargs["execution_token"] = execution_token
                 if capability is not None and "capability" in parameters:
                     kwargs["capability"] = capability
-                outcome = await authorize(tool_call, signal, **kwargs)
-                if hasattr(outcome, "decision"):
-                    decision = outcome.decision
-                    approval_origin = outcome.origin
-                else:
-                    decision = outcome
+                decision = await authorize(tool_call, signal, **kwargs)
+                if approval_started or already_decided:
+                    approval_origin = "user"
+                elif decision is ApprovalDecision.ALLOW:
+                    durable_decision = await self.policy.durable_decision(tool_call.id)
+                    if durable_decision == ApprovalDecision.ALLOW.value:
+                        approval_origin = "user"
             except Exception as exc:  # noqa: BLE001 - report approval failures
                 return done(ToolResult(
                     tool_call.id, f"approval failed: {exc}", True

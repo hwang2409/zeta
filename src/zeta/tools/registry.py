@@ -1106,11 +1106,12 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 return await finalize(_legacy_result(_canceled_result(tool_call.id)))
         self._approval_origins[tool_call.id] = approval_origin
         if _lifecycle_sink is not None:
-            try:
+            parameters = inspect.signature(_lifecycle_sink).parameters
+            if "data" in parameters:
                 _lifecycle_sink(
-                    "execution_start", {"approval_origin": approval_origin}
+                    "execution_start", data={"approval_origin": approval_origin}
                 )
-            except TypeError:
+            else:
                 _lifecycle_sink("execution_start")
         stream_publisher = (
             _ToolCallStreamPublisher(tool_call, execution_signal, _stream_sink)

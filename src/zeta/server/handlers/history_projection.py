@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -61,6 +61,7 @@ HISTORY_GROUP_TRUNCATED = "[history group too large; truncated]"
 class HistoryProjection:
     entry_groups: tuple[tuple[Any, ...], ...]
     approval_calls: Mapping[str, object]
+    approval_origins: Mapping[str, object] = MappingProxyType({})
     entry_index: Mapping[str, Any] = MappingProxyType({})
     groups: tuple[tuple[dict[str, object], ...], ...] = ()
     body_sizes: tuple[int, ...] = ()
@@ -254,6 +255,19 @@ def _project_history_group(
     return group, _history_group_body_size(codec, group)
 
 
+def _approval_origins(entries: Iterable[object]) -> dict[str, object]:
+    origins: dict[str, object] = {}
+    for entry in entries:
+        if getattr(entry, "type", None) != "message":
+            continue
+        message = entry.data.get("message", {})
+        result = message.get("tool_result")
+        origin = message.get("metadata", {}).get("zeta.approval_origin")
+        if isinstance(result, dict) and origin in {"automatic", "user"}:
+            origins[result["tool_call_id"]] = origin
+    return origins
+
+
 def history_projection_from_groups(
     groups: tuple[tuple[Any, ...], ...],
     approval_calls: Mapping[str, object],
@@ -273,6 +287,7 @@ def history_projection_from_groups(
     return HistoryProjection(
         (*groups, ()),
         MappingProxyType(dict(approval_calls)),
+        MappingProxyType(_approval_origins(entry_index.values())),
         MappingProxyType(entry_index),
     )
 
@@ -295,6 +310,7 @@ def history_projection(
         content_read=content_read,
         served_turn_end=served_turn_end,
         child_runs=child_runs,
+        approval_origin=approval_origin,
     )
     generation = _generation(store)
     closed = _closed(store)
@@ -308,6 +324,7 @@ def history_projection(
     stable_generation = generation if generation == _generation(store) else None
 
     approval_calls: dict[str, object] = {}
+    approval_origins = _approval_origins(branch)
     accepted_messages: dict[str, dict[str, object]] = {}
     entries: list[list[Any]] = [[]]
     runs: dict[str, str] = {}
@@ -382,6 +399,7 @@ def history_projection(
     built = HistoryProjection(
         tuple(tuple(group) for group in entries),
         MappingProxyType(approval_calls),
+        MappingProxyType(approval_origins),
         MappingProxyType(entry_index),
         frontier=branch[-1].seq if branch else 0,
         frontier_row_id=branch[-1].id if branch else None,
@@ -407,7 +425,7 @@ def history_projection(
                 content_read=content_read,
                 served_turn_end=served_turn_end,
                 child_runs=child_runs,
-            approval_origin=approval_origin,
+                approval_origin=approval_origin,
                 cached=_CachedProjection(generation, built, closed),
             )
             return built
@@ -464,6 +482,7 @@ def _transcript_recovery_history_row(entry: object) -> dict[str, object]:
 def _history_entry_rows(
     entry: object,
     approval_calls: Mapping[str, object],
+    approval_origins: Mapping[str, object],
     *,
     include_delivery_id: bool = False,
     fidelity: bool = False,
@@ -561,10 +580,8 @@ def _history_entry_rows(
                         "name": call["name"],
                         **_project_tool_call_arguments(call, fidelity=fidelity),
                         **(
-                            {"approval_origin": message.get("metadata", {}).get("zeta.approval_origin")}
-                            if approval_origin
-                            and message.get("metadata", {}).get("zeta.approval_origin")
-                            in {"automatic", "user"}
+                            {"approval_origin": approval_origins[call["id"]]}
+                            if approval_origin and call["id"] in approval_origins
                             else {}
                         ),
                     },
@@ -690,6 +707,7 @@ def _history_group(
         for row in _history_entry_rows(
             entry,
             projection.approval_calls,
+            projection.approval_origins,
             include_delivery_id=include_delivery_id,
             fidelity=fidelity,
             content_read=content_read,
@@ -744,6 +762,7 @@ def _history_group_fits(
         for row in _history_entry_rows(
             entry,
             projection.approval_calls,
+            projection.approval_origins,
             include_delivery_id=include_delivery_id,
             fidelity=fidelity,
             content_read=content_read,
