@@ -918,63 +918,82 @@ class _Client:
                 await self.connections.wait_for_lost_controller(deadline)
                 deadline = max(0.0, deadline - (time.monotonic() - start))
             result = self._hello(params)
-            # one record use for the whole hello: bindings, claim, and rebind
-            with self.server.controllers.owned(self) as controller:
-                reconnect_bindings = None
-                if "mcp_bindings" in params:
-                    if self.role != "controller":
-                        raise ProtocolError(
-                            ErrorDescriptor.INVALID_PARAMS,
-                            "mcp_bindings require a controller connection",
+            admission = self._hello_admission
+            claim_attempted = False
+            claim_result: bool | None = None
+            try:
+                # one record use for the whole hello: bindings, claim, and rebind
+                with self.server.controllers.owned(self) as controller:
+                    reconnect_bindings = None
+                    if "mcp_bindings" in params:
+                        if self.role != "controller":
+                            raise ProtocolError(
+                                ErrorDescriptor.INVALID_PARAMS,
+                                "mcp_bindings require a controller connection",
+                            )
+                        from .handlers.lifecycle import reconnect_mcp_bindings
+
+                        reconnect_bindings = await reconnect_mcp_bindings(
+                            self, params, controller
                         )
-                    from .handlers.lifecycle import reconnect_mcp_bindings
+                    if self.role == "controller":
+                        reconnect = "approval_reconnect" in self.features
+                        require_host_binding = "session_host_commands" in self.features
 
-                    reconnect_bindings = await reconnect_mcp_bindings(self, params, controller)
-                if self.role == "controller":
-                    reconnect = "approval_reconnect" in self.features
-                    require_host_binding = "session_host_commands" in self.features
+                        async def claim() -> bool:
+                            return await controller.control.controller_claimed(
+                                reconnect=reconnect,
+                                require_host_binding=require_host_binding,
+                                deadline=deadline,
+                            )
 
-                    async def claim() -> bool:
-                        return await controller.control.controller_claimed(
+                        # shield the claim so a cancel of the hello does not leave the
+                        # approvals lifecycle half-moved; it waits for the bounded claim.
+                        claim_attempted = True
+                        claim_task = asyncio.ensure_future(claim())
+                        try:
+                            claimed = await asyncio.shield(claim_task)
+                            claim_result = claimed
+                        except asyncio.CancelledError:
+                            with contextlib.suppress(Exception):
+                                await claim_task
+                            if claim_task.done() and not claim_task.cancelled():
+                                claimed = claim_task.result()
+                                claim_result = claimed
+                            raise
+                        if not claimed:
+                            raise ProtocolError(
+                                ErrorDescriptor.CONNECTION_CAPACITY,
+                                "another client is already connected",
+                            )
+                        await self.server.parking.claim(
+                            "session_park" in self.features,
                             reconnect=reconnect,
                             require_host_binding=require_host_binding,
-                            deadline=deadline,
                         )
-
-                    # shield the claim so a cancel of the hello does not leave the
-                    # approvals lifecycle half-moved; it waits for the bounded claim.
-                    claim_task = asyncio.ensure_future(claim())
-                    try:
-                        claimed = await asyncio.shield(claim_task)
-                    except asyncio.CancelledError:
-                        with contextlib.suppress(Exception):
-                            await claim_task
-                        raise
-                    if not claimed:
-                        self.handshaken = False
-                        admission = self._hello_admission
-                        if admission is not None:
-                            self.server.controllers.abort_hello(admission)
-                            self._hello_admission = None
-                        raise ProtocolError(
-                            ErrorDescriptor.CONNECTION_CAPACITY,
-                            "another client is already connected",
-                        )
-                    await self.server.parking.claim(
-                        "session_park" in self.features,
-                        reconnect=reconnect,
-                        require_host_binding=require_host_binding,
-                    )
-                    if reconnect_bindings is not None:
-                        await controller.control.reattach_mcp_bindings(
-                            *reconnect_bindings
-                        )
-                    self.server._client_active = True
-                    self.server._client = self
-                    self.connections.activate_controller(self)
-                    if not reconnect:
-                        for control in self.server.controls():
-                            await control.controller_ready()
+                        if reconnect_bindings is not None:
+                            await controller.control.reattach_mcp_bindings(
+                                *reconnect_bindings
+                            )
+                        self.server._client_active = True
+                        self.server._client = self
+                        self.connections.activate_controller(self)
+                        if not reconnect:
+                            for control in self.server.controls():
+                                await control.controller_ready()
+                if admission is not None:
+                    self.server.controllers.commit_hello(admission)
+                self.handshaken = True
+            except BaseException:
+                if claim_attempted and claim_result is not False:
+                    release = self._begin_controller_release()
+                    if release is not None:
+                        with contextlib.suppress(BaseException):
+                            await asyncio.shield(release)
+                if admission is not None:
+                    self.server.controllers.abort_hello(admission)
+                    self._hello_admission = None
+                raise
             return True, result
         if not self.handshaken:
             raise ProtocolError(
@@ -1055,9 +1074,7 @@ class _Client:
                 self.server.controllers.abort_hello(admission)
             raise
         if admission is not None:
-            self.server.controllers.commit_hello(admission)
             self._hello_admission = admission
-        self.handshaken = True
         requests = MethodDescriptor.advertised(
             self.protocol_version, self.features, role
         )
