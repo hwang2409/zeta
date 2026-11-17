@@ -20,6 +20,7 @@ import asyncio
 import itertools
 import re
 import sys
+import threading
 import types
 from collections import deque
 from collections.abc import Callable
@@ -139,6 +140,8 @@ class ExtensionHost:
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self.notify_dropped = 0
         self._pending_notifications: deque[StreamEvent] = deque(maxlen=32)
+        self._notification_lock = threading.Lock()
+        self._notifications_outstanding = 0
         self._packages: dict[str, Path] = {}
         self._closed = False
 
@@ -174,7 +177,9 @@ class ExtensionHost:
         self._closed = True
         self._event_sink = None
         self._event_loop = None
-        self._pending_notifications.clear()
+        with self._notification_lock:
+            self._pending_notifications.clear()
+
         for package in tuple(self._packages):
             self.remove_package(package)
 
@@ -182,11 +187,12 @@ class ExtensionHost:
         self, sink: Callable[[StreamEvent], None] | None,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
-        self._event_sink = sink
-        self._event_loop = loop
-        if sink is not None and loop is not None and self._pending_notifications:
+        with self._notification_lock:
+            self._event_sink = sink
+            self._event_loop = loop
             pending = tuple(self._pending_notifications)
             self._pending_notifications.clear()
+        if sink is not None and loop is not None and pending:
 
             def flush() -> None:
                 for event in pending:
@@ -195,14 +201,18 @@ class ExtensionHost:
             loop.call_soon_threadsafe(flush)
 
     def _send(self, event: StreamEvent) -> None:
-        sink = self._event_sink
-        if self._closed or sink is None:
-            self.notify_dropped += 1
-            return
         try:
-            sink(event)
-        except Exception:  # noqa: BLE001 - extension notices must not break a session
-            self.notify_dropped += 1
+            sink = self._event_sink
+            if self._closed or sink is None:
+                self.notify_dropped += 1
+                return
+            try:
+                sink(event)
+            except Exception:  # noqa: BLE001 - extension notices must not break a session
+                self.notify_dropped += 1
+        finally:
+            with self._notification_lock:
+                self._notifications_outstanding -= 1
 
     def notify(self, extension: str, text: str, level: str) -> None:
         if type(text) is not str or level not in {"info", "warning", "error"}:
@@ -217,15 +227,20 @@ class ExtensionHost:
         if self._closed:
             self.notify_dropped += 1
             return
-        if self._event_sink is None or self._event_loop is None:
-            before = len(self._pending_notifications)
-            self._pending_notifications.append(event)
-            if before == len(self._pending_notifications):
+        with self._notification_lock:
+            if self._notifications_outstanding >= 32:
                 self.notify_dropped += 1
-            return
+                return
+            self._notifications_outstanding += 1
+            if self._event_sink is None or self._event_loop is None:
+                self._pending_notifications.append(event)
+                return
+            loop = self._event_loop
         try:
-            self._event_loop.call_soon_threadsafe(self._send, event)
+            loop.call_soon_threadsafe(self._send, event)
         except RuntimeError:
+            with self._notification_lock:
+                self._notifications_outstanding -= 1
             self.notify_dropped += 1
 
     def add_status(self, manifest: ExtensionManifest, scope: str, *, enabled: bool) -> None:
