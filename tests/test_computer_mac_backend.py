@@ -41,6 +41,7 @@ async def test_repeated_cancellation_drains_one_cleanup_and_restarts() -> None:
     class FakeClient:
         def __init__(self) -> None:
             self.release = threading.Event()
+            self.request_started = threading.Event()
             self.started = 0
             self.cancelled = 0
             self.closed = 0
@@ -49,6 +50,7 @@ async def test_repeated_cancellation_drains_one_cleanup_and_restarts() -> None:
             self.started += 1
 
         def request(self, _op: str, **_args: object) -> dict:
+            self.request_started.set()
             self.release.wait(10)
             return {}
 
@@ -63,7 +65,7 @@ async def test_repeated_cancellation_drains_one_cleanup_and_restarts() -> None:
     backend = MacBackend([])
     backend._client = client  # type: ignore[assignment]
     call = asyncio.create_task(backend._call("move", x=1, y=2))
-    await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.to_thread(client.request_started.wait, 10), 10)
     call.cancel()
     call.cancel()
     with pytest.raises(asyncio.CancelledError):
