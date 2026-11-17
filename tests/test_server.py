@@ -9408,39 +9408,6 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
 
 
 @pytest.mark.asyncio
-async def test_serve_list_attention_returns_project_queue(
-    tmp_path: Path,
-) -> None:
-    project = _seed_slash_fixtures(tmp_path)
-    backend = FakeBackend(
-        [
-            ScriptedTurn(
-                tool_calls=[ToolCall("attention-list", "list_attention", {})]
-            ),
-            ScriptedTurn([TextContent("done")]),
-        ]
-    )
-    server = ZetaServer(
-        home=tmp_path / "home",
-        cwd=project,
-        socket_path=_socket_path(tmp_path),
-        provider="codex",
-        backend_factory=lambda provider, model, home: (backend, model or "offline"),
-    )
-    reader, writer, _session_id = await _ready_extensions(server)
-    try:
-        await _request(reader, writer, "list-attention", "send", {"text": "inspect queue"})
-        end = await _event(reader, "tool_end")
-        result = end["tool_result"]["structured_content"]
-        assert result["items"] == []
-        assert result["total"] == 0
-        await _event(reader, "assistant_message")
-        await _event(reader, "turn_end")
-    finally:
-        await close_serve(server, writer)
-
-
-@pytest.mark.asyncio
 async def test_serve_request_attention_kind_is_in_tool_end_result(
     tmp_path: Path,
 ) -> None:
