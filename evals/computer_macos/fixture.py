@@ -6,6 +6,7 @@ import hashlib
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 WIDTH, HEIGHT = 1280, 800
 
@@ -38,7 +39,7 @@ target.onclick=e=>{{fetch('/event',{{method:'POST',headers:{{'content-type':'app
 class Handler(BaseHTTPRequestHandler):
     server: FixtureServer
     def do_GET(self) -> None:
-        if self.path != "/":
+        if urlsplit(self.path).path != "/":
             self.send_error(404)
             return
         state = trial_state(self.server.state_dir, self.server.trial)
