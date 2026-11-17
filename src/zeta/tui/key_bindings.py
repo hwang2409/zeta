@@ -362,6 +362,7 @@ def build_key_bindings(
     on_picker_rename: Callable[[], None] | None = None,
     on_picker_refresh: Callable[[], None] | None = None,
     picker_active: Callable[[], bool] | None = None,
+    picker_loading: Callable[[], bool] | None = None,
     on_agent_list_down: Callable[[], None] | None = None,
     agent_list_active: Callable[[], bool] | None = None,
     on_agent_list_move: Callable[[int], None] | None = None,
@@ -1130,10 +1131,11 @@ def build_key_bindings(
         @Condition
         def picker_open() -> bool:
             # Only while the composer is empty: a typed message or a full
-            # "/model <name>" keeps its own enter and arrow keys.
+            # "/model <name>" keeps its own enter and arrow keys. Not gated on
+            # startup: /model opens the picker then, and its keys must not
+            # reach the composer.
             return (
-                interactions_enabled()
-                and picker_active is not None
+                picker_active is not None
                 and picker_active()
                 and not get_app().current_buffer.text
             )
@@ -1161,6 +1163,22 @@ def build_key_bindings(
         def picker_cancel(event: KeyPressEvent) -> None:
             del event
             on_picker_cancel()
+
+        if picker_loading is not None:
+            loading = Condition(picker_loading) & ~panel_mode
+
+            # A picker whose rows load owns every key: a typed letter or a paste
+            # would wait in the composer and an Enter would send it as a prompt.
+            # Esc stops the load (its own eager binding is more specific).
+            @bindings.add(Keys.Any, filter=loading, eager=True)
+            @bindings.add(Keys.BracketedPaste, filter=loading, eager=True)
+            def picker_loading_drop(event: KeyPressEvent) -> None:
+                del event
+
+            # Interrupt and exit still act: eager and more specific than the drop.
+            bindings.add(Keys.SIGINT, filter=loading, eager=True)(interrupt)
+            bindings.add(*resolved_keys["interrupt"], filter=loading, eager=True)(interrupt)
+            bindings.add(*resolved_keys["exit"], filter=loading, eager=True)(exit_prompt)
 
         picker_actions = (
             ("d", on_picker_default),

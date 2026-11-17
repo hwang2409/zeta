@@ -179,7 +179,7 @@ def publish_local_project(
     projects.mkdir(parents=True, exist_ok=True, mode=0o700)
     project = projects / project_id
     authority = (
-        registry._identity_write()
+        registry._identity_write(operation="remote_publish")
         if expected_digest == _MISSING
         else registry._project_lock(project_id, "memory", exclusive=True)
     )

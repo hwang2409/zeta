@@ -11,6 +11,7 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+import zeta.agent.finish_gate as finish_gate_module
 import zeta.agent.runner as agent_runner_module
 from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
@@ -91,10 +92,26 @@ async def _unset_child_snapshot(
     async def run_finish_gate(*args, **kwargs):
         nonlocal finish_gate_calls
         finish_gate_calls += 1
-        release_nested.set()
         return await real_run_finish_gate(*args, **kwargs)
 
     monkeypatch.setattr(agent_runner_module, "run_finish_gate", run_finish_gate)
+
+    # Release the nested child only after the finish-gate notice turn has run, so
+    # its completion is always delivered as its own notification turn. Releasing
+    # it at gate entry (before the notice turn) lets the completion race the
+    # notice turn: if it publishes first, the notice turn clears the pending edge
+    # and no separate turn runs, so the turn count flips between 5 and 6 under
+    # load. _wait_for_finish is the gate's first step after the notice turn, so
+    # the nested child is still owned (blocked) during the notice turn and its
+    # completion lands strictly after.
+    orig_wait_for_finish = finish_gate_module._wait_for_finish
+
+    async def wait_for_finish(*args, **kwargs):
+        release_nested.set()
+        return await orig_wait_for_finish(*args, **kwargs)
+
+    # test-contract: seam release the nested child after the finish-gate notice turn
+    monkeypatch.setattr(finish_gate_module, "_wait_for_finish", wait_for_finish)
     catalog = AgentCatalog(
         (
             AgentPreset(

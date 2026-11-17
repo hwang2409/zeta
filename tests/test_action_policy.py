@@ -301,6 +301,11 @@ _EXPECTED_PROVIDER_TOOL_CONTRACTS = {
                 "url.minLength": 1,
             },
         ),
+        "list_attention": (
+            "offset=integer",
+            "",
+            {"offset.minimum": 0},
+        ),
         "mcp_discover": (
             "action=string names=array names[]=string query=string server=string uri=string",
             "",
