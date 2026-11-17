@@ -5,6 +5,7 @@ from enum import Enum, auto
 
 from ..core.checkpoints import ConversationEntry
 from ..protocol.types import Message, StreamEvent, StreamEventType
+from ..tools.computer.projection import computer_state
 from .protocol import TOOL_OUTPUT_MAX_BYTES, EventDescriptor, bounded
 
 
@@ -179,12 +180,43 @@ def structured_content_truncated(
     return None
 
 
+def _computer_event_state(
+    event: StreamEvent, *, running: bool
+) -> dict[str, str] | None:
+    call = event.tool_call
+    if call is None:
+        return None
+    result = event.tool_result
+    return computer_state(
+        call.name,
+        call.arguments,
+        result.structured_content if result is not None else None,
+        running=running,
+    )
+
+
+def _computer_tool_call(event: StreamEvent, state: Mapping[str, str]) -> dict[str, object]:
+    assert event.tool_call is not None
+    return {
+        "id": event.tool_call.id,
+        "name": event.tool_call.name,
+        "arguments": {"action": state["action"]},
+    }
+
+
 def tool_start(
     event: StreamEvent,
     *,
     fidelity: bool = False,
     approval_origin: bool = False,
 ) -> dict[str, object]:
+    computer = _computer_event_state(event, running=True)
+    if computer is not None:
+        return {
+            "tool_call": _computer_tool_call(event, computer),
+            "computer": computer,
+            "data": {},
+        }
     tool_call = _tool_call(event)
     data = dict(event.data)
     origin = data.pop("approval_origin", None)
@@ -260,6 +292,22 @@ def shape_approval_history_rows(
 
 
 def tool_end(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
+    computer = _computer_event_state(event, running=False)
+    if computer is not None:
+        result = event.tool_result
+        return {
+            "tool_call": _computer_tool_call(event, computer),
+            "tool_result": (
+                {
+                    "tool_call_id": result.tool_call_id,
+                    "is_error": result.is_error,
+                }
+                if result is not None
+                else None
+            ),
+            "computer": computer,
+            "data": {},
+        }
     tool_call = _tool_call(event)
     result = event.tool_result.to_dict() if event.tool_result else None
     if fidelity:

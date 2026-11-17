@@ -12,6 +12,7 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from ...protocol.types import StreamEvent, ToolCall, flatten_tool_content
+from ...tools.computer.projection import computer_state
 from .. import theme
 from .base import (
     header_with_status,
@@ -104,6 +105,37 @@ def read_header(call: ToolCall, content: str, result: Any | None) -> Text:
         (f" {path}", theme.BODY),
         (f" · lines {line_start}-{line_end}", theme.DIM),
     )
+
+
+@register_tool_card("computer")
+def computer_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    call = event.tool_call
+    if call is None:
+        return tool_card(event, running=running)
+    result = event.tool_result
+    state = computer_state(
+        call.name,
+        call.arguments,
+        result.structured_content if result is not None else None,
+        running=running,
+    )
+    if state is None:
+        return tool_card(event, running=running)
+    action = state["action"]
+    control = state["control"]
+    parts = ["⏺ computer"]
+    if control == "denied":
+        parts.extend(("denied", state.get("frontmost_bundle_id", "unknown app"), action))
+    elif control == "killed":
+        parts.extend(("killed", action))
+    else:
+        parts.extend((action, control))
+        if result is not None and result.is_error:
+            parts.append("error")
+    shortcut = state.get("kill_switch")
+    if shortcut:
+        parts.append(f"kill {shortcut}")
+    return Text(" · ".join(parts), style=theme.RECEIPT, overflow="fold")
 
 
 def read_tool_card(event: StreamEvent, running: bool) -> RenderableType:

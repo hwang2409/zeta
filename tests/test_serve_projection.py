@@ -1,3 +1,6 @@
+import json
+from types import SimpleNamespace
+
 from zeta.protocol.types import (
     Message,
     MessageRole,
@@ -12,6 +15,7 @@ from zeta.server.event_contract import (
     tool_output,
     tool_start,
 )
+from zeta.server.handlers.history_projection import _history_entry_rows
 from zeta.server.protocol import EventDescriptor, FrameCodec
 
 
@@ -70,6 +74,134 @@ def test_live_projection_golden_params_are_byte_exact() -> None:
     ]
     for name, fields, expected in cases:
         assert _params(name, fields) == expected
+
+
+def _computer_event(control: str, *, bundle: object = "com.example.app", shortcut: object = "ctrl+opt+cmd+esc") -> StreamEvent:
+    call = ToolCall("computer-call", "computer", {"action": "type", "text": "secret input"})
+    structured = {
+        "computer": {
+            "action": "type",
+            "control": control,
+            "kill_switch": shortcut,
+            "frontmost_bundle_id": bundle,
+            "has_screenshot": True,
+            "thumbnail": "raw-base64",
+        },
+        "unrelated": "private result",
+    }
+    return StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            "computer-call",
+            "private result",
+            control != "idle",
+            content_blocks=[
+                {"type": "text", "text": "private result"},
+                {"type": "image", "data": "raw-base64", "mimeType": "image/png"},
+            ],
+            structured_content=structured,
+        ),
+        data={"unrelated": "private event"},
+    )
+
+
+def _wire(event: StreamEvent, *, start: bool) -> dict[str, object]:
+    descriptor = EventDescriptor.TOOL_START if start else EventDescriptor.TOOL_END
+    fields = tool_start(event) if start else tool_end(event)
+    frame = FrameCodec().notification(descriptor, "session", **fields)
+    assert frame is not None
+    return json.loads(frame)["params"]
+
+
+def test_computer_start_end_frame_projection_is_bounded_and_uses_existing_names() -> None:
+    for control in ("active", "idle", "denied", "killed"):
+        end_event = _computer_event(control)
+        start_event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=end_event.tool_call,
+            data={"unrelated": "private event"},
+        )
+        start = _wire(start_event, start=True)
+        end = _wire(end_event, start=False)
+
+        assert start["event"] == "tool_start"
+        assert end["event"] == "tool_end"
+        assert start["computer"] == {
+            "action": "type",
+            "control": "active",
+            "kill_switch": "ctrl+opt+cmd+esc",
+        }
+        assert end["computer"] == {
+            "action": "type",
+            "control": control,
+            "kill_switch": "ctrl+opt+cmd+esc",
+            "frontmost_bundle_id": "com.example.app",
+        }
+        assert start["tool_call"]["arguments"] == {"action": "type"}
+        assert end["tool_call"]["arguments"] == {"action": "type"}
+        assert end["tool_result"] == {"tool_call_id": "computer-call", "is_error": control != "idle"}
+        wire_text = json.dumps((start, end))
+        for excluded in ("secret input", "raw-base64", "thumbnail", "private result", "private event", "has_screenshot"):
+            assert excluded not in wire_text
+
+
+def test_computer_projection_omits_malformed_optional_values_and_extras() -> None:
+    event = _computer_event("denied", bundle="b" * 20_000, shortcut={"bad": True})
+    params = _wire(event, start=False)
+    assert params["computer"] == {"action": "type", "control": "denied"}
+    assert len(json.dumps(params)) < 1000
+
+
+def test_computer_history_matches_live_state_and_stubs_images() -> None:
+    event = _computer_event("denied", bundle="com.denied.exact")
+    live = _wire(event, start=False)
+    result = event.tool_result
+    assert result is not None
+    entry = SimpleNamespace(
+        id="entry",
+        type="message",
+        data={
+            "message": {
+                "role": "tool",
+                "content": [{"type": "tool_use", "tool_call": event.tool_call.to_dict()}],
+                "tool_result": result.to_dict(),
+            }
+        },
+    )
+    rows = _history_entry_rows(
+        entry,
+        {},
+        {},
+        include_delivery_id=False,
+        fidelity=True,
+        content_read=False,
+        approval_origin=False,
+    )
+    history_result = rows[0]["tool_result"]
+    assert history_result["structured_content"] == {"computer": live["computer"]}
+    assert history_result["content_blocks"] == [
+        {"type": "image", "mimeType": "image/png", "size": 7, "data_omitted": True}
+    ]
+    assert "raw-base64" not in json.dumps(rows)
+
+
+def test_child_history_does_not_inherit_parent_computer_state() -> None:
+    child = SimpleNamespace(
+        id="child-entry",
+        type="message",
+        data={"message": {"role": "assistant", "content": [{"type": "text", "text": "child only"}]}},
+    )
+    rows = _history_entry_rows(
+        child,
+        {},
+        {},
+        include_delivery_id=False,
+        fidelity=True,
+        content_read=False,
+        approval_origin=False,
+    )
+    assert "computer" not in json.dumps(rows)
 
 
 def test_bounded_tool_output_golden_matches_origin_main() -> None:
