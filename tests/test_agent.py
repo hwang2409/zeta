@@ -396,13 +396,18 @@ async def test_agent_close_drains_receipt_extension_tasks(tmp_path: Path) -> Non
     class BlockingExtensions:
         def __init__(self) -> None:
             self.started = asyncio.Event()
+            self.both_started = asyncio.Event()
             self.release = asyncio.Event()
+            self.events: list[str] = []
 
         async def emit(self, event: str, *_args: object) -> None:
             if event == "stop":
                 return
-            assert event == "post_tool"
+            assert event in {"post_tool", "tool_result"}
+            self.events.append(event)
             self.started.set()
+            if len(self.events) == 2:
+                self.both_started.set()
             await asyncio.wait_for(self.release.wait(), 10)
 
     loop = AgentLoop(
@@ -429,8 +434,11 @@ async def test_agent_close_drains_receipt_extension_tasks(tmp_path: Path) -> Non
             [ToolResult("receipt-task", "done")],
         )
         await asyncio.wait_for(extensions.started.wait(), 10)
+        await asyncio.wait_for(extensions.both_started.wait(), 10)
+        assert set(extensions.events) == {"post_tool", "tool_result"}
         await loop.close()
-        assert tasks and tasks[0].done() and tasks[0].cancelled()
+        assert len(tasks) == 2
+        assert all(task.done() and task.cancelled() for task in tasks)
     finally:
         extensions.release.set()
         if not loop._closed:

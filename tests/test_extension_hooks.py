@@ -99,7 +99,7 @@ async def test_cancellation_resistant_timeout_releases_call_and_warns_again() ->
             await asyncio.wait_for(release.wait(), 10)
 
     notices: list[str] = []
-    extension_hook = ExtensionHook("hooks", "pre_tool", ignores_cancel, timeout_seconds=0)
+    extension_hook = ExtensionHook("hooks", "pre_tool", ignores_cancel, timeout_seconds=0.001)
     hook = CompositeToolHook(None, [extension_hook], notices.append, _task_owner)
     first = asyncio.create_task(hook("bash", {}))
     assert await asyncio.wait_for(first, 10) is True
