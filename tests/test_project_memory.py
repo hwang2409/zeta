@@ -16,11 +16,13 @@ from pathlib import Path
 import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from zeta import project_locking as locking_module
 from zeta import project_registry as registry_module
 from zeta.core import session_files
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.project_context import load_project_context
 from zeta.core.session import SessionManager
+from zeta.project_errors import ProjectRegistryBusyError
 from zeta.project_memory_history import MemorySnapshot
 from zeta.project_registry import (
     MAX_MEMORY_FILE_SIZE,
@@ -745,15 +747,56 @@ def test_project_record_publish_closes_descriptor_when_fdopen_fails(
 
 
 def test_project_registry_serializes_concurrent_creates_and_rejects_hardlinks(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "projects"
     registry = ProjectRegistry(root)
+    publish_started = threading.Event()
+    release_publish = threading.Event()
+    second_lock_attempted = threading.Event()
+    clock_lock = threading.Lock()
+    monotonic_calls = 0
+    real_publish = registry._publish
+
+    def blocked_publish(*args: object, **kwargs: object) -> None:
+        if not publish_started.is_set():
+            publish_started.set()
+            assert release_publish.wait(10), "timed out waiting to release project create"
+        real_publish(*args, **kwargs)
+
+    def forced_monotonic() -> float:
+        nonlocal monotonic_calls
+        with clock_lock:
+            monotonic_calls += 1
+            call = monotonic_calls
+        if call == 2:
+            second_lock_attempted.set()
+        return 0.0 if call <= 2 else 2.0
+
+    # test-contract: hold the first create, then advance the injected clock while
+    # the second create waits. the old one-second deadline expires; ten seconds does not.
+    # test-contract: seam force the concurrent publication ordering
+    monkeypatch.setattr(registry, "_publish", blocked_publish)
+    monkeypatch.setattr(locking_module.time, "monotonic", forced_monotonic)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(registry.create_project, "project-0", "scope")
+        assert publish_started.wait(10), "first project create did not reach publish"
+        second = pool.submit(registry.create_project, "project-1", "scope")
+        assert second_lock_attempted.wait(10), "second project create did not contend"
+        # test-contract: seam assert the finite identity wait stays pending
+        assert not second.done(), "project create raised ProjectRegistryBusyError before the finite holder released"
+        release_publish.set()
+        first_project = first.result()
+        try:
+            second_project = second.result()
+        except ProjectRegistryBusyError as exc:
+            raise AssertionError("finite concurrent create was rejected as busy") from exc
+        projects = [first_project, second_project]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        projects = list(
+        projects.extend(
             pool.map(
                 lambda index: registry.create_project(f"project-{index}", "scope"),
-                range(12),
+                range(2, 12),
             )
         )
     assert len({project.project_id for project in projects}) == 12
