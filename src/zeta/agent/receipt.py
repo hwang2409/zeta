@@ -725,6 +725,30 @@ class _ReceiptLoop(Protocol):
     ) -> ToolResult: ...
 
 
+def _append_tool_result(
+    owner: _ReceiptLoop, call: ToolCall, result: ToolResult
+) -> Any:
+    registry = getattr(owner, "tool_registry", None)
+    approval_origin = (
+        registry.peek_approval_origin(call.id) if registry is not None else None
+    )
+    receipt = owner.store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent(result.content)],
+            tool_result=result,
+            metadata=(
+                {"zeta.approval_origin": approval_origin}
+                if approval_origin is not None
+                else {}
+            ),
+        )
+    )
+    if registry is not None:
+        registry.take_approval_origin(call.id)
+    return receipt
+
+
 def finalize_agent_results(
     owner: _ReceiptLoop,
     calls: Sequence[ToolCall],
@@ -855,13 +879,7 @@ def finalize_agent_results(
         if foreground_child is not None and result.is_canceled:
             # the lifecycle is final before the parent installs the receipt
             foreground_child.mark_agent_canceled(call.id)
-        receipt = owner.store.append_message(
-            Message(
-                MessageRole.TOOL_RESULT,
-                [TextContent(result.content)],
-                tool_result=result,
-            )
-        )
+        receipt = _append_tool_result(owner, call, result)
         if foreground_child is not None:
             handle = foreground_child.agent_handle()
             if handle is not None:
