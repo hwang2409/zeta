@@ -121,18 +121,33 @@ wait for its last export.
 
 ## local viewer (Jaeger)
 
+This is one copy-paste proof journey. It starts Jaeger, writes the exact global
+settings, and runs a short prompt that uses both the `agent` child-agent tool
+and the `bash` tool. Use a disposable `ZETA_HOME` if you do not want to change
+your normal settings.
+
 ```console
-docker run --rm --name zeta-jaeger \
+docker run -d --rm --name zeta-jaeger \
   -p 127.0.0.1:4318:4318 \
   -p 127.0.0.1:16686:16686 \
   cr.jaegertracing.io/jaegertracing/jaeger:2.23.0
+mkdir -p "${ZETA_HOME:-$HOME/.zeta}"
+cat > "${ZETA_HOME:-$HOME/.zeta}/settings.toml" <<'EOF'
+[otel]
+endpoint = "http://127.0.0.1:4318/v1/traces"
+EOF
+uv tool install --editable '.[otel]'
+zeta --no-session --yolo --max-turns 4 -p 'use the agent tool to ask one child agent to run a short check, then use the bash tool to print "otel-proof"; report only success'
+open http://127.0.0.1:16686
+# when finished:
+docker stop zeta-jaeger
 ```
 
-Set the endpoint above, restart zeta, run a prompt that uses a tool, and open
-`http://127.0.0.1:16686` (service `zeta`). The JSON API in this Jaeger version
-is `/api/v3/traces?query.service_name=zeta&...`. Stop the container with
-`docker stop zeta-jaeger`; zeta keeps working and `/status` shows `degraded`
-after the next batch.
+In Jaeger, select service `zeta` and open the newest trace. The tree should
+show the agent span, a nested child-agent span, and an `execute_tool` span for
+the tool call. The JSON API in this Jaeger version is
+`/api/v3/traces?query.service_name=zeta&...`. Zeta keeps working after
+`docker stop zeta-jaeger`; `/status` shows `degraded` after the next batch.
 
 ## joining traces from another program (achilles)
 
