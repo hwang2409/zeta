@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -21,7 +22,7 @@ from ..core.store._child_runs import (
 )
 from ..core.thread_call import ThreadCallWorkers
 from . import content, event_contract
-from .diagnostics import log_stuck_holder
+from .diagnostics import log_controller_refusal
 from .handlers import history, session, settings, validation
 from .protocol import (
     ErrorDescriptor,
@@ -65,6 +66,10 @@ MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 OUTPUT_MAX_FRAMES = 256
 OUTPUT_OVERFLOW_CLOSE_DEADLINE = 1.0
+
+# A contended-slot refusal logs once per holder, then at most once per this
+# window per holder, with the suppressed count carried on the next log.
+REFUSAL_LOG_INTERVAL_SECONDS = 30.0
 
 # one owner for feature gates and optional wire fields on every output path
 NO_FEATURE = frozenset()
@@ -196,6 +201,14 @@ class ConnectionRegistry(ReplayOutput):
         self._connections: dict[Any, _Connection] = {}
         self._controller: _Connection | None = None
         self._controller_output_paused = False
+        # Rate-limit state for the contended-slot refusal log: the holder a
+        # refusal was last logged against, that log's time, and how many later
+        # refusals against the same holder were suppressed. The clock is an
+        # attribute so a test can inject a deterministic one.
+        self._refusal_clock: Callable[[], float] = time.monotonic
+        self._refusal_logged_for: Any | None = None
+        self._refusal_logged_at = 0.0
+        self._refusal_suppressed = 0
         self._observers: list[_Connection] = []
         self._closed = False
         self.replay = SessionReplay()
@@ -254,7 +267,7 @@ class ConnectionRegistry(ReplayOutput):
                 raise ProtocolError(
                     ErrorDescriptor.CONNECTION_CAPACITY, "observer limit reached"
                 ) from exc
-            self._log_lost_holder_refusal()
+            self._log_controller_refusal(connection)
             raise ProtocolError(
                 ErrorDescriptor.CONNECTION_CAPACITY,
                 "another client is already connected",
@@ -262,26 +275,30 @@ class ConnectionRegistry(ReplayOutput):
         connection.role = role
         return role
 
-    def _log_lost_holder_refusal(self) -> None:
-        """On a controller refusal, if the holder's connection is already gone
-        while its request still runs, log it once (diagnostic only)."""
+    def _log_controller_refusal(self, refused: Any) -> None:
+        """Name the holder and the refused connection on a -32001 slot refusal.
+
+        Diagnostic only. Logs the first refusal per holder, then at most one per
+        ``REFUSAL_LOG_INTERVAL_SECONDS`` per holder, carrying the suppressed
+        count. The holder's stuck request and await chain are added only when
+        its connection is already closed while a request still runs.
+        """
         holder = self._controller
         if holder is None:
             return
         client = holder.connection
-        if getattr(client, "_stuck_holder_reported", True):
+        now = self._refusal_clock()
+        if (
+            self._refusal_logged_for is client
+            and now - self._refusal_logged_at < REFUSAL_LOG_INTERVAL_SECONDS
+        ):
+            self._refusal_suppressed += 1
             return
-        peer_closed = getattr(client, "peer_closed", None)
-        if peer_closed is None or getattr(client, "_request", None) is None:
-            return
-        if not peer_closed():
-            return
-        client._stuck_holder_reported = True
-        log_stuck_holder(
-            client,
-            holder.output,
-            reason="hello refused -32001; holder connection closed while a request runs",
-        )
+        suppressed = self._refusal_suppressed if self._refusal_logged_for is client else 0
+        self._refusal_logged_for = client
+        self._refusal_logged_at = now
+        self._refusal_suppressed = 0
+        log_controller_refusal(client, holder.output, refused, suppressed=suppressed)
 
     def _claim(
         self,

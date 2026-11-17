@@ -73,9 +73,22 @@ async def _controller_hello(client: ReplayClient, request_id: int) -> dict[str, 
     )
 
 
+# Slice 1 adds periodic hold-dump records on the same logger; count only the
+# refusal records so the merge stays green.
+_REFUSAL_PREFIX = "serve: controller hello refused -32001"
+
+
+def _refusal_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == _DIAG_LOGGER and r.getMessage().startswith(_REFUSAL_PREFIX)
+    ]
+
+
 @pytest.mark.parametrize("transport", TRANSPORTS)
 @pytest.mark.asyncio
-async def test_stuck_lost_holder_is_logged_once(
+async def test_stuck_lost_holder_is_logged_with_dump(
     tmp_path: Path,
     transport: Transport,
     monkeypatch: pytest.MonkeyPatch,
@@ -126,30 +139,21 @@ async def test_stuck_lost_holder_is_logged_once(
                     await first.close()
                 assert refused["error"]["code"] == -32001
 
-                # Slice 1 may also log periodic hold-dumps on the same logger;
-                # count only the refusal records for "logged once".
-                def refusals() -> list[logging.LogRecord]:
-                    return [
-                        r
-                        for r in caplog.records
-                        if r.name == _DIAG_LOGGER
-                        and "hello refused -32001" in r.getMessage()
-                    ]
-
-                records = refusals()
+                records = _refusal_records(caplog)
                 assert len(records) == 1, [r.getMessage() for r in records]
                 message = records[0].getMessage()
+                assert "peer_closed=yes" in message, message
                 assert "method=status" in message, message
                 assert "gated_status" in message, message  # an await-chain stack frame
 
-                # A second refused hello against the same stuck holder adds no record.
+                # A second refused hello within the window adds no refusal record.
                 second = await connect_replay(server, transport)
                 try:
                     again = await _controller_hello(second, 1)
                 finally:
                     await second.close()
                 assert again["error"]["code"] == -32001
-                assert refusals() == records
+                assert _refusal_records(caplog) == records
         finally:
             gate.set()
             if server.connections is not None:
@@ -162,7 +166,7 @@ async def test_stuck_lost_holder_is_logged_once(
 
 @pytest.mark.parametrize("transport", TRANSPORTS)
 @pytest.mark.asyncio
-async def test_live_holder_refusal_has_no_dump(
+async def test_live_holder_refusal_is_logged_without_dump(
     tmp_path: Path,
     transport: Transport,
     caplog: pytest.LogCaptureFixture,
@@ -178,6 +182,12 @@ async def test_live_holder_refusal_has_no_dump(
                 finally:
                     await refused_client.close()
                 assert refused["error"]["code"] == -32001
-                assert [r for r in caplog.records if r.name == _DIAG_LOGGER] == []
+                records = _refusal_records(caplog)
+                assert len(records) == 1, [r.getMessage() for r in records]
+                message = records[0].getMessage()
+                assert "peer_closed=no" in message, message
+                # A live holder refusal carries no stuck-request dump.
+                assert "await chain" not in message, message
+                assert "method=" not in message, message
         finally:
             await holder.close()

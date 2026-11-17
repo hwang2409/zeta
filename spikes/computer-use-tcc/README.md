@@ -75,7 +75,9 @@ cd spikes/computer-use-tcc
    Expect `[FAIL] grant LOST after rebuild` → ad-hoc re-keys TCC on every build.
 10. **make a self-signed code-signing cert** — `./run.sh cert` prints the exact steps
     (Keychain Access → Certificate Assistant; **needs your clicks and maybe your login password**;
-    ~2–3 min). Verify with `security find-identity -v -p codesigning`.
+    ~2–3 min). On macOS 26.6, set Trust → Code Signing to **Always Trust** because a
+    Certificate Assistant self-signed root is not trusted by default. Verify with
+    `security find-identity -v -p codesigning`.
 11. **sign with the cert + grant** — `./run.sh build cert` (first use may pop
     "codesign wants to sign… → **Always Allow**"), then `./run.sh grant`, enable the `cuspike`
     entries again, then `./run.sh check` → expect `[PASS]`.
@@ -95,7 +97,8 @@ headless/daemon context (no active GUI login) cannot capture. Skip unless asked.
 
 1. Remove the build dir: `rm -rf build`.
 2. If you explicitly added a trust override, export the certificate from Keychain Access,
-   recover trust in the admin store, then delete the identity:
+   run `security remove-trusted-cert -d <exported-certificate>`, and set Trust → Code Signing
+   to **Use System Defaults** before deleting the identity:
    `security remove-trusted-cert -d <exported-certificate>`.
    Set Trust to "Use System Defaults" in Keychain Access if no override exists.
 3. If you made the self-signed cert (`./run.sh cert`), delete the identity:

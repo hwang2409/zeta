@@ -19,6 +19,20 @@
 import ApplicationServices
 import CoreGraphics
 import Foundation
+import Darwin
+
+func responsibleProcess() -> String {
+    guard let symbol = dlsym(dlopen(nil, RTLD_LAZY), "responsibility_get_pid_responsible_for_pid") else {
+        return "responsible_process=unknown"
+    }
+    typealias Responsible = @convention(c) (pid_t) -> pid_t
+    let responsible = unsafeBitCast(symbol, to: Responsible.self)(getpid())
+    var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+    let pathText = proc_pidpath(responsible, &path, UInt32(path.count)) > 0
+        ? String(cString: path) : "unknown"
+    let bundle = Bundle(path: pathText)?.bundleIdentifier ?? "unknown"
+    return "responsible_pid=\(responsible) executable=\(pathText) bundle_id=\(bundle)"
+}
 
 func preflight() -> (Bool, Bool) {
     let sr = CGPreflightScreenCaptureAccess()
@@ -30,10 +44,12 @@ let cmd = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "prefligh
 
 switch cmd {
 case "preflight":
+    print(responsibleProcess())
     let (sr, ax) = preflight()
     print("screen_recording=\(sr) accessibility=\(ax)")
 
 case "request":
+    print(responsibleProcess())
     let (srBefore, axBefore) = preflight()
     print("before: screen_recording=\(srBefore) accessibility=\(axBefore)")
     // Registers this binary in the Screen Recording list and prompts if unset.

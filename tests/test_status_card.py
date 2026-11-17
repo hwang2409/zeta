@@ -18,6 +18,7 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail
 from tests.support.submissions import await_submission_pipeline
 from zeta.attention_decisions import DecisionItem
 from zeta.attention_records import AttentionStore
@@ -141,8 +142,9 @@ async def test_bare_overlay_commands_dispatch_and_render_through_registry(
         assert "/accounts — list, switch, or label accounts" in rendered_help
         assert dispatched == ["help"]
 
+        # The panel opens from the submit itself, so keys typed after its Enter
+        # reach the panel; the registry command serves the other surfaces.
         app._submit_input(f"/{command}")
-        await await_submission_pipeline(app)
         active = {
             "status": app.status_card_active,
             "mcp": app.status_card_active and app._mcp_manager_open,
@@ -150,7 +152,10 @@ async def test_bare_overlay_commands_dispatch_and_render_through_registry(
             "decisions": app.decisions_panel_active,
         }
         assert active[command], active
-        assert dispatched == ["help", command]
+        if app._overlay_load is not None:
+            await await_or_fail(app._overlay_load, what=f"/{command} load")
+        await await_submission_pipeline(app)
+        assert dispatched == ["help"]
         screen = Screen(initial_width=80, initial_height=24)
         with set_app(session.app):
             session.layout.update_parents_relations()

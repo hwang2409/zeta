@@ -11,9 +11,10 @@ from rich.text import Text
 from ...accounts import AccountId
 from ...accounts.usage import UsageState, format_usage_lines
 from .. import theme
+from ..cards.picker_card import HINT_MARKER, SELECTED_MARKER
 
-HINT = "↑/↓ · enter · l login · x logout · r refresh · d default · n rename · esc"
-VIEW_ONLY_HINT = "↑/↓ · r refresh · esc"
+HINT = f"{HINT_MARKER} · enter · l login · x logout · r refresh · d default · n rename · esc"
+VIEW_ONLY_HINT = f"{HINT_MARKER} · r refresh · esc"
 
 
 @dataclass
@@ -43,7 +44,7 @@ class AccountsPicker:
         highlighted = position == self.index
         label = (self.labels or {}).get(account, account.name)
         line = Text.assemble(
-            ("❯ " if highlighted else "  ", theme.ACCENT),
+            (SELECTED_MARKER if highlighted else "  ", theme.ACCENT),
             (
                 f"{account.provider}:{label}",
                 theme.COMMAND if highlighted else theme.BODY,

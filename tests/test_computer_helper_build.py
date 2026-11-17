@@ -7,6 +7,7 @@ prompting and performs no capture or input, so it is safe on a headless CI runne
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,19 @@ def test_cursor_position_uses_nearest_integer_rule() -> None:
     assert 'Int(loc.y.rounded())' in source
 
 
+def test_indicator_lifecycle_and_interruptible_steps_are_present() -> None:
+    source = HELPER_SOURCE.read_text()
+    assert 'NSStatusBar.system.statusItem' in source
+    assert 'window.ignoresMouseEvents = true' in source
+    assert 'Thread {' in source
+    assert 'app.run()' in source
+    assert 'runInterruptibleSteps(path.dropFirst()' in source
+    assert 'try checkKilled(currentKill())' in source
+    assert 'final class EventGate' in source
+    assert 'commitReply()' in source
+    assert 'runInterruptibleSteps(Array(text)' in source
+
+
 def test_helper_builds_and_answers_hello() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         subprocess.run(
@@ -46,3 +60,41 @@ def test_helper_builds_and_answers_hello() -> None:
     assert reply["version"] == "0.1.0"
     assert isinstance(reply["screen_recording"], bool)
     assert isinstance(reply["accessibility"], bool)
+
+
+def test_selftest_kill_interrupts_steps_and_releases_drag() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["sh", str(BUILD_SCRIPT), tmp], check=True, capture_output=True, timeout=300
+        )
+        output = subprocess.check_output(
+            [str(Path(tmp) / "zeta-computer-helper"), "--selftest-kill"], text=True, timeout=15
+        )
+    results = {item["name"]: item for item in map(json.loads, output.splitlines())}
+    assert results["drag"] == {
+        "name": "drag", "events": ["mouse_down", "drag_1", "mouse_up"],
+        "reply": "killed", "later_reply": "killed"
+    }
+    assert results["type"] == {
+        "name": "type", "events": ["key_down", "key_up"], "reply": "killed", "later_reply": "killed"
+    }
+    assert results["mouse_down"]["events"] == ["mouse_down", "mouse_up"]
+    assert results["mouse_down"]["later_reply"] == "killed"
+    assert results["kill_after_last_step"]["reply"] == "killed"
+    assert results["kill_after_last_step"]["later_reply"] == "killed"
+    assert results["kill_before_commit"]["reply"] == "killed"
+    assert results["kill_before_commit"]["later_reply"] == "killed"
+    assert results["kill_after_commit"]["reply"] == "ok"
+    assert results["kill_after_commit"]["later_reply"] == "killed"
+
+
+def test_helper_exits_when_stdin_reaches_eof() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["sh", str(BUILD_SCRIPT), tmp], check=True, capture_output=True, timeout=300
+        )
+        binary = Path(tmp) / "zeta-computer-helper"
+        process = subprocess.Popen([str(binary)], stdin=subprocess.PIPE)
+        assert process.stdin is not None
+        process.stdin.close()
+        assert process.wait(timeout=15) == 0
