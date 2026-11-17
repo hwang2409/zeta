@@ -21,8 +21,8 @@ from PIL import Image
 from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
-from tests.support.server_client import read_until, send
 from tests.support.serve_close import close_serve
+from tests.support.server_client import read_until, send
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
     TIMEOUT,
