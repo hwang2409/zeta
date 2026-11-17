@@ -121,33 +121,54 @@ wait for its last export.
 
 ## local viewer (Jaeger)
 
-This is one copy-paste proof journey. It starts Jaeger, writes the exact global
-settings, and runs a short prompt that uses both the `agent` child-agent tool
-and the `bash` tool. Use a disposable `ZETA_HOME` if you do not want to change
-your normal settings.
+This is one copy-paste proof journey. It starts Jaeger and runs a short prompt
+from an explicitly selected feature worktree. It uses a disposable,
+credential-free `ZETA_HOME`, so it does not overwrite real settings or mutate a
+globally installed zeta tool.
+
+Set `OTEL_WORKTREE` to the absolute path of the checked-out feature revision
+before starting. The revision check below is required: do not run this journey
+from another checkout.
 
 ```console
+OTEL_WORKTREE=/absolute/path/to/the/zeta-feature-worktree
+OTEL_REVISION=ca8dad93ee5cfe2fb33f004ec84cfc0f8c0a2861
+ZETA_HOME="$(mktemp -d "${TMPDIR:-/tmp}/zeta-otel-home.XXXXXX")"
+
+cd "$OTEL_WORKTREE" && uv run --extra otel python -c 'import zeta; print(zeta.__file__)'
+test "$(git -C "$OTEL_WORKTREE" rev-parse HEAD)" = "$OTEL_REVISION"
+
+mkdir -p "$ZETA_HOME"
+cat > "$ZETA_HOME/settings.toml" <<'EOF'
+[otel]
+endpoint = "http://127.0.0.1:4318/v1/traces"
+EOF
+
 docker run -d --rm --name zeta-jaeger \
   -p 127.0.0.1:4318:4318 \
   -p 127.0.0.1:16686:16686 \
   cr.jaegertracing.io/jaegertracing/jaeger:2.23.0
-mkdir -p "${ZETA_HOME:-$HOME/.zeta}"
-cat > "${ZETA_HOME:-$HOME/.zeta}/settings.toml" <<'EOF'
-[otel]
-endpoint = "http://127.0.0.1:4318/v1/traces"
-EOF
-uv tool install --editable '.[otel]'
-zeta --no-session --yolo --max-turns 4 -p 'use the agent tool to ask one child agent to run a short check, then use the bash tool to print "otel-proof"; report only success'
+cd "$OTEL_WORKTREE" && ZETA_HOME="$ZETA_HOME" uv run --extra otel zeta \
+  --provider ollama --model qwen3:4b --no-session --yolo --max-turns 4 \
+  -p 'use the agent tool to ask one child agent to run a short check, then use the bash tool to print "otel-proof"; report only success'
 open http://127.0.0.1:16686
 # when finished:
 docker stop zeta-jaeger
+rm -rf "$ZETA_HOME"
 ```
 
-In Jaeger, select service `zeta` and open the newest trace. The tree should
-show the agent span, a nested child-agent span, and an `execute_tool` span for
-the tool call. The JSON API in this Jaeger version is
+The first `uv run` must print a `zeta` path under `OTEL_WORKTREE`, and the
+revision check must pass. The local Ollama provider does not use account
+credentials. In Jaeger, select service `zeta` and open the newest trace. The
+tree should show the agent span, a nested child-agent span, and an
+`execute_tool` span for the tool call. The JSON API in this Jaeger version is
 `/api/v3/traces?query.service_name=zeta&...`. Zeta keeps working after
 `docker stop zeta-jaeger`; `/status` shows `degraded` after the next batch.
+
+If you intentionally use a real home instead, set `ZETA_HOME="$HOME/.zeta"` and
+edit only the existing `[otel]` setting without replacing the file. Restore the
+setting and restart zeta processes after the proof. The disposable-home journey
+above is the safe default.
 
 ## joining traces from another program (achilles)
 
