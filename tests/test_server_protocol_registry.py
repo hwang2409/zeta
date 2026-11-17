@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 from pathlib import Path
 
@@ -1213,3 +1214,69 @@ def test_registered_protocol_values_match_pinned_bytes() -> None:
         )
         == b'{"jsonrpc":"2.0","id":7,"result":{"kind":"output","text":"credential error","credential_store_error":{"code":"mcp_credential_store","reason":"invalid_json","server":"live","credential_file":"/home/.zeta/mcp-oauth.json","operation":"load","recovery":"move_aside_then_auth","text":"credential error"}}}\n'
     )
+
+
+_TELEMETRY_HEALTHY = {"enabled": True, "state": "healthy", "reason": None}
+_TELEMETRY_OFF = {"enabled": False, "state": "off", "reason": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "negotiated", "telemetry"),
+    [
+        (False, False, None),
+        (True, False, None),
+        (False, True, _TELEMETRY_OFF),
+        (True, True, _TELEMETRY_HEALTHY),
+    ],
+    ids=["off-plain", "on-plain", "off-otel", "on-otel"],
+)
+async def test_session_settings_telemetry_is_negotiated_on_every_reply(
+    tmp_path: Path, configured: bool, negotiated: bool, telemetry: dict | None
+) -> None:
+    if configured:
+        (tmp_path / "home").mkdir()
+        # nothing listens here, and slice 1 records no span, so the exporter stays healthy
+        (tmp_path / "home" / "settings.toml").write_text(
+            '[otel]\nendpoint = "http://127.0.0.1:9/v1/traces"\n'
+        )
+    features = ["serve_observers", *(["otel"] if negotiated else [])]
+    contract = await ServeContract.start(tmp_path, "unix")
+    try:
+        controller = await contract.connect("controller")
+        await controller.request(
+            "hello", "hello", {"protocol_version": "1.2", "features": features}
+        )
+        created = await controller.request("new", "new_session", {"provider": "codex"})
+        session_id = created["result"]["session"]["session_id"]
+        observer = await contract.connect("observer")
+        await observer.request(
+            "hello",
+            "hello",
+            {"protocol_version": "1.2", "role": "observer", "features": features},
+        )
+        raw = [
+            await controller.request_raw("get", "session_settings", {"session_id": session_id}),
+            await controller.request_raw(
+                "set",
+                "set_settings",
+                {"session_id": session_id, "model": "gpt-5.6-luna", "approval_mode": "ask"},
+            ),
+            await observer.request_raw("observe", "session_settings"),
+        ]
+    finally:
+        await contract.close()
+
+    extra = {} if telemetry is None else {"telemetry": telemetry}
+    assert [json.loads(reply)["result"] for reply in raw] == [
+        {"model": "gpt-5.6-luna", "approval_mode": "ask", **extra, "plan_mode": False},
+        {"model": "gpt-5.6-luna", "approval_mode": "ask", **extra},
+        {"model": "gpt-5.6-luna", "approval_mode": "ask", **extra},
+    ]
+    if not negotiated:
+        # the exact bytes the pre-otel server sent, whether or not telemetry is configured
+        assert raw == [
+            '{"jsonrpc":"2.0","id":"get","result":{"model":"gpt-5.6-luna","approval_mode":"ask","plan_mode":false}}\n',
+            '{"jsonrpc":"2.0","id":"set","result":{"model":"gpt-5.6-luna","approval_mode":"ask"}}\n',
+            '{"jsonrpc":"2.0","id":"observe","result":{"model":"gpt-5.6-luna","approval_mode":"ask"}}\n',
+        ]

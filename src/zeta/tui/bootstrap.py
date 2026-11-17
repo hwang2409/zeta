@@ -48,6 +48,7 @@ from ..skills import (
     discover_session_skills,
 )
 from ..skills.agent_catalog import discover_session_agents
+from ..telemetry import Telemetry, TelemetryError
 from ..tools._shared.process import (
     BackgroundTaskNotice,
     BackgroundTaskShutdownNotice,
@@ -352,6 +353,12 @@ def _create_app_with_root(
         )
     except SettingsError as exc:
         raise SessionError(str(exc)) from exc
+    try:
+        telemetry = Telemetry.configure(config)
+    except TelemetryError as exc:
+        raise SessionError(str(exc)) from None
+    # the app owns it after a successful start; until then this startup cleanup does
+    cleanup.callback(telemetry.shutdown)
     registry = manager.project_registry
     projection = None
     if registry is not None:
@@ -599,6 +606,7 @@ def _create_app_with_root(
         agent_catalog=agent_catalog,
         auto_project=not ephemeral,
         project_discovery=discovery,
+        telemetry=telemetry,
     )
     if opened is None:
         cleanup.enter_context(composition.opened.store)
@@ -666,6 +674,7 @@ def _create_app_with_root(
             cwd=str(metadata.cwd),
             provider=metadata.provider,
             model=metadata.model,
+            telemetry=telemetry,
         )
     app = _app.TUIApp(
         loop,
@@ -694,6 +703,8 @@ def _create_app_with_root(
         on_session_close=recency.flush,
         foreground_event_publisher=foreground_event_publisher,
         observer_host=observer_host,
+        telemetry=telemetry,
+        otel_endpoint=config.otel_endpoint,
     )
     if composition.memory_reconciler is not None:
         composition.memory_reconciler.notice = app._print_system

@@ -51,6 +51,7 @@ from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_session_agents
+from ..telemetry import Telemetry
 from ..tools._shared.background_task_types import BackgroundTaskNotice
 from ..tools._shared.run_work import background_task_row
 from .protocol import EventDescriptor
@@ -238,6 +239,9 @@ class ServerRuntime:
         self._run_work_event_sink: RunWorkEventSink | None = None
         self._work_changed_sink: Callable[[], None] | None = None
         self._setup_reapers: set[asyncio.Task[None]] = set()
+        # process telemetry is owned elsewhere (ZetaServer or the borrowed loop);
+        # the runtime only reads it through this getter
+        self._telemetry_source: Callable[[], Telemetry] = Telemetry.disabled
 
     def backend_for_model(
         self,
@@ -307,6 +311,7 @@ class ServerRuntime:
         runtime.manager = SessionManager(runtime.home, owner_surface="serve")
         runtime._project_registry_probed = True
         runtime._init_sinks()
+        runtime._telemetry_source = lambda: loop.telemetry
         runtime._state = SessionState(
             opened=opened,
             loop=loop,
@@ -436,6 +441,14 @@ class ServerRuntime:
         self._run_work_event_sink = sink
         if self._state is not None:
             self._bind_background_event_sink(self._state)
+
+    @property
+    def telemetry(self) -> Telemetry:
+        return self._telemetry_source()
+
+    def set_telemetry_source(self, source: Callable[[], Telemetry]) -> None:
+        """Borrow the owner's process telemetry; read live, so a later configure shows."""
+        self._telemetry_source = source
 
     def set_work_changed_sink(self, sink: Callable[[], None] | None) -> None:
         """Attach the callback for work that ended without an event (a task exit
@@ -861,6 +874,7 @@ class ServerRuntime:
             auto_project=False,
             project_id=project_id,
             on_plan_mode_change=persist_plan_mode,
+            telemetry=self.telemetry,
             require_selected_account=(
                 self.backend_factory is None and not self._test_scripted_provider
             ),
