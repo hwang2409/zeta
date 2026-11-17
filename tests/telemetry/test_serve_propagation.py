@@ -78,6 +78,7 @@ class Wire:
 
     async def _read(self) -> bytes:
         if self.transport == "unix":
+            # test-contract: transport exact reply bytes are compared, and the websocket branch needs the raw frame decoder
             raw = await await_or_fail(self.reader.readline(), what="unix frame")
             assert raw
         else:
@@ -157,6 +158,7 @@ async def test_negotiated_context_parents_send_turn_and_read_methods(tmp_path, t
     assert hello_span.parent is None
     for span in (send_span, status_span, settings_span):
         assert span.kind is SpanKind.SERVER
+        assert span.parent is not None, span.name
         assert (span.parent.trace_id, span.parent.span_id) == (int(TRACE_ID, 16), int(PARENT_ID, 16))
         assert span.parent.is_remote
         assert span.context.trace_state.get("zeta") == "1"
@@ -164,7 +166,7 @@ async def test_negotiated_context_parents_send_turn_and_read_methods(tmp_path, t
     assert dict(send_span.attributes) == {"rpc.system": "jsonrpc", "rpc.method": "send"}
     assert dict(status_span.attributes) == {"rpc.system": "jsonrpc", "rpc.method": "status"}
     # the turn task the send started inherits the request's span
-    assert agent.parent.span_id == send_span.context.span_id
+    assert agent.parent is not None and agent.parent.span_id == send_span.context.span_id
     assert agent.context.trace_id == int(TRACE_ID, 16)
     # responses and notifications never echo the context
     assert not [raw for raw in wire.received if b"traceparent" in raw or TRACE_ID.encode() in raw or b"tracestate" in raw]

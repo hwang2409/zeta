@@ -809,11 +809,8 @@ class _Client:
         carrier is ignored whole and leaves only a value-free event on the span.
         """
         telemetry = self.server.telemetry
-        received = (
-            request["trace_context"]
-            if "otel" in self.features and request["method"] != "hello"
-            else {}
-        )
+        # hello itself is never parented: features are still empty while it runs
+        received = request["trace_context"] if "otel" in self.features else {}
         carrier = {key: value for key, value in received.items() if type(value) is str}
         accepted = telemetry.extract(carrier)
         malformed = any(key not in accepted for key in received)
