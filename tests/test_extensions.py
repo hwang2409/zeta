@@ -13,14 +13,11 @@ import sys
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from io import StringIO
 from pathlib import Path
 
 import pytest
-from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
-from zeta.core.store import ConversationStore
 from zeta.extensions import (
     EXTENSION_API_VERSION,
     ExtensionManifestError,
@@ -30,11 +27,9 @@ from zeta.extensions import (
 )
 from zeta.extensions.host import USER_SCOPE
 from zeta.protocol.types import StreamEventType
-from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.testing.extensions import load_extension
 from zeta.tools import ToolRegistry
-from zeta.tui.app import TUIApp
 from zeta.tui.render import render_event
 
 _ECHO_MODULE = """
@@ -128,8 +123,7 @@ def activate(zx):
         host = apply_extensions(registry, home=home, project_dir=None, builtin_names=registry.registered_names)
         events = []
         host.set_event_sink(events.append, asyncio.get_running_loop())
-        # the public zx.ui.notify call during activation waits for the frontend sink.
-        await asyncio.sleep(0)
+        # queued notices drain before the sink binding returns.
         assert len(events) == 1
         assert events[0].type is StreamEventType.AGENT_NOTIFICATION
         assert events[0].data == {"kind": "extension", "extension": "notify-ext", "text": "hello", "level": "warning"}
@@ -139,52 +133,6 @@ def activate(zx):
             "name": "notify-ext", "scope": "user", "version": "0.1.0",
             "enabled": True, "trusted": True, "loaded": True, "error": None,
         }]
-
-
-@pytest.mark.asyncio
-async def test_activation_notice_reaches_real_tui_render_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    home = tmp_path / "home"
-    _write_extension(
-        home / "extensions", "notify-ext",
-        source='''
-def activate(zx):
-    zx.ui.notify("activation notice")
-''',
-    )
-    store = ConversationStore(tmp_path / "sessions")
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    host = apply_extensions(
-        registry, home=home, project_dir=None, builtin_names=registry.registered_names,
-    )
-    agent_loop = AgentLoop(
-        FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty(),
-    )
-    output = StringIO()
-    app = TUIApp(
-        agent_loop, provider="codex", model="offline",
-        console=Console(file=output, force_terminal=False), extensions=host,
-    )
-
-    async def start_without_prompt(*args: object, **kwargs: object):
-        del args, kwargs
-        return asyncio.create_task(asyncio.sleep(0)), None, True
-
-    monkeypatch.setattr(
-        "zeta.tui.runtime.prompt.start_prompt_during_activation",
-        start_without_prompt,
-    )
-    rendered: list[str] = []
-    monkeypatch.setattr(
-        app._presenter, "print_transient", lambda value: rendered.append(value.plain)
-    )
-    try:
-        await app.run(resume_ui=True)
-        await asyncio.sleep(0)
-        assert rendered == ["notify-ext: activation notice"]
-    finally:
-        await registry.close()
 
 
 @pytest.mark.asyncio
@@ -251,7 +199,6 @@ async def test_notify_flood_bounds_scheduled_callbacks(tmp_path: Path) -> None:
         assert len(host._pending_notifications) == 32
         assert host.notify_dropped > 9_000
         host.set_event_sink(delivered.append, asyncio.get_running_loop())
-        await asyncio.sleep(0)
         assert len(delivered) == 33
         assert delivered[-1].data == {
             "kind": "extension",

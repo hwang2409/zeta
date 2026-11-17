@@ -125,11 +125,26 @@ class PromptRuntimeMixin:
         Re-entrant: the fork controller re-shows a suspended main runtime by
         calling this again without replaying its transcript.
         """
-        if self.extensions is not None:
-            self.extensions.set_event_sink(
-                lambda event: self._handle_background_event(event),
-                asyncio.get_running_loop(),
-            )
+        extension_notice_after_render = None
+        extension_notice_pending = False
+        extension_notice_handler = None
+        if self.extensions is not None and not getattr(
+            self, "_extension_notice_sink_bound", False
+        ):
+            extension_notice_sink = lambda event: self._handle_background_event(event)
+            extension_notice_loop = asyncio.get_running_loop()
+
+            def bind_extension_notice_sink(application: object) -> None:
+                nonlocal extension_notice_pending
+                if extension_notice_pending:
+                    session.app.after_render.remove_handler(extension_notice_handler)
+                    extension_notice_pending = False
+                self.extensions.set_event_sink(
+                    extension_notice_sink, extension_notice_loop
+                )
+                self._extension_notice_sink_bound = True
+
+            extension_notice_after_render = bind_extension_notice_sink
         set_notice_loop = getattr(self._draft, "set_notice_loop", None)
         if set_notice_loop is not None:
             set_notice_loop(asyncio.get_running_loop())
@@ -151,6 +166,13 @@ class PromptRuntimeMixin:
             self.loop.set_mcp_notice_sink(self._handle_background_notice)
             session = session or self._session or self._make_session()
             self._active_session = session
+            if extension_notice_after_render is not None:
+                if isinstance(session, FullScreenPromptSession):
+                    extension_notice_handler = bind_extension_notice_sink
+                    session.app.after_render.add_handler(extension_notice_handler)
+                    extension_notice_pending = True
+                else:
+                    bind_extension_notice_sink(session.app)
             self._bind_restart_idle_buffer(session)
             self._attach_draft(session)
             activation_task, prompt_task, exited = (
@@ -232,6 +254,11 @@ class PromptRuntimeMixin:
                         self._active_session = None
                         self._terminal_restored = True
         finally:
+            if extension_notice_pending:
+                session = self._active_session
+                if session is not None and extension_notice_handler is not None:
+                    session.app.after_render.remove_handler(extension_notice_handler)
+                extension_notice_pending = False
             # Covers failures before the inner cleanup (a prompt crash during
             # activation); a no-op once the inner cleanup restored the queue.
             self._restore_startup_submissions()
