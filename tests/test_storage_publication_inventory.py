@@ -82,7 +82,6 @@ _RAW_PUBLICATION = {
     ("attention_replies.py", "stage", "os.replace"),
     ("attention_replies.py", "_finish_journal_locked", "os.replace"),
     ("attention_replies.py", "_prepare_locked", "os.replace"),
-    ("extensions/host.py", "persist_disabled", "os.replace"),
 }
 
 _RAW_DELETION = {

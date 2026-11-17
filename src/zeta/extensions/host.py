@@ -17,11 +17,10 @@ skipped. One broken extension never breaks the session or stops the rest.
 from __future__ import annotations
 
 import itertools
-import json
 import os
 import re
+import stat
 import sys
-import tempfile
 import types
 from dataclasses import dataclass
 from pathlib import Path
@@ -121,6 +120,7 @@ class PendingExtension:
 
 _NAMESPACE = "_zeta_extensions"
 _LOAD_NUMBER = itertools.count()
+_DISABLED_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 class ExtensionHost:
@@ -231,51 +231,82 @@ class ExtensionHost:
     def disabled(self) -> frozenset[str]:
         return frozenset(self._disabled)
 
-    def set_enabled(self, name: str, enabled: bool) -> None:
-        if enabled:
-            self._disabled.discard(name)
-        else:
-            self._disabled.add(name)
-
-    @property
-    def settings_disabled(self) -> frozenset[str]:
-        return frozenset(self._settings_disabled)
+    def load_disabled_markers(self) -> None:
+        directory = self._disabled_directory(create=False)
+        if directory is None:
+            return
+        self._disabled.update(
+            entry.name for entry in directory.iterdir()
+            if stat.S_ISREG(entry.lstat().st_mode)
+            and _DISABLED_NAME_RE.fullmatch(entry.name)
+        )
 
     def persist_disabled(self, name: str, enabled: bool) -> bool:
-        """Read, change, and atomically publish the zeta-owned state file."""
-        path = self.home / "extensions-state.json"
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            current = set(data.get("disabled", ()))
-        except FileNotFoundError:
-            current = set()
+        """Create or remove one zeta-owned disabled marker."""
+        if _DISABLED_NAME_RE.fullmatch(name) is None:
+            raise ValueError(f"invalid extension name: {name!r}")
         if name in self._settings_disabled and enabled:
             return False
+        directory = self._disabled_directory(create=True)
+        marker = directory / name
         if enabled:
-            current.discard(name)
+            try:
+                marker.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(marker.lstat().st_mode):
+                    raise OSError(f"disabled marker is not a file: {name}")
+                marker.unlink()
+            self._disabled.discard(name)
         else:
-            current.add(name)
-        payload = json.dumps({"disabled": sorted(current)}, separators=(",", ":")) + "\n"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_name: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                            prefix=f".{path.name}.", delete=False) as temporary:
-                temporary_name = temporary.name
-                os.chmod(temporary.name, 0o600)
-                temporary.write(payload)
-                temporary.flush()
-                os.fsync(temporary.fileno())
-            os.replace(temporary_name, path)
-        except BaseException:
-            if temporary_name is not None:
-                try:
-                    os.unlink(temporary_name)
-                except FileNotFoundError:
-                    pass
-            raise
-        self._disabled = set(self._settings_disabled) | current
+            try:
+                marker.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(marker.lstat().st_mode):
+                    raise OSError(f"disabled marker is not a file: {name}")
+            try:
+                fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                os.close(fd)
+            self._disabled.add(name)
         return True
+
+    def status(self, name: str) -> tuple[str, LoadedExtension | PendingExtension | None]:
+        item = next((item for item in self.loaded if item.name == name), None)
+        if item is None:
+            item = next((item for item in self.disabled_inventory if item.manifest.name == name), None)
+        if item is None:
+            item = next((item for item in self.pending_project if item.manifest.name == name), None)
+        if item is None:
+            return "missing", None
+        if name in self._settings_disabled:
+            return "disabled_in_settings", item
+        if name in self._disabled:
+            return "disabled_next_session", item
+        if any(candidate.manifest.name == name for candidate in self.disabled_inventory):
+            return "enabled_next_session", item
+        if isinstance(item, PendingExtension):
+            return "pending", item
+        return "loaded", item
+
+    def _disabled_directory(self, *, create: bool) -> Path | None:
+        directory = self.home / "extensions-disabled"
+        try:
+            mode = directory.lstat().st_mode
+        except FileNotFoundError:
+            if not create:
+                return None
+            directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            mode = directory.lstat().st_mode
+        if directory.is_symlink() or not stat.S_ISDIR(mode):
+            raise OSError("extensions-disabled must be a real directory")
+        os.chmod(directory, 0o700)
+        return directory
 
     def loaded_declarations(self, name: str) -> tuple[_CommandDeclaration, ...]:
         return self._command_declarations.get(name, ())

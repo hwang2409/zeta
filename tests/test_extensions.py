@@ -9,7 +9,6 @@ behavior tests, not fail-first regression tests.
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -364,11 +363,13 @@ def activate(zx):
             slash_lock = SlashLock()
         assert await registry.dispatch_async(Session(), "/fail") == "extension command failed: boom"
         assert "extension commands" in (await registry.dispatch_async(Session(), "/ext disable commands"))
-        assert (home / "extensions-state.json").read_text() == '{"disabled":["commands"]}\n'
-        assert (home / "extensions-state.json").stat().st_mode & 0o777 == 0o600
-        assert (await registry.dispatch_async(Session(), "/ext info commands")).startswith("commands 0.1.0")
+        marker = home / "extensions-disabled" / "commands"
+        assert marker.is_file()
+        assert marker.stat().st_mode & 0o777 == 0o600
+        assert "disabled (next session)" in await registry.dispatch_async(Session(), "/ext info commands")
         await asyncio.to_thread(host.persist_disabled, "commands", True)
-        assert json.loads((home / "extensions-state.json").read_text())["disabled"] == []
+        assert not marker.exists()
+        assert (await registry.dispatch_async(Session(), "/ext info commands")).startswith("commands 0.1.0")
 
 
 @pytest.mark.asyncio
@@ -386,9 +387,14 @@ async def test_extension_disabled_sources_and_round_trip(tmp_path: Path) -> None
             slash_lock = SlashLock()
         assert "settings.toml" in await registry.dispatch_async(Session(), "/ext enable settings-off")
         await registry.dispatch_async(Session(), "/ext disable active")
-        state = json.loads((home / "extensions-state.json").read_text())
-        assert state["disabled"] == ["active"]
+        marker = home / "extensions-disabled" / "active"
+        assert marker.is_file()
         assert "disabled (next session)" in await registry.dispatch_async(Session(), "/ext info active")
+        next_host = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names,
+                                     disabled=("settings-off",))
+        next_registry = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=next_host)
+        await next_registry.dispatch_async(Session(), "/ext enable active")
+        assert "enabled (next session)" in await next_registry.dispatch_async(Session(), "/ext info active")
 
 
 @pytest.mark.asyncio
@@ -418,3 +424,22 @@ def activate(zx):
         assert await tui.dispatch_async(Session(), "/greet world") == "hello world"
         assert await serve.dispatch_async(Session(), "/greet serve") == "hello serve"
         assert "commands" in (await serve.dispatch_async(Session(), "/ext info commands"))
+
+
+@pytest.mark.asyncio
+async def test_disabled_markers_keep_overlapping_hosts_changes(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_extension(home / "extensions", "first")
+    _write_extension(home / "extensions", "second")
+    async with _open_registry(tmp_path) as tools:
+        host_a = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names)
+        host_b = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names)
+        await asyncio.gather(
+            asyncio.to_thread(host_a.persist_disabled, "first", False),
+            asyncio.to_thread(host_b.persist_disabled, "second", False),
+        )
+        assert (home / "extensions-disabled" / "first").exists()
+        assert (home / "extensions-disabled" / "second").exists()
+        await asyncio.to_thread(host_a.persist_disabled, "first", True)
+        assert not (home / "extensions-disabled" / "first").exists()
+        assert (home / "extensions-disabled" / "second").exists()

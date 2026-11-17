@@ -93,33 +93,40 @@ async def _run_ext(host: ExtensionHost, args: str) -> str:
 async def _ext_list(host: ExtensionHost, name: str) -> str:
     if name:
         return "usage: /ext [list|info|enable|disable] [name]"
-    rows = [
-        f"{item.name} {item.version} ({item.scope})"
-        + (" disabled (next session)" if item.name in host.disabled else "")
-        for item in host.loaded
-    ]
-    rows.extend(f"{item.manifest.name} (disabled next session)" for item in host.disabled_inventory)
-    rows.extend(f"{item.manifest.name} (pending trust)" for item in host.pending_project)
+    names = {item.name for item in host.loaded}
+    names.update(item.manifest.name for item in host.disabled_inventory)
+    names.update(item.manifest.name for item in host.pending_project)
+    rows = [_status_line(host, extension_name) for extension_name in sorted(names)]
     return "\n".join(rows) or "no extensions loaded"
 
 
+def _status_line(host: ExtensionHost, name: str) -> str:
+    state, item = host.status(name)
+    if item is None:
+        return f"{name} not found"
+    manifest = item.manifest if hasattr(item, "manifest") else None
+    version = item.version if manifest is None else manifest.version
+    scope = item.scope if manifest is None else "project"
+    suffix = {
+        "disabled_in_settings": " disabled in settings",
+        "disabled_next_session": " disabled (next session)",
+        "enabled_next_session": " enabled (next session)",
+        "pending": " pending trust",
+    }.get(state, "")
+    return f"{name} {version} ({scope}){suffix}"
+
+
 async def _ext_info(host: ExtensionHost, name: str) -> str:
-    item = next((item for item in host.loaded if item.name == name), None)
-    if item is not None:
-        if item.name in host.disabled:
-            return f"{item.name} {item.version} ({item.scope}) disabled (next session)"
-        return (
-            f"{item.name} {item.version} ({item.scope})\n"
-            f"tools: {', '.join(item.tool_names) or 'none'}\n"
-            f"commands: {', '.join(item.command_names) or 'none'}"
-        )
-    disabled = next((item for item in host.disabled_inventory if item.manifest.name == name), None)
-    if disabled is not None:
-        return f"{name} {disabled.manifest.version} disabled (next session)"
-    pending = next((item for item in host.pending_project if item.manifest.name == name), None)
-    if pending is not None:
-        return f"{name} {pending.manifest.version} (project) pending trust"
-    return f"extension not found: {name}"
+    state, item = host.status(name)
+    if item is None:
+        return f"extension not found: {name}"
+    if state != "loaded":
+        return _status_line(host, name)
+    return (
+        f"{item.name} {item.version} ({item.scope})\n"
+        f"tools: {', '.join(item.tool_names) or 'none'}\n"
+        f"commands: {', '.join(item.command_names) or 'none'}"
+    )
 
 
 async def _ext_enable(host: ExtensionHost, name: str) -> str:
