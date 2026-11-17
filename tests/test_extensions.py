@@ -182,7 +182,7 @@ def activate(zx):
     try:
         await app.run(resume_ui=True)
         await asyncio.sleep(0)
-        assert any("notify-ext: activation notice" in value for value in rendered)
+        assert rendered == ["notify-ext: activation notice"]
     finally:
         await registry.close()
 
