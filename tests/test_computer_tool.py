@@ -524,6 +524,20 @@ def test_plan_2_project_settings_cannot_enable_or_broaden(tmp_path: Path) -> Non
     assert settings.computer.default_app_access == "deny"
 
 
+@pytest.mark.parametrize("value", ["[]", "{}"])
+def test_invalid_whole_computer_setting_falls_back_to_deny(
+    tmp_path: Path, value: str
+) -> None:
+    home = tmp_path / "home"
+    _write_settings(
+        home,
+        f"[computer]\nenabled = true\ndefault_app_access = {value}\n",
+    )
+    loaded = load_settings(home=home)
+    assert loaded.settings.computer.default_app_access == "deny"
+    assert any("default_app_access" in notice for notice in loaded.notices)
+
+
 def test_whole_computer_setting_is_honored_and_default_stays_deny(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_settings(home, "[computer]\nenabled = true\ndefault_app_access = \"allow\"\n")

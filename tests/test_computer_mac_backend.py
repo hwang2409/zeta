@@ -75,11 +75,16 @@ async def test_composition_closes_helper_on_session_shutdown(
 
 
 @pytest.mark.asyncio
-async def test_status_names_empty_allow_list_with_working_settings_lines(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("default, expected", [("deny", "the allow-list is empty"), ("allow", "default app access=allow")])
+async def test_status_reports_effective_empty_allow_list_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, default: str, expected: str
 ) -> None:
     monkeypatch.setattr(mac_module, "make_mac_backend", lambda _config=None: None)
-    runtime = await asyncio.to_thread(_compose, tmp_path, ComputerUseConfig(enabled=True))
+    runtime = await asyncio.to_thread(
+        _compose,
+        tmp_path,
+        ComputerUseConfig(enabled=True, default_app_access=default),
+    )
     try:
         loop = runtime.loop
         snapshot = capture_slash_status(
@@ -110,8 +115,10 @@ async def test_status_names_empty_allow_list_with_working_settings_lines(
         await close_session(runtime.loop)
     assert result["kind"] == "output"
     for text in (tui_text, result["text"]):
-        assert "computer: enabled, allowed app count=0; the allow-list is empty" in text
-        assert '[computer.macos.bundle_ids]\n"com.apple.Safari" = "allow"' in text
+        assert f"computer: enabled, allowed app count=0" in text
+        assert expected in text
+        if default == "deny":
+            assert '[computer.macos.bundle_ids]\n"com.apple.Safari" = "allow"' in text
 
 
 @pytest.mark.asyncio

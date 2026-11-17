@@ -85,7 +85,12 @@ def capture_slash_status(
             ),
             computer_enabled=computer.enabled,
             computer_allowed_apps=len(computer.bundle_ids),
-            computer_empty_allow_list=computer.enabled and not computer.bundle_ids,
+            computer_default_app_access=computer.default_app_access,
+            computer_empty_allow_list=(
+                computer.enabled
+                and computer.default_app_access == "deny"
+                and not computer.bundle_ids
+            ),
             unavailable_accounts=(
                 context.unavailable_accounts
                 if (context := getattr(loop, "account_context", None)) is not None
