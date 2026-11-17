@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 
 from ..core.abort import AbortSignal
 from ..core.approval import (
     ApprovalCapability,
     ApprovalDecision,
+    ApprovalOrigin,
     ApprovalPolicy,
     canceled_result,
 )
@@ -19,6 +20,17 @@ ApprovalHook = Callable[
     [str, dict[str, object]], bool | str | Awaitable[bool | str] | None
 ]
 AdvanceGeneration = Callable[[AbortSignal], AbortSignal]
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalGateResult:
+    result: ToolResult | None
+    signal: AbortSignal
+    origin: ApprovalOrigin
+
+    def __iter__(self) -> Iterator[object]:
+        yield self.result
+        yield self.signal
 
 
 @dataclass(slots=True)
@@ -40,8 +52,14 @@ class ApprovalGate:
         persist_request: bool = True,
         execution_token: str | None = None,
         capability: ApprovalCapability,
-    ) -> tuple[ToolResult | None, AbortSignal]:
+    ) -> ApprovalGateResult:
         execution_signal = signal
+        approval_origin: ApprovalOrigin = "automatic"
+
+        def done(result: ToolResult | None, signal: AbortSignal | None = None) -> ApprovalGateResult:
+            return ApprovalGateResult(
+                result, execution_signal if signal is None else signal, approval_origin
+            )
         if self.policy is not None and not skip_approval:
             # Ephemeral (inline-shell) approvals are never durable rows, so they
             # need no store read here, which keeps the submission-to-registration
@@ -64,7 +82,9 @@ class ApprovalGate:
                     lifecycle("approval_start")
 
             try:
-                authorize = self.policy.authorize
+                authorize = getattr(
+                    self.policy, "authorize_with_origin", self.policy.authorize
+                )
                 parameters = inspect.signature(authorize).parameters
                 kwargs: dict[str, object] = {}
                 if not persist_request and "persist_request" in parameters:
@@ -73,11 +93,16 @@ class ApprovalGate:
                     kwargs["execution_token"] = execution_token
                 if capability is not None and "capability" in parameters:
                     kwargs["capability"] = capability
-                decision = await authorize(tool_call, signal, **kwargs)
+                outcome = await authorize(tool_call, signal, **kwargs)
+                if hasattr(outcome, "decision"):
+                    decision = outcome.decision
+                    approval_origin = outcome.origin
+                else:
+                    decision = outcome
             except Exception as exc:  # noqa: BLE001 - report approval failures
-                return ToolResult(
+                return done(ToolResult(
                     tool_call.id, f"approval failed: {exc}", True
-                ), execution_signal
+                ))
             finally:
                 if approval_started:
                     if lifecycle is not None:
@@ -85,18 +110,18 @@ class ApprovalGate:
                     if slot_acquired:
                         self.policy.release_approval_slot()
             if decision is None:
-                return canceled_result(tool_call.id), execution_signal
+                return done(canceled_result(tool_call.id))
             if signal.is_set():
                 durable_decision = await self.policy.durable_decision(tool_call.id)
                 if durable_decision == ApprovalDecision.DENY.value:
-                    return ToolResult(
+                    return done(ToolResult(
                         tool_call.id, "tool execution denied", True
-                    ), execution_signal
+                    ))
                 if durable_decision != ApprovalDecision.ALLOW.value:
-                    return canceled_result(tool_call.id), execution_signal
+                    return done(canceled_result(tool_call.id))
                 execution_signal = advance_generation(signal)
                 if execution_signal.is_set():
-                    return canceled_result(tool_call.id), execution_signal
+                    return done(canceled_result(tool_call.id))
             if decision is ApprovalDecision.DENY:
                 message = "tool execution denied"
                 denial_reason = getattr(self.policy, "denial_reason", None)
@@ -104,25 +129,25 @@ class ApprovalGate:
                     reason = denial_reason(tool_call.id)
                     if reason:
                         message = f"{message}: {reason}"
-                return ToolResult(tool_call.id, message, True), execution_signal
+                return done(ToolResult(tool_call.id, message, True))
         if self.hook is None:
             if signal.is_set() and execution_signal is signal:
-                return canceled_result(tool_call.id), execution_signal
-            return None, execution_signal
+                return done(canceled_result(tool_call.id))
+            return done(None)
         try:
             allowed = self.hook(tool_call.name, arguments)
             if inspect.isawaitable(allowed):
                 allowed = await allowed
         except Exception as exc:  # noqa: BLE001 - report hook failures
-            return ToolResult(
+            return done(ToolResult(
                 tool_call.id, f"pre-execution hook failed: {exc}", True
-            ), execution_signal
+            ))
         if isinstance(allowed, str):
-            return ToolResult(tool_call.id, allowed, True), execution_signal
+            return done(ToolResult(tool_call.id, allowed, True))
         if allowed is False:
-            return ToolResult(
+            return done(ToolResult(
                 tool_call.id, "tool execution denied by hook", True
-            ), execution_signal
+            ))
         if signal.is_set() and execution_signal is signal:
-            return canceled_result(tool_call.id), execution_signal
-        return None, execution_signal
+            return done(canceled_result(tool_call.id))
+        return done(None)

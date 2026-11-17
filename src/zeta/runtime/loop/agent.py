@@ -608,7 +608,7 @@ class AgentLoop(
         if not prepared:
             self.tool_registry.start_batch()
         abort_signal = self.tool_registry.abort_signal
-        def lifecycle(kind: str) -> None:
+        def lifecycle(kind: str, data: dict[str, object] | None = None) -> None:
             if event_sink is None:
                 return
             event_type = {
@@ -617,7 +617,13 @@ class AgentLoop(
                 "execution_start": StreamEventType.TOOL_EXECUTION_START,
             }.get(kind)
             if event_type is not None:
-                event_sink(StreamEvent(event_type, tool_call=tool_call))
+                event_sink(
+                    StreamEvent(
+                        event_type,
+                        tool_call=tool_call,
+                        data={} if data is None else data,
+                    )
+                )
         try:
             result = await self.tool_registry.execute(
                 tool_call,

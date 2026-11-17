@@ -84,6 +84,7 @@ _HISTORY_ROW_FEATURES = (
     "content_read",
     "served_turn_end",
     "child_runs",
+    "approval_origin",
 )
 
 
@@ -94,6 +95,7 @@ def _history_feature_key(
     content_read: bool,
     served_turn_end: bool,
     child_runs: bool,
+    approval_origin: bool = False,
 ) -> tuple[bool, ...]:
     values = locals()
     return tuple(values[name] for name in _HISTORY_ROW_FEATURES)
@@ -123,6 +125,7 @@ def _cache(
     content_read: bool,
     served_turn_end: bool,
     child_runs: bool = False,
+    approval_origin: bool = False,
 ) -> _CachedProjection | None:
     cache = getattr(store, "_serve_history_projections", {})
     return cache.get(
@@ -132,6 +135,7 @@ def _cache(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
+            approval_origin=approval_origin,
         )
     )
 
@@ -145,6 +149,7 @@ def _publish_cache(
     served_turn_end: bool,
     cached: _CachedProjection,
     child_runs: bool = False,
+    approval_origin: bool = False,
 ) -> None:
     cache = getattr(store, "_serve_history_projections", None)
     if cache is None:
@@ -157,6 +162,7 @@ def _publish_cache(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
+            approval_origin=approval_origin,
         )
     ] = cached
 
@@ -279,6 +285,7 @@ def history_projection(
     content_read: bool = False,
     served_turn_end: bool = False,
     child_runs: bool = False,
+    approval_origin: bool = False,
 ) -> HistoryProjection:
     """Return one immutable wire projection for the store's generation."""
     cached = _cache(
@@ -390,6 +397,7 @@ def history_projection(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
+            approval_origin=approval_origin,
         )
         if cached is None or cached.generation != generation or cached.closed != closed:
             _publish_cache(
@@ -399,6 +407,7 @@ def history_projection(
                 content_read=content_read,
                 served_turn_end=served_turn_end,
                 child_runs=child_runs,
+            approval_origin=approval_origin,
                 cached=_CachedProjection(generation, built, closed),
             )
             return built
@@ -459,6 +468,7 @@ def _history_entry_rows(
     include_delivery_id: bool = False,
     fidelity: bool = False,
     content_read: bool = False,
+    approval_origin: bool = False,
 ) -> list[dict[str, object]]:
     """Project one durable entry to one atomic group of history rows."""
 
@@ -550,6 +560,13 @@ def _history_entry_rows(
                         "id": call["id"],
                         "name": call["name"],
                         **_project_tool_call_arguments(call, fidelity=fidelity),
+                        **(
+                            {"approval_origin": message.get("metadata", {}).get("zeta.approval_origin")}
+                            if approval_origin
+                            and message.get("metadata", {}).get("zeta.approval_origin")
+                            in {"automatic", "user"}
+                            else {}
+                        ),
                     },
                 }
             )
@@ -663,6 +680,7 @@ def _history_group(
     include_delivery_id: bool,
     fidelity: bool,
     content_read: bool,
+    approval_origin: bool,
     backward: bool,
     validator: dict[str, object] | None,
 ) -> tuple[tuple[dict[str, object], ...], int, tuple[dict[str, object], ...], int]:
@@ -675,6 +693,7 @@ def _history_group(
             include_delivery_id=include_delivery_id,
             fidelity=fidelity,
             content_read=content_read,
+            approval_origin=approval_origin,
         )
     ]
     forward, forward_size = _project_history_group(raw, {"next_offset": end})
@@ -703,6 +722,7 @@ def _history_group_fits(
     include_delivery_id: bool = False,
     fidelity: bool = False,
     content_read: bool = False,
+    approval_origin: bool = False,
 ) -> tuple[bool, tuple[dict[str, object], ...], int]:
     candidate = body_size + int(bool(rows and group)) + size
     kwargs = (
@@ -727,6 +747,7 @@ def _history_group_fits(
             include_delivery_id=include_delivery_id,
             fidelity=fidelity,
             content_read=content_read,
+            approval_origin=approval_origin,
         )
     ]
     group, size = _project_history_group(raw, kwargs)

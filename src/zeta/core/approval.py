@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import inspect
 import os
 import stat
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -30,10 +31,19 @@ def child_instance_in_subtree(candidate: str, root: str) -> bool:
     return candidate == root or candidate.startswith(f"{root}:")
 
 
+ApprovalOrigin = Literal["automatic", "user"]
+
+
 class ApprovalDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
     ASK = "ask"
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationOutcome:
+    decision: ApprovalDecision | None
+    origin: ApprovalOrigin
 
 
 @dataclass(frozen=True, slots=True)
@@ -1188,6 +1198,29 @@ class ApprovalPolicy(ApprovalAbortPolicy):
             abort_or_winner=lambda: self._resolve_abort_or_winner(
                 tool_call.id, capability=capability
             ),
+        )
+
+    async def authorize_with_origin(
+        self,
+        tool_call: ToolCall,
+        abort_signal: _AbortSignal,
+        *,
+        persist_request: bool = True,
+        execution_token: str | None = None,
+        capability: ApprovalCapability,
+    ) -> AuthorizationOutcome:
+        state = self._require_store().approval_state_now(tool_call.id)
+        asked = state is not None or self.decide(capability) is ApprovalDecision.ASK
+        parameters = inspect.signature(self.authorize).parameters
+        kwargs: dict[str, object] = {}
+        if "persist_request" in parameters:
+            kwargs["persist_request"] = persist_request
+        if "capability" in parameters:
+            kwargs["capability"] = capability
+        decision = await self.authorize(tool_call, abort_signal, **kwargs)
+        return AuthorizationOutcome(
+            decision,
+            "user" if asked else "automatic",
         )
 
     def forget_ephemeral(self, request_id: str) -> None:

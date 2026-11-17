@@ -855,13 +855,27 @@ def finalize_agent_results(
         if foreground_child is not None and result.is_canceled:
             # the lifecycle is final before the parent installs the receipt
             foreground_child.mark_agent_canceled(call.id)
-        receipt = owner.store.append_message(
-            Message(
-                MessageRole.TOOL_RESULT,
-                [TextContent(result.content)],
-                tool_result=result,
-            )
+        approval_origin = None
+        registry = getattr(owner, "tool_registry", None)
+        if registry is not None:
+            approval_origin = registry.peek_approval_origin(call.id)
+        metadata = (
+            {"zeta.approval_origin": approval_origin}
+            if approval_origin is not None
+            else {}
         )
+        try:
+            receipt = owner.store.append_message(
+                Message(
+                    MessageRole.TOOL_RESULT,
+                    [TextContent(result.content)],
+                    tool_result=result,
+                    metadata=metadata,
+                )
+            )
+        finally:
+            if registry is not None:
+                registry.take_approval_origin(call.id)
         if foreground_child is not None:
             handle = foreground_child.agent_handle()
             if handle is not None:

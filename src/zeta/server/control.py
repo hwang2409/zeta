@@ -1220,7 +1220,11 @@ class ServeControl:
             await self._notify(
                 wire_event,
                 session_id,
-                **event_contract.tool_start(event, fidelity=fidelity),
+                **event_contract.tool_start(
+                    event,
+                    fidelity=fidelity,
+                    approval_origin="tool_approval_origin" in controller.features,
+                ),
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_END:
