@@ -8793,7 +8793,9 @@ async def test_extension_first_paint_handler_is_removed_before_paint_exit(
             release.set()
             if not run_task.done():
                 run_task.cancel()
-                await asyncio.gather(run_task, return_exceptions=True)
+                await asyncio.wait_for(
+                    asyncio.gather(run_task, return_exceptions=True), 10
+                )
 
         assert tuple(session.app.after_render._handlers) == handlers_before
         assert host.binds == []
