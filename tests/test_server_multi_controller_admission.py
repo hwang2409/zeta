@@ -789,12 +789,12 @@ async def test_target_is_reserved_before_one_awaited_open(
         )
         await await_or_fail(entered.wait(), what="target open entered")
         refused = await second.request(3, "resume", {"session_id": target_id})
+        assert opens == 1, "a conflicting controller opened the reserved target"
         assert refused["error"] == {
             "code": -32014,
             "message": "session is controlled by another client",
             "data": {"code": "session_controlled", "session_id": target_id},
         }
-        assert opens == 1, "a conflicting controller opened the reserved target"
         ping = await second.request(4, "ping", {})
         assert "result" in ping
         release.set()
