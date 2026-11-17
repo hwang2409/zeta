@@ -143,7 +143,10 @@ class SessionControllers:
                     ErrorDescriptor.CONNECTION_CAPACITY,
                     "another client is already connected",
                 )
-            if requested == "multi" and reconnect_session_id != self._grace_session_id:
+            if requested == "multi" and (
+                reconnect_session_id is None
+                or reconnect_session_id != self._grace_session_id
+            ):
                 raise ProtocolError(
                     ErrorDescriptor.CONNECTION_CAPACITY,
                     "another client is already connected",
