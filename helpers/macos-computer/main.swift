@@ -72,12 +72,11 @@ final class Flag {
 
     var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
 
-    func withReplyDecision<T>(_ body: () throws -> T) throws -> T {
+    // The reply commit is the linearization point. stdout is written after this lock is released.
+    func commitReply() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        if value { throw HelperError.killed }
-        // linearization point: the kill flag is held through reply publication.
-        return try body()
+        return !value
     }
 }
 
@@ -234,18 +233,64 @@ func mouseButton(_ name: String) throws -> (down: CGEventType, up: CGEventType, 
     }
 }
 
-func postMouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, clickState: Int = 1) {
-    guard
-        let event = CGEvent(
-            mouseEventSource: eventSource, mouseType: type, mouseCursorPosition: point,
-            mouseButton: button)
-    else { return }
-    if clickState > 1 { event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState)) }
-    event.post(tap: .cghidEventTap)
+final class EventGate {
+    private let lock = NSLock()
+    private let killed: Flag
+    private let poster: (CGEvent) -> Void
+    private var held: Set<CGMouseButton> = []
+    private var cursor = CGPoint.zero
+
+    init(killed: Flag, poster: @escaping (CGEvent) -> Void) {
+        self.killed = killed
+        self.poster = poster
+    }
+
+    func post(_ event: CGEvent, type: CGEventType, point: CGPoint, button: CGMouseButton) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !killed.isSet else { throw HelperError.killed }
+        poster(event)
+        if type == .mouseMoved || type == .leftMouseDown || type == .leftMouseDragged ||
+            type == .leftMouseUp || type == .rightMouseDown || type == .rightMouseDragged ||
+            type == .rightMouseUp || type == .otherMouseDown || type == .otherMouseDragged ||
+            type == .otherMouseUp || type == .scrollWheel {
+            cursor = point
+        }
+        if type == .leftMouseDown || type == .rightMouseDown || type == .otherMouseDown {
+            held.insert(button)
+        } else if type == .leftMouseUp || type == .rightMouseUp || type == .otherMouseUp {
+            held.remove(button)
+        }
+    }
+
+    func kill() {
+        lock.lock()
+        defer { lock.unlock() }
+        for button in held {
+            let type: CGEventType = button == .left ? .leftMouseUp :
+                button == .right ? .rightMouseUp : .otherMouseUp
+            if let event = CGEvent(mouseEventSource: eventSource, mouseType: type,
+                                   mouseCursorPosition: cursor, mouseButton: button) {
+                // cleanup is committed under the same lock, at the current cursor position.
+                poster(event)
+            }
+        }
+        held.removeAll()
+    }
 }
 
-func moveMouse(_ point: CGPoint) {
-    postMouse(.mouseMoved, point, .left)
+var eventGate = EventGate(killed: killed) { $0.post(tap: .cghidEventTap) }
+killed.observe { eventGate.kill() }
+
+func postMouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, clickState: Int = 1) throws {
+    guard let event = CGEvent(mouseEventSource: eventSource, mouseType: type,
+                              mouseCursorPosition: point, mouseButton: button) else { return }
+    if clickState > 1 { event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState)) }
+    try eventGate.post(event, type: type, point: point, button: button)
+}
+
+func moveMouse(_ point: CGPoint) throws {
+    try postMouse(.mouseMoved, point, .left)
 }
 
 func checkKilled(_ source: Flag = killed) throws {
@@ -253,11 +298,11 @@ func checkKilled(_ source: Flag = killed) throws {
 }
 
 func runInterruptibleSteps<Step>(
-    _ steps: some Sequence<Step>, killSource: Flag, post: (Step) -> Void
+    _ steps: some Sequence<Step>, killSource: Flag, post: (Step) throws -> Void
 ) throws {
     for step in steps {
         try checkKilled(killSource)
-        post(step)
+        try post(step)
     }
 }
 
@@ -265,34 +310,36 @@ func click(_ point: CGPoint, button name: String, count: Int) throws {
     let b = try mouseButton(name)
     let n = max(1, min(count, 3))
     try runInterruptibleSteps(1...n, killSource: killed) { i in
-        postMouse(b.down, point, b.button, clickState: i)
-        postMouse(b.up, point, b.button, clickState: i)
+        try postMouse(b.down, point, b.button, clickState: i)
+        try postMouse(b.up, point, b.button, clickState: i)
     }
 }
 
-func drag(_ path: [CGPoint]) throws {
+func drag(_ path: [CGPoint], killSource: Flag = killed) throws {
     guard let start = path.first else { throw HelperError.badRequest("drag path is empty") }
-    try checkKilled()
-    postMouse(.leftMouseDown, start, .left)
-    defer { postMouse(.leftMouseUp, path.last ?? start, .left) }
-    try runInterruptibleSteps(path.dropFirst(), killSource: killed) { point in
-        postMouse(.leftMouseDragged, point, .left)
+    try checkKilled(killSource)
+    try postMouse(.leftMouseDown, start, .left)
+    var lastPostedPoint = start
+    defer { try? postMouse(.leftMouseUp, lastPostedPoint, .left) }
+    try runInterruptibleSteps(path.dropFirst(), killSource: killSource) { point in
+        try postMouse(.leftMouseDragged, point, .left)
+        lastPostedPoint = point
     }
-    try checkKilled()
+    try checkKilled(killSource)
 }
 
-func scroll(at point: CGPoint, dx: Int, dy: Int) {
-    moveMouse(point)
+func scroll(at point: CGPoint, dx: Int, dy: Int) throws {
+    try moveMouse(point)
     guard
         let event = CGEvent(
             scrollWheelEvent2Source: eventSource, units: .pixel, wheelCount: 2, wheel1: Int32(dy),
             wheel2: Int32(dx), wheel3: 0)
     else { return }
-    event.post(tap: .cghidEventTap)
+    try eventGate.post(event, type: .scrollWheel, point: point, button: .left)
 }
 
-func typeText(_ text: String) throws {
-    try runInterruptibleSteps(Array(text), killSource: killed) { ch in
+func typeText(_ text: String, killSource: Flag = killed) throws {
+    try runInterruptibleSteps(Array(text), killSource: killSource) { ch in
         var utf16 = Array(String(ch).utf16)
         guard
             let down = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true),
@@ -300,8 +347,8 @@ func typeText(_ text: String) throws {
         else { return }
         down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
         up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        try eventGate.post(down, type: .keyDown, point: .zero, button: .left)
+        try eventGate.post(up, type: .keyUp, point: .zero, button: .left)
     }
 }
 
@@ -348,8 +395,8 @@ func keyCombo(_ combo: String) throws {
     else { throw HelperError.internalError("could not create key event") }
     down.flags = flags
     up.flags = flags
-    down.post(tap: .cghidEventTap)
-    up.post(tap: .cghidEventTap)
+    try eventGate.post(down, type: .keyDown, point: .zero, button: .left)
+    try eventGate.post(up, type: .keyUp, point: .zero, button: .left)
 }
 
 // MARK: - request handling
@@ -403,7 +450,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         ]
     case "move":
         try guardInput()
-        moveMouse(try pointArg(req))
+        try moveMouse(try pointArg(req))
         return [:]
     case "click":
         try guardInput()
@@ -414,12 +461,12 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
     case "mouse_down":
         try guardInput()
         let b = try mouseButton((req["button"] as? String) ?? "left")
-        postMouse(b.down, try pointArg(req), b.button)
+        try postMouse(b.down, try pointArg(req), b.button)
         return [:]
     case "mouse_up":
         try guardInput()
         let b = try mouseButton((req["button"] as? String) ?? "left")
-        postMouse(b.up, try pointArg(req), b.button)
+        try postMouse(b.up, try pointArg(req), b.button)
         return [:]
     case "drag":
         try guardInput()
@@ -453,7 +500,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         return [:]
     case "scroll":
         try guardInput()
-        scroll(at: try pointArg(req), dx: try intArg(req, "dx"), dy: try intArg(req, "dy"))
+        try scroll(at: try pointArg(req), dx: try intArg(req, "dx"), dy: try intArg(req, "dy"))
         return [:]
     default:
         throw HelperError.badRequest("unknown op: \(op)")
@@ -535,7 +582,7 @@ func selfTestKill() {
         case .success: reply = "ok"
         case .failure(let error): reply = error.code
         }
-        let laterReply = (try? source.withReplyDecision { "ok" }) ?? "killed"
+        let laterReply = source.commitReply() ? "ok" : "killed"
         print((try? JSONSerialization.data(withJSONObject: ["name": name, "events": events, "reply": reply, "later_reply": laterReply]))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
     }
@@ -549,7 +596,7 @@ func selfTestKill() {
             dragEvents.append("drag_\(step)")
             if step == 1 { dragKill.set() }
         }
-        try dragKill.withReplyDecision { () }
+        guard dragKill.commitReply() else { throw HelperError.killed }
     } catch { dragResult = .failure((error as? HelperError) ?? .internalError("self-test failed")) }
     emit("drag", dragEvents, dragResult, dragKill)
 
@@ -561,7 +608,7 @@ func selfTestKill() {
             typeEvents.append(character)
             if character == "a" { typeKill.set() }
         }
-        try typeKill.withReplyDecision { () }
+        guard typeKill.commitReply() else { throw HelperError.killed }
     } catch { typeResult = .failure((error as? HelperError) ?? .internalError("self-test failed")) }
     emit("type", typeEvents, typeResult, typeKill)
 
@@ -573,7 +620,7 @@ func selfTestKill() {
             lastEvents.append("last")
             lastKill.set()
         }
-        try lastKill.withReplyDecision { () }
+        guard lastKill.commitReply() else { throw HelperError.killed }
     } catch { lastResult = .failure((error as? HelperError) ?? .internalError("self-test failed")) }
     emit("kill_after_last_step", lastEvents, lastResult, lastKill)
 }
@@ -615,10 +662,10 @@ Thread {
                 var payload = try handle(op, req)
                 payload["id"] = id
                 payload["ok"] = true
-                do {
-                    try killed.withReplyDecision { writeResponse(payload) }
-                } catch {
-                    writeResponse(errorResponse(id, error))
+                if killed.commitReply() {
+                    writeResponse(payload)
+                } else {
+                    writeResponse(errorResponse(id, HelperError.killed))
                 }
             } catch {
                 writeResponse(errorResponse(id, error))
