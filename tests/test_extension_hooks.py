@@ -90,22 +90,27 @@ async def test_pre_tool_denies_and_ignores_returned_replacement() -> None:
 @pytest.mark.asyncio
 async def test_cancellation_resistant_timeout_releases_call_and_warns_again() -> None:
     release = asyncio.Event()
+    cancelled = asyncio.Event()
 
     async def ignores_cancel(_tool: str, _args: dict[str, object]) -> None:
         try:
             await asyncio.wait_for(release.wait(), 10)
         except asyncio.CancelledError:
+            cancelled.set()
             await asyncio.wait_for(release.wait(), 10)
 
     notices: list[str] = []
     extension_hook = ExtensionHook("hooks", "pre_tool", ignores_cancel, timeout_seconds=0.001)
     hook = CompositeToolHook(None, [extension_hook], notices.append, _task_owner)
     first = asyncio.create_task(hook("bash", {}))
-    assert await asyncio.wait_for(first, 10) is True
-    assert notices
-    assert await hook("bash", {}) is True
-    assert len(notices) == 2
-    release.set()
+    try:
+        await asyncio.wait_for(cancelled.wait(), 10)
+        assert first.done()
+        assert notices
+        assert await hook("bash", {}) is True
+        assert len(notices) == 2
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio
