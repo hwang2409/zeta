@@ -41,7 +41,9 @@ def test_indicator_lifecycle_and_interruptible_steps_are_present() -> None:
     assert 'Thread {' in source
     assert 'app.run()' in source
     assert 'runInterruptibleSteps(path.dropFirst()' in source
-    assert 'try checkKilled()' in source
+    assert 'try checkKilled(currentKill())' in source
+    assert 'final class EventGate' in source
+    assert 'commitReply()' in source
     assert 'runInterruptibleSteps(Array(text)' in source
 
 
@@ -73,11 +75,15 @@ def test_selftest_kill_interrupts_steps_and_releases_drag() -> None:
         "name": "drag", "events": ["mouse_down", "drag_1", "mouse_up"],
         "reply": "killed", "later_reply": "killed"
     }
-    assert results["type"]["events"] == ["a"]
-    assert results["type"]["reply"] == "killed"
-    assert results["type"]["later_reply"] == "killed"
+    assert results["type"] == {
+        "name": "type", "events": ["key_down"], "reply": "killed", "later_reply": "killed"
+    }
+    assert results["mouse_down"]["events"] == ["mouse_down"]
+    assert results["mouse_down"]["later_reply"] == "killed"
     assert results["kill_after_last_step"]["reply"] == "killed"
     assert results["kill_after_last_step"]["later_reply"] == "killed"
+    assert results["kill_after_commit"]["reply"] == "ok"
+    assert results["kill_after_commit"]["later_reply"] == "ok"
 
 
 def test_helper_exits_when_stdin_reaches_eof() -> None:

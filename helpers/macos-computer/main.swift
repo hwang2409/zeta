@@ -93,7 +93,7 @@ func killCallback(
             && flags.contains(.maskAlternate)
             && flags.contains(.maskCommand)
         {
-            killed.set()
+            activeKill.set()
         }
     }
     return Unmanaged.passUnretained(event)
@@ -280,7 +280,9 @@ final class EventGate {
 }
 
 var eventGate = EventGate(killed: killed) { $0.post(tap: .cghidEventTap) }
-killed.observe { eventGate.kill() }
+var activeKill = killed
+killed.observe { DispatchQueue.global().async { eventGate.kill() } }
+func currentKill() -> Flag { activeKill }
 
 func postMouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, clickState: Int = 1) throws {
     guard let event = CGEvent(mouseEventSource: eventSource, mouseType: type,
@@ -309,13 +311,14 @@ func runInterruptibleSteps<Step>(
 func click(_ point: CGPoint, button name: String, count: Int) throws {
     let b = try mouseButton(name)
     let n = max(1, min(count, 3))
-    try runInterruptibleSteps(1...n, killSource: killed) { i in
+    try runInterruptibleSteps(1...n, killSource: currentKill()) { i in
         try postMouse(b.down, point, b.button, clickState: i)
         try postMouse(b.up, point, b.button, clickState: i)
     }
 }
 
-func drag(_ path: [CGPoint], killSource: Flag = killed) throws {
+func drag(_ path: [CGPoint], killSource: Flag? = nil) throws {
+    let killSource = killSource ?? currentKill()
     guard let start = path.first else { throw HelperError.badRequest("drag path is empty") }
     try checkKilled(killSource)
     try postMouse(.leftMouseDown, start, .left)
@@ -338,8 +341,8 @@ func scroll(at point: CGPoint, dx: Int, dy: Int) throws {
     try eventGate.post(event, type: .scrollWheel, point: point, button: .left)
 }
 
-func typeText(_ text: String, killSource: Flag = killed) throws {
-    try runInterruptibleSteps(Array(text), killSource: killSource) { ch in
+func typeText(_ text: String, killSource: Flag? = nil) throws {
+    try runInterruptibleSteps(Array(text), killSource: killSource ?? currentKill()) { ch in
         var utf16 = Array(String(ch).utf16)
         guard
             let down = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true),
@@ -369,7 +372,7 @@ let keyCodes: [String: CGKeyCode] = [
 ]
 
 func keyCombo(_ combo: String) throws {
-    try checkKilled()
+    try checkKilled(currentKill())
     let parts = combo.lowercased().split(separator: "+").map(String.init)
     guard !parts.isEmpty else { throw HelperError.badRequest("empty key combo") }
     var flags: CGEventFlags = []
@@ -411,7 +414,10 @@ func pointArg(_ req: [String: Any]) throws -> CGPoint {
     return CGPoint(x: Double(try intArg(req, "x")), y: Double(try intArg(req, "y")))
 }
 
+var selfTestMode = false
+
 func guardInput() throws {
+    if selfTestMode { return }
     if screenIsLocked() { throw HelperError.locked }
     if secureInputEnabled() || securityPromptFrontmost() { throw HelperError.secureInput }
     if !AXIsProcessTrusted() { throw HelperError.notPermitted("Accessibility permission is required") }
@@ -576,53 +582,61 @@ func errorResponse(_ id: Int, _ error: Error) -> [String: Any] {
 }
 
 func selfTestKill() {
-    func emit(_ name: String, _ events: [String], _ result: Result<String, HelperError>, _ source: Flag) {
-        let reply: String
-        switch result {
-        case .success: reply = "ok"
-        case .failure(let error): reply = error.code
-        }
-        let laterReply = source.commitReply() ? "ok" : "killed"
-        print((try? JSONSerialization.data(withJSONObject: ["name": name, "events": events, "reply": reply, "later_reply": laterReply]))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+    selfTestMode = true
+    let cases: [(String, String, Int)] = [
+        ("drag", "drag", 2), ("type", "type", 1), ("mouse_down", "mouse_down", 1),
+        ("kill_after_last_step", "type", 2), ("kill_after_commit", "type", 2),
+    ]
+    func triggerKill() {
+        let event = CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: true)!
+        event.flags = [.maskControl, .maskAlternate, .maskCommand]
+        _ = killCallback(proxy: OpaquePointer(bitPattern: 1)!, type: .keyDown, event: event, userInfo: nil)
     }
-
-    var dragEvents = ["mouse_down"]
-    let dragKill = Flag()
-    var dragResult: Result<String, HelperError> = .success("ok")
-    do {
-        defer { dragEvents.append("mouse_up") }
-        try runInterruptibleSteps([1, 2], killSource: dragKill) { step in
-            dragEvents.append("drag_\(step)")
-            if step == 1 { dragKill.set() }
+    for (name, op, blockAfter) in cases {
+        let flag = Flag()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let cleanup = DispatchSemaphore(value: 0)
+        var events: [String] = []
+        var posts = 0
+        let gate = EventGate(killed: flag) { event in
+            posts += 1
+            let type = event.type
+            if type == .leftMouseDown { events.append("mouse_down") }
+            else if type == .leftMouseDragged { events.append("drag_\(posts - 1)") }
+            else if type == .leftMouseUp { events.append("mouse_up"); cleanup.signal() }
+            else if type == .keyDown { events.append("key_down") }
+            if posts == blockAfter { entered.signal(); release.wait() }
         }
-        guard dragKill.commitReply() else { throw HelperError.killed }
-    } catch { dragResult = .failure((error as? HelperError) ?? .internalError("self-test failed")) }
-    emit("drag", dragEvents, dragResult, dragKill)
-
-    var typeEvents = [String]()
-    let typeKill = Flag()
-    var typeResult: Result<String, HelperError> = .success("ok")
-    do {
-        try runInterruptibleSteps(["a", "b"], killSource: typeKill) { character in
-            typeEvents.append(character)
-            if character == "a" { typeKill.set() }
+        eventGate = gate
+        activeKill = flag
+        flag.observe { DispatchQueue.global().async { gate.kill() } }
+        actionQueue.async(execute: DispatchWorkItem {
+            let req: [String: Any] = op == "drag"
+                ? ["path": [[1, 1], [2, 2], [3, 3]]]
+                : op == "mouse_down" ? ["x": 4, "y": 5, "button": "left"]
+                : ["text": "ab"]
+            let result = Result { try handle(op, req) }
+            if name == "drag" { cleanup.wait() }
+            let committed = flag.commitReply()
+            let failureCode = if case .failure(let error) = result {
+                (error as? HelperError)?.code ?? "killed"
+            } else { "ok" }
+            print((try? JSONSerialization.data(withJSONObject: [
+                "name": name, "events": events,
+                "reply": committed ? "ok" : failureCode,
+                "later_reply": flag.commitReply() ? "ok" : "killed",
+            ])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+        })
+        entered.wait()
+        if name == "kill_after_commit" {
+            release.signal(); actionQueue.sync {}
+            triggerKill()
+        } else {
+            triggerKill()
+            release.signal(); actionQueue.sync {}
         }
-        guard typeKill.commitReply() else { throw HelperError.killed }
-    } catch { typeResult = .failure((error as? HelperError) ?? .internalError("self-test failed")) }
-    emit("type", typeEvents, typeResult, typeKill)
-
-    var lastEvents = [String]()
-    let lastKill = Flag()
-    var lastResult: Result<String, HelperError> = .success("ok")
-    do {
-        try runInterruptibleSteps([1], killSource: lastKill) { _ in
-            lastEvents.append("last")
-            lastKill.set()
-        }
-        guard lastKill.commitReply() else { throw HelperError.killed }
-    } catch { lastResult = .failure((error as? HelperError) ?? .internalError("self-test failed")) }
-    emit("kill_after_last_step", lastEvents, lastResult, lastKill)
+    }
 }
 
 let app = NSApplication.shared
@@ -653,7 +667,7 @@ Thread {
             continue
         }
         actionQueue.async {
-            if killed.isSet {
+            if currentKill().isSet {
                 writeResponse(errorResponse(id, HelperError.killed))
                 return
             }
