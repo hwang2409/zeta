@@ -134,6 +134,8 @@ class ParkedPairs:
 
         async def close() -> None:
             try:
+                if control.runtime.extensions is not None:
+                    await control.runtime.extensions.aclose()
                 try:
                     await control.close()
                 finally:

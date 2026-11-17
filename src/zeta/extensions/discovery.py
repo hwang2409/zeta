@@ -166,18 +166,20 @@ def _load_one(
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
-        return
-    if inspect.isawaitable(result):
-        if inspect.iscoroutine(result):
-            result.close()
-        host.remove_package_for_directory(directory)
-        error = "activate must be synchronous"
-        host.record_error(manifest.name, manifest.version, scope, error)
-        host.notices.append(
-            f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
-        )
-        return
-    host.commit(loading)
+    else:
+        if inspect.isawaitable(result):
+            if inspect.iscoroutine(result):
+                result.close()
+            host.remove_package_for_directory(directory)
+            error = "activate must be synchronous"
+            host.record_error(manifest.name, manifest.version, scope, error)
+            host.notices.append(
+                f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
+            )
+            return
+        host.commit(loading)
+    finally:
+        api.detach_activation()
 
 
 def _import_entry(

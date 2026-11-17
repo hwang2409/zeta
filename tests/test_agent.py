@@ -58,6 +58,7 @@ from zeta.agent.presets import (
     GENERAL_PRESET,
     AgentPreset,
 )
+from zeta.agent.receipt import finalize_agent_results
 from zeta.agent.runner import _child_base_system_prompt
 from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.config.settings import SettingsError, load_settings
@@ -389,6 +390,61 @@ def _approval_capability(name: str, arguments: dict[str, object]) -> ResolvedCap
         None,
         arguments,
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_close_drains_receipt_extension_tasks(tmp_path: Path) -> None:
+    class BlockingExtensions:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.both_started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.events: list[str] = []
+
+        async def emit(self, event: str, *_args: object) -> None:
+            if event == "stop":
+                return
+            assert event in {"post_tool", "tool_result"}
+            self.events.append(event)
+            self.started.set()
+            if len(self.events) == 2:
+                self.both_started.set()
+            await asyncio.wait_for(self.release.wait(), 10)
+
+    loop = AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path),
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    extensions = BlockingExtensions()
+    loop.extensions = extensions
+    tasks: list[asyncio.Task[object]] = []
+    original_create_task = loop._create_task
+
+    def track(coroutine: object) -> asyncio.Task[object]:
+        task = original_create_task(coroutine)  # type: ignore[arg-type]
+        tasks.append(task)
+        return task
+
+    loop._create_task = track  # type: ignore[method-assign]
+    try:
+        finalize_agent_results(
+            loop,
+            [ToolCall("receipt-task", "capture", {})],
+            [ToolResult("receipt-task", "done")],
+        )
+        await asyncio.wait_for(extensions.started.wait(), 10)
+        await asyncio.wait_for(extensions.both_started.wait(), 10)
+        assert set(extensions.events) == {"post_tool", "tool_result"}
+        await loop.close()
+        assert len(tasks) == 2
+        assert all(task.done() and task.cancelled() for task in tasks)
+    finally:
+        extensions.release.set()
+        if not loop._closed:
+            await loop.close()
+        loop.store.close()
 
 
 @pytest.mark.parametrize("error_event", [False, True])
@@ -9535,6 +9591,7 @@ def test_tool_result_retry_keeps_approval_origin(tmp_path: Path) -> None:
     owner = SimpleNamespace(
         store=store,
         hooks=None,
+        extensions=None,
         tool_registry=registry,
         _agent_child_stores={},
         _agent_child_turns={},

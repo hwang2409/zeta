@@ -8788,7 +8788,7 @@ class _RecordingExtensionHost:
     def register_commands(self, registry: object) -> None:
         del registry
 
-    def close(self) -> None:
+    async def aclose(self) -> None:
         pass
 
 

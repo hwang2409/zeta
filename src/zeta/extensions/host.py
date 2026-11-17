@@ -17,6 +17,8 @@ skipped. One broken extension never breaks the session or stops the rest.
 from __future__ import annotations
 
 import asyncio
+import copy
+import inspect
 import itertools
 import os
 import re
@@ -25,8 +27,9 @@ import sys
 import threading
 import time
 import types
+import weakref
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -38,6 +41,57 @@ if TYPE_CHECKING:
     from ..runtime.execution import ToolHandler
     from ..tools.registry import ToolRegistry
     from .manifest import ExtensionManifest
+
+from .api import ExtensionError
+from .hooks import (
+    CompositeToolHook,
+    ExtensionHook,
+    HookRunner,
+    _await_owned_finalizer,
+    _post,
+    run_extension_hooks,
+)
+
+
+def _marshaled_notify(
+    host_ref: weakref.ReferenceType[ExtensionHost],
+    extension: str,
+    text: str,
+    level: str,
+) -> None:
+    host = host_ref()
+    if host is not None:
+        host.notify(extension, text, level)
+
+
+class ExtensionOwnerBridge:
+    """Weak, clearable access from public extension facades to their host."""
+
+    def __init__(self, host: ExtensionHost) -> None:
+        self._host: weakref.ReferenceType[ExtensionHost] | None = weakref.ref(host)
+
+    def clear(self) -> None:
+        self._host = None
+
+    def notify(self, extension: str, text: str, level: str) -> None:
+        host = self._host() if self._host is not None else None
+        if host is None:
+            return
+        loop = host._event_loop
+        if (
+            loop is not None
+            and threading.get_ident() != host._event_thread_id
+            and threading.current_thread().name == "zeta-extension-hooks"
+        ):
+            _post(loop, _marshaled_notify, weakref.ref(host), extension, text, level)
+            return
+        host.notify(extension, text, level)
+
+
+@dataclass(frozen=True, slots=True)
+class ExtensionCloseResult:
+    resistant_hook: bool
+    undelivered_warning_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +119,7 @@ class LoadingExtension:
         self.directory = directory
         self._tools: list[_ToolDeclaration] = []
         self._commands: list[_CommandDeclaration] = []
+        self._hooks: list[ExtensionHook] = []
 
     def declare_tool(
         self,
@@ -94,6 +149,15 @@ class LoadingExtension:
         self, name: str, description: str, handler: Any, body: str | None, kind: str
     ) -> None:
         self._commands.append(_CommandDeclaration(name, description, handler, body, kind))
+
+    def declare_hook(self, event: str, handler: Any) -> None:
+        if not inspect.iscoroutinefunction(handler):
+            raise ExtensionError(f"extension hook '{event}' must be an async function")
+        self._hooks.append(ExtensionHook(self.manifest.name, event, handler))
+
+    @property
+    def hooks(self) -> tuple[ExtensionHook, ...]:
+        return tuple(self._hooks)
 
     @property
     def declarations(self) -> tuple[_ToolDeclaration, ...]:
@@ -163,16 +227,19 @@ class ExtensionHost:
         project_dir: Path | None,
         builtin_names: frozenset[str],
         clock: Callable[[], float] = time.monotonic,
+        hook_timeout_seconds: float = 5.0,
     ) -> None:
         self._registry = registry
         self.home = home
         self.project_dir = project_dir
         self._builtin_names = builtin_names
+        self.hook_timeout_seconds = hook_timeout_seconds
+        self._runner = HookRunner()
         self.loaded: list[LoadedExtension] = []
         self.pending_project: list[PendingExtension] = []
         self.notices: list[str] = []
         self.warnings: list[str] = []
-        self._event_sink: Callable[[StreamEvent], None] | None = None
+        self._event_sink: Callable[[StreamEvent], bool | Awaitable[bool] | None] | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self.notify_dropped = 0
         self._pending_notifications: deque[StreamEvent] = deque()
@@ -188,6 +255,23 @@ class ExtensionHost:
         self.disabled_inventory: list[PendingExtension] = []
         self._errors: dict[tuple[str, str], tuple[str, str]] = {}
         self._closed = False
+        self._closing = False
+        self._close_task: asyncio.Task[ExtensionCloseResult] | None = None
+        self._safety_pending: dict[str, int] = {}
+        self._safety_in_flight: set[str] = set()
+        self._safety_settled = asyncio.Event()
+        self._safety_settled.set()
+        self._safety_refill_task: asyncio.Task[None] | None = None
+        self._admitted_hook_count = 0
+        self._admitted_hooks_settled = asyncio.Event()
+        self._admitted_hooks_settled.set()
+        self._facades: list[ExtensionOwnerBridge] = []
+        self._hooks: list[ExtensionHook] = []
+
+    def facade_bridge(self) -> ExtensionOwnerBridge:
+        bridge = ExtensionOwnerBridge(self)
+        self._facades.append(bridge)
+        return bridge
 
     def new_package(self, directory: Path, extension_name: str) -> tuple[str, types.ModuleType]:
         safe = re.sub(r"[^0-9A-Za-z_]", "_", extension_name)
@@ -220,21 +304,161 @@ class ExtensionHost:
             if name == package or name.startswith(package + "."):
                 del sys.modules[name]
 
-    def close(self) -> None:
-        """Release imported extension namespaces; safe to call more than once."""
-        if self._closed:
-            return
+    async def aclose(self) -> ExtensionCloseResult:
+        """Bound hook cleanup and release host ownership; safe to call repeatedly."""
+        if self._close_task is None:
+            self._closing = True
+            self._close_task = asyncio.create_task(self._finalize_close())
+        return await _await_owned_finalizer(self._close_task)
+
+    async def _finalize_close(self) -> ExtensionCloseResult:
+        result = await self._runner.aclose()
+        try:
+            await asyncio.wait_for(self._admitted_hooks_settled.wait(), 0.25)
+            await asyncio.wait_for(self._safety_settled.wait(), 0.25)
+        except TimeoutError:
+            pass
+        refill = self._safety_refill_task
+        self._safety_refill_task = None
+        if refill is not None:
+            refill.cancel()
+            await asyncio.gather(refill, return_exceptions=True)
+        for extension in tuple(self._safety_pending):
+            await self._flush_safety(extension, final=True)
         self._closed = True
+        for bridge in self._facades:
+            bridge.clear()
+        self._facades.clear()
         self._event_sink = None
         self._event_loop = None
         self._pending_notifications.clear()
         self._pending_notification_drops = 0
+        for package in tuple(self._packages):
+            self.remove_package(package)
+        return ExtensionCloseResult(
+            resistant_hook=result.resistant,
+            undelivered_warning_count=sum(self._safety_pending.values()),
+        )
 
+    def close(self) -> None:
+        """Release an unused host from synchronous test or setup cleanup."""
+        if self._closed:
+            return
+        if not self._runner.close_unused():
+            raise RuntimeError("an invoked extension host must be closed with aclose()")
+        self._closed = True
+        for bridge in self._facades:
+            bridge.clear()
+        self._facades.clear()
+        self._event_sink = None
+        self._event_loop = None
+        self._pending_notifications.clear()
+        self._pending_notification_drops = 0
         for package in tuple(self._packages):
             self.remove_package(package)
 
+    async def _hook_notice(self, extension: str, message: str) -> None:
+        self._safety_pending[extension] = self._safety_pending.get(extension, 0) + 1
+        await self._flush_safety(extension, detail=message)
+
+    async def _flush_safety(
+        self, extension: str, *, detail: str | None = None, final: bool = False
+    ) -> None:
+        if extension in self._safety_in_flight:
+            return
+        count = self._safety_pending.get(extension, 0)
+        sink = self._event_sink
+        if count == 0:
+            return
+        if sink is None:
+            if not self._closing:
+                self._ensure_safety_refill()
+            return
+        self._safety_in_flight.add(extension)
+        self._safety_settled.clear()
+        text = detail if count == 1 and detail is not None else (
+            f"{count} extension hook calls allowed unchecked"
+        )
+        event = StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "extension", "extension": extension,
+                "text": text, "level": "warning",
+            },
+        )
+        try:
+            accepted = await self._deliver_safety(sink, event)
+        finally:
+            self._safety_in_flight.discard(extension)
+            if not self._safety_in_flight:
+                self._safety_settled.set()
+        if accepted:
+            remaining = self._safety_pending.get(extension, 0) - count
+            if remaining > 0:
+                self._safety_pending[extension] = remaining
+            else:
+                self._safety_pending.pop(extension, None)
+        elif final:
+            self.notify_dropped += count
+        elif not self._closing:
+            self._ensure_safety_refill()
+
+    async def _deliver_safety(self, sink: Any, event: StreamEvent) -> bool:
+        try:
+            receipt = sink(event)
+            if inspect.isawaitable(receipt):
+                receipt = await asyncio.wait_for(receipt, 0.25)
+            return receipt is not False
+        except Exception:  # noqa: BLE001 - warning delivery is best effort
+            self.notify_dropped += 1
+            return False
+
+    def _ensure_safety_refill(self) -> None:
+        if self._safety_refill_task is None or self._safety_refill_task.done():
+            self._safety_refill_task = asyncio.create_task(self._refill_safety())
+
+    async def _refill_safety(self) -> None:
+        while self._safety_pending and not self._closing:
+            await asyncio.sleep(1)
+            for extension in tuple(self._safety_pending):
+                await self._flush_safety(extension)
+
+    def pre_tool_hook(self, base: Any = None) -> Any:
+        composite = CompositeToolHook(
+            base, self._hooks, self._hook_notice, self._runner
+        )
+
+        async def invoke(tool: str, arguments: dict[str, Any]) -> bool | str:
+            if self._closing:
+                return True
+            self._admitted_hook_count += 1
+            self._admitted_hooks_settled.clear()
+            try:
+                return await composite(tool, arguments)
+            finally:
+                self._admitted_hook_count -= 1
+                if self._admitted_hook_count == 0:
+                    self._admitted_hooks_settled.set()
+
+        return invoke
+
+    async def emit(self, event: str, *payload: Any) -> str | None:
+        if self._closing:
+            return None
+        self._admitted_hook_count += 1
+        self._admitted_hooks_settled.clear()
+        try:
+            return await run_extension_hooks(
+                self._hooks, event, copy.deepcopy(payload), self._hook_notice,
+                self._runner,
+            )
+        finally:
+            self._admitted_hook_count -= 1
+            if self._admitted_hook_count == 0:
+                self._admitted_hooks_settled.set()
+
     def set_event_sink(
-        self, sink: Callable[[StreamEvent], None] | None,
+        self, sink: Callable[[StreamEvent], bool | Awaitable[bool] | None] | None,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         self._event_sink = sink
@@ -363,6 +587,9 @@ class ExtensionHost:
                     f"{display} shadows {shadow}"
                 )
         self._command_declarations[extension.manifest.name] = extension.command_declarations
+        for hook in extension.hooks:
+            hook.timeout_seconds = self.hook_timeout_seconds
+            self._hooks.append(hook)
         self.loaded.append(
             LoadedExtension(
                 name=extension.manifest.name,

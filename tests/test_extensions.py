@@ -31,7 +31,7 @@ from zeta.extensions import (
     parse_manifest,
 )
 from zeta.extensions.host import USER_SCOPE
-from zeta.protocol.types import StreamEvent, StreamEventType
+from zeta.protocol.types import StreamEvent, StreamEventType, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.testing.extensions import _trust_pending_for_test, load_extension
@@ -178,6 +178,74 @@ def activate(zx):
         assert delivered == ["first", "second"]
         await asyncio.wait_for(nested_delivered.wait(), 10)
         assert delivered == ["first", "second", "nested"]
+
+
+@pytest.mark.asyncio
+async def test_hook_fail_open_notice_reaches_real_tui_render_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    _write_extension(
+        home / "extensions", "notify-ext",
+        source='''
+def activate(zx):
+    async def safety(_tool, _arguments):
+        raise RuntimeError("boom")
+
+    async def probe(arguments, _abort_signal):
+        return {"content": [], "isError": False, "structuredContent": arguments}
+
+    zx.ui.notify("activation notice")
+    zx.on("pre_tool", safety)
+    zx.register_tool("probe", probe, requires_approval=False)
+''',
+    )
+    store = ConversationStore(tmp_path / "sessions")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    agent_loop = AgentLoop(
+        FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty(),
+    )
+    host = await asyncio.to_thread(
+        apply_extensions, registry, home=home, project_dir=None,
+        builtin_names=registry.registered_names,
+    )
+    agent_loop.extensions = host
+    registry.set_pre_execute_hook(host.pre_tool_hook(registry.pre_execute_hook))
+    output = StringIO()
+    app = TUIApp(
+        agent_loop, provider="codex", model="offline",
+        console=Console(file=output, force_terminal=False), extensions=host,
+    )
+
+    rendered: list[str] = []
+    monkeypatch.setattr(
+        app._presenter, "print_transient", lambda value: rendered.append(value.plain)
+    )
+    try:
+        async with owned_app(app):
+            host.set_event_sink(app._handle_background_event, asyncio.get_running_loop())
+            for index in range(2):
+                result = await registry.execute(ToolCall(f"probe-{index}", "probe", {}))
+                assert result["isError"] is False
+            await asyncio.sleep(0)
+            assert rendered == [
+                "notify-ext: activation notice",
+                "notify-ext: pre_tool failed: boom; call allowed unchecked",
+                "notify-ext: pre_tool disabled; call allowed unchecked",
+            ]
+            for index in range(100):
+                result = await registry.execute(ToolCall(f"flood-{index}", "probe", {}))
+                assert result["isError"] is False
+            await asyncio.sleep(0)
+            assert host.notices == []
+            assert len(host._notification_buckets) == 1
+            assert host.notify_dropped == 0
+            assert host._safety_pending == {}
+            assert len(host._pending_notifications) == 0
+            assert agent_loop._tracked_tasks == set()
+    finally:
+        await agent_loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio

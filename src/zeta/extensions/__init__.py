@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .api import EXTENSION_API_VERSION, ExtensionAPI, ExtensionError
 from .discovery import apply_extensions
+from .hooks import CompositeToolHook, ExtensionHook
 from .host import (
     ExtensionHost,
     ExtensionStatus,
@@ -25,8 +26,10 @@ from .store import ExtensionTrustError
 
 __all__ = [
     "EXTENSION_API_VERSION",
+    "CompositeToolHook",
     "ExtensionAPI",
     "ExtensionError",
+    "ExtensionHook",
     "ExtensionHost",
     "ExtensionManifest",
     "ExtensionManifestError",

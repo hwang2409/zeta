@@ -459,6 +459,10 @@ def compose_runtime(
             builtin_names=builtin_tool_names,
             disabled=config.extensions_disabled,
         )
+        loop.extensions = extensions
+        loop.tool_registry.set_pre_execute_hook(
+            extensions.pre_tool_hook(loop.tool_registry.pre_execute_hook)
+        )
         loop.tool_schemas = tuple(loop.tool_registry.schemas)
         if background_event_sink is not None:
             loop.set_background_event_sink(background_event_sink)

@@ -307,6 +307,7 @@ class AgentLoop(
         self.on_completion_success = on_completion_success
         self._on_plan_mode_change = on_plan_mode_change
         self.hooks = hooks
+        self.extensions: Any = None
         if self.hooks is not None:
             self.hooks.bind_session(store.session_id)
             if self.tool_registry.pre_execute_hook is None:
@@ -523,6 +524,8 @@ class AgentLoop(
             if self.hooks is not None:
                 self.hooks.stop()
                 await self.hooks.close()
+            if self.extensions is not None:
+                await self.extensions.emit("stop")
             if self._mcp_mount_task is not None and not self._mcp_mount_task.done():
                 self._mcp_mount_task.cancel()
                 await asyncio.gather(self._mcp_mount_task, return_exceptions=True)
@@ -575,6 +578,8 @@ class AgentLoop(
         self._pending_task_recovery = ()
         await recovery_lease.activate_agent_children(self)
         self.session_start()
+        if self.extensions is not None:
+            await self.extensions.emit("session_start")
         if self.memory_reconciler is not None:
             self.memory_reconciler.activity()
         await self._activate_project_inbox()
@@ -709,6 +714,10 @@ class AgentLoop(
                 )
         if self.hooks is not None and system_message is None and not notification_turn:
             self.hooks.user_prompt_submit(user_text)
+        if self.extensions is not None and system_message is None and not notification_turn:
+            injected = await self.extensions.emit("user_prompt_submit", user_text)
+            if injected:
+                host_instruction = f"{host_instruction}\n{injected}".strip()
         if system_message is not None and not notification_turn:
             await self._append_turn_message(system_message, on_persisted=on_persisted)
         elif system_message is None and not notification_turn and persist_user_message:

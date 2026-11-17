@@ -158,6 +158,50 @@ async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("controller_accepts", "observer_accepts", "expected"),
+    [
+        (True, True, (2, 0)),
+        (True, False, (1, 1)),
+        (False, True, (1, 1)),
+        (False, False, (0, 2)),
+    ],
+)
+async def test_feature_publication_receipt_accounts_every_recipient(
+    monkeypatch: pytest.MonkeyPatch,
+    controller_accepts: bool,
+    observer_accepts: bool,
+    expected: tuple[int, int],
+) -> None:
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    controller = _ControllerConnection()
+    observer = _ControllerConnection()
+    registry.register(controller)
+    registry.register(observer)
+    registry.negotiate_role(controller, "controller", "1.2", frozenset({"extensions"}))
+    registry.negotiate_role(
+        observer, "observer", "1.2", frozenset({"extensions", "serve_observers"})
+    )
+
+    async def send(_connection: object, _frame: object) -> bool:
+        return controller_accepts
+
+    monkeypatch.setattr(registry, "send", send)
+    # test-contract: seam force each observer admission result independently
+    monkeypatch.setattr(
+        registry, "_publish_observer", lambda _state, _frame: observer_accepts
+    )
+    receipt = await registry.publish_feature_event(
+        "extensions", EventDescriptor.EXTENSION_NOTICE, "session",
+        data={"kind": "extension"},
+    )
+    assert (receipt.admitted_count, receipt.rejected_count) == expected
+    registry.release(controller)
+    registry.release(observer)
+    await registry.aclose()
+
+
+@pytest.mark.asyncio
 async def test_protocol_1_2_projection_keeps_negotiated_version_before_hello() -> None:
     registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()

@@ -888,6 +888,13 @@ def finalize_agent_results(
                 )
         if owner.hooks is not None:
             owner.hooks.post_tool(call.name, result.content)
+        if owner.extensions is not None:
+            owner._create_task(
+                owner.extensions.emit("post_tool", call.name, result.content)
+            )
+            owner._create_task(
+                owner.extensions.emit("tool_result", call.name, result)
+            )
         if call.name == "agent":
             is_background = (
                 result.structured_content is not None
