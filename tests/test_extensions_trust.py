@@ -203,6 +203,27 @@ def test_fingerprint_rejects_symlink_and_size_bound(tmp_path: Path) -> None:
         fingerprint(extension)
 
 
+@pytest.mark.asyncio
+async def test_trust_rejects_mismatched_directory_before_review_and_discovery(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    extension = _extension(project / ".zeta" / "extensions" / "foo", name="bar")
+    with pytest.raises(ExtensionTrustError, match="rename the folder"):
+        trust(home=home, project_dir=project, scope="project", name="foo", accept=True)
+    assert not trust_module.trust_path(home).exists()
+
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    registry = ToolRegistry(cwd, skill_catalog=SkillCatalog.empty())
+    try:
+        host = apply_extensions(registry, home=home, project_dir=project, builtin_names=registry.registered_names)
+        assert not host.pending_project
+        assert any("rename the folder" in notice for notice in host.notices)
+        assert extension.exists()
+    finally:
+        await registry.close()
+
+
 def test_trust_requires_review(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _extension(home / "extensions" / "demo")

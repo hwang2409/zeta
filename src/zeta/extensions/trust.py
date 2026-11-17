@@ -14,7 +14,7 @@ from pathlib import Path
 
 from ..core.session_files import atomic_publish_file
 from .manifest import MANIFEST_FILENAME, ExtensionManifestError, parse_manifest
-from .paths import ExtensionTrustError, extension_path
+from .paths import ExtensionTrustError, extension_path, validate_extension_identity
 
 TRUST_FILENAME = "extensions-trust.json"
 GIT_FILENAME = ".zeta-extension-git.json"
@@ -235,8 +235,9 @@ def trust(*, home: str | Path, project_dir: str | Path | None, scope: str, name:
     target = extension_path(home, project_dir, scope, name)
     if not target.is_dir():
         raise ExtensionTrustError(f"extension not installed: {name}")
-    fingerprint(target)
     manifest = _manifest(target)
+    validate_extension_identity(target, manifest.name)
+    fingerprint(target)
     _review(manifest, target, current=None, action="trust", accept=accept, confirm=confirm)
     set_trusted(home, scope, name, target, True)
 
@@ -252,10 +253,7 @@ def update(name: str, *, home: str | Path, project_dir: str | Path | None, scope
         fingerprint(staged)
         fingerprint(target)
         manifest = _manifest(staged)
-        if manifest.name != name:
-            raise ExtensionTrustError(
-                f"update manifest name {manifest.name!r} does not match installed name {name!r}"
-            )
+        validate_extension_identity(target, manifest.name)
         _review(manifest, staged, current=target, action="update", accept=accept, confirm=confirm)
         shutil.rmtree(target)
         shutil.move(str(staged), target)

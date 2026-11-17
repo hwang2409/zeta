@@ -44,7 +44,11 @@ from .manifest import (
     ExtensionManifestError,
     parse_manifest,
 )
-from .paths import ExtensionTrustError, extension_root
+from .paths import (
+    ExtensionTrustError,
+    extension_root,
+    validate_extension_identity,
+)
 from .trust import is_trusted
 
 EXTENSIONS_DIRNAME = "extensions"
@@ -77,14 +81,18 @@ def apply_extensions(
     project_scope_dir = _scope_dir(project_dir, ".zeta")
     for directory in _extension_dirs(user_dir):
         manifest = _manifest_or_notice(host, directory, USER_SCOPE)
-        if manifest is None or _skip(host, manifest, directory, disabled_set):
+        if manifest is None or not _identity_or_notice(host, directory, manifest, USER_SCOPE):
+            continue
+        if _skip(host, manifest, directory, disabled_set):
             continue
         _load_one(host, directory, manifest, USER_SCOPE)
     if project_scope_dir is not None and project_scope_dir != user_dir:
         pending_names: list[str] = []
         for directory in _extension_dirs(project_scope_dir):
             manifest = _manifest_or_notice(host, directory, PROJECT_SCOPE)
-            if manifest is None or _skip(host, manifest, directory, disabled_set):
+            if manifest is None or not _identity_or_notice(host, directory, manifest, PROJECT_SCOPE):
+                continue
+            if _skip(host, manifest, directory, disabled_set):
                 continue
             trusted = _project_trusted(host, manifest, directory)
             if trusted:
@@ -254,6 +262,22 @@ def _manifest_or_notice(
             f"invalid manifest: {_short(exc)}"
         )
         return None
+
+
+def _identity_or_notice(
+    host: ExtensionHost,
+    directory: Path,
+    manifest: ExtensionManifest,
+    scope: str,
+) -> bool:
+    try:
+        validate_extension_identity(directory, manifest.name)
+    except ExtensionTrustError as exc:
+        host.notices.append(
+            f"extensions · ignored {scope} extension {_display(directory)}: {exc}"
+        )
+        return False
+    return True
 
 
 def _extension_dirs(base: Path | None) -> list[Path]:
