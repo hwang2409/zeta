@@ -27,6 +27,7 @@ from ..storage_format import (
     feature_enabled,
     pending_releases,
 )
+from ..telemetry import Telemetry, TelemetryError
 from . import (
     accounts,
     login,
@@ -212,6 +213,7 @@ class ZetaServer:
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         max_role: str = "controller",
         prebound_socket: socket.socket | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
             raise ValueError("choose socket_path or port, not both")
@@ -239,6 +241,8 @@ class ZetaServer:
         # after the cancel, log the stuck-holder task dump at this interval.
         self.lost_request_cancel_bound = 1.0
         self._borrowed = runtime is not None
+        # a borrowed server shows its host's telemetry; an owning server configures its own in start()
+        self.telemetry = telemetry or Telemetry.disabled()
         runtime = runtime or ServerRuntime(
             self.home,
             cwd=cwd,
@@ -354,6 +358,8 @@ class ZetaServer:
         """Point the runtime's sinks at its control; a borrowed runtime keeps its owner's."""
         if not self._borrowed:
             runtime = control.runtime
+            # every pair's sessions trace through this server's process telemetry
+            runtime.set_telemetry_source(lambda: self.telemetry)
             runtime.set_approval_control_binder(control.bind_policy)
             runtime.set_background_event_sink(control._publish_background_event)
             runtime.set_memory_notice_sink(control._publish_memory_notice)
@@ -399,6 +405,13 @@ class ZetaServer:
         return str(self.socket_path)
 
     async def start(self) -> None:
+        if not self._borrowed and not self.telemetry.enabled():
+            try:
+                self.telemetry = await asyncio.to_thread(
+                    lambda: Telemetry.configure(load_settings(home=self.home).settings)
+                )
+            except TelemetryError as exc:
+                raise SessionError(str(exc)) from None
         if not self._borrowed:
             await self.runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
@@ -501,6 +514,9 @@ class ZetaServer:
                 finally:
                     self._server = None
                     self._unix_listener = None
+                    if not self._borrowed:
+                        # last, so every close step can still export; idempotent for a second close
+                        await asyncio.to_thread(self.telemetry.shutdown)
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -693,9 +709,10 @@ class _Client:
         self._request = (request["method"], request_id, time.monotonic())
         await self.connections.wait_until_settled(self)
         try:
-            result = await self._dispatch(
-                request_id, request["method"], request["params"]
-            )
+            with self._traced(request):
+                result = await self._dispatch(
+                    request_id, request["method"], request["params"]
+                )
         except ProtocolError as exc:
             await self._write(
                 self.codec.error_response(
@@ -783,6 +800,27 @@ class _Client:
                 for control in self.server.controls():
                     await control.controller_ready(reconnect=True)
         self._request = None
+
+    @contextlib.contextmanager
+    def _traced(self, request: dict[str, Any]) -> Iterator[None]:
+        """Serve span for one request, under the client's W3C parent once it negotiated `otel`.
+
+        Tasks the handler starts (a send's turn) copy this context. A malformed
+        carrier is ignored whole and leaves only a value-free event on the span.
+        """
+        telemetry = self.server.telemetry
+        # hello itself is never parented: features are still empty while it runs
+        received = request["trace_context"] if "otel" in self.features else {}
+        carrier = {key: value for key, value in received.items() if type(value) is str}
+        accepted = telemetry.extract(carrier)
+        malformed = any(key not in accepted for key in received)
+        with (
+            telemetry.use_trace_context({} if malformed else accepted),
+            telemetry.serve_span(request["method"]) as span,
+        ):
+            if malformed:
+                span.invalid_propagation()
+            yield
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""

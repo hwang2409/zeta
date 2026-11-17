@@ -28,6 +28,7 @@ from .client import (
     MCPResource,
     MCPTool,
     MCPTransportError,
+    caller_trace_context,
     canceled_result,
     detached_result,
     initialize_params,
@@ -39,6 +40,7 @@ from .client import (
     resource_content_from_result,
     resources_from_result,
     tools_from_result,
+    traced_params,
     translate_call_result,
 )
 from .config import MCPServerConfig
@@ -335,7 +337,7 @@ class StreamableHTTPMCPClient(MCPClient):
             "jsonrpc": "2.0",
             "id": request_id,
             "method": method,
-            "params": dict(params),
+            "params": traced_params(method, params, request_id, self.protocol_version),
         }
         owner = asyncio.current_task()
         if owner is None:
@@ -549,6 +551,7 @@ class StreamableHTTPMCPClient(MCPClient):
                 oauth_token,
                 accept="application/json, text/event-stream",
                 content_type="application/json",
+                extra_headers=caller_trace_context(str(payload["method"])),
                 json=dict(payload),
             ) as response:
                 state.response = response

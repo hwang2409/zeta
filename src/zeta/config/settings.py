@@ -93,6 +93,7 @@ _TOP_KEYS = frozenset(
         "agents",
         "mcp",
         "retention",
+        "otel",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -180,6 +181,7 @@ class Settings:
     mcp_call_deadline_seconds: float = 300.0
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
+    otel_endpoint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,6 +223,7 @@ class ResolvedConfig:
     mcp_call_deadline_seconds: float = 300.0
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
+    otel_endpoint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +254,10 @@ def load_settings(
     project_data = (
         _parse(project_path, notices) if project_path != global_path else {}
     )
+    if "otel" in project_data:
+        # [otel] picks a local collector for the whole process; a repository must not.
+        where = _display_path(project_path) if project_path is not None else "project settings"
+        raise SettingsError(f"[otel] is global-only; remove it from {where}")
     project_data = _strip_unsafe_project_keys(project_data, project_path, warnings)
     global_allow, global_deny = _validate_policy_layer(global_data, global_path)
     project_allow, project_deny = _validate_policy_layer(project_data, project_path)
@@ -392,6 +399,7 @@ def resolve(
         mcp_call_deadline_seconds=settings.mcp_call_deadline_seconds,
         mcp_max_wire_bytes=settings.mcp_max_wire_bytes,
         mcp_spill_after_bytes=settings.mcp_spill_after_bytes,
+        otel_endpoint=settings.otel_endpoint,
     )
 
 
@@ -640,6 +648,18 @@ def _validate(
     command_niceness = _validated_int_range(
         commands, "command_niceness", notices, minimum=0, maximum=19
     )
+    otel = data.get("otel", {})
+    if not isinstance(otel, Mapping) or set(otel) - {"endpoint"}:
+        raise SettingsError("invalid otel settings")
+    otel_endpoint = otel.get("endpoint")
+    if otel_endpoint is not None:
+        from ..telemetry import TelemetryError
+        from ..telemetry.runtime import validate_loopback_endpoint
+
+        try:
+            validate_loopback_endpoint(otel_endpoint)
+        except TelemetryError as exc:
+            raise SettingsError(str(exc)) from None
     mcp = data.get("mcp", {})
     mcp_limits = _validated_mcp_limits(mcp)
     mcp = cast(Mapping[str, Any], mcp)
@@ -685,6 +705,7 @@ def _validate(
         mcp_call_deadline_seconds=mcp_limits.deadline_seconds,
         mcp_max_wire_bytes=mcp_limits.max_wire_bytes,
         mcp_spill_after_bytes=mcp_limits.spill_after_bytes,
+        otel_endpoint=otel_endpoint,
     )
 
 

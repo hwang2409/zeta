@@ -189,6 +189,9 @@ class ApprovalDecision(StrEnum):
     DENY = "deny"
 
 
+APPROVAL_SCOPES = frozenset({"once", "always_tool"})
+
+
 class EventDescriptor(StrEnum):
     """One documented JSON-RPC event name."""
 
@@ -244,6 +247,7 @@ SUPPORTED_PROTOCOL_VERSIONS = ("1.0", "1.1", PROTOCOL_VERSION)
 # Optional 1.1 features. A client opts in through ``hello.features``; the
 # server echoes the supported subset in ``capabilities.features``.
 FEATURES = (
+    "otel",
     "session_cwd",
     "new_session_settings",
     "user_message_event",
@@ -770,7 +774,9 @@ class FrameCodec:
                 "request params must be an object",
                 request_id=request_id,
             )
-        return {"id": raw_request_id, "method": method, "params": params}
+        # W3C trace context: kept raw here; the connection uses it only after `otel` was negotiated
+        trace_context = {key: value[key] for key in ("traceparent", "tracestate") if key in value}
+        return {"id": raw_request_id, "method": method, "params": params, "trace_context": trace_context}
 
     def response(self, request_id: str | int | None, result: object) -> _Frame:
         value = {"jsonrpc": "2.0", "id": request_id, "result": result}

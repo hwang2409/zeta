@@ -7059,6 +7059,34 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
     assert rendered == (
         "Status\n\0overlay-rule\0\n"
         "session_id: status-fixture\nprovider: codex\nmodel: gpt-5.6-luna\n"
+        "otel: off\n"
+        "completion_client_setups: none\n"
+        "vim_mode: on\nplan_mode: off\nexplicit_finish: on\nmax_agent_depth: 3\n"
+        "retained_tail: 6\ntokens_used_this_session: 150\n"
+        "tokens_in_current_context: 120\ncompaction_marker_count: 1\n"
+        "checkpoint_count: 2\ncomputer: disabled, allowed app count=0\nlive_pending_approvals: 1 (approval-1 (bash))\n"
+        "mcp: 1 mounted, 0 failed\nusage:\n  input_tokens: 10\n"
+        "  output_tokens: 50\n  cache_read_tokens: 60\n  cache_write_tokens: 30\n"
+        "  cache_hit_rate: 60.0%\n  child_cache_read_tokens: 0\n"
+        "  child_cache_write_tokens: 0\n  child_uncached_input_tokens: 0\n"
+        "  child_output_tokens: 0\n  child_cache_hit_rate: n/a\n"
+        "  cache_hit_trend: 1:60%\n  estimated_cost_usd: $0.000123\n"
+        "prompt_cache_read: 60\nprompt_cache_write: 30\n"
+        "prompt_cache_uncached_input: 10\nprompt_cache_hit_rate: 60.0%\n"
+        "output_tokens_this_session: 50\ncontext:\n  window: 120 / 1050000\n"
+        "  fill: [--------------------] 0%\ncompaction_history:\n  none\n"
+        "context_files: /repo/AGENTS.md\n"
+        "hooks: stop: true\nautomatic_memory_failure: none\n"
+        "transcript_index_failure: none\nproject_context_health: healthy\n"
+        "\0overlay-rule\0\n"
+        "↑/↓ or j/k scroll · pgup/pgdn page · home/end jump · esc close"
+    )
+
+    # retain the computer-use parent expectation alongside main's telemetry line.
+    rendered = rendered.replace("otel: off\n", "")
+    assert rendered == (
+        "Status\n\0overlay-rule\0\n"
+        "session_id: status-fixture\nprovider: codex\nmodel: gpt-5.6-luna\n"
         "completion_client_setups: none\n"
         "vim_mode: on\nplan_mode: off\nexplicit_finish: on\nmax_agent_depth: 3\n"
         "retained_tail: 6\ntokens_used_this_session: 150\n"
