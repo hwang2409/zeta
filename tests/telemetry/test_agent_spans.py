@@ -174,7 +174,7 @@ def test_turns_and_inference_nest_under_one_agent_span(tmp_path, traced, provide
     asyncio.run(_run(loop))
     spans = memory.get_finished_spans()
     names = _by_name(spans)
-    assert sorted(names) == sorted(["invoke_agent zeta", "zeta.turn", f"chat {model}"])
+    assert sorted(names) == sorted(["invoke_agent zeta", "zeta.turn", f"chat {model}", "execute_tool noop"])
     (agent,) = names["invoke_agent zeta"]
     turns = sorted(names["zeta.turn"], key=lambda span: span.attributes["zeta.turn.number"])
     chats = names[f"chat {model}"]
@@ -185,6 +185,8 @@ def test_turns_and_inference_nest_under_one_agent_span(tmp_path, traced, provide
     assert [turn.parent.span_id for turn in turns] == [agent.context.span_id] * 2
     assert [turn.attributes["zeta.tool.count"] for turn in turns] == [1, 0]
     assert [chat.parent.span_id for chat in chats] == [turn.context.span_id for turn in turns]
+    (tool,) = names["execute_tool noop"]
+    assert tool.parent.span_id == turns[0].context.span_id
     for chat in chats:
         assert chat.kind is SpanKind.CLIENT
         assert chat.attributes["gen_ai.provider.name"] == genai_provider

@@ -246,14 +246,13 @@ class AgentNotificationMixin:
         )
         telemetry = self.telemetry
         turn_span: SpanHandle | None = None
-        # shortcut: the root is always profile "zeta"; slice 3a names child profiles.
         with telemetry.agent_span(
-            "zeta",
-            agent_name="zeta",
-            conversation_id=self.store.session_id,
+            self.agent_profile,
+            agent_name=self.agent_profile,
+            conversation_id=self.conversation_id,
             model=getattr(self.backend, "model", ""),
             depth=self.agent_depth,
-            background=False,
+            background=self.agent_background,
         ):
             try:
                 try:
@@ -264,7 +263,7 @@ class AgentNotificationMixin:
                             if turn_span is not None:  # a redispatch starts a turn without TURN_END
                                 turn_span.__exit__(None, None, None)
                             turn_span = telemetry.turn_span(
-                                conversation_id=self.store.session_id,
+                                conversation_id=self.conversation_id,
                                 turn_number=event.data.get("turn", 0),
                                 notification=notification_turn,
                             )

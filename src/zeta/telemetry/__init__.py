@@ -46,11 +46,13 @@ class SpanHandle:
         if self._implementation is not None:
             self._implementation.retry(attempt=attempt, reason=reason, delay=delay, after=after)
 
-    def approval_requested(self, *, decision: str, scope: str) -> None:
+    def approval_requested(self, *, decision: str, scope: str | None = None) -> None:
+        """``scope`` is omitted where the grant scope is unknown (the shared approval gate)."""
         if self._implementation is not None:
             self._implementation.approval_requested(decision=decision, scope=scope)
 
-    def approval_resolved(self, *, decision: str, scope: str, duration: int) -> None:
+    def approval_resolved(self, *, decision: str | None, duration: int, scope: str | None = None) -> None:
+        """``decision`` is None when the approval ended with no decision (cancelled or failed); ``duration`` is in ms."""
         if self._implementation is not None:
             self._implementation.approval_resolved(decision=decision, scope=scope, duration=duration)
 

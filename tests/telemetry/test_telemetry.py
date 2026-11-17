@@ -484,7 +484,7 @@ def _real_values() -> list:
     cases += [("tool_span", "name", name, "zeta.tool.name") for name in ("bash", "web_search", "filesystem__read_file")]
     cases += [("tool_span", "tool_type", kind, "zeta.tool.type") for kind in ("function", "computer", "mcp", "agent")]
     cases += [("agent_span", "agent_name", name, "zeta.agent.name") for name in ("worker", "ux-tester")]
-    cases += [("turn_span", "conversation_id", "0123456789abcdef0123456789abcdef", "gen_ai.conversation.id")]
+    cases += [("turn_span", "conversation_id", conversation, "gen_ai.conversation.id") for conversation in (_SESSION, f"{_SESSION}:1", f"{_SESSION}:12:3")]
     call_ids = ("toolu_01A09q90qw90lq917835lq9", "call_abc123XYZ", "fc_68a1b2c3d4e5", "ollama-01234567-89ab-cdef-0123-456789abcdef", "inline-0123456789abcdef0123456789abcdef")
     cases += [("tool_span", "call_id", call_id, "zeta.tool.call.id") for call_id in call_ids]
     return [pytest.param(*case, id=f"{case[0]}-{case[1]}-{case[2]}") for case in cases]
@@ -494,6 +494,27 @@ def _real_values() -> list:
 def test_real_value_is_exported_unchanged(memory_telemetry, route, field, value, location) -> None:
     surfaces = dict(_surfaces(_emit(memory_telemetry, route, field, value)))
     assert surfaces.get(location) == value, sorted(surfaces.items())
+
+
+# near-miss child instance ids: zero, empty, or non-numeric levels, and deeper than the hard depth limit 5.
+@pytest.mark.parametrize("conversation", [f"{_SESSION}:0", f"{_SESSION}:", f"{_SESSION}:1:x", _SESSION + ":1" * 6, "1"])
+def test_malformed_conversation_id_is_replaced(memory_telemetry, conversation) -> None:
+    surfaces = dict(_surfaces(_emit(memory_telemetry, "turn_span", "conversation_id", conversation)))
+    assert surfaces["gen_ai.conversation.id"] == "_invalid"
+
+
+def test_absent_approval_fields_are_omitted(memory_telemetry) -> None:
+    instance, exported = memory_telemetry
+    exported.clear()
+    with instance.turn_span(conversation_id=_SESSION, turn_number=1, notification=False) as span:
+        span.approval_requested(decision="ask")
+        span.approval_resolved(decision=None, duration=3)
+    instance._implementation._provider.force_flush()
+    (exported_span,) = exported
+    assert [(event.name, dict(event.attributes)) for event in exported_span.events] == [
+        ("zeta.approval.requested", {"decision": "ask"}),
+        ("zeta.approval.resolved", {"duration": 3}),
+    ]
 
 
 def test_profile_name_and_error_type_are_exported(memory_telemetry) -> None:

@@ -186,6 +186,9 @@ class AgentLoop(
         self.backend = backend
         # the process owner's telemetry (TUI app or zeta serve); disabled is a no-op
         self.telemetry = telemetry or Telemetry.disabled()
+        # span identity: the child runner sets the profile name and background flag
+        self.agent_profile = "zeta"
+        self.agent_background = False
         self._init_backend_owners(backend)
         self.store = store
         self.store.recover_client_deliveries()
@@ -321,6 +324,11 @@ class AgentLoop(
         self._plan_mode_prior_prompt: str | Message | None = None
         if "agent" in self.tool_registry.definitions_by_name:
             self.tool_registry.set_agent_runner(self._run_agent_tool)
+    @property
+    def conversation_id(self) -> str:
+        """The trace conversation id: a child's instance id, else the session id."""
+        return self.agent_instance_id or self.store.session_id
+
     @property
     def background_work_descriptions(self) -> tuple[str, ...]:
         process_work = tuple(
@@ -912,7 +920,7 @@ class AgentLoop(
                         getattr(self.backend, "model", ""),
                         provider=getattr(self.backend, "provider", ""),
                         stream=True,
-                        conversation_id=self.store.session_id,
+                        conversation_id=self.conversation_id,
                     ))
                     completion = self.context_assembler.dispatch_admitted_request(
                         self.backend,

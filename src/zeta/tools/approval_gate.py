@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
@@ -14,6 +15,9 @@ from ..core.approval import (
     canceled_result,
 )
 from ..protocol.types import ToolCall, ToolResult
+from ..telemetry import SpanHandle
+
+_NO_SPAN = SpanHandle()
 
 ApprovalHook = Callable[
     [str, dict[str, object]], bool | str | Awaitable[bool | str] | None
@@ -40,8 +44,10 @@ class ApprovalGate:
         persist_request: bool = True,
         execution_token: str | None = None,
         capability: ApprovalCapability,
+        span: SpanHandle | None = None,
     ) -> tuple[ToolResult | None, AbortSignal]:
         execution_signal = signal
+        span = span or _NO_SPAN
         if self.policy is not None and not skip_approval:
             # Ephemeral (inline-shell) approvals are never durable rows, so they
             # need no store read here, which keeps the submission-to-registration
@@ -58,10 +64,13 @@ class ApprovalGate:
                 and self.policy.decide(capability) is ApprovalDecision.ASK
             )
             slot_acquired = False
+            decision: ApprovalDecision | None = None
             if approval_started:
                 slot_acquired = await self.policy.acquire_approval_slot()
                 if lifecycle is not None:
                     lifecycle("approval_start")
+                span.approval_requested(decision=ApprovalDecision.ASK.value)
+                asked_at = time.monotonic()
 
             try:
                 authorize = self.policy.authorize
@@ -80,6 +89,10 @@ class ApprovalGate:
                 ), execution_signal
             finally:
                 if approval_started:
+                    span.approval_resolved(
+                        decision=None if decision is None else str(decision),
+                        duration=round((time.monotonic() - asked_at) * 1000),
+                    )
                     if lifecycle is not None:
                         lifecycle("approval_end")
                     if slot_acquired:

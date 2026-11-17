@@ -43,7 +43,8 @@ _APPROVAL_DECISIONS = frozenset({"allow", "deny", "ask", "approve"})
 # server.protocol.APPROVAL_SCOPES.
 _APPROVAL_SCOPES = frozenset({"once", "always_tool"})
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
-_SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
+# a session id, or a child agent instance id: the root session id plus ":<n>" per nesting level.
+_SESSION_ID = re.compile(r"[0-9a-f]{32}(?::[1-9][0-9]{0,8}){0,5}\Z")
 _TOOL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:__[A-Za-z0-9][A-Za-z0-9_-]{0,127})?\Z")
 _CALL_ID = re.compile(r"(?=.{1,128}\Z)(?:toolu_[A-Za-z0-9_-]+|call_[A-Za-z0-9_-]+|fc_[A-Za-z0-9_-]+|ollama-[0-9a-f-]+|inline-[0-9a-f-]+)\Z")
 # catalog ids and ollama names: [host/][namespace/]model[:tag], e.g. locally-created-model, qwen3:4b, hf.co/user/model:Q4_K_M.
@@ -74,7 +75,7 @@ def _field_value(key: str, value: object) -> object:
 
 
 def _safe_attributes(attributes: Mapping[str, object] | None, allowed_keys: frozenset[str]) -> dict[str, object]:
-    return {key: _field_value(key, value) if isinstance(value, (str, int, bool)) else "_invalid" for key, value in (attributes or {}).items() if key in allowed_keys}
+    return {key: _field_value(key, value) if isinstance(value, (str, int, bool)) else "_invalid" for key, value in (attributes or {}).items() if key in allowed_keys and value is not None}
 
 
 # This is the single owner of the loopback endpoint policy.
@@ -161,10 +162,10 @@ class _SpanHandle(SpanHandle):
             "gen_ai.retry.delay": delay, "gen_ai.retry.after": after,
         }, _EVENT_ATTRIBUTE_KEYS["gen_ai.client.retry"]))
 
-    def approval_requested(self, *, decision: str, scope: str) -> None:
+    def approval_requested(self, *, decision: str, scope: str | None = None) -> None:
         self._span.add_event("zeta.approval.requested", attributes=_safe_attributes({"decision": decision, "scope": scope}, _EVENT_ATTRIBUTE_KEYS["zeta.approval.requested"]))
 
-    def approval_resolved(self, *, decision: str, scope: str, duration: int) -> None:
+    def approval_resolved(self, *, decision: str | None, duration: int, scope: str | None = None) -> None:
         self._span.add_event("zeta.approval.resolved", attributes=_safe_attributes({"decision": decision, "scope": scope, "duration": duration}, _EVENT_ATTRIBUTE_KEYS["zeta.approval.resolved"]))
 
     def fail(self, exc: BaseException | type[BaseException] | None) -> None:
