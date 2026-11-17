@@ -43,6 +43,7 @@ from ...agent.tool_results import validated_tool_result as _validated_tool_resul
 from ...agent.turn_limit import ChildTurnControl
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
+from ...core.computer_retention import ComputerScreenshotRetention
 from ...core.context import BudgetExceeded, ContextAssembler
 from ...core.hooks import HookManager
 from ...core.session_links import ChildLineagePublisher
@@ -286,15 +287,25 @@ class AgentLoop(
         self._dispatch_progress = DispatchProgress()
         if system_prompt is None:
             system_prompt = load_identity(catalog=self.tool_registry.skill_catalog)
-        self.context_assembler = context_assembler or ContextAssembler(
-            store,
-            token_budget=token_budget,
-            retained_tail=retained_tail,
-            system_prompt=system_prompt,
-            backend=backend,
-            on_completion_success=on_completion_success,
-            usage_sink=usage_sink,
+        self.computer_screenshot_retention = ComputerScreenshotRetention(
+            persist_screenshots=self.tool_registry.computer_config.persist_screenshots
         )
+        if context_assembler is None:
+            context_assembler = ContextAssembler(
+                store,
+                token_budget=token_budget,
+                retained_tail=retained_tail,
+                system_prompt=system_prompt,
+                backend=backend,
+                on_completion_success=on_completion_success,
+                usage_sink=usage_sink,
+                computer_screenshot_retention=self.computer_screenshot_retention,
+            )
+        else:
+            context_assembler._computer_screenshot_retention = (
+                self.computer_screenshot_retention
+            )
+        self.context_assembler = context_assembler
         self._initialize_step_delivery(store)
         self._configure_live_config(
             skill_catalog=self.tool_registry.skill_catalog,

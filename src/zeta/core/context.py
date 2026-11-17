@@ -5,6 +5,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
+from .computer_retention import ComputerScreenshotRetention
 from .context_parts.budget import ContextRequestBudget
 from .context_parts.markers import ContextMarkerMixin
 from .context_parts.preparation import ContextPreparation
@@ -132,6 +133,7 @@ class ContextAssembler(ContextMarkerMixin):
         on_token_growth: Callable[[int], None] | None = None,
         on_before_eviction: Callable[[int, int], None] | None = None,
         safety_margin: float = DEFAULT_SAFETY_MARGIN,
+        computer_screenshot_retention: ComputerScreenshotRetention | None = None,
     ) -> None:
         if token_budget <= 0:
             raise ValueError("token budget must be positive")
@@ -151,6 +153,9 @@ class ContextAssembler(ContextMarkerMixin):
         self.telemetry_sink = telemetry_sink
         self.on_token_growth = on_token_growth
         self.on_before_eviction = on_before_eviction
+        self._computer_screenshot_retention = (
+            computer_screenshot_retention or ComputerScreenshotRetention()
+        )
         self.last_compaction_telemetry: dict[str, Any] = {}
         self._descendant_usage = {
             "input_tokens": 0,
@@ -750,7 +755,15 @@ class ContextAssembler(ContextMarkerMixin):
                         pinned_message=plan.pinned_message,
                         expected_parent_id=snapshot["branch_id"],
                         kind=EVICTION_KIND,
-                        view=list(plan.view),
+                        view=[
+                            {
+                                **dict(item),
+                                "message": self._computer_screenshot_retention.durable_message(
+                                    Message.from_dict(item["message"])
+                                ).to_dict(),
+                            }
+                            for item in plan.view
+                        ],
                         telemetry=dict(plan.telemetry or {}),
                         fact_floor=plan.fact_floor,
                     )
@@ -1299,7 +1312,17 @@ class ContextAssembler(ContextMarkerMixin):
                         ),
                     )
                 )
-        return _with_interrupted_results(items, entries)
+        visible = _with_interrupted_results(items, entries)
+        retention = getattr(self, "_computer_screenshot_retention", None)
+        if retention is None:
+            return visible
+        projected = retention.project([item.message for item in visible])
+        return [
+            item
+            if message is item.message
+            else _ContextItem(item.entry, message, item.fixed)
+            for item, message in zip(visible, projected, strict=True)
+        ]
 
     @staticmethod
     def _branch_id(entries: Sequence[ConversationEntry]) -> str | None:

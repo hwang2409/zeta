@@ -6,15 +6,18 @@ from zeta.providers.completion import owned_completion
 from pathlib import Path
 import asyncio
 import base64
+import gc
 import hashlib
 import json
 import threading
+import weakref
 from tempfile import TemporaryDirectory
 from collections.abc import Callable
 
 import pytest
 
 import zeta.core.context as context_module
+from zeta.config.settings import ComputerUseConfig
 from zeta.core.context import (
     AssembledContext,
     BudgetExceeded,
@@ -29,6 +32,8 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.runtime.loop.agent import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.tools import ToolRegistry
+from zeta.tools.computer.fake import FakeBackend as ComputerFakeBackend
 from zeta.providers.anthropic import build_messages_payload
 from zeta.codex import CodexStreamError
 from zeta.providers.codex_payload import build_responses_payload
@@ -52,6 +57,67 @@ from zeta.protocol.types import (
 )
 
 
+_SCREENSHOT_DATA = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
+    "YGD4DwABBAEAHnOcQAAAAABJRU5ErkJggg=="
+)
+_SECOND_SCREENSHOT_DATA = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg"
+    "+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+)
+
+
+def _computer_result(call_id: str, data: str = _SCREENSHOT_DATA) -> ToolResult:
+    return ToolResult(
+        call_id,
+        "screenshot 1x1 image/png",
+        content_blocks=[
+            {"type": "text", "text": "screenshot 1x1 image/png", "truncated": False, "full_size": 24},
+            {"type": "image", "data": data, "mimeType": "image/png", "width": 1, "height": 1, "size": 70},
+        ],
+        structured_content={"computer": {"has_screenshot": True, "control": "idle"}},
+    )
+
+
+def _computer_loop(tmp_path: Path, *, persist: bool = False) -> AgentLoop:
+    registry = ToolRegistry(
+        tmp_path,
+        register_builtin=False,
+        skill_catalog=SkillCatalog.empty(),
+        computer=ComputerUseConfig(persist_screenshots=persist),
+    )
+    return AgentLoop(
+        FakeBackend([]),
+        ConversationStore(tmp_path),
+        registry=registry,
+        skill_catalog=SkillCatalog.empty(),
+    )
+
+
+def _append_computer_result(loop: AgentLoop, result: ToolResult) -> None:
+    loop._finalize_tool_results(
+        [ToolCall(result.tool_call_id, "computer", {"action": "screenshot"})],
+        [result],
+    )
+
+
+def _images_data(result: ToolResult) -> list[str]:
+    return [
+        block["data"]
+        for block in result.content_blocks or ()
+        if block.get("type") == "image"
+    ]
+
+
+def _context_image_data(messages: list[Message]) -> list[str]:
+    return [
+        data
+        for message in messages
+        if message.tool_result is not None
+        for data in _images_data(message.tool_result)
+    ]
+
+
 def _update_prompt(assembler: ContextAssembler, prompt: Message) -> None:
     update = getattr(assembler, "update_system_prompt", None)
     if update is None:
@@ -73,6 +139,125 @@ def owned_context_store(tmp_path: Path):
         yield store
     finally:
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_registered_computer_receipt_does_not_persist_screenshot(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        computer=ComputerUseConfig(
+            enabled=True,
+            default_app_access="allow",
+            persist_screenshots=False,
+        ),
+    )
+    registry.computer_backend = ComputerFakeBackend()
+    backend = FakeBackend(
+        [
+            ScriptedTurn(tool_calls=[ToolCall("shot", "computer", {"action": "screenshot"})]),
+            ScriptedTurn(content=[TextContent("done")]),
+        ]
+    )
+    loop = AgentLoop(
+        backend, store, registry=registry, skill_catalog=SkillCatalog.empty()
+    )
+    try:
+        events = [
+            event
+            async for event in loop.run_turn("look", origin=MessageOrigin.USER)
+        ]
+        live_result = next(
+            event.tool_result
+            for event in events
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+        )
+        marker = _images_data(live_result)[0]
+        session_json = (store.session_dir / "conversation.jsonl").read_text()
+        assert marker not in session_json
+        assert _context_image_data(backend.calls[1][0]) == [marker]
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_computer_screenshots_are_live_latest_only_and_not_persisted(
+    tmp_path: Path,
+) -> None:
+    loop = _computer_loop(tmp_path)
+    first = _computer_result("shot-1")
+    _append_computer_result(loop, first)
+    first_owner = weakref.ref(loop.computer_screenshot_retention._latest)
+    del first
+    second = _computer_result("shot-2", _SECOND_SCREENSHOT_DATA)
+    _append_computer_result(loop, second)
+    before = branch_messages(loop.store)
+    assembled = await loop.context_assembler.assemble_context()
+    after = branch_messages(loop.store)
+    session_json = (loop.store.session_dir / "conversation.jsonl").read_text()
+    try:
+        gc.collect()
+        assert _SCREENSHOT_DATA not in session_json
+        assert _context_image_data(assembled.messages) == [_SECOND_SCREENSHOT_DATA]
+        assert first_owner() is None
+        assert before == after
+    finally:
+        await loop.close()
+        loop.store.close()
+
+
+@pytest.mark.asyncio
+async def test_computer_screenshot_reopen_has_only_durable_stub(tmp_path: Path) -> None:
+    loop = _computer_loop(tmp_path)
+    _append_computer_result(loop, _computer_result("shot"))
+    session_dir = loop.store.session_dir
+    await loop.close()
+    loop.store.close()
+
+    reopened = ConversationStore(
+        session_dir.parent, session_id=session_dir.name, _must_exist=True
+    )
+    try:
+        messages = branch_messages(reopened)
+        result = next(message.tool_result for message in messages if message.tool_result)
+        computer = result.structured_content["computer"]
+        assembled = await ContextAssembler(reopened).assemble_context()
+        assert result.content_blocks[0]["type"] == "text"
+        assert computer["screenshot"] == {
+            "type": "image",
+            "mimeType": "image/png",
+            "width": 1,
+            "height": 1,
+            "size": 70,
+            "data_omitted": True,
+        }
+        assert _context_image_data(assembled.messages) == []
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_persisted_computer_screenshots_still_project_latest_only(
+    tmp_path: Path,
+) -> None:
+    loop = _computer_loop(tmp_path, persist=True)
+    _append_computer_result(loop, _computer_result("shot-1"))
+    _append_computer_result(
+        loop, _computer_result("shot-2", _SECOND_SCREENSHOT_DATA)
+    )
+    try:
+        session_json = (loop.store.session_dir / "conversation.jsonl").read_text()
+        assembled = await loop.context_assembler.assemble_context()
+        assert _SCREENSHOT_DATA in session_json
+        assert _SECOND_SCREENSHOT_DATA in session_json
+        assert _context_image_data(assembled.messages) == [_SECOND_SCREENSHOT_DATA]
+    finally:
+        await loop.close()
+        loop.store.close()
 
 
 @pytest.mark.parametrize(

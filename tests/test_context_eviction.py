@@ -21,6 +21,7 @@ from zeta.context_eviction import (
     eviction_view,
     recall_history,
 )
+from zeta.core.computer_retention import ComputerScreenshotRetention
 from zeta.core.context import CompactionPolicy, ContextAssembler
 from zeta.core.context_parts.tool_results import truncate_tool_results
 from zeta.core.store import ConversationEntry, ConversationStore
@@ -50,6 +51,58 @@ from zeta.providers.ollama import _messages as build_ollama_messages
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+
+_COMPUTER_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAHnOcQAAAAABJRU5ErkJggg=="
+
+
+@pytest.mark.asyncio
+async def test_computer_screenshot_does_not_resurrect_across_evictions(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    retention = ComputerScreenshotRetention()
+    result = ToolResult(
+        "shot",
+        "screenshot 1x1",
+        content_blocks=[
+            {"type": "image", "data": _COMPUTER_IMAGE, "mimeType": "image/png", "width": 1, "height": 1}
+        ],
+        structured_content={"computer": {"has_screenshot": True}},
+    )
+    store.append_message(
+        Message(MessageRole.TOOL_RESULT, [], tool_result=retention.durable(result))
+    )
+    retention.remember(result)
+    assembler = ContextAssembler(
+        store,
+        token_budget=200,
+        retained_tail=1,
+        computer_screenshot_retention=retention,
+        compaction_policy=EmptyEvictionPolicy(),
+    )
+    try:
+        sizes: list[int] = []
+        image_counts: list[int] = []
+        for cycle in range(3):
+            store.append_message(text(MessageRole.ASSISTANT, f"old {cycle} " * 200))
+            store.append_message(text(MessageRole.USER, f"latest {cycle}"))
+            context = await assembler.assemble_context(
+                force=True, bypass_eviction_hysteresis=True
+            )
+            encoded = json.dumps(
+                [message.to_dict() for message in context.messages], sort_keys=True
+            )
+            sizes.append(len(encoded))
+            image_counts.append(encoded.count(_COMPUTER_IMAGE))
+        assert image_counts[0] <= 1
+        assert image_counts[1:] == [0, 0]
+        assert max(sizes) < 20_000
+        assert len(ContextAssembler._active_markers(branch_entries(store))) == 1
+        assert _COMPUTER_IMAGE not in (
+            store.session_dir / "conversation.jsonl"
+        ).read_text()
+    finally:
+        store.close()
 
 
 @pytest.mark.parametrize("seqs", [[2, 1], [1, 1], [1, 3], [None]])

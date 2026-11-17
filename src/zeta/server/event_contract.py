@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from enum import Enum, auto
 
 from ..core.checkpoints import ConversationEntry
+from ..core.computer_retention import public_tool_result
 from ..protocol.types import Message, StreamEvent, StreamEventType
 from .protocol import TOOL_OUTPUT_MAX_BYTES, EventDescriptor, bounded
 
@@ -261,7 +262,7 @@ def shape_approval_history_rows(
 
 def tool_end(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
     tool_call = _tool_call(event)
-    result = event.tool_result.to_dict() if event.tool_result else None
+    result = public_tool_result(event.tool_result) if event.tool_result else None
     if fidelity:
         tool_call = _project_tool_call(tool_call)
         if result is not None:

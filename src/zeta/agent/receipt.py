@@ -713,6 +713,7 @@ class _ReceiptLoop(Protocol):
     _agent_child_types: Any
     _background_owner: Any
     agent_instance_id: str | None
+    computer_screenshot_retention: Any
 
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None: ...
 
@@ -732,11 +733,13 @@ def _append_tool_result(
     approval_origin = (
         registry.peek_approval_origin(call.id) if registry is not None else None
     )
+    retention = getattr(owner, "computer_screenshot_retention", None)
+    durable_result = retention.durable(result) if retention is not None else result
     receipt = owner.store.append_message(
         Message(
             MessageRole.TOOL_RESULT,
             [TextContent(result.content)],
-            tool_result=result,
+            tool_result=durable_result,
             metadata=(
                 {"zeta.approval_origin": approval_origin}
                 if approval_origin is not None
@@ -744,6 +747,8 @@ def _append_tool_result(
             ),
         )
     )
+    if retention is not None:
+        retention.remember(result)
     if registry is not None:
         registry.take_approval_origin(call.id)
     return receipt
