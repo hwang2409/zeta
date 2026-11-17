@@ -946,6 +946,11 @@ class _Client:
                     "mcp_bindings require a controller connection",
                 )
             if role == "controller":
+                if (
+                    self.server.controllers.controller_mode == "multi"
+                    and isinstance(params.get("session_id"), str)
+                ):
+                    self.server.controllers.claim_existing(self, params["session_id"])
                 with self.server.controllers.owned(self) as controller:
                     await self._setup_controller_hello(params, deadline, controller)
             if admission is not None:

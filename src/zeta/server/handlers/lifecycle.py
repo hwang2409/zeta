@@ -144,7 +144,7 @@ async def _new_session(
             )
             if incoming is not None:
                 if self.server.controllers.controller_mode == "multi":
-                    controller = self.server.controllers.bind_created(self, incoming)
+                    controller = self.server.controllers.acquire_created(self, incoming)
                 else:
                     controller = self.server.attach(incoming)
             if initial_model is not None and initial_mode is not None:

@@ -277,6 +277,28 @@ class SessionControllers:
             raise unattached_error
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
 
+    def claim_existing(self, connection: Any, session_id: str) -> None:
+        """Claim an already resident session for a reconnecting controller."""
+        record = self._by_session.get(session_id)
+        if isinstance(record, SessionAcquisition):
+            record = record.target
+        if record is None:
+            for candidate in self._records.values():
+                if candidate.runtime.session_id == session_id and not candidate.closing:
+                    record = candidate
+                    break
+        if record is None or record.closing:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        holder = next((owner for owner, item in self._by_connection.items() if item is record), None)
+        if holder is not None and holder is not connection:
+            raise ProtocolError(
+                ErrorDescriptor.SESSION_CONTROLLED,
+                "session is controlled by another client",
+                {"session_id": session_id},
+            )
+        self._by_session[session_id] = record
+        self._by_connection[connection] = record
+
     def reserve_session(
         self, connection: Any, session_id: str, candidate: SessionController
     ) -> SessionAcquisition:
@@ -305,21 +327,13 @@ class SessionControllers:
         self._by_connection[acquisition.connection] = acquisition.target
         return self._use(acquisition.target)
 
-    def bind_created(self, connection: Any, record: SessionController) -> SessionUse:
-        """Bind a newly created session after its runtime assigns its id."""
+    def acquire_created(self, connection: Any, record: SessionController) -> SessionUse:
+        """Reserve and commit a newly created target after it gets its id."""
         session_id = record.runtime.session_id
         if session_id is None:
             raise RuntimeError("created session has no id")
-        existing = self._by_session.get(session_id)
-        if existing is not None and existing is not record:
-            raise ProtocolError(
-                ErrorDescriptor.SESSION_CONTROLLED,
-                "session is controlled by another client",
-                {"session_id": session_id},
-            )
-        self._by_session[session_id] = record
-        self._by_connection[connection] = record
-        return self._use(record)
+        acquisition = self.reserve_session(connection, session_id, record)
+        return self.commit_session(acquisition)
 
     def abort_session(self, acquisition: SessionAcquisition) -> asyncio.Task[None] | None:
         if self._by_session.get(acquisition.session_id) is acquisition:
