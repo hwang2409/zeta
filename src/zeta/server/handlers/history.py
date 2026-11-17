@@ -62,7 +62,11 @@ def _stable_history_read[T](
 
 
 def child_history(
-    produce_reader: Callable[[bool], object], params: dict, *, fidelity: bool
+    produce_reader: Callable[[bool], object],
+    params: dict,
+    *,
+    fidelity: bool,
+    approval_origin: bool = False,
 ) -> dict:
     """Serve one child history page from a stable observer snapshot.
 
@@ -74,7 +78,12 @@ def child_history(
     def read(reader: object) -> dict:
         runtime = SimpleNamespace(opened=SimpleNamespace(store=reader))
         return history(
-            runtime, params, backward_enabled=True, fidelity=fidelity, child_runs=True
+            runtime,
+            params,
+            backward_enabled=True,
+            fidelity=fidelity,
+            child_runs=True,
+            approval_origin=approval_origin,
         )
 
     return _stable_history_read(

@@ -471,6 +471,7 @@ async def test_automatic_approval_origin_is_live_and_replayed_over_socket(
         await request(reader, writer, 3, "send", {"text": "hello"})
         started = await event(reader, "tool_start")
         assert started["tool_call"]["approval_origin"] == "automatic"
+        assert "approval_origin" not in started["data"]
         await event(reader, "agent_end")
 
         store = server.runtime.opened.store
