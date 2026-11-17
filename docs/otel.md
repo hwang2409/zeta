@@ -196,8 +196,9 @@ EOF
 )
 ```
 
-The first `uv run` must print a `zeta` path under `OTEL_WORKTREE`, and the
-revision check must pass. The local Ollama provider does not use account
+The viewer readiness check waits up to about 60 seconds before failing. The
+first `uv run` must print a `zeta` path under `OTEL_WORKTREE`, and the revision
+check must pass. The local Ollama provider does not use account
 credentials. In otel-gui, open the newest `zeta` trace. The tree should show
 the parent `invoke_agent` span, its `execute_tool agent` span, the nested child
 agent, and the child work. The viewer and OTLP endpoint above bind only to
