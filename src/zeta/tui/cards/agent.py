@@ -48,7 +48,7 @@ class _Receipt:
 
     @property
     def plain(self) -> str:
-        return f"{self._header.plain}\n{self._answer}"
+        return f"{self._header.plain} · {self._answer}"
 
     def __rich_console__(
         self, console: Console, options: ConsoleOptions
@@ -488,11 +488,15 @@ class AgentCard:
         elapsed = elapsed_seconds
         if elapsed is None:
             value = event.data.get("elapsed_seconds")
-            if isinstance(value, (int, float)):
-                elapsed = max(0.0, float(value))
+            if isinstance(value, (int, float)) and value > 0:
+                elapsed = float(value)
             else:
                 value = event.data.get("elapsed_ms")
-                elapsed = max(0.0, float(value) / 1000) if isinstance(value, (int, float)) else 0.0
+                elapsed = (
+                    float(value) / 1000
+                    if isinstance(value, (int, float)) and value > 0
+                    else None
+                )
         turns = turns_used
         event_depth = event.data.get("depth")
         display_depth = 1
@@ -546,14 +550,15 @@ class AgentCard:
         if handle:
             fields[1 if agent_type else 0] += f" {handle}"
         fields.append(f"{turns} turns")
-        if elapsed is not None:
-            fields.append(f"{max(0.0, elapsed):.1f}s")
+        if elapsed is not None and elapsed > 0:
+            fields.append(f"{elapsed:.1f}s")
         fields.extend((receipt_status, f"depth {display_depth}"))
         if tool_calls is not None:
             fields.append(f"{tool_calls} tool calls")
         model = structured.get("model", cls._model(call))
         if isinstance(model, str) and model:
             fields.append(model)
+        fields = [field for field in fields if field != "0.0s"]
         header = Text(
             " · ".join(fields),
             style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
