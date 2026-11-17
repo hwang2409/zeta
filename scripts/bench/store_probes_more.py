@@ -67,7 +67,7 @@ async def _evict_event(store: Any, assembler: Any, event: int) -> dict[str, Any]
             force=True, bypass_eviction_hysteresis=True
         )
         elapsed = (time.perf_counter_ns() - started) / 1e6
-    marker = next((e for e in reversed(store._entries) if e.type == "compaction"), None)
+    marker = store.latest_compaction_marker()
     data = marker.data if marker is not None else {}
     floor, view = data.get("fact_floor"), data.get("view")
     return {
@@ -82,7 +82,7 @@ async def _evict_event(store: Any, assembler: Any, event: int) -> dict[str, Any]
         "view_items": len(view) if isinstance(view, list) else None,
         "context_messages": len(context.messages),
         "context_tokens": context.token_count,
-        "log_rows": len(store._entries),
+        "log_rows": len(store.resident_refs()),
         "ops": ops,
     }
 
@@ -130,7 +130,6 @@ def probe_evict(args: argparse.Namespace) -> dict[str, Any]:
             events.append({"timed_events_uninstrumented": summary(times)})
 
         asyncio.run(run())
-        store._owner_thread_id = None
         store.append_message(user_message("profile " + filler))
         events.append(
             {

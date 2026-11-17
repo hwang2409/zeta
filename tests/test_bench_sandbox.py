@@ -37,6 +37,34 @@ def _load_sandbox():
     return module
 
 
+def test_store_eviction_probe_runs_on_synthetic_session(tmp_path: Path) -> None:
+    env = os.environ.copy()
+    env.update(HOME=str(tmp_path), ZETA_HOME=str(tmp_path / ".zeta"))
+    run = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/bench/store_probes.py"),
+            "evict",
+            "--session",
+            "fresh",
+            "-n",
+            "1",
+            "--events",
+            "1",
+        ],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert run.returncode == 0, run.stderr
+    result = json.loads(run.stdout)
+    assert result["events"][0]["event"] == 1
+
+
 # Installed as sitecustomize in the bench.py process, so it applies to the
 # unmodified harness. It records the provider traffic of the run: each TCP
 # connect to a loopback host (the local stub), each read of the Claude keychain
