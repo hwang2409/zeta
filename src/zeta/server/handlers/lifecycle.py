@@ -120,7 +120,7 @@ async def _setup(self, body: Any, params: dict[str, Any], controller: SessionUse
 
 
 async def _settle_controller_release(
-    self: _Client, control: ServeControl
+    self: Any, control: ServeControl
 ) -> bool:
     """Finish one semantic release and report deferred caller cancellation."""
     release = control.begin_controller_release(
@@ -139,7 +139,7 @@ async def _settle_controller_release(
 
 
 async def _release_previous(
-    self: _Client, acquisition: SessionAcquisition
+    self: Any, acquisition: SessionAcquisition
 ) -> None:
     previous = acquisition.previous
     if previous is None or previous is acquisition.target:

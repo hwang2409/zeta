@@ -2402,7 +2402,7 @@ async def test_client_close_emits_approval_end_once(tmp_path: Path) -> None:
         assert next(iter(server.connections.clients()), None) is not None
         closing = asyncio.create_task(next(iter(server.connections.clients()), None).close())
         frames = await _frames_until_eof(reader)
-        await closing
+        await await_or_fail(closing, what="client close")
         ends = _named_events(frames, "approval_end")
         assert [event["request_id"] for event in ends] == [approval["request_id"]]
     finally:

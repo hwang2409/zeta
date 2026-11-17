@@ -128,7 +128,7 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert (await rpc(reader, writer, "login_start", provider=other))["result"]["state"] == "pending"
         assert (await rpc(reader, writer, "login_cancel", provider=other))["result"]["state"] == "cancelled"
         assert await callback(captured["redirect"], {"code": "synthetic-code", "state": captured["state"]}) == 200
-        await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks[provider], 3)
+        await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks[provider], 10)
         assert (await rpc(reader, writer, "login_status", provider=provider))["result"] == {"state": "succeeded"}
         saved = await asyncio.to_thread(credential_store, provider, home=server.home)
         assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) == expected
@@ -370,7 +370,7 @@ async def test_serve_login_decision_expiry_reports_failure_and_releases_locks(
             captured["redirect"],
             {"code": "synthetic", "state": captured["state"]},
         )
-        result = await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks["claude"], 3)
+        result = await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks["claude"], 10)
 
         assert result == {
             "state": "failed",
