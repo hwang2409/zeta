@@ -571,7 +571,7 @@ def valid_eviction_view(
                 and result.get("tool_call_id") not in tool_call_ids
             ):
                 orphan_result = True
-    return not (tool_call_ids and orphan_result)
+    return not orphan_result
 
 
 def invalid_eviction_markers(

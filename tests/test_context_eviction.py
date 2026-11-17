@@ -85,15 +85,11 @@ def test_invalid_eviction_view_sequences_are_boundaries(
 
 
 def test_eviction_view_with_orphan_tool_result_is_invalid() -> None:
-    call, _ = tool_pair("read", "orphan", "output")
-    _, other_result = tool_pair("read", "other", "output")
+    _, result = tool_pair("read", "orphan", "output")
     marker = ConversationEntry(
         seq=3, id="marker", parent_id=None, lane="main", type="compaction",
         data={"kind": "evict", "source_seq_start": 1, "source_seq_end": 2,
-              "view": [
-                  {"seq": 1, "message": call.to_dict()},
-                  {"seq": 2, "message": other_result.to_dict()},
-              ]},
+              "view": [{"seq": 2, "message": result.to_dict()}]},
     )
     items = ContextAssembler._marker_items(marker, {1, 2})
     assert all(item.message.metadata["eviction_view_invalid"] for item in items)
