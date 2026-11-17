@@ -9591,6 +9591,7 @@ def test_tool_result_retry_keeps_approval_origin(tmp_path: Path) -> None:
     owner = SimpleNamespace(
         store=store,
         hooks=None,
+        extensions=None,
         tool_registry=registry,
         _agent_child_stores={},
         _agent_child_turns={},
