@@ -358,6 +358,8 @@ class ZetaServer:
         """Point the runtime's sinks at its control; a borrowed runtime keeps its owner's."""
         if not self._borrowed:
             runtime = control.runtime
+            # every pair's sessions trace through this server's process telemetry
+            runtime.set_telemetry_source(lambda: self.telemetry)
             runtime.set_approval_control_binder(control.bind_policy)
             runtime.set_background_event_sink(control._publish_background_event)
             runtime.set_memory_notice_sink(control._publish_memory_notice)
@@ -411,8 +413,6 @@ class ZetaServer:
             except TelemetryError as exc:
                 raise SessionError(str(exc)) from None
         if not self._borrowed:
-            # sessions this server opens trace through its process telemetry
-            self.runtime.telemetry = self.telemetry
             await self.runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(

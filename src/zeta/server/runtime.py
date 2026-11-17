@@ -228,8 +228,6 @@ class ServerRuntime:
         self.manager = SessionManager(self.home, owner_surface="serve")
         self._project_registry_probed = False
         self._state: SessionState | None = None
-        # an owning ZetaServer replaces this with its process telemetry in start()
-        self.telemetry = Telemetry.disabled()
         self._init_sinks()
 
     def _init_sinks(self) -> None:
@@ -241,6 +239,9 @@ class ServerRuntime:
         self._run_work_event_sink: RunWorkEventSink | None = None
         self._work_changed_sink: Callable[[], None] | None = None
         self._setup_reapers: set[asyncio.Task[None]] = set()
+        # process telemetry is owned elsewhere (ZetaServer or the borrowed loop);
+        # the runtime only reads it through this getter
+        self._telemetry_source: Callable[[], Telemetry] = Telemetry.disabled
 
     def backend_for_model(
         self,
@@ -309,8 +310,8 @@ class ServerRuntime:
         runtime.backend_factory = None
         runtime.manager = SessionManager(runtime.home, owner_surface="serve")
         runtime._project_registry_probed = True
-        runtime.telemetry = loop.telemetry
         runtime._init_sinks()
+        runtime._telemetry_source = lambda: loop.telemetry
         runtime._state = SessionState(
             opened=opened,
             loop=loop,
@@ -440,6 +441,14 @@ class ServerRuntime:
         self._run_work_event_sink = sink
         if self._state is not None:
             self._bind_background_event_sink(self._state)
+
+    @property
+    def telemetry(self) -> Telemetry:
+        return self._telemetry_source()
+
+    def set_telemetry_source(self, source: Callable[[], Telemetry]) -> None:
+        """Borrow the owner's process telemetry; read live, so a later configure shows."""
+        self._telemetry_source = source
 
     def set_work_changed_sink(self, sink: Callable[[], None] | None) -> None:
         """Attach the callback for work that ended without an event (a task exit
