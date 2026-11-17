@@ -492,6 +492,7 @@ def test_resolve_attention_refuses_owner_that_starts_after_lookup(
         assert ready.wait(10), "timed out waiting for the predecessor to restart"
         return matches
 
+    # test-contract: seam force the predecessor startup after exact-id lookup
     monkeypatch.setattr(resolve_module, "_foreign_matches", start_owner_after_lookup)
     registry = ToolRegistry(
         tmp_path,
