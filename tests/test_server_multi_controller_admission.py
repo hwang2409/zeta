@@ -314,8 +314,8 @@ async def test_cancelled_hello_transaction_public_recovery(
             task = original_release(*args, **kwargs)
             async def held() -> None:
                 release_started.set()
-                await release_gate.wait()
-                await asyncio.shield(task)
+                await asyncio.wait_for(release_gate.wait(), 10)
+                await asyncio.wait_for(asyncio.shield(task), 10)
             return asyncio.create_task(held())
         monkeypatch.setattr(control, "begin_controller_release", begin_release)
 
@@ -370,6 +370,7 @@ async def test_cancelled_hello_transaction_public_recovery(
             if client._request is not None and client._request[0] == "hello":
                 return await _cancel_at(original, (client, *args), kwargs, after=False)
             return await original(client, *args, **kwargs)
+        # test-contract: seam response-publication cancellation uses the existing writer.
         monkeypatch.setattr(_Client, "_write", gated)
 
     params: dict[str, Any] = {"protocol_version": "1.1", "features": ["multi_controller"]}
