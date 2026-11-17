@@ -890,8 +890,6 @@ class _Client:
                 handler = self._run_task
                 if handler is not None and not handler.done() and handler is not asyncio.current_task():
                     handler.cancel()
-                    with contextlib.suppress(BaseException):
-                        await handler
                 await self.connections.flush(self)
             self._local_close = True
             self.writer.close()
