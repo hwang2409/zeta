@@ -17,11 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.core.commands.slash_registry import SlashLock, SlashSurface
 from zeta.core.slash import create_slash_registry
-from zeta.core.store import ConversationStore
 from zeta.extensions import (
     EXTENSION_API_VERSION,
     ExtensionManifestError,
