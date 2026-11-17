@@ -32,7 +32,7 @@ from zeta.extensions import (
     trust_project_extensions,
 )
 from zeta.extensions.host import USER_SCOPE
-from zeta.protocol.types import StreamEventType, ToolCall
+from zeta.protocol.types import StreamEvent, StreamEventType, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.testing.extensions import load_extension
@@ -133,8 +133,7 @@ def activate(zx):
         host = apply_extensions(registry, home=home, project_dir=None, builtin_names=registry.registered_names)
         events = []
         host.set_event_sink(events.append, asyncio.get_running_loop())
-        # the public zx.ui.notify call during activation waits for the frontend sink.
-        await asyncio.sleep(0)
+        # queued notices drain before the sink binding returns.
         assert len(events) == 1
         assert events[0].type is StreamEventType.AGENT_NOTIFICATION
         assert events[0].data == {"kind": "extension", "extension": "notify-ext", "text": "hello", "level": "warning"}
@@ -144,6 +143,41 @@ def activate(zx):
             "name": "notify-ext", "scope": "user", "version": "0.1.0",
             "enabled": True, "trusted": True, "loaded": True, "error": None,
         }]
+
+
+@pytest.mark.asyncio
+async def test_sink_binding_drains_detached_fifo_without_recursion(
+    tmp_path: Path,
+) -> None:
+    source = """
+def activate(zx):
+    zx.ui.notify("first")
+    zx.ui.notify("second")
+"""
+    home = tmp_path / "home"
+    _write_extension(home / "extensions", "notify-ext", source=source)
+    async with _open_registry(tmp_path) as registry:
+        host = apply_extensions(
+            registry,
+            home=home,
+            project_dir=None,
+            builtin_names=registry.registered_names,
+        )
+        delivered: list[str] = []
+        nested_delivered = asyncio.Event()
+
+        def sink(event: StreamEvent) -> None:
+            text = event.data["text"]
+            delivered.append(text)
+            if text == "first":
+                host.notify("notify-ext", "nested", "info")
+            elif text == "nested":
+                nested_delivered.set()
+
+        host.set_event_sink(sink, asyncio.get_running_loop())
+        assert delivered == ["first", "second"]
+        await asyncio.wait_for(nested_delivered.wait(), 10)
+        assert delivered == ["first", "second", "nested"]
 
 
 @pytest.mark.asyncio
@@ -215,6 +249,7 @@ def activate(zx):
 
 
 
+
 @pytest.mark.asyncio
 async def test_api_version_mismatch_refused_with_notice(tmp_path: Path) -> None:
     home = tmp_path / "home"
@@ -279,7 +314,6 @@ async def test_notify_flood_bounds_scheduled_callbacks(tmp_path: Path) -> None:
         assert len(host._pending_notifications) == 32
         assert host.notify_dropped > 9_000
         host.set_event_sink(delivered.append, asyncio.get_running_loop())
-        await asyncio.sleep(0)
         assert len(delivered) == 33
         assert delivered[-1].data == {
             "kind": "extension",

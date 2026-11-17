@@ -286,10 +286,9 @@ class ExtensionHost:
         dropped = self._pending_notification_drops
         self._pending_notification_drops = 0
         for event in pending:
-            loop.call_soon(self._send, event)
+            self._send(event)
         if dropped:
-            loop.call_soon(
-                self._send,
+            self._send(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={
@@ -298,7 +297,7 @@ class ExtensionHost:
                         "text": f"{dropped} extension notices dropped",
                         "level": "warning",
                     },
-                ),
+                )
             )
 
     def _send(self, event: StreamEvent) -> None:
