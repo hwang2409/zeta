@@ -947,17 +947,17 @@ class _Client:
                     "mcp_bindings require a controller connection",
                 )
             if role == "controller":
-                if (
-                    self.server.controllers.controller_mode == "multi"
-                    and isinstance(params.get("session_id"), str)
-                ):
-                    acquisition = self.server.controllers.reserve_existing(
-                        self, params["session_id"]
+                requested_session_id = params.get("session_id")
+                session_id = (
+                    requested_session_id
+                    if (
+                        self.server.controllers.controller_mode == "multi"
+                        and isinstance(requested_session_id, str)
                     )
-                    controller_use = self.server.controllers.use_acquisition(acquisition)
-                else:
-                    controller_use = self.server.controllers.owned(self)
-                with controller_use as controller:
+                    else None
+                )
+                with self.server.controllers.owned(self, session_id) as controller:
+                    acquisition = controller.acquisition
                     await self._setup_controller_hello(params, deadline, controller)
             if admission is not None:
                 self.server.controllers.commit_hello(admission)

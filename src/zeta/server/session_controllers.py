@@ -63,12 +63,18 @@ class SessionUse:
     or the completion it was handed to settles. A close of the record waits
     until it holds no use."""
 
-    __slots__ = ("_owner", "_state", "generation", "record")
+    __slots__ = ("_owner", "_state", "acquisition", "generation", "record")
 
-    def __init__(self, owner: SessionControllers, record: SessionController) -> None:
+    def __init__(
+        self,
+        owner: SessionControllers,
+        record: SessionController,
+        acquisition: SessionAcquisition | None = None,
+    ) -> None:
         self._owner = owner
         self._state: Literal["held", "transferred", "released"] = "held"
         self.record = record
+        self.acquisition = acquisition
         self.generation = record.generation
 
     @property
@@ -246,8 +252,11 @@ class SessionControllers:
     def attached(self) -> SessionController:
         return self._attached
 
-    def owned(self, connection: Any) -> SessionUse:
+    def owned(self, connection: Any, session_id: str | None = None) -> SessionUse:
         """A use of the persistent record controlled by ``connection``."""
+        if session_id is not None:
+            acquisition = self.reserve_existing(connection, session_id)
+            return self._use(acquisition.target, acquisition)
         record = self._by_connection.get(connection, self._attached)
         if record.closing:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
@@ -326,12 +335,6 @@ class SessionControllers:
         )
         self._by_session[session_id] = acquisition
         return acquisition
-
-    def use_acquisition(self, acquisition: SessionAcquisition) -> SessionUse:
-        """Hold the exact target reserved by ``acquisition`` during setup."""
-        if self._by_session.get(acquisition.session_id) is not acquisition:
-            raise RuntimeError("session acquisition is no longer current")
-        return self._use(acquisition.target)
 
     def commit_session(self, acquisition: SessionAcquisition) -> SessionUse:
         if self._by_session.get(acquisition.session_id) is not acquisition:
@@ -506,8 +509,12 @@ class SessionControllers:
             self._drains.setdefault(record, []).append(waiter)
             await waiter
 
-    def _use(self, record: SessionController) -> SessionUse:
-        use = SessionUse(self, record)
+    def _use(
+        self,
+        record: SessionController,
+        acquisition: SessionAcquisition | None = None,
+    ) -> SessionUse:
+        use = SessionUse(self, record, acquisition)
         record.uses.add(use)
         return use
 
