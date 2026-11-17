@@ -173,6 +173,7 @@ class ExtensionHost:
         self._notification_buckets: dict[str, tuple[float, float, int]] = {}
         self._packages: dict[str, Path] = {}
         self._closed = False
+        self._hooks: list[ExtensionHook] = []
 
     def new_package(self, directory: Path, extension_name: str) -> tuple[str, types.ModuleType]:
         safe = re.sub(r"[^0-9A-Za-z_]", "_", extension_name)
