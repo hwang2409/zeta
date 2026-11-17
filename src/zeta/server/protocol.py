@@ -189,6 +189,9 @@ class ApprovalDecision(StrEnum):
     DENY = "deny"
 
 
+APPROVAL_SCOPES = frozenset({"once", "always_tool"})
+
+
 class EventDescriptor(StrEnum):
     """One documented JSON-RPC event name."""
 

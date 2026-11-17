@@ -8,6 +8,7 @@ from ...mcp import MCPManagementError, MCPToolRefreshError
 from .. import abort_scope, accounts, model_selection, slash_commands
 from .. import control as session_grants
 from ..protocol import (
+    APPROVAL_SCOPES,
     Access,
     ApprovalDecision,
     ErrorDescriptor,
@@ -54,7 +55,7 @@ async def steer(client, request_id, params):
 
 async def _resolve_approval(client, params, decision):
     scope = params.get("scope", "once")
-    if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
+    if not isinstance(scope, str) or scope not in APPROVAL_SCOPES:
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS, "scope must be 'once' or 'always_tool'"
         )
