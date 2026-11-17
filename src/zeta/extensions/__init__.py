@@ -16,14 +16,7 @@ from .host import (
     LoadedExtension,
     PendingExtension,
 )
-from .trust import (
-    ExtensionTrustError,
-    fingerprint,
-    remove,
-    trust,
-    untrust,
-    update,
-)
+from .trust import ExtensionTrustError
 from .manifest import (
     ExtensionManifest,
     ExtensionManifestError,
@@ -35,7 +28,6 @@ __all__ = [
     "ExtensionAPI",
     "ExtensionError",
     "ExtensionTrustError",
-    "fingerprint",
     "ExtensionHost",
     "ExtensionManifest",
     "ExtensionManifestError",
@@ -45,8 +37,4 @@ __all__ = [
     "apply_extensions",
     "parse_manifest",
     "trust_project_extensions",
-    "remove",
-    "trust",
-    "untrust",
-    "update",
 ]
