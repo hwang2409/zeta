@@ -149,6 +149,7 @@ _RAW_DELETION = {
     ("attention_replies.py", "_send_staged_locked", "unlink"),
     ("attention_replies.py", "_recover_locked", "unlink"),
     ("attention_replies.py", "_cleanup", "unlink"),
+    ("extensions/host.py", "_disabled_marker", "unlink"),
     ("tools/_spill.py", "_evict_before", "unlink"),
     ("tools/_spill.py", "temporary_file", "unlink"),
     ("tools/_spill.py", "_try_unlink", "unlink"),

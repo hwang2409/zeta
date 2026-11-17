@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
-import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -75,29 +74,31 @@ def apply_extensions(
         task_owner=task_owner,  # type: ignore[arg-type]
         clock=clock,
     )
-    disabled_set = frozenset(disabled)
+    host._settings_disabled = set(disabled)
+    host._disabled = set(disabled)
+    try:
+        host.load_disabled_markers()
+    except OSError as exc:
+        host.notices.append(f"extensions · cannot read disabled markers: {exc}")
+    disabled_set = frozenset(host._disabled)
     user_dir = _scope_dir(home, "")
     project_scope_dir = _scope_dir(project_dir, ".zeta")
     for directory in _extension_dirs(user_dir):
         manifest = _manifest_or_notice(host, directory, USER_SCOPE)
-        if manifest is None:
-            continue
-        enabled = not _skip(host, manifest, directory, disabled_set)
-        host.add_status(manifest, USER_SCOPE, enabled=enabled)
-        if not enabled:
+        if manifest is None or _skip(
+            host, manifest, directory, USER_SCOPE, disabled_set,
+        ):
             continue
         _load_one(host, directory, manifest, USER_SCOPE)
     if project_scope_dir is not None and project_scope_dir != user_dir:
         pending_names: list[str] = []
         for directory in _extension_dirs(project_scope_dir):
             manifest = _manifest_or_notice(host, directory, PROJECT_SCOPE)
-            if manifest is None:
+            if manifest is None or _skip(
+                host, manifest, directory, PROJECT_SCOPE, disabled_set,
+            ):
                 continue
-            enabled = not _skip(host, manifest, directory, disabled_set)
-            host.add_status(manifest, PROJECT_SCOPE, enabled=enabled)
-            if not enabled:
-                continue
-            host.pending_project.append(PendingExtension(manifest, directory))
+            host.pending_project.append(PendingExtension(manifest, directory, PROJECT_SCOPE))
             pending_names.append(manifest.name)
         if pending_names:
             host.warnings.append(
@@ -118,17 +119,18 @@ def trust_project_extensions(host: ExtensionHost) -> None:
     pending = list(host.pending_project)
     host.pending_project.clear()
     for item in pending:
-        host.mark_trusted(item.manifest.name, PROJECT_SCOPE)
-        _load_one(host, item.directory, item.manifest, PROJECT_SCOPE)
+        _load_one(host, item.directory, item.manifest, item.scope)
 
 
 def _skip(
     host: ExtensionHost,
     manifest: ExtensionManifest,
     directory: Path,
+    scope: str,
     disabled: frozenset[str],
 ) -> bool:
     if manifest.name in disabled:
+        host.disabled_inventory.append(PendingExtension(manifest, directory, scope))
         host.notices.append(f"extensions · {manifest.name} disabled by settings")
         return True
     if manifest.api_version > EXTENSION_API_VERSION:
@@ -152,7 +154,7 @@ def _load_one(
         module = _import_entry(directory, manifest, host=host)
     except Exception as exc:  # noqa: BLE001 - loading must fail open
         error = f"import failed: {_short(exc)}"
-        host.mark_error(manifest.name, error, scope)
+        host.record_error(manifest.name, manifest.version, scope, error)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
@@ -161,7 +163,7 @@ def _load_one(
     if not callable(entry):
         host.remove_package_for_directory(directory)
         error = f"no callable {manifest.entry_function}(zx)"
-        host.mark_error(manifest.name, error, scope)
+        host.record_error(manifest.name, manifest.version, scope, error)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
@@ -173,7 +175,7 @@ def _load_one(
     except Exception as exc:  # noqa: BLE001 - a broken activate must not break the session
         host.remove_package_for_directory(directory)
         error = f"activate raised: {_short(exc)}"
-        host.mark_error(manifest.name, error, scope)
+        host.record_error(manifest.name, manifest.version, scope, error)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
@@ -183,7 +185,7 @@ def _load_one(
             result.close()
         host.remove_package_for_directory(directory)
         error = "activate must be synchronous"
-        host.mark_error(manifest.name, error, scope)
+        host.record_error(manifest.name, manifest.version, scope, error)
         host.notices.append(
             f"extensions · ignored {scope} extension {manifest.name} ({display}): {error}"
         )
@@ -226,7 +228,7 @@ def _import_entry(
         raise ImportError(f"could not build import spec for {entry_path}")
     module = importlib.util.module_from_spec(spec)
     module.__package__ = entry_package
-    sys.modules[entry_full] = module
+    host.register_module(pkg_name, manifest.entry_module, module)
     try:
         spec.loader.exec_module(module)
     except BaseException:

@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import itertools
+import os
 import re
+import stat
 import sys
 import threading
 import time
@@ -55,6 +57,15 @@ class _ToolDeclaration:
     kwargs: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class _CommandDeclaration:
+    name: str
+    description: str
+    handler: Any
+    body: str | None
+    kind: str
+
+
 class LoadingExtension:
     """One extension while its ``activate`` runs; collects declarations."""
 
@@ -63,6 +74,7 @@ class LoadingExtension:
         self.scope = scope
         self.directory = directory
         self._tools: list[_ToolDeclaration] = []
+        self._commands: list[_CommandDeclaration] = []
         self._hooks: list[ExtensionHook] = []
 
     def declare_tool(
@@ -89,6 +101,11 @@ class LoadingExtension:
             kwargs["actions"] = actions
         self._tools.append(_ToolDeclaration(name, handler, kwargs))
 
+    def declare_command(
+        self, name: str, description: str, handler: Any, body: str | None, kind: str
+    ) -> None:
+        self._commands.append(_CommandDeclaration(name, description, handler, body, kind))
+
     def declare_hook(self, event: str, handler: Any) -> None:
         if not inspect.iscoroutinefunction(handler):
             raise ExtensionError(f"extension hook '{event}' must be an async function")
@@ -102,16 +119,9 @@ class LoadingExtension:
     def declarations(self) -> tuple[_ToolDeclaration, ...]:
         return tuple(self._tools)
 
-
-@dataclass(slots=True)
-class ExtensionStatus:
-    name: str
-    scope: str
-    version: str
-    enabled: bool
-    trusted: bool
-    loaded: bool = False
-    error: str | None = None
+    @property
+    def command_declarations(self) -> tuple[_CommandDeclaration, ...]:
+        return tuple(self._commands)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,18 +133,43 @@ class LoadedExtension:
     scope: str
     directory: Path
     tool_names: tuple[str, ...]
+    command_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
 class PendingExtension:
-    """A project-scope extension discovered but not yet trusted (not loaded)."""
+    """An extension discovered but not loaded in this session."""
 
     manifest: ExtensionManifest
     directory: Path
+    scope: str
+
+
+@dataclass(frozen=True, slots=True)
+class ExtensionStatus:
+    """Current public state of one discovered extension."""
+
+    name: str
+    version: str
+    scope: str
+    state: str
+    trusted: bool
+    tool_names: tuple[str, ...] = ()
+    command_names: tuple[str, ...] = ()
+    error: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.state not in {"disabled_in_settings", "disabled_next_session"}
+
+    @property
+    def loaded(self) -> bool:
+        return self.state == "loaded"
 
 
 _NAMESPACE = "_zeta_extensions"
 _LOAD_NUMBER = itertools.count()
+_DISABLED_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 class ExtensionHost:
@@ -161,7 +196,6 @@ class ExtensionHost:
         self.pending_project: list[PendingExtension] = []
         self.notices: list[str] = []
         self.warnings: list[str] = []
-        self.statuses: dict[tuple[str, str], ExtensionStatus] = {}
         self._event_sink: Callable[[StreamEvent], None] | None = None
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self.notify_dropped = 0
@@ -172,6 +206,11 @@ class ExtensionHost:
         self._notification_clock = clock
         self._notification_buckets: dict[str, tuple[float, float, int]] = {}
         self._packages: dict[str, Path] = {}
+        self._command_declarations: dict[str, tuple[_CommandDeclaration, ...]] = {}
+        self._disabled: set[str] = set()
+        self._settings_disabled: set[str] = set()
+        self.disabled_inventory: list[PendingExtension] = []
+        self._errors: dict[tuple[str, str], tuple[str, str]] = {}
         self._closed = False
         self._hooks: list[ExtensionHook] = []
 
@@ -188,6 +227,12 @@ class ExtensionHost:
         sys.modules[package] = module
         self._packages[package] = directory
         return package, module
+
+    def register_module(self, package: str, name: str, module: types.ModuleType) -> None:
+        """Register an imported entry module under a host-owned namespace."""
+        if package not in self._packages:
+            raise ValueError(f"unknown extension package: {package}")
+        sys.modules[f"{package}.{name}"] = module
 
     def remove_package_for_directory(self, directory: Path) -> None:
         for package, package_directory in tuple(self._packages.items()):
@@ -212,6 +257,17 @@ class ExtensionHost:
 
         for package in tuple(self._packages):
             self.remove_package(package)
+
+    def _hook_notice(self, extension: str, message: str) -> None:
+        self.notify(extension, message, "warning")
+
+    def pre_tool_hook(self, base: Any = None) -> CompositeToolHook:
+        return CompositeToolHook(base, self._hooks, self._hook_notice, self._task_owner)
+
+    async def emit(self, event: str, *payload: Any) -> str | None:
+        return await run_extension_hooks(
+            self._hooks, event, payload, self._hook_notice, self._task_owner
+        )
 
     def set_event_sink(
         self, sink: Callable[[StreamEvent], None] | None,
@@ -303,44 +359,18 @@ class ExtensionHost:
             return
         self._event_loop.call_soon(self._send, event)
 
-    def add_status(self, manifest: ExtensionManifest, scope: str, *, enabled: bool) -> None:
-        self.statuses[(manifest.name, scope)] = ExtensionStatus(
-            manifest.name, scope, manifest.version, enabled, scope == USER_SCOPE
-        )
-
-    def mark_loaded(self, name: str, scope: str) -> None:
-        status = self.statuses.get((name, scope))
-        if status is not None:
-            status.loaded = True
-            status.error = None
-
-    def mark_error(self, name: str, error: str, scope: str) -> None:
-        status = self.statuses.get((name, scope))
-        if status is not None:
-            status.error = error
-
-    def mark_trusted(self, name: str, scope: str) -> None:
-        status = self.statuses.get((name, scope))
-        if status is not None:
-            status.trusted = True
+    def record_error(
+        self, name: str, version: str, scope: str, error: str,
+    ) -> None:
+        self._errors[(name, scope)] = (version, error)
 
     def status_rows(self) -> list[dict[str, object]]:
+        """Adapt the host-owned status records for the serve surface."""
         return [{
             "name": item.name, "scope": item.scope, "version": item.version,
-            "enabled": item.enabled, "trusted": item.trusted, "loaded": item.loaded,
-            "error": item.error,
-        } for item in self.statuses.values()]
-
-    def _hook_notice(self, extension: str, message: str) -> None:
-        self.notify(extension, message, "warning")
-
-    def pre_tool_hook(self, base: Any = None) -> CompositeToolHook:
-        return CompositeToolHook(base, self._hooks, self._hook_notice, self._task_owner)
-
-    async def emit(self, event: str, *payload: Any) -> str | None:
-        return await run_extension_hooks(
-            self._hooks, event, payload, self._hook_notice, self._task_owner
-        )
+            "enabled": item.enabled, "trusted": item.trusted,
+            "loaded": item.loaded, "error": item.error,
+        } for item in self.statuses()]
 
     def commit(self, extension: LoadingExtension) -> None:
         """Register a successfully activated extension's tools."""
@@ -369,7 +399,7 @@ class ExtensionHost:
                     f"extensions · {extension.scope} extension tool '{name}' from "
                     f"{display} shadows {shadow}"
                 )
-        self.mark_loaded(extension.manifest.name, extension.scope)
+        self._command_declarations[extension.manifest.name] = extension.command_declarations
         for hook in extension.hooks:
             hook.timeout_seconds = self.hook_timeout_seconds
             self._hooks.append(hook)
@@ -380,8 +410,142 @@ class ExtensionHost:
                 scope=extension.scope,
                 directory=extension.directory,
                 tool_names=tuple(added),
+                command_names=tuple(item.name for item in extension.command_declarations),
             )
         )
+
+    @property
+    def disabled(self) -> frozenset[str]:
+        return frozenset(self._disabled)
+
+    def load_disabled_markers(self) -> None:
+        directory = self._disabled_directory(create=False)
+        if directory is None:
+            return
+        for entry in directory.iterdir():
+            if _DISABLED_NAME_RE.fullmatch(entry.name) is None:
+                continue
+            try:
+                exists = self._disabled_marker(entry, "read")
+            except OSError as exc:
+                self.notices.append(f"extensions · cannot read disabled marker {entry.name}: {exc}")
+                continue
+            if exists:
+                self._disabled.add(entry.name)
+
+    def persist_disabled(self, name: str, enabled: bool) -> bool:
+        """Create or remove one zeta-owned disabled marker."""
+        if _DISABLED_NAME_RE.fullmatch(name) is None:
+            raise ValueError(f"invalid extension name: {name!r}")
+        if name in self._settings_disabled and enabled:
+            return False
+        directory = self._disabled_directory(create=True)
+        exists = self._disabled_marker(directory / name, "remove" if enabled else "create")
+        if exists:
+            self._disabled.add(name)
+        else:
+            self._disabled.discard(name)
+        return True
+
+    def _disabled_marker(self, marker: Path, action: str) -> bool:
+        if action == "create":
+            try:
+                fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                action = "read"
+            else:
+                os.close(fd)
+                return True
+        try:
+            mode = marker.lstat().st_mode
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(mode):
+            raise OSError(f"disabled marker is not a file: {marker.name}")
+        if action == "remove":
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            return False
+        return True
+
+    def statuses(self) -> tuple[ExtensionStatus, ...]:
+        """Project current loading state into immutable public records."""
+        records: list[ExtensionStatus] = []
+        seen: set[tuple[str, str]] = set()
+        for item in self.loaded:
+            key = (item.name, item.scope)
+            if key not in seen:
+                seen.add(key)
+                records.append(self._loaded_status(item))
+        for item in (*self.disabled_inventory, *self.pending_project):
+            key = (item.manifest.name, item.scope)
+            if key not in seen:
+                seen.add(key)
+                records.append(self._pending_status(item))
+        for (name, scope), (version, error) in self._errors.items():
+            if (name, scope) not in seen:
+                state = self._state(name, loaded=False)
+                records.append(ExtensionStatus(
+                    name=name, version=version, scope=scope,
+                    state="error" if state == "pending" else state,
+                    trusted=True, error=error,
+                ))
+        return tuple(records)
+
+    def status(self, name: str) -> ExtensionStatus | None:
+        return next((record for record in self.statuses() if record.name == name), None)
+
+    def _loaded_status(self, item: LoadedExtension) -> ExtensionStatus:
+        return ExtensionStatus(
+            name=item.name, version=item.version, scope=item.scope,
+            state=self._state(item.name, loaded=True), trusted=True,
+            tool_names=item.tool_names, command_names=item.command_names,
+        )
+
+    def _pending_status(self, item: PendingExtension) -> ExtensionStatus:
+        return ExtensionStatus(
+            name=item.manifest.name, version=item.manifest.version, scope=item.scope,
+            state=self._state(
+                item.manifest.name,
+                loaded=False,
+                disabled_inventory=item in self.disabled_inventory,
+            ),
+            trusted=item.scope == USER_SCOPE,
+        )
+
+    def _state(self, name: str, *, loaded: bool, disabled_inventory: bool = False) -> str:
+        if name in self._settings_disabled:
+            return "disabled_in_settings"
+        if name in self._disabled:
+            return "disabled_next_session"
+        if disabled_inventory:
+            return "enabled_next_session"
+        return "loaded" if loaded else "pending"
+
+    def _disabled_directory(self, *, create: bool) -> Path | None:
+        directory = self.home / "extensions-disabled"
+        try:
+            mode = directory.lstat().st_mode
+        except FileNotFoundError:
+            if not create:
+                return None
+            directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+            mode = directory.lstat().st_mode
+        if directory.is_symlink() or not stat.S_ISDIR(mode):
+            raise OSError("extensions-disabled must be a real directory")
+        os.chmod(directory, 0o700)
+        return directory
+
+    def loaded_declarations(self, name: str) -> tuple[_CommandDeclaration, ...]:
+        return self._command_declarations.get(name, ())
+
+    def register_commands(self, registry: Any) -> None:
+        """Add activated extension commands to a shared slash registry."""
+        from .commands import register_commands
+
+        register_commands(registry, self)
 
     def _shadow_phrase(self, name: str) -> str | None:
         if name in self._builtin_names:

@@ -9,7 +9,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from ..mcp.prompt_commands import SlashPromptError
 from ..model_input import ModelInputEnvelope
@@ -940,6 +940,7 @@ def create_slash_registry(
     project_registry_state: ProjectRegistryState | None = None,
     surface: SlashSurface = SlashSurface.TUI,
     include_tui_only: bool = False,
+    extensions: Any | None = None,
 ) -> SlashCommandRegistry:
     """Register shared builtins before custom commands and skills."""
 
@@ -1203,6 +1204,8 @@ def create_slash_registry(
             reason=loop_owned,
         )
     )
+    if extensions is not None:
+        extensions.register_commands(registry)
     result = load_custom_commands(
         home=effective_home,
         project_dir=project_dir or Path.cwd(),
