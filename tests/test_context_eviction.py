@@ -84,6 +84,17 @@ def test_invalid_eviction_view_sequences_are_boundaries(
     assert all(item.message.metadata["eviction_view_invalid"] for item in items)
 
 
+def test_eviction_view_with_orphan_tool_result_is_invalid() -> None:
+    _, result = tool_pair("read", "orphan", "output")
+    marker = ConversationEntry(
+        seq=3, id="marker", parent_id=None, lane="main", type="compaction",
+        data={"kind": "evict", "source_seq_start": 1, "source_seq_end": 2,
+              "view": [{"seq": 2, "message": result.to_dict()}]},
+    )
+    items = ContextAssembler._marker_items(marker, {1, 2})
+    assert all(item.message.metadata["eviction_view_invalid"] for item in items)
+
+
 def test_legacy_pinned_message_uses_original_source_order() -> None:
     request = text(MessageRole.USER, "request")
     entries = [
@@ -3487,6 +3498,37 @@ async def test_manual_eviction_bypasses_hysteresis_without_summary_fallback(
         for entry in branch_entries(store)
         if entry.type == "compaction"
     )
+
+
+@pytest.mark.asyncio
+async def test_parallel_results_stay_ordered_and_paired_across_evictions(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store.append_message(with_message_origin(text(MessageRole.USER, "old request"), MessageOrigin.USER))
+    store.append_message(text(MessageRole.ASSISTANT, "old context " * 1200))
+    calls = [tool_pair("read", f"parallel-{index}", f"output {index} " * 500) for index in range(4)]
+    store.append_message(Message(MessageRole.ASSISTANT, [block for call, _ in calls for block in call.content]))
+    for index in (3, 2, 0, 1):
+        store.append_message(calls[index][1])
+    store.append_message(text(MessageRole.ASSISTANT, "batch consumed"))
+    store.append_message(with_message_origin(text(MessageRole.USER, "latest request"), MessageOrigin.USER))
+    assembler = ContextAssembler(store, token_budget=1_200, retained_tail=1)
+    try:
+        for index in range(4):
+            with patch("zeta.core.context.evict_messages", wraps=evict_messages) as evict:
+                context = await assembler.assemble_context(force=True, bypass_eviction_hysteresis=True)
+            assert evict.call_args_list
+            for call in evict.call_args_list:
+                records = call.args[0]
+                assert [seq for seq, _ in records] == sorted(seq for seq, _ in records)
+            markers = [entry for entry in branch_entries(store) if entry.type == "compaction"]
+            for marker in markers:
+                assert [item["seq"] for item in marker.data["view"]] == sorted(item["seq"] for item in marker.data["view"])
+            assert_payload_pairing(context.messages)
+            if index < 3:
+                store.append_message(text(MessageRole.ASSISTANT, f"follow-up {index}"))
+                store.append_message(with_message_origin(text(MessageRole.USER, f"next {index}"), MessageOrigin.USER))
+    finally:
+        store.close()
 
 
 @pytest.mark.asyncio

@@ -869,10 +869,13 @@ class ContextAssembler(ContextMarkerMixin):
         previous_floor = _fact_floor.previous_fact_floor(
             eviction_markers, invalid_markers
         )
-        record_rows = (
-            (int(item.message.metadata.get("source_seq", item.entry.seq)), item.message)
-            for item in candidates
-            if item.entry is not None
+        record_rows = sorted(
+            (
+                (int(item.message.metadata.get("source_seq", item.entry.seq)), item.message)
+                for item in candidates
+                if item.entry is not None
+            ),
+            key=lambda record: record[0],
         )
         source_messages = {
             entry.seq: Message.from_dict(entry.data["message"])
