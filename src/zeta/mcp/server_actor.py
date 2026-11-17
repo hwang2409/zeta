@@ -14,6 +14,7 @@ from weakref import WeakKeyDictionary, WeakSet
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..protocol.types import StructuredToolResult
+from .abandoned_closes import AbandonedCloses, live_abandoned_closes
 from .call_deadline import MCPCallDeadline, finish_call_cleanup
 from .client import (
     MCPClient,
@@ -89,7 +90,6 @@ AUTO_RECONNECT_MAX_DELAY_SECONDS = 30.0
 MCP_EAGER_TOOL_LIMIT = 32
 
 NoticeSink = Callable[[str], None]
-
 
 @dataclass(frozen=True, slots=True)
 class _SetupOutcome:
@@ -181,6 +181,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._requests: dict[int, _CallRequest | _PromptRequest] = {}
         self._resource_requests: dict[int, _ResourceRequest] = {}
         self._scheduled_closes: dict[int, tuple[MCPClient, asyncio.Task[object]]] = {}
+        # at most one abandoned (timed-out) close per server stays referenced
+        # here; later ones are dropped so re-binds cannot stack leaked tasks.
+        self._abandoned_closes = AbandonedCloses()
         self._next_identifier = 0
         self._client: MCPClient | None = None
         self._tools: tuple[MCPTool, ...] = ()
@@ -1295,9 +1298,8 @@ class MCPServerActor(MCPDefinitionPublisher):
         safe_close's inner wait_for may never return; waiting for it here would
         wedge the loop and pin the controller slot on resume (RCA resume-stuck).
         Wait at most CLIENT_CLOSE_TIMEOUT_SECONDS, then cancel the stragglers
-        and stop waiting. They stay owned in self._children (and self.
-        _scheduled_closes) and are retrieved by their done callbacks, so an
-        abandoned close is never reused and never logs as never-retrieved.
+        and abandon them through _abandon_close, which drops them from the owned
+        sets so repeated re-binds cannot stack leaked tasks.
         """
         pending = {task for task in tasks if not task.done()}
         if not pending:
@@ -1307,13 +1309,27 @@ class MCPServerActor(MCPDefinitionPublisher):
             return
         for task in still:
             task.cancel()
+            self._abandon_close(task)
         logger.warning(
-            "MCP server %s: %d %s did not finish in %.1fs; abandoning them",
+            "MCP server %s: %d %s did not finish in %.1fs; abandoning them "
+            "(%d abandoned closes live)",
             self.name,
             len(still),
             what,
             CLIENT_CLOSE_TIMEOUT_SECONDS,
+            live_abandoned_closes(),
         )
+
+    def _abandon_close(self, task: asyncio.Task[object]) -> None:
+        """Drop a timed-out close from the actor's owned sets and hand it to the
+        abandoned-close owner, which keeps at most one live per server so
+        repeated re-binds cannot accumulate references."""
+        for client_id, (_, scheduled) in list(self._scheduled_closes.items()):
+            if scheduled is task:
+                del self._scheduled_closes[client_id]
+                break
+        self._children.discard(task)
+        self._abandoned_closes.abandon(task)
 
     def _schedule_close(
         self,
