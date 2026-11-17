@@ -467,7 +467,6 @@ class ContextAssembler(ContextMarkerMixin):
             return prepared_context
         # the one compaction span for automatic, forced retry, and manual /compact
         # work; a branch-change retry inside _evict_context nests its own attempt
-        markers_before = self.store.compaction_marker_count()
         with self.telemetry.context_span(
             emergency=emergency, tokens_before=prepared_context.token_count
         ) as span:
@@ -481,10 +480,8 @@ class ContextAssembler(ContextMarkerMixin):
                 emergency=emergency,
                 reserved_estimator_tokens=reserved_estimator_tokens,
             )
-            span.set_compaction(
-                tokens_after=context.token_count,
-                marker_count=self.store.compaction_marker_count() - markers_before,
-            )
+            # telemetry only records values the code already has: no store reads here
+            span.set_compaction(tokens_after=context.token_count)
         return context
 
     def _summary_inference_span(self, backend: CompletionBackend) -> SpanHandle:

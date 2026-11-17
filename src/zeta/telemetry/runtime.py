@@ -20,7 +20,7 @@ _OPERATION_ATTRIBUTE_KEYS = {
     "turn": frozenset({"gen_ai.conversation.id", "zeta.turn.number", "zeta.notification"}),
     "inference": frozenset({"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.conversation.id", "zeta.stream"}),
     "tool": frozenset({"gen_ai.operation.name", "zeta.tool.name", "zeta.tool.type", "zeta.tool.call.id", "zeta.agent.name", "gen_ai.conversation.id"}),
-    "context": frozenset({"zeta.emergency", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count"}),
+    "context": frozenset({"zeta.emergency", "zeta.tokens.before", "zeta.tokens.after"}),
 }
 _EVENT_ATTRIBUTE_KEYS = {"gen_ai.client.retry": frozenset({"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after"}), "zeta.approval.requested": frozenset({"decision", "scope"}), "zeta.approval.resolved": frozenset({"decision", "scope", "duration"})}
 _ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.tool.count"})
@@ -56,7 +56,7 @@ _STRING_RULES = {
     "gen_ai.response.finish_reasons": _FINISH_REASONS, "gen_ai.retry.reason": _RETRY_REASONS,
     "decision": _APPROVAL_DECISIONS, "scope": _APPROVAL_SCOPES, "error.type": _PYTHON_NAME,
 }
-_INT_KEYS = frozenset({"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.agent.depth", "zeta.turn.number", "zeta.tool.count", "zeta.tokens.before", "zeta.tokens.after", "zeta.marker.count", "gen_ai.retry.attempt", "gen_ai.retry.delay", "duration"})
+_INT_KEYS = frozenset({"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.agent.depth", "zeta.turn.number", "zeta.tool.count", "zeta.tokens.before", "zeta.tokens.after", "gen_ai.retry.attempt", "gen_ai.retry.delay", "duration"})
 _BOOL_KEYS = frozenset({"zeta.background", "zeta.notification", "zeta.stream", "zeta.emergency", "gen_ai.retry.after"})
 
 
@@ -155,9 +155,8 @@ class _SpanHandle(SpanHandle):
         self._set("zeta.tool.call.arguments.size", argument_bytes)
         self._set("zeta.tool.call.result.size", result_bytes)
 
-    def set_compaction(self, *, tokens_after: int, marker_count: int) -> None:
+    def set_compaction(self, *, tokens_after: int) -> None:
         self._set("zeta.tokens.after", tokens_after)
-        self._set("zeta.marker.count", marker_count)
 
     def retry(self, *, attempt: int, reason: str, delay: int, after: bool) -> None:
         self._span.add_event("gen_ai.client.retry", attributes=_safe_attributes({

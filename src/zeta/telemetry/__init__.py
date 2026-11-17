@@ -66,9 +66,9 @@ class SpanHandle:
         if self._implementation is not None:
             self._implementation.set_sizes(argument_bytes=argument_bytes, result_bytes=result_bytes)
 
-    def set_compaction(self, *, tokens_after: int, marker_count: int) -> None:
+    def set_compaction(self, *, tokens_after: int) -> None:
         if self._implementation is not None:
-            self._implementation.set_compaction(tokens_after=tokens_after, marker_count=marker_count)
+            self._implementation.set_compaction(tokens_after=tokens_after)
 
     def fail(self, exc: BaseException | type[BaseException] | None) -> None:
         """Mark the span failed; ``None`` is a failure with no exception (error.type ``_OTHER``)."""

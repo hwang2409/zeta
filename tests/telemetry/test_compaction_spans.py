@@ -88,7 +88,7 @@ def test_automatic_compaction_is_one_span_under_the_turn_with_the_summaries_as_c
     summaries = _children(spans, compact)
     assert [span.name for span in summaries] == [CHAT] * 3
     assert len(names[CHAT]) == 4
-    assert dict(compact.attributes) == {"zeta.emergency": False, "zeta.tokens.before": 90, "zeta.tokens.after": 32, "zeta.marker.count": 1}
+    assert dict(compact.attributes) == {"zeta.emergency": False, "zeta.tokens.before": 90, "zeta.tokens.after": 32}
     for summary in summaries:
         assert summary.attributes["gen_ai.provider.name"] == "anthropic"
         assert summary.attributes["gen_ai.usage.total_tokens"] == 20
@@ -115,7 +115,7 @@ def test_forced_retry_compaction_is_one_emergency_span_in_the_same_turn(tmp_path
     assert sorted(span.name for span in _children(spans, turn)) == [CHAT, CHAT, COMPACT]
     # emergency eviction is deterministic: no summary call
     assert _children(spans, compact) == []
-    assert dict(compact.attributes) == {"zeta.emergency": True, "zeta.tokens.before": 150, "zeta.tokens.after": 31, "zeta.marker.count": 1}
+    assert dict(compact.attributes) == {"zeta.emergency": True, "zeta.tokens.before": 150, "zeta.tokens.after": 31}
     assert compact.attributes.get("error.type") is None
     _assert_no_content(spans)
 
@@ -157,7 +157,7 @@ def test_manual_compact_is_one_root_span_with_the_summary_as_child(tmp_path, tra
     (compact,), (summary,) = _by_name(spans)[COMPACT], _by_name(spans)[CHAT]
     assert compact.parent is None
     assert summary.parent.span_id == compact.context.span_id
-    assert dict(compact.attributes) == {"zeta.emergency": False, "zeta.tokens.before": 90, "zeta.tokens.after": 32, "zeta.marker.count": 1}
+    assert dict(compact.attributes) == {"zeta.emergency": False, "zeta.tokens.before": 90, "zeta.tokens.after": 32}
     _assert_no_content(spans)
 
 
