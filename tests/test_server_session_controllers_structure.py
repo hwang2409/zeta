@@ -157,6 +157,8 @@ def test_record_indexes_have_one_owner() -> None:
                             "_parked",
                             "_attached",
                             "_records",
+                            "_by_connection",
+                            "_by_session",
                             "_controller_mode",
                             "_controller_members",
                             "_hello_generations",
@@ -167,6 +169,8 @@ def test_record_indexes_have_one_owner() -> None:
                         "SessionController" in text
                         or "ServeControl" in text
                         or "_parked" in attrs
+                        or "_by_connection" in attrs
+                        or "_by_session" in attrs
                         or "_controller_mode" in attrs
                         or "_controller_members" in attrs
                         or "_hello_generations" in attrs
