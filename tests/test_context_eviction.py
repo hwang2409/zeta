@@ -85,7 +85,7 @@ def test_invalid_eviction_view_sequences_are_boundaries(
 
 
 def test_eviction_view_with_orphan_tool_result_is_invalid() -> None:
-    call, result = tool_pair("read", "orphan", "output")
+    call, _ = tool_pair("read", "orphan", "output")
     _, other_result = tool_pair("read", "other", "output")
     marker = ConversationEntry(
         seq=3, id="marker", parent_id=None, lane="main", type="compaction",
