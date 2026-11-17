@@ -226,8 +226,9 @@ class ExtensionStore:
             target = self._target(root, name)
             metadata = self._git_metadata(target, name)
         snapshot = self._acquire(str(metadata["source"]), root)
-        current = self._copy_installed_for_review(target, root)
+        current: _Snapshot | None = None
         try:
+            current = self._copy_installed_for_review(target, root)
             if snapshot.manifest.name != name:
                 raise ExtensionTrustError(
                     f"manifest name {snapshot.manifest.name!r} does not match folder {name!r}"
@@ -272,7 +273,8 @@ class ExtensionStore:
                 self._finish_committed(update_dir)
                 return InstallResult(name, snapshot.commit, snapshot.digest)
         finally:
-            self._discard_operation(current.operation_dir)
+            if current is not None:
+                self._discard_operation(current.operation_dir)
             self._discard_operation(snapshot.operation_dir)
 
     def trust(

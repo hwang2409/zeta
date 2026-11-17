@@ -7,8 +7,11 @@ import multiprocessing
 import os
 import shutil
 import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
 from multiprocessing.connection import Connection
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -53,6 +56,16 @@ class _CheckpointStore(ExtensionStore):
     def _checkpoint(self, name: str) -> None:
         if name == self.stop:
             raise _Stop(name)
+
+
+class _SecondAcquisitionFailureStore(ExtensionStore):
+    acquisitions = 0
+
+    def _checkpoint(self, name: str) -> None:
+        if name == "source_acquired":
+            self.acquisitions += 1
+            if self.acquisitions == 2:
+                raise _Stop(name)
 
 
 @pytest.mark.parametrize(
@@ -106,7 +119,8 @@ def test_public_action_outcomes(
     assert bool(result.extensions) is installed
     if result.extensions:
         assert result.extensions[0].trusted is trusted
-
+    private = home / "extensions" / ".zeta-extension-store"
+    assert not [path for path in private.glob("*") if path.name != "lost+found"]
 
 
 @pytest.mark.parametrize(
@@ -122,6 +136,18 @@ def test_install_stage_failure_changes_no_durable_state(tmp_path: Path, checkpoi
         store.install(str(source), scope="user", accept=True)
     assert not (home / "extensions" / "demo").exists()
     assert _trust(home) == {}
+    assert not list((home / "extensions" / ".zeta-extension-store").glob("stage-*"))
+
+
+
+def test_update_current_snapshot_failure_cleans_new_snapshot(tmp_path: Path) -> None:
+    repository, _ = _git_extension(tmp_path / "repo")
+    home = tmp_path / "home"
+    source = f"git+{repository}@HEAD"
+    ExtensionStore(home=home, project_dir=None).install(source, scope="user", accept=True)
+    store = _SecondAcquisitionFailureStore(home=home, project_dir=None)
+    with pytest.raises(_Stop, match="source_acquired"):
+        store.update("demo", scope="user", accept=True)
     assert not list((home / "extensions" / ".zeta-extension-store").glob("stage-*"))
 
 
@@ -279,6 +305,35 @@ def test_malformed_update_suppresses_only_affected_scope(tmp_path: Path) -> None
     assert sorted(str(path.relative_to(home)) for path in home.rglob("*")) == before
 
 
+def _lock_holder(home: str, entered: Any, release: Any) -> None:
+    store = ExtensionStore(home=Path(home), project_dir=None)
+    with store._locked():
+        entered.set()
+        if not release.wait(10):
+            raise RuntimeError("parent did not release held extension lock")
+
+
+class _WaitingStore(ExtensionStore):
+    def __init__(self, *, connection: Connection, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.connection = connection
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        self.connection.send("locking")
+        with super()._locked():
+            yield
+
+
+def _waiting_writer(home: str, source: str, connection: Connection) -> None:
+    store = _WaitingStore(home=Path(home), project_dir=None, connection=connection)
+    try:
+        assert connection.recv() == "start"
+        store.install(source, scope="user", accept=True)
+    finally:
+        connection.close()
+
+
 def _writer(home: str, source: str, connection: Connection) -> None:
     store = ExtensionStore(home=Path(home), project_dir=None)
     try:
@@ -377,6 +432,32 @@ def test_git_metadata_is_reviewed_and_in_digest(tmp_path: Path, capsys: pytest.C
     assert ".git/" not in reviewed
     assert seen == ["install this extension? [y/N] "]
     assert _trust(home)["user:demo"] == result.digest
+
+
+
+def test_real_process_writer_waits_for_held_store_lock(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    source = _extension(tmp_path / "source", name="waiter")
+    context = multiprocessing.get_context("spawn")
+    entered = context.Event()
+    release = context.Event()
+    holder = context.Process(target=_lock_holder, args=(str(home), entered, release))
+    holder.start()
+    assert entered.wait(10)
+    parent, child = context.Pipe()
+    waiter = context.Process(target=_waiting_writer, args=(str(home), str(source), child))
+    waiter.start()
+    child.close()
+    parent.send("start")
+    assert parent.recv() == "locking"
+    release.set()
+    for process in (holder, waiter):
+        process.join(20)
+        assert process.exitcode == 0
+        process.close()
+    parent.close()
+    assert set(_trust(home)) == {"user:waiter"}
+    assert (home / "extensions" / "waiter").is_dir()
 
 
 def test_malformed_trust_fails_closed_for_project_but_user_loads(tmp_path: Path) -> None:
