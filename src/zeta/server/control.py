@@ -1353,20 +1353,12 @@ class ServeControl:
             )
 
     def _publish_extension_notice(self, session_id: str, message: str) -> None:
-        """Publish transient extension warnings through the extension gate."""
         if not self.closing and self.server.connections is not None:
-            asyncio.create_task(
-                self._notify(
-                    EventDescriptor.EXTENSION_NOTICE,
-                    session_id,
-                    data={
-                        "kind": "extension",
-                        "extension": "extensions",
-                        "text": message,
-                        "level": "warning",
-                    },
-                )
-            )
+            asyncio.create_task(self._notify(
+                EventDescriptor.EXTENSION_NOTICE, session_id,
+                data={"kind": "extension", "extension": "extensions",
+                      "text": message, "level": "warning"},
+            ))
 
     def _admit_controller(
         self, event: EventDescriptor, session_id: str | None = None, **fields: object
