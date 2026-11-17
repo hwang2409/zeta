@@ -331,19 +331,16 @@ class ExtensionHost:
             "error": item.error,
         } for item in self.statuses.values()]
 
-    def set_notice_sink(self, sink: Any) -> None:
-        self.notice_sink = sink
-
-    def _notice(self, message: str) -> None:
-        self.notices.append(message)
-        if self.notice_sink is not None:
-            self.notice_sink(message)
+    def _hook_notice(self, extension: str, message: str) -> None:
+        self.notify(extension, message, "warning")
 
     def pre_tool_hook(self, base: Any = None) -> CompositeToolHook:
-        return CompositeToolHook(base, self._hooks, self._notice, self._task_owner)
+        return CompositeToolHook(base, self._hooks, self._hook_notice, self._task_owner)
 
     async def emit(self, event: str, *payload: Any) -> str | None:
-        return await run_extension_hooks(self._hooks, event, payload, self._notice, self._task_owner)
+        return await run_extension_hooks(
+            self._hooks, event, payload, self._hook_notice, self._task_owner
+        )
 
     def commit(self, extension: LoadingExtension) -> None:
         """Register a successfully activated extension's tools."""

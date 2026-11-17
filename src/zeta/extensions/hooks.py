@@ -78,7 +78,7 @@ class CompositeToolHook:
         self,
         base: Callable[[str, dict[str, Any]], Awaitable[bool | str]] | None,
         hooks: list[ExtensionHook],
-        notice: Callable[[str], None],
+        notice: Callable[[str, str], None],
         task_owner: TaskOwner,
     ) -> None:
         self._base = base
@@ -90,7 +90,7 @@ class CompositeToolHook:
         self, hook: ExtensionHook, tool: str, args: dict[str, Any]
     ) -> tuple[str, dict[str, Any] | None]:
         if hook.disabled:
-            self._failure(hook, "disabled; call allowed unchecked")
+            self._failure(hook, "disabled")
             return "continue", None
         try:
             result = await _invoke_with_deadline(
@@ -127,8 +127,8 @@ class CompositeToolHook:
             outcome, replacement = await self._run_hook(hook, tool, args)
             if replacement is not None:
                 self._notice(
-                    f"extension hook warning: {hook.extension} pre_tool returned "
-                    "replacement arguments; ignored"
+                    hook.extension,
+                    "pre_tool returned replacement arguments; ignored",
                 )
             if outcome != "continue":
                 return outcome
@@ -137,7 +137,8 @@ class CompositeToolHook:
     def _failure(self, hook: ExtensionHook, detail: str) -> None:
         # This is intentionally emitted on every failure, not only when disabling.
         self._notice(
-            f"extension hook warning: {hook.extension} pre_tool {detail}; call allowed unchecked"
+            hook.extension,
+            f"pre_tool {detail}; call allowed unchecked",
         )
 
 
@@ -145,7 +146,7 @@ async def run_extension_hooks(
     hooks: list[ExtensionHook],
     event: str,
     payload: tuple[Any, ...],
-    notice: Callable[[str], None],
+    notice: Callable[[str, str], None],
     task_owner: TaskOwner,
 ) -> str | None:
     """Run non-blocking hooks and return bounded injected text, if any."""
@@ -162,7 +163,7 @@ async def run_extension_hooks(
             raise
         except Exception as exc:  # noqa: BLE001 - extension code must fail open
             hook.disabled = True
-            notice(f"extension hook warning: {hook.extension} {event} failed: {_short(exc)}")
+            notice(hook.extension, f"{event} failed: {_short(exc)}")
             continue
         if isinstance(result, str) and event == "user_prompt_submit":
             injected = result[:HOOK_OUTPUT_LIMIT]

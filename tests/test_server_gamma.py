@@ -346,33 +346,86 @@ async def test_active_resume_rejects_a_session_whose_cwd_was_removed(
 
 
 @pytest.mark.asyncio
-async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("failure", "features", "expected"),
+    [
+        ("timeout", ["extensions"], "pre_tool timed out; call allowed unchecked"),
+        ("crash", ["extensions"], "pre_tool failed: boom; call allowed unchecked"),
+        ("crash", [], None),
+    ],
+)
+async def test_pre_tool_fail_open_notice_uses_real_gated_serve_path(
+    tmp_path: Path,
+    failure: str,
+    features: list[str],
+    expected: str | None,
+) -> None:
     extension_dir = tmp_path / "home" / "extensions" / "notice"
     extension_dir.mkdir(parents=True)
     (extension_dir / "zeta-extension.toml").write_text(
         '[extension]\nname = "notice"\nversion = "1"\napi_version = 1\nentry = "ext:activate"\n'
     )
-    (extension_dir / "ext.py").write_text("def activate(zx): pass\n")
+    (extension_dir / "ext.py").write_text(
+        '''
+import asyncio
+
+
+def activate(zx):
+    async def safety(_tool, arguments):
+        if arguments["failure"] == "timeout":
+            await asyncio.Event().wait()
+        raise RuntimeError("boom")
+
+    async def probe(arguments, _abort_signal):
+        return {"content": [], "isError": False, "structuredContent": arguments}
+
+    zx.on("pre_tool", safety)
+    zx.register_tool("probe", probe, requires_approval=False)
+'''
+    )
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
-        await _hello(reader, writer, ["extensions"])
-        server.control._publish_extension_notice("session", "pre_tool timed out; call allowed unchecked")
-        for _ in range(5):
-            await asyncio.sleep(0)
+        await _hello(reader, writer, features)
+        created = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"]
+        session_id = created["session"]["session_id"]
+        host = server.runtime.extensions
+        loop = server.runtime.loop
+        assert host is not None and loop is not None
+        host._hooks[0].timeout_seconds = 0.001
+
+        for index in range(2):
+            result = await loop.tool_registry.execute(
+                ToolCall(f"probe-{index}", "probe", {"failure": failure})
+            )
+            assert result["isError"] is False
         await send(reader, writer, 3, "ping")
         frames = await read_until(
             reader, lambda frame: frame.get("id") == 3, what="ping response"
         )
-        ping_index = next(i for i, frame in enumerate(frames) if frame.get("id") == 3)
-        notice_indexes = [
-            i for i, frame in enumerate(frames) if frame.get("params", {}).get("event") == "extension_notice"
+        notices = [
+            frame["params"]["data"]
+            for frame in frames
+            if frame.get("params", {}).get("event") == "extension_notice"
         ]
-        assert notice_indexes and notice_indexes[0] < ping_index
-        assert frames[notice_indexes[0]]["params"]["data"] == {
-            "kind": "extension", "extension": "extensions",
-            "text": "pre_tool timed out; call allowed unchecked", "level": "warning"
-        }
+        if expected is None:
+            assert notices == []
+        else:
+            assert [notice["text"] for notice in notices] == [
+                expected,
+                "pre_tool disabled; call allowed unchecked",
+            ]
+            assert all(
+                notice == {
+                    "kind": "extension", "extension": "notice",
+                    "text": notice["text"], "level": "warning",
+                }
+                for notice in notices
+            )
+        assert host.notices == []
+        assert len(host._pending_notifications) == 0
+        assert loop._tracked_tasks == set()
+        assert server.runtime.session_id == session_id
     finally:
         await close_serve(server, writer)
 

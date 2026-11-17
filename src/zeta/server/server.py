@@ -362,7 +362,6 @@ class ZetaServer:
                     self.connections.loop,
                 )
             runtime.set_memory_notice_sink(control._publish_memory_notice)
-            runtime.set_extension_notice_sink(control._publish_extension_notice)
             runtime.set_run_work_event_sink(control._publish_run_work_event)
             runtime.set_background_wake_sink(control._schedule_background_wake)
             runtime.set_work_changed_sink(

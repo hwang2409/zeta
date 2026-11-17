@@ -81,7 +81,7 @@ async def test_pre_tool_denies_and_ignores_returned_replacement() -> None:
             ExtensionHook("hooks", "pre_tool", replacement),
             ExtensionHook("hooks", "pre_tool", deny),
         ],
-        notices.append,
+        lambda _extension, message: notices.append(message),
         _task_owner,
     )
     assert await hook("bash", args) == "blocked"
@@ -121,7 +121,7 @@ async def test_tool_hook_composes_file_hooks_before_extensions_and_denies(tmp_pa
         registry = ToolRegistry(
             tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty(),
             pre_execute_hook=CompositeToolHook(
-                base, hooks, lambda _: None, _task_owner
+                base, hooks, lambda _extension, _message: None, _task_owner
             ),
         )
         registry.register("capture", capture)
@@ -175,7 +175,10 @@ async def test_cancellation_resistant_timeout_releases_call_and_warns_again() ->
 
     notices: list[str] = []
     extension_hook = ExtensionHook("hooks", "pre_tool", ignores_cancel, timeout_seconds=0.001)
-    hook = CompositeToolHook(None, [extension_hook], notices.append, _task_owner)
+    hook = CompositeToolHook(
+        None, [extension_hook], lambda _extension, message: notices.append(message),
+        _task_owner,
+    )
     first = asyncio.create_task(hook("bash", {}))
     try:
         await asyncio.wait_for(cancelled.wait(), 10)
@@ -202,7 +205,7 @@ async def test_hook_tasks_are_owned_and_drained_on_close() -> None:
             [ExtensionHook("hooks", "post_tool", post_tool)],
             "post_tool",
             ("capture", "ok"),
-            lambda _: None,
+            lambda _extension, _message: None,
             owner,
         )
     )
@@ -227,8 +230,8 @@ async def test_turn_cancellation_does_not_wait_for_hook() -> None:
             await asyncio.wait_for(release.wait(), 10)
 
     hook = CompositeToolHook(
-        None, [ExtensionHook("hooks", "pre_tool", ignores_cancel)], lambda _: None,
-        _task_owner,
+        None, [ExtensionHook("hooks", "pre_tool", ignores_cancel)],
+        lambda _extension, _message: None, _task_owner,
     )
     task = asyncio.create_task(hook("bash", {}))
     await asyncio.wait_for(started.wait(), 10)
@@ -253,8 +256,8 @@ async def test_pre_tool_runs_once_across_prepare_and_execute(tmp_path: Path) -> 
     registry = ToolRegistry(
         tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty(),
         pre_execute_hook=CompositeToolHook(
-            None, [ExtensionHook("hooks", "pre_tool", count)], lambda _: None,
-            _task_owner,
+            None, [ExtensionHook("hooks", "pre_tool", count)],
+            lambda _extension, _message: None, _task_owner,
         ),
     )
     registry.register("capture", capture, parameters={"type": "object"})
@@ -277,7 +280,10 @@ async def test_timeout_disables_hook_and_warns() -> None:
 
     notices: list[str] = []
     extension_hook = ExtensionHook("hooks", "pre_tool", hangs, timeout_seconds=0.001)
-    hook = CompositeToolHook(None, [extension_hook], notices.append, _task_owner)
+    hook = CompositeToolHook(
+        None, [extension_hook], lambda _extension, message: notices.append(message),
+        _task_owner,
+    )
     assert await asyncio.wait_for(hook("bash", {}), 10) is True
     assert extension_hook.disabled
     assert len(notices) == 1
