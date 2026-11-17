@@ -61,13 +61,13 @@ HISTORY_GROUP_TRUNCATED = "[history group too large; truncated]"
 class HistoryProjection:
     entry_groups: tuple[tuple[Any, ...], ...]
     approval_calls: Mapping[str, object]
-    approval_origins: Mapping[str, object] = MappingProxyType({})
     entry_index: Mapping[str, Any] = MappingProxyType({})
     groups: tuple[tuple[dict[str, object], ...], ...] = ()
     body_sizes: tuple[int, ...] = ()
     # seq and stable id of the newest active-branch row this projection includes
     frontier: int = 0
     frontier_row_id: str | None = None
+    approval_origins: Mapping[str, object] = MappingProxyType({})
 
 
 @dataclass
@@ -287,8 +287,8 @@ def history_projection_from_groups(
     return HistoryProjection(
         (*groups, ()),
         MappingProxyType(dict(approval_calls)),
-        MappingProxyType(_approval_origins(entry_index.values())),
         MappingProxyType(entry_index),
+        approval_origins=MappingProxyType(_approval_origins(entry_index.values())),
     )
 
 
@@ -399,10 +399,10 @@ def history_projection(
     built = HistoryProjection(
         tuple(tuple(group) for group in entries),
         MappingProxyType(approval_calls),
-        MappingProxyType(approval_origins),
         MappingProxyType(entry_index),
         frontier=branch[-1].seq if branch else 0,
         frontier_row_id=branch[-1].id if branch else None,
+        approval_origins=MappingProxyType(approval_origins),
     )
     if stable_generation is None or skip_cache:
         return built
@@ -482,7 +482,7 @@ def _transcript_recovery_history_row(entry: object) -> dict[str, object]:
 def _history_entry_rows(
     entry: object,
     approval_calls: Mapping[str, object],
-    approval_origins: Mapping[str, object],
+    approval_origins: Mapping[str, object] = MappingProxyType({}),
     *,
     include_delivery_id: bool = False,
     fidelity: bool = False,
