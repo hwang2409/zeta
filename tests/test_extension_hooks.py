@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.extensions.api import ExtensionAPI, ExtensionError
 from zeta.extensions.hooks import (
     CompositeToolHook,
