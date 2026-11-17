@@ -320,6 +320,7 @@ class ZetaServer:
         self._prebound_socket = prebound_socket
         self._frame_writes = FrameWriteOwner()
         self._idle_drain: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.foreground_event_publisher = foreground_event_publisher or ForegroundEventPublisher()
@@ -470,69 +471,97 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self, *, approval_settlement_timeout: float | None = None) -> None:
-        if self.connections is not None:
-            # no new connection from here on; the records drain below
-            self.connections.stop_admission()
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_all(approval_settlement_timeout)
+            )
+        elif self._close_task.done():
+            return
+        try:
+            await asyncio.shield(self._close_task)
+        except asyncio.CancelledError:
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(self._close_task)
+            raise
+
+    async def _close_all(self, approval_settlement_timeout: float | None) -> None:
+        first: BaseException | None = None
+
+        async def attempt(operation: Awaitable[object]) -> None:
+            nonlocal first
+            task = asyncio.ensure_future(operation)
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                if first is None:
+                    first = exc
+                try:
+                    await asyncio.shield(task)
+                except BaseException as task_error:  # noqa: BLE001
+                    if first is None:
+                        first = task_error
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
+
+        registry = self.connections
+        if registry is not None:
+            registry.stop_admission()
         if self._retention_owner is not None:
-            await self._retention_owner.stop()
+            await attempt(self._retention_owner.stop())
         if self._idle_drain is not None:
             self._idle_drain.cancel()
-            await asyncio.wait([self._idle_drain])
+            await asyncio.gather(self._idle_drain, return_exceptions=True)
             self._idle_drain = None
-        try:
-            clients = () if self.connections is None else self.connections.clients()
-            handlers = tuple(
-                client._run_task
-                for client in clients
-                if client._run_task is not None and not client._run_task.done()
-            )
-            # Start semantic releases while outputs are still available. The
-            # registry closes transports below, so release notifications must be
-            # published first.
-            registry = self.connections
-            for client in clients:
-                release = client._begin_controller_release()
-                if release is not None:
-                    await asyncio.shield(release)
-                if registry is not None:
-                    await registry.flush(client)
-            # Cancel registry-owned reads before waiting for request handlers. A
-            # slash read can be queued behind the registry's worker pool.
-            if registry is not None:
-                await registry.aclose()
-                self.connections = None
-            for handler in handlers:
-                handler.cancel()
-            await asyncio.gather(*handlers, return_exceptions=True)
-            close_results = await asyncio.gather(
-                *(client.close(graceful=True) for client in clients),
-                return_exceptions=True,
-            )
-            self.parking.close_all(approval_settlement_timeout)
-            await self.controllers.close(
-                approval_settlement_timeout, self._close_foreground_events
-            )
-            if failure := next(
-                (result for result in close_results if isinstance(result, BaseException)),
-                None,
-            ):
-                raise failure
-        finally:
-            if self.connections is not None:
-                await self.connections.aclose()
-                self.connections = None
-            await self._frame_writes.aclose()
+
+        clients = () if registry is None else registry.clients()
+        handlers = tuple(
+            client._run_task
+            for client in clients
+            if client._run_task is not None and not client._run_task.done()
+        )
+        for client in clients:
             try:
-                if self._websocket is not None:
-                    await self._websocket.close()
-                if self._unix_listener is not None:
-                    await self._unix_listener.close()
-                elif self._server is not None:
-                    self._server.close()
-                    await self._server.wait_closed()
-            finally:
-                self._server = None
-                self._unix_listener = None
+                release = client._begin_controller_release()
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
+                continue
+            if release is not None:
+                await attempt(release)
+        if registry is not None:
+            for client in clients:
+                await attempt(registry.flush(client))
+            await attempt(registry.stop_workers())
+        for handler in handlers:
+            handler.cancel()
+        await attempt(asyncio.gather(*handlers, return_exceptions=True))
+        for client in clients:
+            await attempt(client.close(graceful=True))
+        try:
+            self.parking.close_all(approval_settlement_timeout)
+        except BaseException as exc:  # noqa: BLE001
+            if first is None:
+                first = exc
+        await attempt(self.controllers.close(
+            approval_settlement_timeout, self._close_foreground_events
+        ))
+        if registry is not None:
+            self.connections = None
+        await attempt(self._frame_writes.aclose())
+        try:
+            if self._websocket is not None:
+                await attempt(self._websocket.close())
+            if self._unix_listener is not None:
+                await attempt(self._unix_listener.close())
+            elif self._server is not None:
+                self._server.close()
+                await attempt(self._server.wait_closed())
+        finally:
+            self._server = None
+            self._unix_listener = None
+        if first is not None:
+            raise first
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -944,27 +973,63 @@ class _Client:
         async with self._close_lock:
             if self._closed:
                 return
+            first: BaseException | None = None
+
+            async def attempt(operation: Awaitable[object]) -> None:
+                nonlocal first
+                task = asyncio.ensure_future(operation)
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError as exc:
+                    if first is None:
+                        first = exc
+                    try:
+                        await asyncio.shield(task)
+                    except BaseException as task_error:  # noqa: BLE001
+                        if first is None:
+                            first = task_error
+                except BaseException as exc:  # noqa: BLE001
+                    if first is None:
+                        first = exc
+
             had_physical_controller = self.connections.is_controller(self)
             release = self._begin_controller_release()
             if release is not None:
-                await asyncio.shield(release)
-            await accounts.cancel_owned_switch(self)
-            await self.logins.close()
+                await attempt(release)
+            await attempt(accounts.cancel_owned_switch(self))
+            await attempt(self.logins.close())
             if graceful:
-                await self.connections.flush(self)
+                await attempt(self.connections.flush(self))
             self._local_close = True
             close = getattr(self.writer, "close", None)
             if close is not None:
-                close()
+                try:
+                    close()
+                except BaseException as exc:  # noqa: BLE001
+                    if first is None:
+                        first = exc
             wait_closed = getattr(self.writer, "wait_closed", None)
             if wait_closed is not None:
-                with contextlib.suppress(Exception):
-                    await wait_closed()
+                await attempt(wait_closed())
             if had_physical_controller or self.server.controllers.is_controller(self):
-                self.server.controllers.release_connection(self)
-            self.connections.release(self)
-            self.connections.unregister(self)
+                try:
+                    self.server.controllers.release_connection(self)
+                except BaseException as exc:  # noqa: BLE001
+                    if first is None:
+                        first = exc
+            try:
+                self.connections.release(self)
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
+            try:
+                self.connections.unregister(self)
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
             self._closed = True
+            if first is not None:
+                raise first
 
     async def _route_hello(self, params: dict[str, Any]) -> tuple[bool, object]:
         deadline = control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS

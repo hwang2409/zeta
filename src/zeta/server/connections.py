@@ -1255,21 +1255,45 @@ class ConnectionRegistry(ReplayOutput):
         """Refuse every later connection; server shutdown calls this first."""
         self._closed = True
 
-    async def aclose(self) -> None:
+    async def stop_workers(self) -> None:
+        """Stop registry-owned work without owning physical client lifetime."""
+        first: BaseException | None = None
         self._closed = True
-        self._unregister_child_run_sink()
+        try:
+            self._unregister_child_run_sink()
+        except BaseException as exc:  # noqa: BLE001
+            first = exc
+        try:
+            await asyncio.to_thread(self.close_child_reader)
+        except BaseException as exc:  # noqa: BLE001
+            if first is None:
+                first = exc
+        try:
+            self._reads.close()
+        except BaseException as exc:  # noqa: BLE001
+            if first is None:
+                first = exc
         states = tuple(self._connections.values())
-        await asyncio.to_thread(self.close_child_reader)
-        self._reads.close()
         for state in states:
             if state.output is not None:
-                self._settle_output(state.output)
+                try:
+                    self._settle_output(state.output)
+                except BaseException as exc:  # noqa: BLE001
+                    if first is None:
+                        first = exc
         await asyncio.gather(
-            *(state.connection.close() for state in states), return_exceptions=True
+            *(state.output.writer_task for state in states
+              if state.output is not None and state.output.writer_task is not None),
+            return_exceptions=True,
         )
-        self._connections.clear()
         self._observers.clear()
         self._controllers.clear()
+        if first is not None:
+            raise first
+
+    async def aclose(self) -> None:
+        """Stop registry workers; physical clients unregister themselves."""
+        await self.stop_workers()
 
 
 def perform_child_history_read(
