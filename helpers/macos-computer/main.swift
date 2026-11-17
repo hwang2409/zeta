@@ -173,6 +173,15 @@ struct Capture {
     let originY: Int
 }
 
+func captureWithSafety<T>(
+    _ safety: @escaping () throws -> Void, _ capture: () async throws -> T
+) async throws -> T {
+    try safety()
+    let value = try await capture()
+    try safety()
+    return value
+}
+
 func captureDisplay(_ index: Int) throws -> Capture {
     let sem = DispatchSemaphore(value: 0)
     var result: Capture?
@@ -199,10 +208,10 @@ func captureDisplay(_ index: Int) throws -> Capture {
             config.height = pxHeight
             config.showsCursor = true
             // The desktop can become protected while ScreenCaptureKit awaits content or pixels.
-            try guardSafety()
-            let cgImage = try await SCScreenshotManager.captureImage(
-                contentFilter: filter, configuration: config)
-            try guardSafety()
+            let cgImage = try await captureWithSafety(guardSafety) {
+                try await SCScreenshotManager.captureImage(
+                    contentFilter: filter, configuration: config)
+            }
             let rep = NSBitmapImageRep(cgImage: cgImage)
             guard let png = rep.representation(using: .png, properties: [:]) else {
                 throw HelperError.internalError("png encode failed")
@@ -631,6 +640,13 @@ let stdout = FileHandle.standardOutput
 let responseLock = NSLock()
 let actionQueue = DispatchQueue(label: "zeta-computer-helper.actions")
 
+func shutdown(eventGate: EventGate, kill: Flag, queue: DispatchQueue) {
+    // Stop new posts, drain accepted work, then release again. EventGate.kill is idempotent.
+    kill.set()
+    queue.sync {}
+    eventGate.kill()
+}
+
 func writeResponse(_ dict: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
     responseLock.lock()
@@ -734,12 +750,58 @@ func selfTestKill() {
     }
 }
 
+func selfTestLifecycle() {
+    selfTestMode = true
+    let captureDone = DispatchSemaphore(value: 0)
+    var captureResult = ""
+    var safetyCalls = 0
+    Task {
+        do {
+            _ = try await captureWithSafety({
+                safetyCalls += 1
+                if safetyCalls == 2 { throw HelperError.secureInput }
+            }) { "png-bytes" }
+            captureResult = "returned"
+        } catch {
+            captureResult = "refused"
+        }
+        captureDone.signal()
+    }
+    captureDone.wait()
+
+    let flag = Flag()
+    let queue = DispatchQueue(label: "zeta-computer-helper.selftest-shutdown")
+    var events: [String] = []
+    let gate = EventGate(killed: flag) { event in
+        if event.type == .leftMouseDown { events.append("mouse_down") }
+        if event.type == .leftMouseUp { events.append("mouse_up") }
+        if event.type == .keyDown { events.append("key_down") }
+        if event.type == .keyUp { events.append("key_up") }
+    }
+    let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                       mouseCursorPosition: .zero, mouseButton: .left)!
+    let key = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)!
+    try? gate.post(down, type: .leftMouseDown, point: .zero, button: .left)
+    try? gate.postKey(key, keycode: 0, flags: [], down: true)
+    queue.async {
+        try? gate.post(down, type: .leftMouseDown, point: .zero, button: .left)
+    }
+    shutdown(eventGate: gate, kill: flag, queue: queue)
+    print((try? JSONSerialization.data(withJSONObject: [
+        "capture": captureResult, "safety_calls": safetyCalls, "events": events,
+    ])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let indicator = Indicator()
 killed.observe { DispatchQueue.main.async { indicator.hide() } }
 if CommandLine.arguments.contains("--selftest-kill") {
     selfTestKill()
+    exit(0)
+}
+if CommandLine.arguments.contains("--selftest-lifecycle") {
+    selfTestLifecycle()
     exit(0)
 }
 installKillSwitch()
@@ -765,10 +827,7 @@ Thread {
             runRequest(id: id, op: op, request: req, indicator: indicator, sink: writeResponse)
         }
     }
-    // Shutdown owns the boundary: stop new posts, drain accepted work, then release again.
-    activeKill.set()
-    actionQueue.sync {}
-    eventGate.kill()
+    shutdown(eventGate: eventGate, kill: activeKill, queue: actionQueue)
     DispatchQueue.main.sync {
         indicator.hide()
         app.terminate(nil)

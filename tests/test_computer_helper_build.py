@@ -72,6 +72,24 @@ def test_helper_builds_and_answers_hello() -> None:
     assert isinstance(reply["accessibility"], bool)
 
 
+def test_selftest_lifecycle_refuses_raced_capture_and_orders_shutdown() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["sh", str(BUILD_SCRIPT), tmp], check=True, capture_output=True, timeout=300
+        )
+        output = subprocess.check_output(
+            [str(Path(tmp) / "zeta-computer-helper"), "--selftest-lifecycle"],
+            text=True,
+            timeout=15,
+        )
+    result = json.loads(output)
+    assert result["capture"] == "refused"
+    assert result["safety_calls"] == 2
+    assert result["events"][-2:] == ["mouse_up", "key_up"]
+    assert result["events"].count("mouse_up") == 1
+    assert result["events"].count("key_up") == 1
+
+
 def test_selftest_kill_interrupts_steps_and_releases_drag() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         subprocess.run(
