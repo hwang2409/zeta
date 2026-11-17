@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -93,7 +94,11 @@ class CompositeToolHook:
             return "continue", None
         try:
             result = await _invoke_with_deadline(
-                hook.handler, hook.timeout_seconds, self._task_owner, tool, args
+                hook.handler,
+                hook.timeout_seconds,
+                self._task_owner,
+                tool,
+                copy.deepcopy(args),
             )
         except asyncio.CancelledError:
             raise
@@ -121,8 +126,10 @@ class CompositeToolHook:
                 continue
             outcome, replacement = await self._run_hook(hook, tool, args)
             if replacement is not None:
-                args.clear()
-                args.update(replacement)
+                self._notice(
+                    f"extension hook warning: {hook.extension} pre_tool returned "
+                    "replacement arguments; ignored"
+                )
             if outcome != "continue":
                 return outcome
         return True

@@ -63,8 +63,9 @@ def test_hooks_reject_sync_handlers_at_registration() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pre_tool_can_deny_and_modify_arguments() -> None:
-    async def modify(_tool: str, args: dict[str, object]) -> dict[str, object]:
+async def test_pre_tool_denies_and_ignores_returned_replacement() -> None:
+    async def replacement(_tool: str, args: dict[str, object]) -> dict[str, object]:
+        args["mutated_copy"] = True
         return {"arguments": {**args, "safe": True}}
 
     async def deny(_tool: str, _args: dict[str, object]) -> str:
@@ -75,15 +76,16 @@ async def test_pre_tool_can_deny_and_modify_arguments() -> None:
     hook = CompositeToolHook(
         None,
         [
-            ExtensionHook("hooks", "pre_tool", modify),
+            ExtensionHook("hooks", "pre_tool", replacement),
             ExtensionHook("hooks", "pre_tool", deny),
         ],
         notices.append,
         _task_owner,
     )
     assert await hook("bash", args) == "blocked"
-    assert args == {"safe": True}
-    assert notices == []
+    assert args == {"safe": False}
+    assert len(notices) == 1
+    assert "replacement arguments; ignored" in notices[0]
 
 
 @pytest.mark.asyncio
@@ -184,101 +186,6 @@ async def test_pre_tool_runs_once_across_prepare_and_execute(tmp_path: Path) -> 
         result = await registry.execute(call)
         assert result["isError"] is False
         assert calls == 1
-    finally:
-        await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_registry_executes_validated_modified_arguments(tmp_path: Path) -> None:
-    seen: list[dict[str, object]] = []
-
-    def capture(arguments: dict[str, object]) -> str:
-        seen.append(arguments)
-        return "ok"
-
-    async def modify(_tool: str, args: dict[str, object]) -> dict[str, object]:
-        return {"arguments": {**args, "value": "changed"}}
-
-    registry = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty(),
-        pre_execute_hook=CompositeToolHook(
-            None, [ExtensionHook("hooks", "pre_tool", modify)], lambda _: None,
-            _task_owner,
-        ),
-    )
-    registry.register("capture", capture, parameters={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]})
-    try:
-        result = await registry.execute(ToolCall("call-1", "capture", {"value": "original"}))
-        assert result["isError"] is False
-        assert seen == [{"value": "changed"}]
-    finally:
-        await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_approval_sees_and_executes_modified_arguments(tmp_path: Path) -> None:
-    approved: list[dict[str, object]] = []
-
-    class RecordingPolicy(ApprovalPolicy):
-        async def authorize(self, tool_call, abort_signal, **kwargs):
-            approved.append(dict(tool_call.arguments))
-            return ApprovalDecision.ALLOW
-
-    def capture(arguments: dict[str, object]) -> str:
-        assert arguments == {"value": "changed"}
-        return "ok"
-
-    async def modify(_tool: str, args: dict[str, object]) -> dict[str, object]:
-        return {"arguments": {**args, "value": "changed"}}
-
-    registry = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty(),
-        approval_policy=RecordingPolicy(default="allow"), enforce_approvals=True,
-        pre_execute_hook=CompositeToolHook(
-            None, [ExtensionHook("hooks", "pre_tool", modify)], lambda _: None,
-            _task_owner,
-        ),
-    )
-    registry.register(
-        "capture", capture,
-        parameters={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
-    )
-    try:
-        result = await registry.execute(ToolCall("call-approval", "capture", {"value": "original"}))
-        assert result["isError"] is False
-        assert approved == [{"value": "changed"}]
-    finally:
-        await registry.close()
-
-
-@pytest.mark.asyncio
-async def test_registry_rejects_invalid_modified_arguments(tmp_path: Path) -> None:
-    called = False
-
-    def capture(_arguments: dict[str, object]) -> str:
-        nonlocal called
-        called = True
-        return "bad"
-
-    async def modify(_tool: str, _args: dict[str, object]) -> dict[str, object]:
-        return {"arguments": {"value": 7}}
-
-    registry = ToolRegistry(
-        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty(),
-        pre_execute_hook=CompositeToolHook(
-            None, [ExtensionHook("hooks", "pre_tool", modify)], lambda _: None,
-            _task_owner,
-        ),
-    )
-    registry.register(
-        "capture", capture,
-        parameters={"type": "object", "properties": {"value": {"type": "string"}}, "required": ["value"]},
-    )
-    try:
-        result = await registry.execute(ToolCall("call-1", "capture", {"value": "original"}))
-        assert result["isError"] is True
-        assert result["structuredContent"]["error"]["kind"] == "invalid_arguments"
-        assert called is False
     finally:
         await registry.close()
 

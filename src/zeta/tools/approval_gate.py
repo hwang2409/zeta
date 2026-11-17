@@ -40,7 +40,6 @@ class ApprovalGate:
         persist_request: bool = True,
         execution_token: str | None = None,
         capability: ApprovalCapability,
-        run_hook: bool = True,
     ) -> tuple[ToolResult | None, AbortSignal]:
         execution_signal = signal
         if self.policy is not None and not skip_approval:
@@ -106,7 +105,7 @@ class ApprovalGate:
                     if reason:
                         message = f"{message}: {reason}"
                 return ToolResult(tool_call.id, message, True), execution_signal
-        if not run_hook or self.hook is None:
+        if self.hook is None:
             if signal.is_set() and execution_signal is signal:
                 return canceled_result(tool_call.id), execution_signal
             return None, execution_signal
