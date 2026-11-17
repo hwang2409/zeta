@@ -1079,7 +1079,10 @@ class ConnectionRegistry(ReplayOutput):
         runtime = connection.server.runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "server has no active session")
-        return await self.run_read(connection, lambda: settings.settings(runtime))
+        telemetry = settings.telemetry(connection)
+        return await self.run_read(
+            connection, lambda: settings.settings(runtime, telemetry=telemetry)
+        )
 
     async def read_child_run_history(
         self, connection: Any, params: dict[str, Any]

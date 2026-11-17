@@ -12,6 +12,7 @@ from pathlib import Path
 
 from ..core.abort import AbortSignal
 from ..protocol.types import StructuredToolResult
+from ..telemetry import Telemetry
 from ..tools.registry import ToolRegistry
 from . import connection as mcp_connection
 from .client import (
@@ -107,7 +108,10 @@ class MCPMount:
         *,
         sources: dict[str, Path] | None = None,
         home: str | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
+        # the process owner's telemetry; every actor this mount makes traces with it
+        self.telemetry = telemetry or Telemetry.disabled()
         if isinstance(registry, ToolRegistry):
             self.registry: ToolRegistry | None = registry
             server_configs = dict(configs or {})
@@ -547,6 +551,7 @@ class MCPMount:
             limits=self.limits,
             auto_base_delay=AUTO_RECONNECT_BASE_DELAY_SECONDS,
             auto_max_delay=AUTO_RECONNECT_MAX_DELAY_SECONDS,
+            telemetry=self.telemetry,
         )
 
     def _discard_server(self, name: str) -> MCPServerActor | None:
@@ -616,6 +621,7 @@ async def mount_mcp_servers(
     home: str | None = None,
     bindings: dict[str, dict[str, str]] | None = None,
     binding_configs: dict[str, MCPServerConfig] | None = None,
+    telemetry: Telemetry | None = None,
 ) -> MCPMount:
     """Connect configured servers and register each discovered tool."""
 
@@ -644,6 +650,7 @@ async def mount_mcp_servers(
             if name in config.sources
         },
         home=home,
+        telemetry=telemetry,
     )
     actors: list[MCPServerActor] = []
     skipped: list[str] = []

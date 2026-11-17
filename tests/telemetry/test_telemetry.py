@@ -61,7 +61,7 @@ def test_hostile_environment_does_not_disable_private_configuration(monkeypatch:
         monkeypatch.delenv(name, raising=False)
 
     instance = telemetry.Telemetry.configure(SimpleNamespace(otel_endpoint="http://127.0.0.1:4318/v1/traces"))
-    with instance.turn_span(conversation_id="test", turn_number=1, notification=False, tool_count=0):
+    with instance.turn_span(conversation_id="test", turn_number=1, notification=False):
         carrier = instance.current_trace_context()
     limits = vars(instance._implementation._provider._span_limits)
     instance.shutdown()
@@ -124,7 +124,7 @@ def test_transport_ignores_proxy_and_does_not_follow_redirects(monkeypatch: pyte
     try:
         endpoint = f"http://127.0.0.1:{server.server_port}/v1/traces"
         instance = telemetry.Telemetry.configure(endpoint)
-        with instance.turn_span(conversation_id="test", turn_number=1, notification=False, tool_count=0):
+        with instance.turn_span(conversation_id="test", turn_number=1, notification=False):
             pass
         instance.shutdown()
         assert received.wait(5)
@@ -170,7 +170,7 @@ def test_shutdown_is_synchronous_and_export_failure_is_not_logged(monkeypatch: p
     app_logger.addHandler(handler)
     try:
         instance = telemetry.Telemetry.configure("http://127.0.0.1:4318/v1/traces")
-        with instance.turn_span(conversation_id="test", turn_number=1, notification=False, tool_count=0):
+        with instance.turn_span(conversation_id="test", turn_number=1, notification=False):
             pass
         instance.shutdown()
         instance.shutdown()
@@ -264,9 +264,11 @@ _VALID: dict[str, object] = {
     "depth": 1, "background": True, "turn_number": 1, "notification": False, "tool_count": 0,
     "provider": "claude", "stream": True, "name": "bash", "tool_type": "function",
     "call_id": "toolu_01A09q90qw90lq917835lq9", "emergency": False, "tokens_before": 10, "tokens_after": 5,
-    "marker_count": 1, "input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "attempt": 1,
+    "input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "attempt": 1,
     "reason": "stream_error", "delay": 2, "after": False, "decision": "allow", "scope": "once", "duration": 4,
     "finish_reason": "end_turn", "argument_bytes": 5, "result_bytes": 6,
+    # serve_span and mcp_span share the "method" parameter; serve_span is only ever called with "method" as the field under test
+    "method": "tools/call", "server": "fake", "target": "echo", "request_id": 7, "protocol_version": "2025-06-18",
 }
 _RESERVED = (
     "gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.system_instructions",
@@ -286,8 +288,8 @@ _ADVERSARIAL = {
     "overlong": "x" * 300,
     "unicode": "unicode-\u2603",
 }
-_HELPERS = ("agent_span", "turn_span", "inference_span", "tool_span", "context_span")
-_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_sizes", "fail")
+_HELPERS = ("agent_span", "turn_span", "inference_span", "tool_span", "context_span", "serve_span", "mcp_span")
+_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "set_compaction", "invalid_propagation", "set_mcp_request", "fail")
 # where a shape-accepted value may appear: "<name>" is the span name.
 _SHAPE_FIELDS = {
     ("agent_span", "profile"): {"<name>"},
@@ -297,6 +299,8 @@ _SHAPE_FIELDS = {
     ("tool_span", "name"): {"<name>", "zeta.tool.name"},
     ("tool_span", "agent_name"): {"zeta.agent.name"},
     ("set_response", "model"): {"gen_ai.response.model"},
+    ("mcp_span", "server"): {"zeta.mcp.server.name"},
+    ("mcp_span", "target"): {"<name>", "gen_ai.tool.name"},
 }
 
 
@@ -358,7 +362,8 @@ def _emit(memory_telemetry, route: str, field: str, value: object) -> list:
             if route == "fail":
                 span.fail(value if isinstance(value, BaseException) else ValueError(value))
             else:
-                getattr(span, route)(**({name: _VALID[name] for name in _params(route)} | {field: value}))
+                # a value-free route (invalid_propagation) takes no field
+                getattr(span, route)(**({name: _VALID[name] for name in _params(route)} | ({field: value} if field else {})))
     instance._implementation._provider.force_flush()
     return list(exported)
 
@@ -392,7 +397,7 @@ def test_adversarial_value_never_leaves_its_field(memory_telemetry, route, field
 def test_table_covers_every_route_and_string_parameter() -> None:
     helpers = {name for name in dir(telemetry.Telemetry) if name.endswith("_span") and not name.startswith("_")}
     methods = {name for name in vars(telemetry.SpanHandle) if not name.startswith("_")}
-    routes = {route for route, _field in _FIELDS}
+    routes = {*_HELPERS, *_HANDLE_METHODS}
     assert helpers | methods == routes
     for route in routes:
         owner = telemetry.Telemetry if route in helpers else telemetry.SpanHandle
@@ -440,13 +445,17 @@ def _source_finish_reasons() -> set[str]:
 
 def _source_closed_sets() -> dict[str, set[str]]:
     from zeta.core.approval import ApprovalDecision as CoreDecision
-    from zeta.models.catalog import PROVIDER_MODELS
+    from zeta.mcp.client import CALLER_METHODS
+    from zeta.server.handlers.registry import HANDLERS
     from zeta.server.protocol import APPROVAL_SCOPES
     from zeta.server.protocol import ApprovalDecision as ServeDecision
 
     return {
         "reason": _source_retry_reasons(), "finish_reason": _source_finish_reasons(),
-        "decision": {*CoreDecision, *ServeDecision}, "scope": set(APPROVAL_SCOPES), "provider": set(PROVIDER_MODELS),
+        "decision": {*CoreDecision, *ServeDecision}, "scope": set(APPROVAL_SCOPES),
+        # the dispatch registry, plus hello, which the connection routes before it
+        "serve_method": {"hello", *(descriptor.wire for descriptor in HANDLERS)},
+        "mcp_method": set(CALLER_METHODS),
     }
 
 
@@ -455,9 +464,20 @@ def test_closed_set_mirrors_equal_their_sources() -> None:
 
     mirrors = {
         "reason": runtime._RETRY_REASONS, "finish_reason": runtime._FINISH_REASONS,
-        "decision": runtime._APPROVAL_DECISIONS, "scope": runtime._APPROVAL_SCOPES, "provider": runtime._PROVIDERS,
+        "decision": runtime._APPROVAL_DECISIONS, "scope": runtime._APPROVAL_SCOPES,
+        "serve_method": runtime._SERVE_METHODS,
+        "mcp_method": runtime._MCP_METHODS,
     }
     assert {name: set(values) for name, values in mirrors.items()} == _source_closed_sets()
+
+
+def test_every_catalog_provider_maps_to_an_accepted_genai_name() -> None:
+    from zeta.models.catalog import PROVIDER_MODELS
+    from zeta.telemetry import runtime
+    from zeta.telemetry.attributes import GEN_AI_PROVIDER_NAMES
+
+    assert set(GEN_AI_PROVIDER_NAMES) == set(PROVIDER_MODELS)
+    assert set(GEN_AI_PROVIDER_NAMES.values()) == runtime._PROVIDERS
 
 
 def _real_values() -> list:
@@ -468,16 +488,21 @@ def _real_values() -> list:
         "finish_reason": ("set_response", "gen_ai.response.finish_reasons"),
         "decision": ("approval_resolved", "zeta.approval.resolved.decision"),
         "scope": ("approval_requested", "zeta.approval.requested.scope"),
-        "provider": ("inference_span", "gen_ai.provider.name"),
+        "serve_method": ("serve_span", "rpc.method"),
+        "mcp_method": ("mcp_span", "mcp.method.name"),
     }
-    cases = [(location[field][0], field, value, location[field][1]) for field, values in _source_closed_sets().items() for value in sorted(values)]
+    # serve_method and mcp_method are both the "method" parameter of their helper
+    cases = [(location[name][0], name.removeprefix("serve_").removeprefix("mcp_"), value, location[name][1]) for name, values in _source_closed_sets().items() for value in sorted(values)]
     models = {model for models in PROVIDER_MODELS.values() for model in models} | {"locally-created-model", "qwen3:4b", "hf.co/user/model:Q4_K_M"}
     cases += [("inference_span", "model", model, "gen_ai.request.model") for model in sorted(models)]
     cases += [("set_response", "model", "locally-created-model", "gen_ai.response.model")]
     cases += [("tool_span", "name", name, "zeta.tool.name") for name in ("bash", "web_search", "filesystem__read_file")]
     cases += [("tool_span", "tool_type", kind, "zeta.tool.type") for kind in ("function", "computer", "mcp", "agent")]
     cases += [("agent_span", "agent_name", name, "zeta.agent.name") for name in ("worker", "ux-tester")]
-    cases += [("turn_span", "conversation_id", "0123456789abcdef0123456789abcdef", "gen_ai.conversation.id")]
+    cases += [("mcp_span", "server", name, "zeta.mcp.server.name") for name in ("fake", "github-mcp", "docs.internal")]
+    cases += [("mcp_span", "target", name, "gen_ai.tool.name") for name in ("echo", "get_issue", "search-docs")]
+    cases += [("set_mcp_request", "protocol_version", version, "mcp.protocol.version") for version in ("2025-06-18", "2025-11-25")]
+    cases += [("turn_span", "conversation_id", conversation, "gen_ai.conversation.id") for conversation in (_SESSION, f"{_SESSION}:1", f"{_SESSION}:12:3")]
     call_ids = ("toolu_01A09q90qw90lq917835lq9", "call_abc123XYZ", "fc_68a1b2c3d4e5", "ollama-01234567-89ab-cdef-0123-456789abcdef", "inline-0123456789abcdef0123456789abcdef")
     cases += [("tool_span", "call_id", call_id, "zeta.tool.call.id") for call_id in call_ids]
     return [pytest.param(*case, id=f"{case[0]}-{case[1]}-{case[2]}") for case in cases]
@@ -489,9 +514,41 @@ def test_real_value_is_exported_unchanged(memory_telemetry, route, field, value,
     assert surfaces.get(location) == value, sorted(surfaces.items())
 
 
+# near-miss child instance ids: zero, empty, or non-numeric levels, and deeper than the hard depth limit 5.
+@pytest.mark.parametrize("conversation", [f"{_SESSION}:0", f"{_SESSION}:", f"{_SESSION}:1:x", _SESSION + ":1" * 6, "1"])
+def test_malformed_conversation_id_is_replaced(memory_telemetry, conversation) -> None:
+    surfaces = dict(_surfaces(_emit(memory_telemetry, "turn_span", "conversation_id", conversation)))
+    assert surfaces["gen_ai.conversation.id"] == "_invalid"
+
+
+def test_absent_approval_fields_are_omitted(memory_telemetry) -> None:
+    instance, exported = memory_telemetry
+    exported.clear()
+    with instance.turn_span(conversation_id=_SESSION, turn_number=1, notification=False) as span:
+        span.approval_requested(decision="ask")
+        span.approval_resolved(decision=None, duration=3)
+    instance._implementation._provider.force_flush()
+    (exported_span,) = exported
+    assert [(event.name, dict(event.attributes)) for event in exported_span.events] == [
+        ("zeta.approval.requested", {"decision": "ask"}),
+        ("zeta.approval.resolved", {"duration": 3}),
+    ]
+
+
 def test_profile_name_and_error_type_are_exported(memory_telemetry) -> None:
     surfaces = dict(_surfaces(_emit(memory_telemetry, "agent_span", "profile", "ux-tester")))
     assert surfaces["<name>"] == "invoke_agent ux-tester"
     surfaces = dict(_surfaces(_emit(memory_telemetry, "fail", "exc", LookupError("secret detail"))))
     assert surfaces["error.type"] == "LookupError"
     assert "secret detail" not in str(surfaces)
+
+
+def test_invalid_propagation_event_carries_no_value(memory_telemetry) -> None:
+    surfaces = _surfaces(_emit(memory_telemetry, "invalid_propagation", "", None))
+    assert ("<event>", "zeta.serve.invalid_propagation") in surfaces
+    assert not [location for location, _text in surfaces if location.startswith("zeta.serve.invalid_propagation.")]
+
+
+def test_serve_span_name_and_attributes_are_fixed(memory_telemetry) -> None:
+    surfaces = dict(_surfaces(_emit(memory_telemetry, "serve_span", "method", "session_history")))
+    assert surfaces == {"<name>": "serve session_history", "rpc.system": "jsonrpc", "rpc.method": "session_history"}

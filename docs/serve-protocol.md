@@ -216,6 +216,20 @@ to 128 decimal digits. An error uses the parsed id when the frame exposed a
 safe id. It uses `null` when parsing did not expose an id or the id exceeded a
 documented limit.
 
+### trace context (`otel` feature)
+
+After its `hello` negotiated `otel`, a client may add W3C trace context to any
+later request as optional top-level string fields `traceparent` and
+`tracestate` (the W3C Trace Context header values). Baggage is not supported.
+The server makes the request's `serve <method>` span a child of that context,
+and work the request starts (for example the turn a `send` starts) is traced
+under it. A malformed value never rejects the request: the server ignores the
+whole context and records a value-free `zeta.serve.invalid_propagation` event
+on the span. Responses and notifications never carry trace context. Before
+`otel` is negotiated, and on `hello` itself, the server ignores both fields.
+A client sends them only after its `hello` negotiated `otel`; zeta's own
+outbound clients send none, because none of them runs inside a span.
+
 ## requests
 
 ### `list_sessions`
@@ -1947,7 +1961,7 @@ error code and message. Provider status and origin remain internal.
   catalogs, and `providers`, a model-name-to-provider map (`claude` or `codex`).
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
-- `session_settings`: returns `model`, `approval_mode`, and `plan_mode`.
+- `session_settings`: returns `model`, `approval_mode`, and `plan_mode`. with the negotiated `otel` feature it also returns `telemetry` (`enabled`, `state`, and `reason`); endpoint and exporter details are never returned.
 - `account_list`: takes `session_id` and returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and
   `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
@@ -2169,6 +2183,7 @@ negotiate a feature sees the behavior from before the feature existed.
 
 | feature | effect |
 | --- | --- |
+| `otel` | `session_settings` adds `telemetry` with enabled, state, and reason; requests accept top-level `traceparent` and `tracestate` |
 | `session_cwd` | `new_session` accepts `cwd` |
 | `new_session_settings` | `new_session` accepts `approval_mode` (with `model`) as an initial setting |
 | `user_message_event` | `send`, `steer`, and `send_images` emit `user_message` |
