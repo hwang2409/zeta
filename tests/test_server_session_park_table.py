@@ -264,7 +264,7 @@ async def x3_close_fails(run: Run) -> None:
         raise RuntimeError("injected close failure")
 
     parked.close = close
-    run.caplog.set_level(logging.ERROR, logger="zeta.server.parking")
+    run.caplog.set_level(logging.ERROR, logger="zeta.server.session_controllers")
     run.backend.gates[0].set()
     await _until(lambda: server.parking.get(a) is None, "A leaves the parked set")
 
@@ -272,12 +272,12 @@ async def x3_close_fails(run: Run) -> None:
         return [
             (record.getMessage(), type(record.exc_info[1]))
             for record in run.caplog.records
-            if record.name == "zeta.server.parking"
+            if record.name == "zeta.server.session_controllers"
         ]
 
     await _until(logged, "the failed close is logged")
     assert logged() == [(f"closing session {a} failed", RuntimeError)]
-    assert not server.parking.closing_tasks()
+    assert server.controllers.closing_session_ids() == []
     result = await client.call("resume", {"session_id": a})
     assert result["session"]["session_id"] == a
     assert "attached" not in result
@@ -367,17 +367,17 @@ async def c2_cancel_resume_waiting_for_close(run: Run) -> None:
 
     parked.runtime.close = held_close
     waiting = asyncio.Event()
-    original_wait = server.parking.wait_closed
+    original_wait = server.controllers.wait_closed
 
     async def wait_closed(session_id: str) -> None:
-        if session_id in server.parking._closing:
+        if session_id in server.controllers.closing_session_ids():
             waiting.set()
         await original_wait(session_id)
 
-    run.monkeypatch.setattr(server.parking, "wait_closed", wait_closed)
+    run.monkeypatch.setattr(server.controllers, "wait_closed", wait_closed)
     run.backend.gates[0].set()
     await await_or_fail(close_started.wait(), what="idle close started")
-    (closing,) = server.parking.closing_tasks()
+    (closing,) = [record.close_task for record in server.controllers.records() if record.closing]
     resume = asyncio.create_task(client.call("resume", {"session_id": a}))
     try:
         await await_or_fail(waiting.wait(), what="resume waits for the close")
@@ -549,7 +549,7 @@ async def d2_stale_check_after_resume(run: Run) -> None:
     for control in late_checks:
         original_check(control)
     assert server.controllers.attached().control is parked
-    assert a not in server.parking._closing
+    assert a not in server.controllers.closing_session_ids()
     assert (await client.call("status"))["session"]["session_id"] == a
 
 

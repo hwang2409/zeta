@@ -44,6 +44,7 @@ from zeta.server.delivery import (
     ResolvedModelInput,
     _deliver_after_commit,
 )
+from zeta.server.session_controllers import SessionControllers
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -108,6 +109,21 @@ class SteerTurnEndBackend:
             message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
         )
 
+
+
+async def _deliver(
+    requests: DeliveryRequests, method: str, params: dict[str, Any], features: frozenset[str]
+) -> dict[str, object]:
+    """A delivery as the serve request runs it: through a session use. Return or
+    raise only once the delivery's completion released that use, so its effects
+    are final even when the request was cancelled first."""
+    use = SessionControllers(requests._control).owned(None)  # type: ignore[arg-type]
+    try:
+        return await getattr(requests, method)(use, params, features)
+    finally:
+        async with asyncio.timeout(10):
+            while use.record.uses:
+                await asyncio.sleep(0)
 
 @pytest.mark.asyncio
 async def test_max_turns_emits_terminal_error(tmp_path: Path) -> None:
@@ -197,7 +213,7 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
     requests = DeliveryRequests(control)
     features = frozenset({"delivery_id"})
     request_task = asyncio.create_task(
-        getattr(requests, method)({"text": "hello", "delivery_id": "cancel-1"}, features)
+        _deliver(requests, method, {"text": "hello", "delivery_id": "cancel-1"}, features)
     )
     await await_or_fail(append_started.wait(), what="append start")
     release_append.set()
@@ -207,9 +223,7 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
     assert store.client_delivery("cancel-1") is not None
     # canceled at commit: no echo, the work still runs once
     assert effects == (["start"] if method == "send" else ["steer"])
-    duplicate = await getattr(
-        requests, method
-    )({"text": "hello", "delivery_id": "cancel-1"}, features)
+    duplicate = await _deliver(requests, method, {"text": "hello", "delivery_id": "cancel-1"}, features)
     assert duplicate["duplicate"] is True
     assert effects == (["start"] if method == "send" else ["steer"])
     if method == "steer":
@@ -259,7 +273,7 @@ async def test_delivery_id_cancel_before_append_commits_does_nothing(
     control.start_turn = lambda *args, **kwargs: effects.append("start")
     requests = DeliveryRequests(control)
     task = asyncio.create_task(
-        getattr(requests, method)({"text": "hello", "delivery_id": "cancel-2"}, frozenset({"delivery_id"}))
+        _deliver(requests, method, {"text": "hello", "delivery_id": "cancel-2"}, frozenset({"delivery_id"}))
     )
     await await_or_fail(append_started.wait(), what="append start")
     task.cancel()
@@ -1614,10 +1628,10 @@ async def test_committed_delivery_runs_work_when_echo_fails(method: str) -> None
     params = {"text": "hello", "delivery_id": f"{method}-error"}
 
     with pytest.raises(ConnectionError):
-        await getattr(requests, method)(params, frozenset({"delivery_id"}))
+        await _deliver(requests, method, params, frozenset({"delivery_id"}))
 
     assert control.start_calls + control.steer_calls == 1
-    retry = await getattr(requests, method)(params, frozenset({"delivery_id"}))
+    retry = await _deliver(requests, method, params, frozenset({"delivery_id"}))
     assert retry["duplicate"] is True
     assert control.start_calls + control.steer_calls == 1
 
@@ -1666,12 +1680,12 @@ async def test_cancel_cleans_up_echo_and_runs_committed_work(method: str) -> Non
     control.echo_stalls = True
     requests = DeliveryRequests(control)
     request = asyncio.create_task(
-        getattr(requests, method)(
+        _deliver(requests, method,
             {"text": "hello", "delivery_id": f"{method}-cancel"},
             frozenset({"delivery_id", "user_message_event"}),
         )
     )
-    await control.echo_started.wait()
+    await await_or_fail(control.echo_started.wait(), what="echo starts")
     request.cancel()
 
     with pytest.raises(asyncio.CancelledError):
@@ -1696,7 +1710,7 @@ async def test_cancel_during_commit_runs_work_without_waiting_for_echo(method: s
 
     control.store.append_client_delivery_async = append_then_cancel
     request = asyncio.create_task(
-        getattr(requests, method)(
+        _deliver(requests, method,
             {"text": "hello", "delivery_id": f"{method}-commit-cancel"},
             frozenset({"delivery_id", "user_message_event"}),
         )

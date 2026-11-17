@@ -8,6 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
+from typing import Any
 from uuid import uuid4
 
 from ..core.approval import ApprovalPolicy, ApprovalRequest, child_instance_in_subtree
@@ -76,7 +77,9 @@ class Start:
 class Decide:
     method: ApprovalDecision
     request_id: str
-    scope: str = "once"
+    scope: str
+    # hands the deciding request's session use to the settlement task
+    transfer: Callable[[asyncio.Future[Any]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,8 +325,8 @@ class ApprovalLifecycle:
                 return _Completed()
             case Start(stream_event, session_id, wire_event):
                 return self._start_approval(stream_event, session_id, wire_event)
-            case Decide(method, request_id, scope):
-                return self.resolve_approval(method, request_id, scope)
+            case Decide(method, request_id, scope, transfer):
+                return self.resolve_approval(method, request_id, scope, transfer)
             case ExternalEnd(key, session_id, data, suppress_write_errors):
                 return self._end_approval(
                     key,
@@ -663,7 +666,11 @@ class ApprovalLifecycle:
         return self._reserve_record(record, decision)
 
     async def resolve_approval(
-        self, method: str, request_id: str, scope: str = "once"
+        self,
+        method: str,
+        request_id: str,
+        scope: str,
+        transfer: Callable[[asyncio.Future[Any]], None],
     ) -> tuple[dict[str, object], ApprovalKey]:
         policy = self._policy()
         if policy is None:
@@ -702,6 +709,7 @@ class ApprovalLifecycle:
         )
         settlement = self._start_settlement(record, self._settle_record(record, decision))
         self._change(record, settlement=settlement)
+        transfer(settlement)
         try:
             resolution = await approval_settlement.settlement_outcome(record.admitted, settlement)
         except OSError as exc:

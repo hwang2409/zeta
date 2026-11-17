@@ -320,9 +320,9 @@ async def _serve_bash_turn(tmp_path: Path, decision: str) -> dict[str, Any]:
         return published
 
     async def delay_decision_response_until_tool_end(
-        method: str, request_id: str, scope: str = "once"
+        use: object, method: str, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
-        result = await resolve_approval(method, request_id, scope)
+        result = await resolve_approval(use, method, request_id, scope)
         await asyncio.wait_for(tool_ended.wait(), 10)
         return result
 

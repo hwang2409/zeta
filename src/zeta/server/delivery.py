@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from .control import ServeControl
     from .runtime import SessionState
+    from .session_controllers import SessionUse
 
 
 class TurnOutcome(StrEnum):
@@ -55,17 +56,32 @@ class DeliveryRequests:
         # the end-of-turn decision in continue_after_turn) so only one wins.
         self._turn_guard = asyncio.Lock()
 
+    # Each request runs as one completion that owns the request's session use:
+    # the commit, its echo, and its turn start finish even after the request is
+    # cancelled, and the record cannot close before they do.
     async def send(
-        self, params: dict[str, Any], features: frozenset[str]
+        self, use: SessionUse, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
-        async with self._turn_guard:
-            return await self._send(params, features)
+        return await use.run(self._guarded(self._send, params, features))
 
     async def send_images(
-        self, params: dict[str, Any], features: frozenset[str]
+        self, use: SessionUse, params: dict[str, Any], features: frozenset[str]
+    ) -> dict[str, object]:
+        return await use.run(self._guarded(self._send_images, params, features))
+
+    async def steer(
+        self, use: SessionUse, params: dict[str, Any], features: frozenset[str]
+    ) -> dict[str, object]:
+        return await use.run(self._steer(params, features))
+
+    async def _guarded(
+        self,
+        work: Callable[[dict[str, Any], frozenset[str]], Coroutine[Any, Any, dict[str, object]]],
+        params: dict[str, Any],
+        features: frozenset[str],
     ) -> dict[str, object]:
         async with self._turn_guard:
-            return await self._send_images(params, features)
+            return await work(params, features)
 
     async def _send(
         self, params: dict[str, Any], features: frozenset[str]
@@ -241,7 +257,7 @@ class DeliveryRequests:
         )
         return outcome
 
-    async def steer(
+    async def _steer(
         self, params: dict[str, Any], features: frozenset[str]
     ) -> dict[str, object]:
         control = self._control
@@ -425,7 +441,7 @@ class DeliveryRequests:
                 control._schedule_background_wake(session_id)
                 return
             if (
-                not control.closing
+                not control.server.controllers.is_closing(control)
                 and control.controller_present()
                 and not control.client_turn_detached()
                 and control.runtime.state is state

@@ -61,7 +61,7 @@ from .protocol import (
     negotiate_protocol_version,
 )
 from .runtime import BackendFactory, ServerRuntime
-from .session_controllers import SessionController, SessionControllers
+from .session_controllers import SessionController, SessionControllers, SessionUse
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
@@ -322,7 +322,7 @@ class ZetaServer:
         control = ServeControl(self, runtime, self.foreground_event_publisher)
         # every pair shares this manager; sessionless reads use it with no record
         self.manager = runtime.manager
-        self.controllers = SessionControllers(control)
+        self.controllers = SessionControllers(control, owns_runtime=not self._borrowed)
         self._bind_pair(control)
         self.parking = ParkedPairs(lambda: self.connections, self.controllers)
 
@@ -331,8 +331,9 @@ class ZetaServer:
         yield self.controllers.attached().control
         yield from self.parking.pairs()
 
-    def new_pair(self) -> SessionController:
-        """An empty pair beside the attached one; it shares the session manager."""
+    def new_pair(self) -> SessionUse:
+        """An empty pair beside the attached one, reserved by the returned use
+        until its setup ends; it shares the session manager."""
         self.parking.require_room()
         control = ServeControl(
             self, self.controllers.attached().runtime.sibling(), self.foreground_event_publisher
@@ -463,6 +464,9 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self, *, approval_settlement_timeout: float | None = None) -> None:
+        if self.connections is not None:
+            # no new connection from here on; the records drain below
+            self.connections.stop_admission()
         if self._retention_owner is not None:
             await self._retention_owner.stop()
         if self._idle_drain is not None:
@@ -471,30 +475,18 @@ class ZetaServer:
             self._idle_drain = None
         try:
             if self._client is not None:
+                handler = self._client._run_task
+                if handler is not None and not handler.done():
+                    handler.cancel()
                 await self._client.close(graceful=True)
         finally:
             self._client = None
             self._client_active = False
             self.parking.close_all(approval_settlement_timeout)
-            record = self.controllers.retire(self.controllers.attached())
             try:
-                try:
-                    await self.controllers.drained(record)
-                    await record.control.close()
-                finally:
-                    await self._close_foreground_events()
-                try:
-                    if not self._borrowed:
-                        await record.runtime.close()
-                finally:
-                    try:
-                        await record.control.wait_for_approval_settlement(
-                            approval_settlement_timeout
-                        )
-                    finally:
-                        await asyncio.gather(
-                            *self.parking.closing_tasks(), return_exceptions=True
-                        )
+                await self.controllers.close(
+                    approval_settlement_timeout, self._close_foreground_events
+                )
             finally:
                 if self.connections is not None:
                     await self.connections.aclose()

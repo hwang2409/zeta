@@ -127,11 +127,11 @@ async def resume(client, request_id, params, controller):
 
 
 async def send(client, request_id, params, controller):
-    return await controller.control.deliveries.send(params, client.features)
+    return await controller.control.deliveries.send(controller, params, client.features)
 
 
 async def steer(client, request_id, params, controller):
-    return await controller.control.deliveries.steer(params, client.features)
+    return await controller.control.deliveries.steer(controller, params, client.features)
 
 
 async def _resolve_approval(client, params, decision, controller):
@@ -145,7 +145,7 @@ async def _resolve_approval(client, params, decision, controller):
             ErrorDescriptor.INVALID_PARAMS, "scope 'always_tool' requires approve"
         )
     return await controller.control.resolve_approval(
-        decision, validation.required_string(params, "request_id"), scope
+        controller, decision, validation.required_string(params, "request_id"), scope
     )
 
 
@@ -308,7 +308,7 @@ async def set_compaction(client, request_id, params, controller):
 
 async def send_images(client, request_id, params, controller):
     validation.active(controller.runtime, params)
-    return await controller.control.deliveries.send_images(params, client.features)
+    return await controller.control.deliveries.send_images(controller, params, client.features)
 
 
 async def path_complete(client, request_id, params, controller):

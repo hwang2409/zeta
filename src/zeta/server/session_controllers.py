@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Self
 
@@ -13,15 +15,26 @@ if TYPE_CHECKING:
     from .control import ServeControl
     from .runtime import ServerRuntime
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(slots=True, eq=False)
 class SessionController:
     """The persistent runtime/control pair for one resident session. Only
-    ``SessionControllers`` changes ``uses``."""
+    ``SessionControllers`` changes ``uses`` and the close state."""
 
     control: ServeControl
     generation: int
+    # false for a runtime the server borrowed (an observer host's): its owner
+    # closes it, so the record's close never does
+    owns_runtime: bool = True
     uses: set[SessionUse] = field(default_factory=set)
+    # set by ``retire``: no resolution, wake, or claim from here on, but the
+    # record stays resident (and counts) until ``close_task`` ends
+    closing: bool = False
+    close_task: asyncio.Task[None] | None = None
+    # the session the record held when its close began
+    closing_session_id: str | None = None
 
     @property
     def runtime(self) -> ServerRuntime:
@@ -69,14 +82,27 @@ class SessionUse:
         self._state = "transferred"
         completion.add_done_callback(lambda _done: self._owner._settle(self))
 
+    async def run[T](self, work: Coroutine[Any, Any, T]) -> T:
+        """Run ``work`` as the one completion that owns this use. A cancel of the
+        request reaches ``work`` once and drops only the response: what ``work``
+        does on cancel (abort before its commit, finish after it) still holds
+        the record open."""
+        task = asyncio.create_task(work)
+        self.transfer_to(task)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+
 
 class SessionControllers:
     """Own the attached record and the records available for selection."""
 
-    def __init__(self, control: ServeControl) -> None:
+    def __init__(self, control: ServeControl, *, owns_runtime: bool = True) -> None:
         self._generations = itertools.count(1)
         self._records: dict[ServeControl, SessionController] = {
-            control: SessionController(control, next(self._generations))
+            control: SessionController(control, next(self._generations), owns_runtime)
         }
         self._attached = self._records[control]
         self._parked: dict[str, SessionController] = {}
@@ -89,10 +115,12 @@ class SessionControllers:
     def record_for(self, control: ServeControl) -> SessionController:
         return self._records[control]
 
-    def register(self, control: ServeControl) -> SessionController:
+    def register(self, control: ServeControl) -> SessionUse:
+        """A new generation for ``control``, reserved by the returned use until
+        its setup ends."""
         record = SessionController(control, next(self._generations))
         self._records[control] = record
-        return record
+        return self._use(record)
 
     def attached(self) -> SessionController:
         return self._attached
@@ -100,6 +128,8 @@ class SessionControllers:
     def owned(self, connection: Any) -> SessionUse:
         """A use of the persistent record controlled by ``connection``."""
         del connection
+        if self._attached.closing:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         return self._use(self._attached)
 
     def selected(
@@ -116,7 +146,7 @@ class SessionControllers:
         del connection
         attached = self._attached.runtime
         if (
-            self._attached in self._records.values()
+            not self._attached.closing
             and attached.opened is not None
             and attached.session_id == session_id
         ):
@@ -129,11 +159,13 @@ class SessionControllers:
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
 
     def attach(self, record: SessionController) -> SessionController:
+        assert not record.closing
         self._parked.pop(record.runtime.session_id, None)
         self._attached = record
         return record
 
     def park(self, record: SessionController) -> SessionController:
+        assert not record.closing
         self._parked[record.runtime.session_id] = record
         return record
 
@@ -150,19 +182,125 @@ class SessionControllers:
     def parked_record(self, session_id: str) -> SessionController | None:
         return self._parked.get(session_id)
 
-    def retire(self, record: SessionController) -> SessionController:
-        """Take ``record`` out of every index before its close starts: the one
-        step every close of a resident control goes through. ``attached()``
-        keeps naming a retired final record only for shutdown."""
+    def closing_session_ids(self) -> list[str]:
+        """The sessions of detached records still closing; each counts toward
+        the resident limit."""
+        return [
+            record.closing_session_id
+            for record in self._records.values()
+            if record.closing and record is not self._attached and record.closing_session_id
+        ]
+
+    def is_closing(self, control: ServeControl) -> bool:
+        """``control`` has begun its close (or ended it): no wake or new work."""
+        record = self._records.get(control)
+        return record is None or record.closing
+
+    def retire(
+        self, record: SessionController, settlement_timeout: float | None = None
+    ) -> asyncio.Task[None]:
+        """The one close of a resident record; a second call returns the same
+        close. Resolution stops now; the control closes, then the runtime, only
+        once no use holds the record; approval settlement is verified last;
+        only then does the record leave ``records()``. A failed close is
+        logged, since nobody need await it."""
+        return self._begin_close(record, settlement_timeout, None)
+
+    def _begin_close(
+        self,
+        record: SessionController,
+        settlement_timeout: float | None,
+        before_runtime_close: Callable[[], Awaitable[None]] | None,
+        *,
+        report: bool = True,
+    ) -> asyncio.Task[None]:
+        if record.close_task is not None:
+            return record.close_task
+        assert self._records.get(record.control) is record, "retire of a foreign record"
+        runtime = record.runtime
+        record.closing = True
+        record.closing_session_id = runtime.session_id if runtime.opened is not None else None
         # by identity: a record whose setup failed has no session id
         self._parked = {key: item for key, item in self._parked.items() if item is not record}
-        self._records.pop(record.control, None)
-        return record
+        task = asyncio.create_task(
+            self._close(record, settlement_timeout, before_runtime_close)
+        )
+        if report:
+            task.add_done_callback(lambda done: _report_close(done, record.closing_session_id))
+        record.close_task = task
+        return task
 
-    async def drained(self, record: SessionController) -> None:
-        """Wait until no use of ``record`` is held by a completion; a close runs
-        only after this. A use its request still holds does not delay a close
-        yet: that request may wait on the registry close that follows."""
+    async def _close(
+        self,
+        record: SessionController,
+        settlement_timeout: float | None,
+        before_runtime_close: Callable[[], Awaitable[None]] | None,
+    ) -> None:
+        control = record.control
+        try:
+            try:
+                await self._drained(record)
+                await control.close()
+            finally:
+                try:
+                    try:
+                        if before_runtime_close is not None:
+                            await before_runtime_close()
+                    finally:
+                        if record.owns_runtime:
+                            await record.runtime.close()
+                finally:
+                    await control.wait_for_approval_settlement(settlement_timeout)
+        finally:
+            del self._records[control]
+
+    async def wait_closed(self, session_id: str) -> None:
+        """Wait until every closing record of ``session_id`` has closed."""
+        for record in tuple(self._records.values()):
+            if record.closing and record.closing_session_id == session_id:
+                assert record.close_task is not None
+                # a cancelled waiter must not cancel the close
+                await asyncio.shield(record.close_task)
+
+    async def close(
+        self,
+        settlement_timeout: float | None,
+        before_attached_runtime_close: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Server shutdown: close every resident record and wait for every close.
+        ``before_attached_runtime_close`` runs just before the attached record's
+        runtime would close (owned or not), and that close's error propagates;
+        the others are logged by their close. A cancel of the shutdown does not
+        cancel a close."""
+        for record in tuple(self._parked.values()):
+            self.retire(record, settlement_timeout)
+        done = self._attached.close_task
+        if done is not None and done.done():
+            # a repeated shutdown: the first one already reported this close
+            await asyncio.gather(
+                *(record.close_task for record in self._records.values() if record.close_task),
+                return_exceptions=True,
+            )
+            return
+        # its close error reaches the caller, so it is not logged as well
+        attached = self._begin_close(
+            self._attached, settlement_timeout, before_attached_runtime_close, report=False
+        )
+        others = [
+            record.close_task
+            for record in self._records.values()
+            if record.close_task is not None and record.close_task is not attached
+        ]
+        try:
+            await asyncio.shield(attached)
+        finally:
+            await asyncio.gather(*others, return_exceptions=True)
+
+    async def _drained(self, record: SessionController) -> None:
+        """Wait until no use of ``record`` is held by a completion. A use its
+        request still holds does not delay the close: that request may wait on
+        the registry close that follows, and its finalizer work, if any, already
+        owns a transferred use."""
         while self._transferred(record):
             waiter = asyncio.get_running_loop().create_future()
             self._drains.setdefault(record, []).append(waiter)
@@ -193,7 +331,7 @@ class SessionControllers:
         del connection
         record = use.record
         runtime = record.runtime
-        if record not in self._records.values() or record.generation != use.generation or (
+        if record.closing or record not in self._records.values() or record.generation != use.generation or (
             session_id is not None
             and (runtime.opened is None or runtime.session_id != session_id)
         ):
@@ -201,3 +339,9 @@ class SessionControllers:
 
     def is_attached(self, control: ServeControl) -> bool:
         return self._attached.control is control
+
+
+def _report_close(task: asyncio.Task[None], session_id: str | None) -> None:
+    # a close that nobody awaits would otherwise fail without a trace
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        logger.error("closing session %s failed", session_id, exc_info=exc)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -15,12 +14,10 @@ if TYPE_CHECKING:
     from .control import ServeControl
     from .session_controllers import SessionController, SessionControllers
 
-logger = logging.getLogger(__name__)
-
-
 class ParkedPairs:
-    """Owns every parked and closing pair: park or close a pair the client left,
-    report its row, and close it once it holds no work. Loop thread only."""
+    """The parking policy: park or close a pair the client left, report its
+    row, and close it once it holds no work. ``SessionControllers`` owns the
+    records and their close. Loop thread only."""
 
     def __init__(
         self,
@@ -32,12 +29,14 @@ class ParkedPairs:
         self._controllers = controllers
         # parked plus closing pairs; each holds a loop, its store, and its MCP servers
         self.limit = limit
-        self._closing: dict[str, asyncio.Task[None]] = {}
         # the last parked_session_changed data sent per parked session
         self._sent: dict[str, dict[str, object]] = {}
 
     def require_room(self) -> None:
-        held = [*(control.runtime.session_id for control in self._controllers.parked_controls()), *self._closing]
+        held = [
+            *(control.runtime.session_id for control in self._controllers.parked_controls()),
+            *self._controllers.closing_session_ids(),
+        ]
         if len(held) >= self.limit:
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY,
@@ -71,7 +70,7 @@ class ParkedPairs:
             self._controllers.park(self._controllers.record_for(outgoing))
             self.changed(outgoing)
         else:
-            self._close_pair(self._controllers.retire(self._controllers.record_for(outgoing)))
+            self._controllers.retire(self._controllers.record_for(outgoing))
 
     def changed(self, control: ServeControl) -> None:
         """Report this parked pair's state and close it once idle; a no-op for a
@@ -121,52 +120,12 @@ class ParkedPairs:
         """Close a parked pair now; its turn ends ``disconnect``."""
         if control in self._controllers.parked_controls():
             session_id = control.runtime.session_id
-            record = self._controllers.retire(self._controllers.record_for(control))
+            self._controllers.retire(self._controllers.record_for(control), settlement_timeout)
             self._publish(
                 control,
                 {"session_id": session_id, "state": "closed", "pending_approvals": 0},
             )
             self._sent.pop(session_id, None)
-            self._close_pair(record, settlement_timeout)
-
-    def _close_pair(
-        self, record: SessionController, settlement_timeout: float | None = None
-    ) -> None:
-        """Close a record ``SessionControllers.retire`` already took out."""
-        assert record not in self._controllers.records()
-        control = record.control
-        session_id = control.runtime.session_id
-        control.closing = True  # no wake starts from here on
-
-        async def close() -> None:
-            try:
-                try:
-                    await self._controllers.drained(record)
-                    await control.close()
-                finally:
-                    try:
-                        await control.runtime.close()
-                    finally:
-                        await control.wait_for_approval_settlement(settlement_timeout)
-            finally:
-                if self._closing.get(session_id) is task:
-                    del self._closing[session_id]
-
-        def report(done: asyncio.Task[None]) -> None:
-            # a close that no resume awaits would otherwise fail without a trace
-            if not done.cancelled() and (exc := done.exception()) is not None:
-                logger.error("closing session %s failed", session_id, exc_info=exc)
-
-        task = asyncio.create_task(close())
-        task.add_done_callback(report)
-        self._closing[session_id] = task
-
-    async def wait_closed(self, session_id: str) -> None:
-        """Wait until a closing pair has released ``session_id``."""
-        task = self._closing.get(session_id)
-        if task is not None:
-            # a cancelled request must not cancel the close
-            await asyncio.shield(task)
 
     async def claim(
         self, keep: bool, *, reconnect: bool, require_host_binding: bool
@@ -193,6 +152,3 @@ class ParkedPairs:
     def close_all(self, settlement_timeout: float | None) -> None:
         for control in self._controllers.parked_controls():
             self.close(control, settlement_timeout)
-
-    def closing_tasks(self) -> tuple[asyncio.Task[None], ...]:
-        return tuple(self._closing.values())

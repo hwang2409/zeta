@@ -65,6 +65,7 @@ if TYPE_CHECKING:
     from ..mcp import MCPServerConfig
     from .runtime import ServerRuntime
     from .server import ZetaServer
+    from .session_controllers import SessionUse
 
 USER_MESSAGE_MAX_BYTES = 262_144
 CONTROLLER_HANDOFF_DEADLINE_SECONDS = 10.0
@@ -164,7 +165,6 @@ class ServeControl:
         # Serve reads requests serially per connection and has one controller,
         # so this lock never contends today; status projects its holder.
         self.slash_lock = SlashLock(offload=self._run_blocking)
-        self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
         self._active_mcp_bindings: dict[str, dict[str, str]] = {}
         self._mcp_binding_servers: frozenset[str] = frozenset()
@@ -181,7 +181,7 @@ class ServeControl:
             if self.runtime.opened is not None
             else None,
             offload=lambda job: self._run_blocking(job),
-            is_closing=lambda: self.closing,
+            is_closing=lambda: self.server.controllers.is_closing(self),
             grant_published=self._publish_session_grant,
         )
 
@@ -637,7 +637,6 @@ class ServeControl:
         self._approvals.prune_ended()
 
     async def close(self) -> None:
-        self.closing = True
         task = self._grace_task
         if task is not None:
             task.cancel()
@@ -702,7 +701,7 @@ class ServeControl:
             connections.release_deferred_replay(session_id, close=True)
 
     async def _run_blocking(self, job: Callable[[], object]) -> object:
-        if self.closing:
+        if self.server.controllers.is_closing(self):
             return await asyncio.to_thread(job)
         registry = self.server.connections
         if registry is None:
@@ -718,14 +717,15 @@ class ServeControl:
         return self._approvals.cleanup_delegated(child_instance_id)
 
     async def resolve_approval(
-        self, method: ApprovalDecision, request_id: str, scope: str = "once"
+        self, use: SessionUse, method: ApprovalDecision, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
         loop = self.runtime.loop
         policy = self.runtime.policy
         if loop is None or policy is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        # the decision's settlement owns the request's use from its start
         result, core_key = await self._approvals.transition(
-            Decide(ApprovalDecision(method), request_id, scope)
+            Decide(ApprovalDecision(method), request_id, scope, use.transfer_to)
         )
         assert isinstance(result, dict)
         # The Decide just wrote on this thread, so the memoized `*_now` seam has
@@ -930,7 +930,7 @@ class ServeControl:
             )
 
     def _schedule_background_wake(self, session_id: str) -> None:
-        if self.closing or self._session_swap_id == session_id:
+        if self.server.controllers.is_closing(self) or self._session_swap_id == session_id:
             return
         loop = self.runtime.loop
         state = self.runtime.state
@@ -1313,7 +1313,7 @@ class ServeControl:
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
         """Schedule child events from the loop's synchronous sink."""
         self._maybe_idle()
-        if not self.closing:
+        if not self.server.controllers.is_closing(self):
             asyncio.create_task(
                 self._event(event, session_id=session_id, background=True)
             )
@@ -1326,7 +1326,7 @@ class ServeControl:
             # the sink may run on a worker thread; check idleness on the loop
             self._maybe_idle()
             controller = connections.controller_metadata()
-            if not self.closing and controller is not None and "run_work" in controller.features:
+            if not self.server.controllers.is_closing(self) and controller is not None and "run_work" in controller.features:
                 if event is EventDescriptor.BACKGROUND_TASK_UPDATED:
                     awaitable = self._notify(EventDescriptor.BACKGROUND_TASK_UPDATED, session_id, **fields)
                 elif event is EventDescriptor.TODO_UPDATED:
@@ -1342,7 +1342,7 @@ class ServeControl:
 
     def _publish_memory_notice(self, session_id: str, message: str) -> None:
         """Publish updates only when the client negotiated the optional feature."""
-        if not self.closing and self.server.connections is not None:
+        if not self.server.controllers.is_closing(self) and self.server.connections is not None:
             asyncio.create_task(
                 self._notify(
                     event_contract.AUXILIARY_WIRE_EVENTS[

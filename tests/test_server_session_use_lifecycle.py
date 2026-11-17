@@ -120,7 +120,7 @@ async def test_shutdown_waits_for_a_cancelled_history_worker(
 
         closing = asyncio.create_task(server.close())
         await _spin(
-            lambda: handler.done() and record not in server.controllers.records(),
+            lambda: handler.done() and record.closing,
             what="server close cancels the history request and retires the record",
         )
         assert handler.cancelled() or handler.done()
@@ -169,7 +169,7 @@ async def test_parked_session_closes_after_an_observer_history_worker(
         observer.writer.write_eof()
         backend.open_all()
         await _spin(
-            lambda: record not in server.controllers.records(),
+            lambda: record.closing,
             what="the idle parked session starts its close",
         )
         await _settle_until(lambda: bool(gate.closes))
