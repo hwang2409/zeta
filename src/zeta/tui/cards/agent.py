@@ -29,6 +29,7 @@ from .agent_sync import (
     AgentTranscriptTreeSnapshot,
 )
 from .base import compact_tool_card
+from .markdown import render_markdown
 from .shared import hard_wrap_by_cells
 
 if TYPE_CHECKING:
@@ -38,6 +39,22 @@ AGENT_TOOL_NAME = "agent"
 MAX_ARGUMENTS = 140
 MAX_RESULT = 180
 MAX_TAIL_LINES = 20
+
+
+class _Receipt:
+    def __init__(self, header: Text, answer: str) -> None:
+        self._header = header
+        self._answer = answer
+
+    @property
+    def plain(self) -> str:
+        return f"{self._header.plain}\n{self._answer}"
+
+    def __rich_console__(
+        self, console: Console, options: ConsoleOptions
+    ) -> RenderResult:
+        yield self._header
+        yield render_markdown(self._answer)
 
 
 class _TailLine(str):
@@ -453,7 +470,7 @@ class AgentCard:
         turns_used: int | None = None,
         depth: int | None = None,
         lifecycle: dict[str, Any] | None = None,
-    ) -> Text | None:
+    ) -> RenderableType | None:
         call = event.tool_call
         result = event.tool_result
         if call is None or result is None or call.name.casefold() != "agent":
@@ -466,7 +483,7 @@ class AgentCard:
         )
         if lifecycle:
             lifecycle_elapsed = lifecycle.get("elapsed")
-            if type(lifecycle_elapsed) in {int, float} and lifecycle_elapsed >= 0:
+            if type(lifecycle_elapsed) in {int, float} and lifecycle_elapsed > 0:
                 elapsed_seconds = float(lifecycle_elapsed)
         elapsed = elapsed_seconds
         if elapsed is None:
@@ -508,6 +525,10 @@ class AgentCard:
         canonical_receipt = has_agent_receipt_suffix(result.content)
         receipt_parts = result.content.rsplit(" · ", 5) if canonical_receipt else []
         receipt_answer = receipt_parts[0] if canonical_receipt else result.content
+        if canonical_receipt and elapsed_seconds is None:
+            elapsed_text = receipt_parts[2].removesuffix("s")
+            if re.fullmatch(r"\d+(?:\.\d+)?", elapsed_text):
+                elapsed = float(elapsed_text)
         tool_calls = lifecycle.get("tool_calls") if lifecycle else None
         if type(tool_calls) is not int or tool_calls < 0:
             tool_calls_text = receipt_parts[3] if canonical_receipt else ""
@@ -524,27 +545,24 @@ class AgentCard:
         handle = cls._short_handle(structured.get("child_instance_id"))
         if handle:
             fields[1 if agent_type else 0] += f" {handle}"
-        fields.extend(
-            (
-                f"{turns} turns",
-                f"{max(0.0, elapsed or 0.0):.1f}s",
-                receipt_status,
-                f"depth {display_depth}",
-            )
-        )
+        fields.append(f"{turns} turns")
+        if elapsed is not None:
+            fields.append(f"{max(0.0, elapsed):.1f}s")
+        fields.extend((receipt_status, f"depth {display_depth}"))
         if tool_calls is not None:
             fields.append(f"{tool_calls} tool calls")
         model = structured.get("model", cls._model(call))
         if isinstance(model, str) and model:
             fields.append(model)
-        if receipt_answer:
-            fields.append(receipt_answer)
-        return Text(
+        header = Text(
             " · ".join(fields),
             style=theme.ERROR if receipt_status in {"failed", "canceled"} else theme.RECEIPT,
             no_wrap=True,
             overflow="ellipsis",
         )
+        if not receipt_answer:
+            return header
+        return _Receipt(header, receipt_answer)
 
     @classmethod
     def render_start(cls, event: StreamEvent) -> RenderableType | None:

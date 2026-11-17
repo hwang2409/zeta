@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..core.agent_progress import publish_child_ended
+from ..core.agent_progress import live_agent_lifecycle, publish_child_ended
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import (
     Message,
@@ -706,11 +706,18 @@ async def finish_background_child(
             "error": "failed",
         }[status]
         effective_parent_store, effective_parent_id = background_owner.parent_edge(child_instance_id, parent_store, agent_instance_id)
-        terminal_stats = agent_stats({**(child_store.agent_lifecycle() or {}), "turns_used": turns_used}, status=status)
+        lifecycle = child_store.agent_lifecycle() or {}
+        live_lifecycle = live_agent_lifecycle(child_store.agent_lifecycle_path) or {}
+        terminal_stats = agent_stats(
+            {**lifecycle, **live_lifecycle, "turns_used": turns_used}, status=status
+        )
         result_text = notification_text or "background child completed"
         if explicit_finish_report is not None:
             explicit_terminal = _background_terminal(
-                lifecycle=child_store.agent_lifecycle(),
+                lifecycle={
+                    **(child_store.agent_lifecycle() or {}),
+                    **(live_agent_lifecycle(child_store.agent_lifecycle_path) or {}),
+                },
                 report=explicit_finish_report,
                 turns_used=turns_used,
                 tool_call_id=tool_call.id,
