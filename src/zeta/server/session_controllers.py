@@ -18,6 +18,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True, slots=True)
+class HelloAdmission:
+    connection: Any
+    mode: Literal["legacy", "multi"]
+    generation: int
+
+
 @dataclass(slots=True, eq=False)
 class SessionController:
     """The persistent runtime/control pair for one resident session. Only
@@ -106,8 +113,72 @@ class SessionControllers:
         }
         self._attached = self._records[control]
         self._parked: dict[str, SessionController] = {}
+        # hello admission is semantic state.  The generation makes rollback
+        # safe when a failed connection races a later hello.
+        self._controller_mode: Literal["empty", "legacy", "multi"] = "empty"
+        self._controller_members: dict[Any, int] = {}
+        self._hello_generations = itertools.count(1)
+        self._grace_session_id: str | None = None
         # close waiters per record, woken when its last use settles
         self._drains: dict[SessionController, list[asyncio.Future[None]]] = {}
+
+    @property
+    def controller_mode(self) -> Literal["empty", "legacy", "multi"]:
+        return self._controller_mode
+
+    def admit_hello(
+        self,
+        connection: Any,
+        *,
+        negotiated_multi: bool,
+        reconnect_session_id: str | None = None,
+    ) -> HelloAdmission:
+        """Reserve process controller mode before claiming the physical socket."""
+        requested: Literal["legacy", "multi"] = "multi" if negotiated_multi else "legacy"
+        if self._controller_mode == "empty":
+            self._controller_mode = requested
+        elif not self._controller_members:
+            if self._controller_mode != requested:
+                raise ProtocolError(
+                    ErrorDescriptor.CONNECTION_CAPACITY,
+                    "another client is already connected",
+                )
+            if requested == "multi" and reconnect_session_id != self._grace_session_id:
+                raise ProtocolError(
+                    ErrorDescriptor.CONNECTION_CAPACITY,
+                    "another client is already connected",
+                )
+        elif self._controller_mode != requested or (
+            requested == "legacy" and self._controller_members
+        ):
+            raise ProtocolError(
+                ErrorDescriptor.CONNECTION_CAPACITY,
+                "another client is already connected",
+            )
+        generation = next(self._hello_generations)
+        self._controller_members[connection] = generation
+        return HelloAdmission(connection, requested, generation)
+
+    def commit_hello(self, admission: HelloAdmission) -> None:
+        if self._controller_members.get(admission.connection) != admission.generation:
+            raise RuntimeError("hello admission is no longer current")
+
+    def abort_hello(self, admission: HelloAdmission) -> None:
+        if self._controller_members.get(admission.connection) != admission.generation:
+            return
+        del self._controller_members[admission.connection]
+        if not self._controller_members:
+            self._controller_mode = "empty"
+
+    def release_connection(self, connection: Any, reason: str = "eof") -> None:
+        del reason
+        self._controller_members.pop(connection, None)
+        if not self._controller_members:
+            self._grace_session_id = (
+                self._attached.runtime.session_id
+                if self._attached.runtime.opened is not None
+                else None
+            )
 
     def records(self) -> tuple[SessionController, ...]:
         return tuple(self._records.values())

@@ -26,9 +26,8 @@ async def test_dormant_multi_controller_test_capability_keeps_legacy_admission(
         hello = await negotiate(first, replay=False, extra=("multi_controller",))
         assert "multi_controller" in hello["result"]["capabilities"]["features"]
 
-        refused = await negotiate(second, replay=False, extra=("multi_controller",))
-        assert refused["error"]["code"] == -32001
-        assert await second.closed(2) == []
+        admitted = await negotiate(second, replay=False, extra=("multi_controller",))
+        assert "multi_controller" in admitted["result"]["capabilities"]["features"]
     finally:
         await first.close()
         await second.close()

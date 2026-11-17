@@ -200,7 +200,7 @@ class ConnectionRegistry(ReplayOutput):
     ) -> None:
         self.loop = loop
         self._connections: dict[Any, _Connection] = {}
-        self._controller: _Connection | None = None
+        self._controllers: list[_Connection] = []
         self._controller_output_paused = False
         # Rate-limit state for the contended-slot refusal log: the holder a
         # refusal was last logged against, that log's time, and how many later
@@ -220,6 +220,10 @@ class ConnectionRegistry(ReplayOutput):
         self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
         self._child_reader_lock = threading.Lock()
         self._reads = ThreadCallWorkers(loop, workers=2, name="zeta-read")
+
+    @property
+    def _controller(self) -> _Connection | None:
+        return self._controllers[0] if self._controllers else None
 
     def register(self, connection: Any) -> None:
         if self._closed:
@@ -312,9 +316,7 @@ class ConnectionRegistry(ReplayOutput):
         if state.role is not None:
             raise ValueError("connection already claimed")
         if role == "controller":
-            if self._controller is not None:
-                raise RuntimeError("controller occupied")
-            self._controller = state
+            self._controllers.append(state)
         else:
             if len(self._observers) >= 8:
                 raise RuntimeError("observer limit reached")
@@ -575,8 +577,8 @@ class ConnectionRegistry(ReplayOutput):
         if state is None:
             return
         state.released.set()
-        if state is self._controller:
-            self._controller = None
+        if state in self._controllers:
+            self._controllers.remove(state)
             self._controller_output_paused = True
         if state in self._observers:
             self._observers.remove(state)
@@ -1245,7 +1247,7 @@ class ConnectionRegistry(ReplayOutput):
         )
         self._connections.clear()
         self._observers.clear()
-        self._controller = None
+        self._controllers.clear()
 
 
 def perform_child_history_read(

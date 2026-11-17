@@ -568,6 +568,7 @@ class _Client:
         self._connected_at = time.monotonic()
         self._last_frame_at = self._connected_at
         self._client_version: str | None = None
+        self._hello_admission = None
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
             home=server.home, runtime=server.controllers.attached().runtime, codec=self.codec
@@ -878,6 +879,7 @@ class _Client:
         if self._local_close:
             return
         self._begin_controller_release()
+        self.server.controllers.release_connection(self)
         self.connections.release(self)
 
     async def close(self, *, graceful: bool = False) -> None:
@@ -895,6 +897,7 @@ class _Client:
             self.writer.close()
             with contextlib.suppress(Exception):
                 await self.writer.wait_closed()
+            self.server.controllers.release_connection(self)
             self.connections.release(self)
             self._closed = True
 
@@ -1020,13 +1023,27 @@ class _Client:
             accepted.remove("child_run_events")
         self.features = frozenset(accepted)
         assert self.server.connections is not None
-        role = self.server.connections.negotiate_role(
-            self,
-            params.get("role", "controller"),
-            self.protocol_version,
-            self.features,
-            max_role=self.max_role,
-        )
+        role_name = params.get("role", "controller")
+        admission = None
+        if role_name == "controller":
+            admission = self.server.controllers.admit_hello(
+                self,
+                negotiated_multi="multi_controller" in self.features,
+                reconnect_session_id=params.get("session_id")
+                if isinstance(params.get("session_id"), str)
+                else None,
+            )
+        try:
+            role = self.server.connections.negotiate_role(
+                self, role_name, self.protocol_version, self.features, max_role=self.max_role
+            )
+        except BaseException:
+            if admission is not None:
+                self.server.controllers.abort_hello(admission)
+            raise
+        if admission is not None:
+            self.server.controllers.commit_hello(admission)
+            self._hello_admission = admission
         self.handshaken = True
         requests = MethodDescriptor.advertised(
             self.protocol_version, self.features, role
