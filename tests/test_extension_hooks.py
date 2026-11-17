@@ -212,8 +212,9 @@ def activate(zx):
         encoding="utf-8",
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    host = apply_extensions(
-        registry, home=home, project_dir=None, builtin_names=registry.registered_names
+    host = await asyncio.to_thread(
+        apply_extensions, registry, home=home, project_dir=None,
+        builtin_names=registry.registered_names,
     )
     events = []
     sink_thread = []
@@ -267,8 +268,9 @@ def activate(zx):
     builtins._zeta_weak_started = started
     builtins._zeta_weak_release = release
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    host = apply_extensions(
-        registry, home=home, project_dir=None, builtin_names=registry.registered_names
+    host = await asyncio.to_thread(
+        apply_extensions, registry, home=home, project_dir=None,
+        builtin_names=registry.registered_names,
     )
     host.set_event_sink(lambda _event: True, asyncio.get_running_loop())
     invocation = asyncio.create_task(host.pre_tool_hook()("bash", {}))
@@ -303,8 +305,9 @@ def activate(zx):
         encoding="utf-8",
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    host = apply_extensions(
-        registry, home=home, project_dir=None, builtin_names=registry.registered_names
+    host = await asyncio.to_thread(
+        apply_extensions, registry, home=home, project_dir=None,
+        builtin_names=registry.registered_names,
     )
     notices = []
     host.set_event_sink(lambda event: notices.append(event) or True, asyncio.get_running_loop())
@@ -359,8 +362,9 @@ def activate(zx):
         encoding="utf-8",
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    host = apply_extensions(
-        registry, home=home, project_dir=None, builtin_names=registry.registered_names
+    host = await asyncio.to_thread(
+        apply_extensions, registry, home=home, project_dir=None,
+        builtin_names=registry.registered_names,
     )
     accepted = False
     notices = []

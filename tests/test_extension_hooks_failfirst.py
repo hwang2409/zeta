@@ -20,10 +20,6 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
 
-def _task_owner(coroutine: object) -> asyncio.Task[object]:
-    return asyncio.create_task(coroutine)  # type: ignore[arg-type]
-
-
 def _write_extension(home: Path, source: str) -> None:
     directory = home / "extensions" / "hooks"
     directory.mkdir(parents=True)
@@ -65,10 +61,9 @@ def test_python314_inherited_thread_context_is_empty(tmp_path: Path) -> None:
                     '    zx.on("pre_tool", hook)\\n'
                 )
                 registry = ToolRegistry(root, skill_catalog=SkillCatalog.empty())
-                host = apply_extensions(
-                    registry, home=root / "home", project_dir=None,
+                host = await asyncio.to_thread(
+                    apply_extensions, registry, home=root / "home", project_dir=None,
                     builtin_names=registry.registered_names,
-                    task_owner=asyncio.create_task,
                 )
                 token = ambient.set(object())
                 try:
@@ -122,9 +117,9 @@ def activate(zx):
 """,
     )
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    host = apply_extensions(
-        registry, home=home, project_dir=None, builtin_names=registry.registered_names,
-        task_owner=_task_owner,
+    host = await asyncio.to_thread(
+        apply_extensions, registry, home=home, project_dir=None,
+        builtin_names=registry.registered_names,
     )
     host._hooks[0].timeout_seconds = 0.01
     host.set_event_sink(lambda _event: True, asyncio.get_running_loop())
@@ -171,9 +166,9 @@ def activate(zx):
     builtins._zeta_hook_started = started
     builtins._zeta_hook_release = release
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
-    host = apply_extensions(
-        registry, home=home, project_dir=None, builtin_names=registry.registered_names,
-        task_owner=_task_owner,
+    host = await asyncio.to_thread(
+        apply_extensions, registry, home=home, project_dir=None,
+        builtin_names=registry.registered_names,
     )
     notices = []
     host.set_event_sink(lambda event: notices.append(event) or True, asyncio.get_running_loop())

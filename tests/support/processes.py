@@ -22,6 +22,58 @@ _READY_TOKEN = b"ZETA_TEST_READY\n"
 _T = TypeVar("_T")
 
 
+def run_with_captured_stderr(
+    stderr_path: str,
+    target: Callable[..., object],
+    args: tuple[object, ...],
+) -> None:
+    fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.dup2(fd, sys.stderr.fileno())
+    finally:
+        os.close(fd)
+    target(*args)
+
+
+def recv_process_message(
+    connection: Connection,
+    *,
+    process: Process | None = None,
+    stderr_path: Path | None = None,
+    timeout: float = 10,
+    what: str,
+) -> object:
+    timed_out = False
+    if connection.poll(timeout):
+        try:
+            return connection.recv()
+        except EOFError:
+            failure = "closed its pipe"
+    else:
+        timed_out = True
+        failure = f"did not send {what} within {timeout:g} s"
+
+    exitcode: int | None = None
+    if process is not None:
+        process.join(0 if timed_out else 10)
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
+        if process.is_alive():
+            process.kill()
+            process.join(10)
+        exitcode = process.exitcode
+    stderr = ""
+    if stderr_path is not None and stderr_path.exists():
+        stderr = stderr_path.read_text(encoding="utf-8", errors="replace").strip()
+    connection.close()
+    if process is not None:
+        process.close()
+    raise AssertionError(
+        f"child {failure}; exit code {exitcode}; captured stderr: {stderr or '<empty>'}"
+    )
+
+
 async def _run_child_process_cleanup(
     process: Process,
     *,

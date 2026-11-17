@@ -9,7 +9,7 @@ synchronous ``activate(zx)`` entry function that declares tools on the
 from __future__ import annotations
 
 from .api import EXTENSION_API_VERSION, ExtensionAPI, ExtensionError
-from .discovery import apply_extensions, trust_project_extensions
+from .discovery import apply_extensions
 from .hooks import CompositeToolHook, ExtensionHook
 from .host import (
     ExtensionHost,
@@ -22,6 +22,7 @@ from .manifest import (
     ExtensionManifestError,
     parse_manifest,
 )
+from .store import ExtensionTrustError
 
 __all__ = [
     "EXTENSION_API_VERSION",
@@ -33,9 +34,9 @@ __all__ = [
     "ExtensionManifest",
     "ExtensionManifestError",
     "ExtensionStatus",
+    "ExtensionTrustError",
     "LoadedExtension",
     "PendingExtension",
     "apply_extensions",
     "parse_manifest",
-    "trust_project_extensions",
 ]

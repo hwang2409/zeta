@@ -227,7 +227,6 @@ class ExtensionHost:
         builtin_names: frozenset[str],
         clock: Callable[[], float] = time.monotonic,
         hook_timeout_seconds: float = 5.0,
-        task_owner: object | None = None,
     ) -> None:
         self._registry = registry
         self.home = home
