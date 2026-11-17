@@ -5,11 +5,13 @@ import multiprocessing
 import os
 import threading
 from collections import OrderedDict
+from io import StringIO
 from multiprocessing.connection import Connection
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
 import zeta.tools.agent as agent_tools
 from tests.support.branch_reads import branch_messages
@@ -812,6 +814,64 @@ async def test_background_notification_carries_structured_stats(tmp_path: Path) 
         "canceled": False,
     }
     assert stats["elapsed"] >= 0
+
+
+def test_receipt_renders_markdown_answer() -> None:
+    call = ToolCall("markdown-receipt", "agent", {"prompt": "inspect", "description": "review"})
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done **bold** [link](https://example.com) `code`",
+            structured_content={"turns_used": 1, "child_session_path": ""},
+        ),
+    )
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=80).print(rendered)
+    assert "**bold**" not in output.getvalue()
+    assert "bold" in output.getvalue()
+
+
+def test_receipt_wraps_long_answer_without_losing_the_end() -> None:
+    call = ToolCall("wrap-receipt", "agent", {"prompt": "inspect", "description": "review"})
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "a " * 60 + "lastword",
+            structured_content={"turns_used": 1, "child_session_path": ""},
+        ),
+    )
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=30).print(rendered)
+    text = output.getvalue()
+    assert "lastword" in text
+    assert len(text.splitlines()) > 2
+
+
+def test_receipt_shows_terminal_stats() -> None:
+    call = ToolCall("stats-receipt", "agent", {"prompt": "inspect", "description": "review"})
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done · 50 turns · 12.3s · 7 tool calls · error=false · canceled=false",
+            structured_content={"turns_used": 50, "child_session_path": ""},
+        ),
+    )
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=120).print(rendered)
+    assert "12.3s" in output.getvalue()
+    assert "7 tool calls" in output.getvalue()
 
 
 def test_foreground_receipt_shows_lifecycle_stats(tmp_path: Path) -> None:
