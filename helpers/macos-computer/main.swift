@@ -466,10 +466,14 @@ func pointArg(_ req: [String: Any]) throws -> CGPoint {
 
 var selfTestMode = false
 
-func guardInput() throws {
-    if selfTestMode { return }
+func guardSafety() throws {
     if screenIsLocked() { throw HelperError.locked }
     if secureInputEnabled() || securityPromptFrontmost() { throw HelperError.secureInput }
+}
+
+func guardInput() throws {
+    if selfTestMode { return }
+    try guardSafety()
     if !AXIsProcessTrusted() { throw HelperError.notPermitted("Accessibility permission is required") }
 }
 
@@ -484,7 +488,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
     case "state":
         return [
             "locked": screenIsLocked(),
-            "secure_input": secureInputEnabled(),
+            "secure_input": secureInputEnabled() || securityPromptFrontmost(),
             "frontmost_bundle_id": frontmostBundleID(),
         ]
     case "cursor_position":
@@ -492,7 +496,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         // Use the same nearest-integer rule as all integer input coordinates.
         return ["x": Int(loc.x.rounded()), "y": Int(loc.y.rounded())]
     case "screenshot":
-        if screenIsLocked() { throw HelperError.locked }
+        try guardSafety()
         if !CGPreflightScreenCaptureAccess() {
             throw HelperError.notPermitted(
                 "Screen Recording permission is required; turn it on in System Settings > " +
@@ -756,6 +760,7 @@ Thread {
             runRequest(id: id, op: op, request: req, indicator: indicator, sink: writeResponse)
         }
     }
+    eventGate.kill()
     actionQueue.sync {}
     DispatchQueue.main.sync {
         indicator.hide()

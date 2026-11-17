@@ -22,7 +22,7 @@ from .scaling import (
     to_model_point,
 )
 
-_SCROLL_UNIT = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
+_SCROLL_UNIT = {"up": (0, 1), "down": (0, -1), "left": (1, 0), "right": (-1, 0)}
 _REFUSAL_REASON = {"locked": "the screen is locked", "secure_input": "a password field or secure input is active", "killed": "the kill switch is engaged; restart the helper to re-enable control"}
 
 

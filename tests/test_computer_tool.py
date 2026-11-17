@@ -65,7 +65,7 @@ _ACTION_CASES = [
     ({"action": "left_mouse_up", "coordinate": [2, 3]}, [("state",), ("mouse_up", 2, 3, "left"), ("state",), ("screenshot", None)]),
     ({"action": "type", "text": "hi"}, [("state",), ("type_text", "hi"), ("state",), ("screenshot", None)]),
     ({"action": "key", "text": "cmd+s"}, [("state",), ("key", "cmd+s"), ("state",), ("screenshot", None)]),
-    ({"action": "scroll", "coordinate": [1, 1], "scroll_direction": "down", "scroll_amount": 3}, [("state",), ("scroll", 1, 1, 0, 3), ("state",), ("screenshot", None)]),
+    ({"action": "scroll", "coordinate": [1, 1], "scroll_direction": "down", "scroll_amount": 3}, [("state",), ("scroll", 1, 1, 0, -3), ("state",), ("screenshot", None)]),
     ({"action": "cursor_position"}, [("state",), ("cursor_position",)]),
     ({"action": "wait"}, [("state",), ("state",), ("screenshot", None)]),
 ]

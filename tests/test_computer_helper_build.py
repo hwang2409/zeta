@@ -21,6 +21,7 @@ from zeta.tools.computer.helper_client import HelperClient
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILD_SCRIPT = REPO_ROOT / "scripts" / "build-computer-helper.sh"
 HELPER_SOURCE = REPO_ROOT / "helpers" / "macos-computer" / "main.swift"
+CLIENT_SOURCE = REPO_ROOT / "src" / "zeta" / "tools" / "computer" / "helper_client.py"
 
 pytestmark = [
     pytest.mark.skipif(shutil.which("swiftc") is None, reason="swiftc not available"),
@@ -32,6 +33,34 @@ def test_cursor_position_uses_nearest_integer_rule() -> None:
     source = HELPER_SOURCE.read_text()
     assert 'Int(loc.x.rounded())' in source
     assert 'Int(loc.y.rounded())' in source
+
+
+def test_native_scroll_keeps_quartz_line_wheel_signs() -> None:
+    from zeta.tools.computer import _SCROLL_UNIT
+
+    assert _SCROLL_UNIT == {"up": (0, 1), "down": (0, -1), "left": (1, 0), "right": (-1, 0)}
+    source = HELPER_SOURCE.read_text()
+    assert "units: .line" in source
+    assert "wheel1: Int32(dy)" in source
+    assert "wheel2: Int32(dx)" in source
+
+
+def test_helper_eof_and_cancel_release_held_input_before_exit() -> None:
+    source = HELPER_SOURCE.read_text()
+    eof_path = source[source.index("while let line = readLine"):]
+    assert "eventGate.kill()" in eof_path
+    assert eof_path.index("eventGate.kill()") < eof_path.index("actionQueue.sync {}")
+    client = CLIENT_SOURCE.read_text()
+    cancel = client[client.index("    def cancel"):client.index("    def _kill")]
+    assert "proc.stdin.close()" in cancel
+    assert "self._kill()" in cancel
+
+
+def test_screenshot_rechecks_native_security_state() -> None:
+    source = HELPER_SOURCE.read_text()
+    screenshot = source[source.index('case "screenshot"'):source.index('case "move"')]
+    assert "try guardSafety()" in screenshot
+    assert '"secure_input": secureInputEnabled() || securityPromptFrontmost()' in source
 
 
 def test_indicator_lifecycle_and_interruptible_steps_are_present() -> None:
