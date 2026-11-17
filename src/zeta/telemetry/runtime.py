@@ -375,4 +375,6 @@ def configure(endpoint: str) -> _Runtime:
         logger_state.append((logger, logger.disabled, logger.propagate, logger.level, list(logger.handlers)))
         logger.disabled = True
         logger.propagate = False
+        # module loggers below "opentelemetry.exporter" stop here; with no handler found, logging prints them to stderr
+        logger.handlers[:] = [logging.NullHandler()]
     return _Runtime(provider, provider.get_tracer("zeta"), TraceContextTextMapPropagator(), cell, logger_state)
