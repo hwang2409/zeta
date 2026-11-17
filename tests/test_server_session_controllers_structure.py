@@ -17,7 +17,7 @@ SCANNED = [*sorted(ROOT.rglob("*.py")), *sorted((ROOT.parent / "remote").rglob("
 # everything below them takes the record as an argument
 RESOLVER_ENTRIES = {
     "handlers/registry.py:dispatch": "owned",
-    "server.py:_Client._route_request": "owned",
+    "server.py:_Client._route_hello": "owned",
     "session_replay/__init__.py:join_history_and_subscribe": "selected",
     "handlers/registry.py:child_run_events": "selected",
     "handlers/registry.py:path_complete": "selected",
