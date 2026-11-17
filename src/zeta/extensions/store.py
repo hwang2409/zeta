@@ -200,7 +200,12 @@ class ExtensionStore:
                 os.rename(snapshot.tree, target)
                 _fsync_directory(root)
                 self._checkpoint("install_target_published")
-                self._change_trust(trust, scope, snapshot.manifest.name, snapshot.digest)
+                try:
+                    self._change_trust(trust, scope, snapshot.manifest.name, snapshot.digest)
+                except ExtensionTrustError:
+                    if self._read_trust().get(self._key(scope, snapshot.manifest.name)) == snapshot.digest:
+                        return InstallResult(snapshot.manifest.name, snapshot.commit, snapshot.digest)
+                    raise
                 self._checkpoint("install_trust_published")
                 return InstallResult(snapshot.manifest.name, snapshot.commit, snapshot.digest)
         finally:
@@ -227,6 +232,14 @@ class ExtensionStore:
                 raise ExtensionTrustError(
                     f"manifest name {snapshot.manifest.name!r} does not match folder {name!r}"
                 )
+            with self._locked():
+                self._recover_or_raise(root)
+                trust = self._read_trust()
+                current_locked = self._snapshot_existing(target, root)
+                if current_locked.digest == snapshot.digest and trust.get(self._key(scope, name)) == snapshot.digest:
+                    return InstallResult(name, snapshot.commit, snapshot.digest)
+                if current_locked.digest != current.digest:
+                    raise ExtensionTrustError(f"extension changed since review: {name}")
             self._review(snapshot, current=current, action="update", accept=accept, confirm=confirm)
             with self._locked():
                 self._recover_or_raise(root)
@@ -250,7 +263,10 @@ class ExtensionStore:
                 try:
                     self._change_trust(trust, scope, name, snapshot.digest)
                 except ExtensionTrustError:
-                    self._recover_or_raise(root)
+                    persisted = self._read_trust()
+                    self._recover(root, persisted)
+                    if persisted.get(self._key(scope, name)) == snapshot.digest:
+                        return InstallResult(name, snapshot.commit, snapshot.digest)
                     raise
                 self._checkpoint("update_trust_published")
                 self._finish_committed(update_dir)
@@ -309,6 +325,8 @@ class ExtensionStore:
                 _fsync_directory(root)
                 _fsync_directory(store)
                 self._checkpoint("remove_hidden")
+            else:
+                self._remove_residue(root, name)
             self._change_trust(trust, scope, name, None)
             self._checkpoint("remove_trust_published")
             if trash is not None:
@@ -431,6 +449,9 @@ class ExtensionStore:
             return operation
         except OSError as exc:
             raise ExtensionTrustError(f"cannot create extension stage: {operation}") from exc
+        except Exception:
+            self._discard_operation(operation)
+            raise
 
     def _acquire(self, source: str, root: Path) -> _Snapshot:
         operation = self._stage(root)
@@ -444,6 +465,7 @@ class ExtensionStore:
                 subprocess.run(["git", "clone", "--quiet", git[0], str(tree)], check=True, capture_output=True, text=True)
                 subprocess.run(["git", "-C", str(tree), "checkout", "--quiet", git[1]], check=True, capture_output=True, text=True)
                 commit = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+                shutil.rmtree(tree / ".git")
             os.chmod(tree, 0o700)
             self._checkpoint("source_acquired")
             if git is not None:
@@ -459,6 +481,11 @@ class ExtensionStore:
         except OSError as exc:
             self._discard_operation(operation)
             raise ExtensionTrustError(f"cannot acquire extension source: {source}") from exc
+        except Exception:
+            self._discard_operation(operation)
+            raise
+        except BaseException:
+            raise
 
     def _copy_installed_for_review(self, target: Path, root: Path) -> _Snapshot:
         operation = self._stage(root)
@@ -476,6 +503,9 @@ class ExtensionStore:
         except OSError as exc:
             self._discard_operation(operation)
             raise ExtensionTrustError(f"extension not installed: {target.name}") from exc
+        except Exception:
+            self._discard_operation(operation)
+            raise
 
     def _snapshot_existing(self, target: Path, root: Path) -> _Snapshot:
         if target.parent != root:
@@ -718,6 +748,16 @@ class ExtensionStore:
             return snapshot.digest
         except ExtensionTrustError:
             return "invalid"
+
+    def _remove_residue(self, root: Path, name: str) -> None:
+        store = self._private_root(root)
+        for path in sorted(store.glob("remove-*")):
+            try:
+                snapshot = self._snapshot_existing(path, store)
+            except ExtensionTrustError:
+                continue
+            if snapshot.manifest.name == name:
+                _remove_tree(path)
 
     def _target(self, root: Path, name: str) -> Path:
         target = root / name
