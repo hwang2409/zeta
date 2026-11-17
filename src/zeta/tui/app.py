@@ -329,6 +329,7 @@ class TUIApp(
             project_eligible=project_eligible,
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
             include_tui_only=True,
+            extensions=self.extensions,
         )
         self.loop.add_live_config_listener(self._slash_commands)
         self.loop.set_mcp_prompt_refresh(

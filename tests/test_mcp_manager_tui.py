@@ -166,6 +166,7 @@ async def test_public_mcp_views_repair_a_committed_cancelled_add(
                     tmp_path / "home" / "projects"
                 )
             ),
+            state=SimpleNamespace(extensions=None),
         )
         try:
             result = await run_command(runtime, "/mcp disable durable")

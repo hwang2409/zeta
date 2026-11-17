@@ -67,9 +67,7 @@ class ExtensionKit:
 def _trust_pending_for_test(host: ExtensionHost) -> None:
     pending = list(host.pending_project)
     host.pending_project.clear()
-    for pending_item in pending:
-        item = pending_item.item
-        host.mark_trusted(item.name, item.scope)
+    for item in pending:
         _load_one(host, item.directory, item.manifest, item.scope)
 
 

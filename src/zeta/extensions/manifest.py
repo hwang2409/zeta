@@ -18,20 +18,8 @@ from dataclasses import dataclass
 MANIFEST_FILENAME = "zeta-extension.toml"
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
-# Keys accepted inside the ``[extension]`` table. ``changelog`` and
-# ``load_in_children`` are accepted now (so a forward-looking manifest parses)
-# but are only acted on by later slices.
-_EXTENSION_KEYS = frozenset(
-    {
-        "name",
-        "version",
-        "api_version",
-        "entry",
-        "description",
-        "changelog",
-        "load_in_children",
-    }
-)
+# Keys implemented by the current extension loader.
+_EXTENSION_KEYS = frozenset({"name", "version", "api_version", "entry", "description"})
 
 
 class ExtensionManifestError(ValueError):
@@ -48,7 +36,6 @@ class ExtensionManifest:
     entry_module: str
     entry_function: str
     description: str
-    load_in_children: bool
 
 
 def parse_manifest(text: str) -> ExtensionManifest:
@@ -87,9 +74,6 @@ def parse_manifest(text: str) -> ExtensionManifest:
     description = table.get("description", "")
     if not isinstance(description, str):
         raise ExtensionManifestError("description must be a string")
-    load_in_children = table.get("load_in_children", False)
-    if type(load_in_children) is not bool:
-        raise ExtensionManifestError("load_in_children must be a boolean")
     return ExtensionManifest(
         name=name,
         version=version,
@@ -97,7 +81,6 @@ def parse_manifest(text: str) -> ExtensionManifest:
         entry_module=entry_module,
         entry_function=entry_function,
         description=description,
-        load_in_children=load_in_children,
     )
 
 

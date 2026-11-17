@@ -426,6 +426,11 @@ class SlashCommandRegistry:
         """Replace live MCP prompt commands from one mount snapshot."""
         self._mcp_prompts.replace(tuple(entries))
 
+    def add_notice(self, notice: str) -> None:
+        """Record a visible registry warning for all command surfaces."""
+        self._notices.append(notice)
+        self._warning_notices.add(notice)
+
     def register_custom(self, command: CustomCommand) -> None:
         """Register a custom command unless a built-in owns its name."""
 
@@ -445,7 +450,29 @@ class SlashCommandRegistry:
             self._notices.append(notice)
             self._warning_notices.add(notice)
             return
-        if command.name in self._custom_commands and command.source == "home":
+        if command.name in self._custom_commands:
+            existing = self._custom_commands[command.name]
+            if command.source == "home":
+                notice = (
+                    f"custom command {command.path}: /{command.name} is shadowed by "
+                    f"{existing.source}; keeping the existing command"
+                )
+                self.add_notice(notice)
+                return
+            if existing.source == "home" and command.source == "project":
+                notice = (
+                    f"custom command {existing.path}: /{command.name} is shadowed by "
+                    "project; keeping the project command"
+                )
+                self._custom_commands[command.name] = command
+                self.add_notice(notice)
+                return
+            notice = (
+                f"ignored custom command {command.path}: /{command.name} "
+                f"already belongs to {existing.source}; keeping the earlier command"
+            )
+            self._notices.append(notice)
+            self._warning_notices.add(notice)
             return
         self._custom_commands[command.name] = command
 
