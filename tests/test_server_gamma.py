@@ -371,8 +371,10 @@ async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         server.runtime.extensions.notify("notice", "hello", "info")
         await asyncio.sleep(0)
-        frames = await _frames_until_event(reader, "extension_notice")
-        assert frames[-1]["params"]["data"] == {
+        frames = await _request(reader, writer, 3, "ping")
+        assert frames[-1]["id"] == 3
+        notices = await _frames_until_event(reader, "extension_notice")
+        assert notices[-1]["params"]["data"] == {
             "kind": "extension", "extension": "notice", "text": "hello", "level": "info"
         }
     finally:
