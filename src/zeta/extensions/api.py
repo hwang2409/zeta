@@ -6,12 +6,13 @@ methods on ``zx``. The entry function is synchronous and only *records*
 declarations (it does not run the session), mirroring the existing
 ``register(registry)`` contract for ``~/.zeta/tools`` tools.
 
-Slice 1 exposes ``register_tool`` only. Later slices add commands, event
-hooks, and UI primitives on this same object.
+The API exposes command and tool registration; later slices add event hooks and
+UI primitives on this same object.
 """
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -62,6 +63,30 @@ class ExtensionAPI:
     @property
     def project_dir(self) -> Path | None:
         return self._host.project_dir
+
+    def register_command(
+        self,
+        name: str,
+        *,
+        description: str = "",
+        handler: Any = None,
+        body: str | None = None,
+        kind: str = "prompt",
+    ) -> None:
+        """Declare a slash command for this extension."""
+        if type(name) is not str or not name:
+            raise ExtensionError("register_command name must be a nonempty string")
+        if (handler is None) == (body is None):
+            raise ExtensionError("register_command needs exactly one of handler or body")
+        if handler is not None and not inspect.iscoroutinefunction(handler):
+            raise ExtensionError(
+                "register_command handler must be an async coroutine function"
+            )
+        if body is not None and not isinstance(body, str):
+            raise ExtensionError("register_command body must be a string")
+        if kind not in {"prompt", "exec"}:
+            raise ExtensionError("register_command kind must be 'prompt' or 'exec'")
+        self._extension.declare_command(name, description, handler, body, kind)
 
     def register_tool(
         self,
