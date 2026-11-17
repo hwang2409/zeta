@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.support.replay_transport import (
     Transport,
     connect_replay,
@@ -16,7 +17,7 @@ from tests.support.replay_transport import (
     short_socket_path,
 )
 from tests.test_server_replay_table import _backend_factory
-from zeta.server.server import ZetaServer
+from zeta.server.server import ZetaServer, _Client
 
 
 async def _close_server(server, clients) -> None:
@@ -287,11 +288,115 @@ _CANCEL_ROWS = (
 )
 
 
-async def _cancel_at(original: Any, args: tuple[Any, ...], kwargs: dict[str, Any], *, after: bool) -> Any:
-    if not after:
-        raise asyncio.CancelledError
-    await original(*args, **kwargs)
-    raise asyncio.CancelledError
+async def _bound_reconnect_params(server, transport: Transport) -> dict[str, Any]:
+    seed = await connect_replay(server, transport)
+    hello = await negotiate(
+        seed,
+        replay=False,
+        extra=("multi_controller", "approval_reconnect", "session_mcp_bindings"),
+    )
+    assert "result" in hello
+    created = await seed.request(2, "new_session", {})
+    session_id = created["result"]["session"]["session_id"]
+    control = server.controllers.attached().control
+    control._mcp_binding_required = True
+    control._mcp_binding_servers = frozenset()
+    control._active_mcp_bindings = {}
+    await seed.close()
+    return {
+        "protocol_version": "1.1",
+        "features": [
+            "multi_controller",
+            "approval_reconnect",
+            "session_mcp_bindings",
+        ],
+        "mcp_bindings": [],
+        "session_id": session_id,
+    }
+
+
+def _gate_async(monkeypatch, owner, name: str, entered: asyncio.Event, release: asyncio.Event, *, after: bool) -> None:
+    original = getattr(owner, name)
+
+    async def gated(*args: Any, **kwargs: Any) -> Any:
+        if not after:
+            entered.set()
+            await await_or_fail(release.wait(), what=f"release {name} before")
+        result = await original(*args, **kwargs)
+        if after:
+            entered.set()
+            await await_or_fail(release.wait(), what=f"release {name} after")
+        return result
+
+    monkeypatch.setattr(owner, name, gated)
+
+
+def _capture_real_hello_handler(
+    monkeypatch: pytest.MonkeyPatch,
+    entered: asyncio.Event,
+    release: asyncio.Event,
+    row: str,
+) -> dict[str, Any]:
+    original = _Client._route_hello
+    captured: dict[str, Any] = {}
+
+    async def routed(client: _Client, params: dict[str, Any]) -> tuple[bool, object]:
+        if "task" not in captured:
+            captured["client"] = client
+            captured["task"] = asyncio.current_task()
+        result = await original(client, params)
+        if row == "commit_hello_after" and client is captured["client"]:
+            entered.set()
+            await await_or_fail(release.wait(), what="release after hello commit")
+        return result
+
+    # test-contract: seam capture the real server handler without a product hook.
+    monkeypatch.setattr(_Client, "_route_hello", routed)
+    return captured
+
+
+async def _assert_failed_socket_closed_without_success(client) -> None:
+    await await_or_fail(client.reader.read(), what="cancelled hello socket closes")
+    assert client.reader.at_eof(), "cancelled hello socket stayed open"
+    frames = [*client.wire_received, *client.buffered]
+    assert not any(frame.get("id") == 1 and "result" in frame for frame in frames), (
+        "cancelled hello published a successful response"
+    )
+
+
+async def _assert_public_recovery(server, transport: Transport, params: dict[str, Any]) -> None:
+    session_id = params.get("session_id")
+    if isinstance(session_id, str):
+        recovered = await connect_replay(server, transport)
+        try:
+            result = await recovered.request(
+                1,
+                "hello",
+                {
+                    "protocol_version": "1.1",
+                    "features": ["multi_controller"],
+                    "session_id": session_id,
+                },
+            )
+            assert "result" in result, "exact-session multi reconnect did not recover"
+        finally:
+            await recovered.close()
+        return
+
+    fresh_multi = await connect_replay(server, transport)
+    try:
+        result = await negotiate(
+            fresh_multi, replay=False, extra=("multi_controller",)
+        )
+        assert "result" in result, "cancelled hello left a semantic reservation"
+    finally:
+        await fresh_multi.close()
+    legacy = await connect_replay(server, transport)
+    try:
+        result = await negotiate(legacy, replay=False)
+        assert "result" in result, "fresh multi close did not release dormant mode"
+    finally:
+        await legacy.close()
 
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
@@ -300,110 +405,152 @@ async def _cancel_at(original: Any, args: tuple[Any, ...], kwargs: dict[str, Any
 async def test_cancelled_hello_transaction_public_recovery(
     tmp_path: Path, transport: Transport, row: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """cancel each real transaction boundary and recover through a new socket."""
+    """externally cancel the real server handler at each hello transaction edge."""
     server = replay_server(tmp_path, transport, _backend_factory)
     await server.start()
+    params: dict[str, Any] = {
+        "protocol_version": "1.1",
+        "features": ["multi_controller"],
+    }
+    if row.startswith(("reconnect_mcp_bindings", "reattach_mcp_bindings")):
+        params = await _bound_reconnect_params(server, transport)
+
     failed = await connect_replay(server, transport)
     control = server.controllers.attached().control
+    entered = asyncio.Event()
+    release = asyncio.Event()
     release_started = asyncio.Event()
-    release_gate = asyncio.Event()
-    original_release = control.begin_controller_release
+    release_cleanup = asyncio.Event()
+    captured = _capture_real_hello_handler(monkeypatch, entered, release, row)
 
-    if row == "release_in_progress":
-        def begin_release(*args: Any, **kwargs: Any) -> asyncio.Task[None]:
-            task = original_release(*args, **kwargs)
-            async def held() -> None:
-                release_started.set()
-                await asyncio.wait_for(release_gate.wait(), 10)
-                await asyncio.wait_for(asyncio.shield(task), 10)
-            return asyncio.create_task(held())
-        monkeypatch.setattr(control, "begin_controller_release", begin_release)
-
-    if row.startswith(("reconnect_mcp_bindings", "reattach_mcp_bindings")):
+    if row.startswith("reconnect_mcp_bindings"):
         from zeta.server.handlers import lifecycle
-        async def fake_bindings(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], dict[str, Any]]:
-            return {}, {}
-        monkeypatch.setattr(lifecycle, "reconnect_mcp_bindings", fake_bindings)
-        if row.startswith("reconnect"):
-            original = fake_bindings
-            after = row.endswith("after")
-            async def gated(*args: Any, **kwargs: Any) -> Any:
-                return await _cancel_at(original, args, kwargs, after=after)
-            monkeypatch.setattr(lifecycle, "reconnect_mcp_bindings", gated)
-        else:
-            original = control.reattach_mcp_bindings
-            after = row.endswith("after")
-            async def gated(*args: Any, **kwargs: Any) -> Any:
-                return await _cancel_at(original, args, kwargs, after=after)
-            monkeypatch.setattr(control, "reattach_mcp_bindings", gated)
-    elif row.startswith("controller_claimed"):
-        original = control.controller_claimed
-        after = row.endswith("after")
-        async def gated(*args: Any, **kwargs: Any) -> Any:
-            return await _cancel_at(original, args, kwargs, after=after)
-        monkeypatch.setattr(control, "controller_claimed", gated)
-    elif row.startswith("parking_claim"):
-        original = server.parking.claim
-        after = row.endswith("after")
-        async def gated(*args: Any, **kwargs: Any) -> Any:
-            return await _cancel_at(original, args, kwargs, after=after)
-        monkeypatch.setattr(server.parking, "claim", gated)
-    elif row.startswith("controller_ready"):
-        original = control.controller_ready
-        after = row.endswith("after")
-        async def gated(*args: Any, **kwargs: Any) -> Any:
-            return await _cancel_at(original, args, kwargs, after=after)
-        monkeypatch.setattr(control, "controller_ready", gated)
-    elif row.startswith("commit_hello") or row == "release_in_progress":
-        original = server.controllers.commit_hello
-        after = True if row == "release_in_progress" else row.endswith("after")
-        def gated(*args: Any, **kwargs: Any) -> None:
-            if not after:
-                raise asyncio.CancelledError
-            original(*args, **kwargs)
-            raise asyncio.CancelledError
-        monkeypatch.setattr(server.controllers, "commit_hello", gated)
-    elif row == "response_publication":
-        from zeta.server.server import _Client
-        original = _Client._write
-        async def gated(client: Any, *args: Any, **kwargs: Any) -> Any:
-            if client._request is not None and client._request[0] == "hello":
-                return await _cancel_at(original, (client, *args), kwargs, after=False)
-            return await original(client, *args, **kwargs)
-        # test-contract: seam response-publication cancellation uses the existing writer.
-        monkeypatch.setattr(_Client, "_write", gated)
 
-    params: dict[str, Any] = {"protocol_version": "1.1", "features": ["multi_controller"]}
-    if row.startswith(("reconnect_mcp_bindings", "reattach_mcp_bindings")):
-        params.update(features=["multi_controller", "approval_reconnect"], mcp_bindings=[], session_id="cancelled-session")
-    task = asyncio.create_task(failed.request(1, "hello", params))
-    try:
-        if row == "release_in_progress":
-            await asyncio.wait_for(release_started.wait(), 10)
-            release_gate.set()
-        with contextlib.suppress(BaseException):
-            await asyncio.wait_for(task, 10)
-        await asyncio.wait_for(failed.close(), 10)
-        monkeypatch.undo()
-        result = None
-        for _ in range(20):
-            recovered = await connect_replay(server, transport)
-            try:
-                candidate = await asyncio.wait_for(negotiate(recovered, replay=False), 10)
-                if "result" in candidate:
-                    result = candidate
-                    break
-            except (AssertionError, ConnectionError, TimeoutError, asyncio.CancelledError):
-                continue
-            finally:
-                await recovered.close()
-        assert result is not None, (
-            f"cancelled hello did not release its public slot: "
-            f"mode={server.controllers.controller_mode} members={len(server.controllers._controller_members)} "
-            f"holder={server.connections.controller_metadata()}"
+        _gate_async(
+            monkeypatch,
+            lifecycle,
+            "reconnect_mcp_bindings",
+            entered,
+            release,
+            after=row.endswith("after"),
         )
+    elif row.startswith("controller_claimed"):
+        _gate_async(
+            monkeypatch,
+            control,
+            "controller_claimed",
+            entered,
+            release,
+            after=row.endswith("after"),
+        )
+    elif row.startswith("parking_claim"):
+        _gate_async(
+            monkeypatch,
+            server.parking,
+            "claim",
+            entered,
+            release,
+            after=row.endswith("after"),
+        )
+    elif row.startswith("reattach_mcp_bindings"):
+        _gate_async(
+            monkeypatch,
+            control,
+            "reattach_mcp_bindings",
+            entered,
+            release,
+            after=row.endswith("after"),
+        )
+    elif row.startswith("controller_ready"):
+        _gate_async(
+            monkeypatch,
+            control,
+            "controller_ready",
+            entered,
+            release,
+            after=row.endswith("after"),
+        )
+    elif row == "commit_hello_before":
+        _gate_async(
+            monkeypatch,
+            _Client,
+            "_setup_controller_hello",
+            entered,
+            release,
+            after=True,
+        )
+    elif row == "response_publication":
+        original_write = _Client._write
+
+        async def gated_write(client: _Client, *args: Any, **kwargs: Any) -> Any:
+            if (
+                client is captured.get("client")
+                and client._request is not None
+                and client._request[:2] == ("hello", 1)
+            ):
+                entered.set()
+                await await_or_fail(release.wait(), what="release hello response write")
+            return await original_write(client, *args, **kwargs)
+
+        monkeypatch.setattr(_Client, "_write", gated_write)
+    elif row == "release_in_progress":
+        _gate_async(
+            monkeypatch,
+            _Client,
+            "_setup_controller_hello",
+            entered,
+            release,
+            after=True,
+        )
+        original_release = control._controller_release
+
+        def held_release(*args: Any, **kwargs: Any):
+            operation = original_release(*args, **kwargs)
+
+            async def finish() -> None:
+                release_started.set()
+                await await_or_fail(
+                    release_cleanup.wait(), what="release held cleanup"
+                )
+                await await_or_fail(operation, what="real release operation")
+
+            return finish()
+
+        monkeypatch.setattr(control, "_controller_release", held_release)
+
+    request = asyncio.create_task(failed.request(1, "hello", params))
+    try:
+        await await_or_fail(entered.wait(), what=f"{row} entered")
+        handler = captured["task"]
+        assert handler is not request, "test captured the client task, not the server handler"
+        assert handler is captured["client"]._run_task
+        handler.cancel()
+        if row == "release_in_progress":
+            await await_or_fail(
+                release_started.wait(), what="real controller release started"
+            )
+            handler.cancel()
+            release_cleanup.set()
+        else:
+            release.set()
+        with contextlib.suppress(BaseException):
+            await await_or_fail(request, what=f"{row} client request ends")
+        await _assert_failed_socket_closed_without_success(failed)
+        release_task = control._controller_release_task
+        if release_task is not None:
+            await await_or_fail(
+                asyncio.shield(release_task), what=f"{row} release cleanup completes"
+            )
+        monkeypatch.undo()
+        assert not server.controllers._controller_members
+        await _assert_public_recovery(server, transport, params)
     finally:
-        release_gate.set()
+        release.set()
+        release_cleanup.set()
+        if not request.done():
+            request.cancel()
+            with contextlib.suppress(BaseException):
+                await await_or_fail(request, what="cancelled client request cleanup")
         with contextlib.suppress(BaseException):
             await failed.close()
         await server.close()
@@ -411,31 +558,77 @@ async def test_cancelled_hello_transaction_public_recovery(
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
 @pytest.mark.asyncio
-async def test_cancelled_old_hello_does_not_remove_newer_multi_token(
+async def test_cancelled_old_cleanup_does_not_remove_concurrent_newer_multi_token(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server = replay_server(tmp_path, transport, _backend_factory)
     await server.start()
-    failed = await connect_replay(server, transport)
-    control = server.controllers.attached().control
-    original = control.controller_claimed
-
-    async def cancelled(*args: Any, **kwargs: Any) -> Any:
-        await original(*args, **kwargs)
-        raise asyncio.CancelledError
-
-    monkeypatch.setattr(control, "controller_claimed", cancelled)
-    task = asyncio.create_task(
-        failed.request(1, "hello", {"protocol_version": "1.1", "features": ["multi_controller"]})
+    old = await connect_replay(server, transport)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    captured = _capture_real_hello_handler(monkeypatch, entered, release, "overlap")
+    _gate_async(
+        monkeypatch,
+        _Client,
+        "_setup_controller_hello",
+        entered,
+        release,
+        after=True,
     )
-    with contextlib.suppress(BaseException):
-        await asyncio.wait_for(task, 10)
-    await asyncio.wait_for(failed.close(), 10)
-    monkeypatch.undo()
-    newer = await connect_replay(server, transport)
+    old_server_client = captured
+    original_close = _Client.close
+
+    async def held_close(client: _Client, *args: Any, **kwargs: Any) -> None:
+        if client is old_server_client.get("client"):
+            cleanup_started.set()
+            await await_or_fail(cleanup_release.wait(), what="old cleanup release")
+        await original_close(client, *args, **kwargs)
+
+    monkeypatch.setattr(_Client, "close", held_close)
+    old_request = asyncio.create_task(
+        old.request(
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["multi_controller"]},
+        )
+    )
+    newer = legacy = recovered = None
     try:
-        result = await negotiate(newer, replay=False, extra=("multi_controller",))
-        assert "result" in result
-    finally:
+        await await_or_fail(entered.wait(), what="old hello reached post-setup gate")
+        old_handler = captured["task"]
+        assert old_handler is captured["client"]._run_task
+        old_handler.cancel()
+        await await_or_fail(cleanup_started.wait(), what="old release cleanup held")
+        monkeypatch.undo()
+
+        newer = await connect_replay(server, transport)
+        admitted = await negotiate(newer, replay=False, extra=("multi_controller",))
+        assert "result" in admitted, "newer multi token was not admitted during old cleanup"
+        cleanup_release.set()
+        with contextlib.suppress(BaseException):
+            await await_or_fail(old_request, what="old cancelled request ends")
+        await _assert_failed_socket_closed_without_success(old)
+        usable = await newer.request(2, "status", {})
+        assert "result" in usable, "old cleanup displaced the newer controller"
+        legacy = await connect_replay(server, transport)
+        refused = await negotiate(legacy, replay=False)
+        assert refused["error"]["code"] == -32001, (
+            "old cleanup cleared mode while the newer token still owned it"
+        )
         await newer.close()
-        await server.close()
+        recovered = await connect_replay(server, transport)
+        admitted_legacy = await negotiate(recovered, replay=False)
+        assert "result" in admitted_legacy
+    finally:
+        release.set()
+        cleanup_release.set()
+        if not old_request.done():
+            old_request.cancel()
+            with contextlib.suppress(BaseException):
+                await old_request
+        await _close_server(
+            server,
+            tuple(client for client in (old, newer, legacy, recovered) if client is not None),
+        )

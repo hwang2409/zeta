@@ -10,6 +10,7 @@ import socket
 import stat
 import time
 from collections.abc import Awaitable, Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +62,12 @@ from .protocol import (
     negotiate_protocol_version,
 )
 from .runtime import BackendFactory, ServerRuntime
-from .session_controllers import SessionController, SessionControllers, SessionUse
+from .session_controllers import (
+    HelloAdmission,
+    SessionController,
+    SessionControllers,
+    SessionUse,
+)
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
@@ -526,6 +532,16 @@ class ZetaServer:
             registry.release(client)
 
 
+@dataclass(frozen=True)
+class _HelloNegotiation:
+    protocol_version: str
+    client_version: str | None
+    features: tuple[str, ...]
+    role: object
+    extended: bool
+    requested_features: bool
+
+
 class _Client:
     def __init__(
         self,
@@ -569,6 +585,8 @@ class _Client:
         self._last_frame_at = self._connected_at
         self._client_version: str | None = None
         self._hello_admission = None
+        self._hello_claim_attempted = False
+        self._hello_claim_result: bool | None = None
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
             home=server.home, runtime=server.controllers.attached().runtime, codec=self.codec
@@ -906,85 +924,128 @@ class _Client:
             self._closed = True
 
     async def _route_hello(self, params: dict[str, Any]) -> tuple[bool, object]:
-        # keep admission provisional until every control-side mutation succeeds.
         deadline = control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS
         if params.get("role", "controller") == "controller":
             start = time.monotonic()
             await self.connections.wait_for_lost_controller(deadline)
             deadline = max(0.0, deadline - (time.monotonic() - start))
-        result = self._hello(params)
-        admission = self._hello_admission
-        claim_attempted = False
-        claim_result: bool | None = None
+
+        hello = self._negotiate_hello(params)
+        self.protocol_version = hello.protocol_version
+        self._client_version = hello.client_version
+        self.features = frozenset(hello.features)
+        admission = None
         try:
-            with self.server.controllers.owned(self) as controller:
-                reconnect_bindings = None
-                if "mcp_bindings" in params:
-                    if self.role != "controller":
-                        raise ProtocolError(
-                            ErrorDescriptor.INVALID_PARAMS,
-                            "mcp_bindings require a controller connection",
-                        )
-                    from .handlers.lifecycle import reconnect_mcp_bindings
-
-                    reconnect_bindings = await reconnect_mcp_bindings(
-                        self, params, controller
-                    )
-                if self.role == "controller":
-                    reconnect = "approval_reconnect" in self.features
-                    require_host_binding = "session_host_commands" in self.features
-
-                    async def claim() -> bool:
-                        return await controller.control.controller_claimed(
-                            reconnect=reconnect,
-                            require_host_binding=require_host_binding,
-                            deadline=deadline,
-                        )
-
-                    claim_attempted = True
-                    claim_task = asyncio.ensure_future(claim())
-                    try:
-                        claimed = await asyncio.shield(claim_task)
-                        claim_result = claimed
-                    except asyncio.CancelledError:
-                        with contextlib.suppress(Exception):
-                            await claim_task
-                        if claim_task.done() and not claim_task.cancelled():
-                            claimed = claim_task.result()
-                            claim_result = claimed
-                        raise
-                    if not claimed:
-                        raise ProtocolError(
-                            ErrorDescriptor.CONNECTION_CAPACITY,
-                            "another client is already connected",
-                        )
-                    await self.server.parking.claim(
-                        "session_park" in self.features,
-                        reconnect=reconnect,
-                        require_host_binding=require_host_binding,
-                    )
-                    if reconnect_bindings is not None:
-                        await controller.control.reattach_mcp_bindings(*reconnect_bindings)
-                    self.server._client_active = True
-                    self.server._client = self
-                    self.connections.activate_controller(self)
-                    if not reconnect:
-                        for control in self.server.controls():
-                            await control.controller_ready()
+            role, admission = self._claim_hello_role(hello, params)
+            result = self._hello_result(hello, role)
+            if "mcp_bindings" in params and role != "controller":
+                raise ProtocolError(
+                    ErrorDescriptor.INVALID_PARAMS,
+                    "mcp_bindings require a controller connection",
+                )
+            if role == "controller":
+                await self._setup_controller_hello(params, deadline)
             if admission is not None:
                 self.server.controllers.commit_hello(admission)
             self.handshaken = True
         except BaseException:
-            if claim_attempted and claim_result is not False:
-                release = self._begin_controller_release()
-                if release is not None:
-                    with contextlib.suppress(BaseException):
-                        await asyncio.shield(release)
-            if admission is not None:
-                self.server.controllers.abort_hello(admission)
-                self._hello_admission = None
+            await self._rollback_hello(admission)
             raise
         return True, result
+
+    def _claim_hello_role(
+        self, hello: _HelloNegotiation, params: dict[str, Any]
+    ) -> tuple[str, HelloAdmission | None]:
+        admission = None
+        if hello.role == "controller":
+            try:
+                admission = self.server.controllers.admit_hello(
+                    self,
+                    negotiated_multi="multi_controller" in self.features,
+                    reconnect_session_id=params.get("session_id")
+                    if isinstance(params.get("session_id"), str)
+                    else None,
+                )
+            except ProtocolError as exc:
+                if exc.code == ErrorDescriptor.CONNECTION_CAPACITY.code:
+                    self.connections.log_controller_refusal(self)
+                raise
+        try:
+            role = self.connections.negotiate_role(
+                self,
+                hello.role,
+                self.protocol_version,
+                self.features,
+                max_role=self.max_role,
+            )
+        except BaseException:
+            if admission is not None:
+                self.server.controllers.abort_hello(admission)
+            raise
+        self._hello_admission = admission
+        return role, admission
+
+    async def _rollback_hello(self, admission: HelloAdmission | None) -> None:
+        release = (
+            self._begin_controller_release()
+            if self._hello_claim_attempted and self._hello_claim_result is not False
+            else None
+        )
+        if release is not None:
+            with contextlib.suppress(BaseException):
+                await asyncio.shield(release)
+        if admission is not None:
+            self.server.controllers.abort_hello(admission)
+            self._hello_admission = None
+
+    async def _setup_controller_hello(
+        self, params: dict[str, Any], deadline: float
+    ) -> None:
+        with self.server.controllers.owned(self) as controller:
+            reconnect_bindings = None
+            if "mcp_bindings" in params:
+                from .handlers.lifecycle import reconnect_mcp_bindings
+
+                reconnect_bindings = await reconnect_mcp_bindings(
+                    self, params, controller
+                )
+            reconnect = "approval_reconnect" in self.features
+            require_host_binding = "session_host_commands" in self.features
+            self._hello_claim_attempted = True
+            claim_task = asyncio.create_task(
+                controller.control.controller_claimed(
+                    reconnect=reconnect,
+                    require_host_binding=require_host_binding,
+                    deadline=deadline,
+                )
+            )
+            try:
+                claimed = await asyncio.shield(claim_task)
+                self._hello_claim_result = claimed
+            except asyncio.CancelledError:
+                with contextlib.suppress(Exception):
+                    await claim_task
+                if claim_task.done() and not claim_task.cancelled():
+                    self._hello_claim_result = claim_task.result()
+                raise
+            if not claimed:
+                raise ProtocolError(
+                    ErrorDescriptor.CONNECTION_CAPACITY,
+                    "another client is already connected",
+                )
+            await self.server.parking.claim(
+                "session_park" in self.features,
+                reconnect=reconnect,
+                require_host_binding=require_host_binding,
+            )
+            if reconnect_bindings is not None:
+                await controller.control.reattach_mcp_bindings(*reconnect_bindings)
+            self.server._client_active = True
+            self.server._client = self
+            self.connections.activate_controller(self)
+            if not reconnect:
+                for control in self.server.controls():
+                    await control.controller_ready()
 
     async def _route_request(
         self, request_id: str | int, method: str, params: dict[str, Any]
@@ -999,16 +1060,15 @@ class _Client:
 
     _dispatch = _dispatch_request
 
-    def _hello(self, params: dict[str, Any]) -> dict[str, object]:
+    def _negotiate_hello(self, params: dict[str, Any]) -> _HelloNegotiation:
         if self.handshaken:
             raise ProtocolError(
                 ErrorDescriptor.INVALID_REQUEST, "hello may only be sent once"
             )
         version = params.get("protocol_version")
-        client_version = params.get("client_version")
-        if isinstance(client_version, str):
-            self._client_version = client_version
-        self.protocol_version = negotiate_protocol_version(version, client_version)
+        raw_client_version = params.get("client_version")
+        client_version = raw_client_version if isinstance(raw_client_version, str) else None
+        protocol_version = negotiate_protocol_version(version, client_version)
         requested = params.get("features")
         if requested is not None and (
             not isinstance(requested, list)
@@ -1017,7 +1077,7 @@ class _Client:
             raise ProtocolError(
                 ErrorDescriptor.INVALID_PARAMS, "features must be an array of strings"
             )
-        extended = self.protocol_version != "1.0"
+        extended = protocol_version != "1.0"
         accepted = (
             [
                 item
@@ -1034,7 +1094,6 @@ class _Client:
             accepted.remove("turn_reconnect")
         if "in_flight_replay" in accepted and "session_replay_seq" not in accepted:
             accepted.remove("in_flight_replay")
-        # a borrowed runtime cannot make a second pair
         if "session_park" in accepted and (
             "resume_attach" not in accepted or self.server._borrowed
         ):
@@ -1044,46 +1103,31 @@ class _Client:
             and not CHILD_RUN_EVENTS_PREREQUISITES <= set(accepted)
         ):
             accepted.remove("child_run_events")
-        self.features = frozenset(accepted)
-        assert self.server.connections is not None
-        role_name = params.get("role", "controller")
-        admission = None
-        if role_name == "controller":
-            try:
-                admission = self.server.controllers.admit_hello(
-                    self,
-                    negotiated_multi="multi_controller" in self.features,
-                    reconnect_session_id=params.get("session_id")
-                    if isinstance(params.get("session_id"), str)
-                    else None,
-                )
-            except ProtocolError as exc:
-                if exc.code == ErrorDescriptor.CONNECTION_CAPACITY.code:
-                    self.server.connections.log_controller_refusal(self)
-                raise
-        try:
-            role = self.server.connections.negotiate_role(
-                self, role_name, self.protocol_version, self.features, max_role=self.max_role
-            )
-        except BaseException:
-            if admission is not None:
-                self.server.controllers.abort_hello(admission)
-            raise
-        if admission is not None:
-            self._hello_admission = admission
-        requests = MethodDescriptor.advertised(
-            self.protocol_version, self.features, role
+        return _HelloNegotiation(
+            protocol_version,
+            client_version,
+            tuple(accepted),
+            params.get("role", "controller"),
+            extended,
+            requested is not None,
         )
-        if extended:
+
+    def _hello_result(
+        self, hello: _HelloNegotiation, role: str
+    ) -> dict[str, object]:
+        requests = MethodDescriptor.advertised(
+            hello.protocol_version, self.features, role
+        )
+        if hello.extended:
             self.server.turn_contexts.add_request(requests, self.features)
         capabilities: dict[str, object] = {
             "requests": requests,
             "notifications": ["event"],
         }
-        if extended and requested is not None:
-            capabilities["features"] = accepted
+        if hello.extended and hello.requested_features:
+            capabilities["features"] = list(hello.features)
         result = hello_result(
-            self.protocol_version,
+            hello.protocol_version,
             capabilities,
             self.server.controllers.attached().runtime.project_registry_warning,
         )
