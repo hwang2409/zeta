@@ -53,6 +53,13 @@ _OWNER_COUNT_GROUPS = []
 _OWNER_LEAK_BASELINE = _TEST_SITE_PACKAGES / "owner_leak_ratchet.txt"
 
 
+@pytest.fixture(autouse=True)
+def reset_process_update_monitor(monkeypatch: pytest.MonkeyPatch) -> None:
+    from zeta.runtime import update_notice
+
+    monkeypatch.setattr(update_notice, "_process_monitor", None)
+
+
 def pytest_sessionstart(session: pytest.Session) -> None:
     global _OWNER_COUNTS
     if not _IS_REPOSITORY_TESTS:
