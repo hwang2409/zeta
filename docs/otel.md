@@ -121,7 +121,7 @@ wait for its last export.
 
 ## local viewer (otel-gui)
 
-This is one copy-paste proof journey. It downloads the pinned MIT-licensed
+This is one copy-paste proof journey. It downloads the exact-version, digest-pinned, MIT-licensed
 `otel-gui` v3.1.0 macOS arm64 release into disposable space and runs it on
 literal loopback only. It uses a disposable, credential-free `ZETA_HOME`, so it
 does not overwrite real settings or mutate a globally installed zeta tool.
@@ -131,34 +131,50 @@ starting. The revision check below is required: do not run this journey from
 another checkout.
 
 ```console
-OTEL_WORKTREE=/absolute/path/to/the/zeta-checkout
-OTEL_REVISION=663bc41baebf0aeb7e70a7605e75641240ee9abd
-ZETA_HOME="$(mktemp -d "${TMPDIR:-/tmp}/zeta-otel-home.XXXXXX")"
-VIEWER_HOME="$(mktemp -d "${TMPDIR:-/tmp}/otel-gui.XXXXXX")"
-VIEWER_URL=https://github.com/metafab/otel-gui/releases/download/v3.1.0/otel-gui-macos-arm64.tar.gz
-VIEWER_SHA256=2982fd3b3c44a459dd8a8ae973c7b6a835165ddaad4b500e414272122f3a281d
+(
+  set -e
+  OTEL_WORKTREE=/absolute/path/to/the/zeta-checkout
+  OTEL_REVISION=663bc41baebf0aeb7e70a7605e75641240ee9abd
+  ZETA_HOME="$(mktemp -d "${TMPDIR:-/tmp}/zeta-otel-home.XXXXXX")"
+  VIEWER_HOME="$(mktemp -d "${TMPDIR:-/tmp}/otel-gui.XXXXXX")"
+  VIEWER_URL=https://github.com/metafab/otel-gui/releases/download/v3.1.0/otel-gui-macos-arm64.tar.gz
+  VIEWER_SHA256=2982fd3b3c44a459dd8a8ae973c7b6a835165ddaad4b500e414272122f3a281d
 
-cd "$OTEL_WORKTREE" && uv run --extra otel python -c 'import zeta; print(zeta.__file__)'
-test "$(git -C "$OTEL_WORKTREE" rev-parse HEAD)" = "$OTEL_REVISION"
+  cleanup() {
+    status=$?
+    trap - EXIT INT TERM HUP
+    if [ -n "${VIEWER_PID:-}" ]; then
+      kill "$VIEWER_PID" 2>/dev/null || true
+      wait "$VIEWER_PID" 2>/dev/null || true
+    fi
+    rm -rf "$ZETA_HOME" "$VIEWER_HOME"
+    exit "$status"
+  }
+  trap cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
-mkdir -p "$ZETA_HOME"
-cat > "$ZETA_HOME/settings.toml" <<'EOF'
+  test "$(git -C "$OTEL_WORKTREE" rev-parse HEAD)" = "$OTEL_REVISION"
+  cd "$OTEL_WORKTREE"
+  uv run --extra otel python -c 'import zeta; print(zeta.__file__)'
+
+  mkdir -p "$ZETA_HOME"
+  cat > "$ZETA_HOME/settings.toml" <<'EOF'
 [otel]
 endpoint = "http://127.0.0.1:4319/v1/traces"
 EOF
-curl -fsSL "$VIEWER_URL" -o "$VIEWER_HOME/otel-gui.tar.gz"
-printf '%s  %s\n' "$VIEWER_SHA256" "$VIEWER_HOME/otel-gui.tar.gz" | shasum -a 256 -c -
-tar -xzf "$VIEWER_HOME/otel-gui.tar.gz" -C "$VIEWER_HOME"
-VIEWER_BIN=$(find "$VIEWER_HOME" -type f -name otel-gui -perm -111 | head -1)
-HOST=127.0.0.1 PORT=4319 "$VIEWER_BIN" &
-VIEWER_PID=$!
-cd "$OTEL_WORKTREE" && ZETA_HOME="$ZETA_HOME" uv run --extra otel zeta \
-  --provider ollama --model qwen3:4b --no-session --yolo --max-turns 8 \
-  -p 'you must use the agent tool now: ask exactly one child agent to run a short check. after the child returns, use the bash tool to print exactly otel-proof. do not answer until both tool calls complete. report only success.'
-open http://127.0.0.1:4319
-# when finished:
-kill "$VIEWER_PID"
-rm -rf "$ZETA_HOME" "$VIEWER_HOME"
+  curl -fsSL "$VIEWER_URL" -o "$VIEWER_HOME/otel-gui.tar.gz"
+  printf '%s  %s\n' "$VIEWER_SHA256" "$VIEWER_HOME/otel-gui.tar.gz" | shasum -a 256 -c -
+  tar -xzf "$VIEWER_HOME/otel-gui.tar.gz" -C "$VIEWER_HOME"
+  VIEWER_BIN=$(find "$VIEWER_HOME" -type f -name otel-gui -perm -111 | head -1)
+  HOST=127.0.0.1 PORT=4319 "$VIEWER_BIN" &
+  VIEWER_PID=$!
+  ZETA_HOME="$ZETA_HOME" uv run --extra otel zeta \
+    --provider ollama --model qwen3:4b --no-session --yolo --max-turns 8 \
+    -p 'you must use the agent tool now: ask exactly one child agent to run a short check. after the child returns, use the bash tool to print exactly otel-proof. do not answer until both tool calls complete. report only success.'
+  open http://127.0.0.1:4319
+)
 ```
 
 The first `uv run` must print a `zeta` path under `OTEL_WORKTREE`, and the
