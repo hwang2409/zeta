@@ -159,6 +159,36 @@ async def test_turn_cancellation_does_not_wait_for_hook() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pre_tool_runs_once_across_prepare_and_execute(tmp_path: Path) -> None:
+    calls = 0
+
+    def capture(_arguments: dict[str, object]) -> str:
+        return "ok"
+
+    def count(_tool: str, _args: dict[str, object]) -> bool:
+        nonlocal calls
+        calls += 1
+        return True
+
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty(),
+        pre_execute_hook=CompositeToolHook(
+            None, [ExtensionHook("hooks", "pre_tool", count)], lambda _: None,
+            _task_owner,
+        ),
+    )
+    registry.register("capture", capture, parameters={"type": "object"})
+    try:
+        call = ToolCall("call-once", "capture", {})
+        assert await registry.prepare_approval(call) is None
+        result = await registry.execute(call)
+        assert result["isError"] is False
+        assert calls == 1
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
 async def test_registry_executes_validated_modified_arguments(tmp_path: Path) -> None:
     seen: list[dict[str, object]] = []
 

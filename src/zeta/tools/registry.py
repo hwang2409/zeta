@@ -316,6 +316,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         )
         self._cwd_recovery_notices: list[tuple[str, str]] = []
         self._tools: dict[str, ToolDefinition] = {}
+        self._prepared_effective_calls: dict[
+            str, tuple[ToolCall, ToolDefinition, ResolvedCapability, dict[str, Any]]
+        ] = {}
         # Set by MCPMount.  It is deliberately copied by clone_for_session so
         # discovery remains available in child sessions without sharing tools.
         self._mcp_mount: Any = None
@@ -899,6 +902,18 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         if isinstance(current, dict):
             return current
         _definition, _capability, arguments = current
+        if _capability.binding is ApprovalBinding.PATH and _capability.subject_field:
+            canonical = os.path.realpath(str(_capability.subject_value))
+            arguments[_capability.subject_field] = canonical
+            _capability = replace(
+                _capability, subject_value=canonical, arguments=dict(arguments)
+            )
+        elif _capability.binding is ApprovalBinding.CWD:
+            self.update_bash_cwd(os.path.realpath(self.bash_cwd))
+        capture_binding = getattr(self.approval_policy, "_capture_pending_binding", None)
+        if callable(capture_binding):
+            capture_binding(tool_call, _capability)
+        original_arguments = dict(arguments)
         if self.pre_execute_hook is not None:
             try:
                 hook_result = self.pre_execute_hook(tool_call.name, arguments)
@@ -910,6 +925,8 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 return _error_result(hook_result, kind="hook_denied")
             if hook_result is False:
                 return _error_result("tool execution denied by hook", kind="hook_denied")
+        if arguments == original_arguments:
+            return replace(tool_call, arguments=original_arguments), _definition, _capability, original_arguments
         effective_call = replace(tool_call, arguments=dict(arguments))
         current = self._current_execution(effective_call)
         if isinstance(current, dict):
@@ -918,10 +935,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         return effective_call, definition, capability, arguments
 
     async def prepare_approval(self, tool_call: ToolCall) -> ApprovalRequest | None:
-        if self.approval_policy is None:
-            return None
         if not self.tool_is_allowed(tool_call.name):
-            await self.abort_approval(tool_call)
             return None
         definition = self._tools.get(tool_call.name)
         if definition is None:
@@ -932,13 +946,16 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         except (KeyError, UnknownToolAction, InvalidActionArguments, TypeError, ValueError):
             await self.abort_approval(tool_call)
             return None
-        if not capability.requires_approval and not self.enforce_approvals:
-            return None
         effective = await self._effective_tool_call(tool_call)
         if isinstance(effective, dict):
             await self.abort_approval(tool_call)
             return None
+        self._prepared_effective_calls[tool_call.id] = effective
+        if self.approval_policy is None:
+            return None
         tool_call, definition, capability, _arguments = effective
+        if not capability.requires_approval and not self.enforce_approvals:
+            return None
         return await self.approval_policy.prepare(tool_call, capability=capability)
 
     def _current_execution(
@@ -1049,7 +1066,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         except (KeyError, TypeError, ValueError) as exc:
             await self.abort_approval(tool_call)
             return await finalize(_error_result(str(exc), kind="invalid_arguments"))
-        effective = await self._effective_tool_call(tool_call)
+        effective = self._prepared_effective_calls.pop(tool_call.id, None)
+        if effective is None:
+            effective = await self._effective_tool_call(tool_call)
         if isinstance(effective, dict):
             await self.abort_approval(tool_call)
             return await finalize(effective)
@@ -1114,10 +1133,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 if (result := self._session_store.tool_result(tool_call.id)) is not None:
                     return await finalize(_legacy_result(result))
             return await finalize(_error_result(claim_error[0], kind=claim_error[1]))
-        current = self._current_execution(tool_call)
-        if isinstance(current, dict):
-            return await finalize(current)
-        definition, capability, arguments = current
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
