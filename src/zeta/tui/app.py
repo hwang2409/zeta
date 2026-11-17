@@ -310,6 +310,10 @@ class TUIApp(
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
+        self._model_catalog_refresh_requested = False
+        self._model_catalog_load_finished = asyncio.Event()
+        if self._model_catalog_loaded:
+            self._model_catalog_load_finished.set()
         self._model_picker: ModelPicker | None = None
         self._accounts_picker: AccountsPicker | None = None
         self._picker_loading: asyncio.Future[Any] | None = None
@@ -444,11 +448,14 @@ class TUIApp(
 
     def _start_model_catalog_load(self) -> None:
         if self._model_catalog_task is not None:
+            self._model_catalog_refresh_requested = True
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        self._model_catalog_loaded = False
+        self._model_catalog_load_finished.clear()
         self._model_catalog_task = loop.create_task(
             self._load_model_catalog_in_background()
         )
@@ -465,7 +472,12 @@ class TUIApp(
         finally:
             self._model_catalog_loaded = True
             self._model_catalog_task = None
-            self.refresh_model_picker()
+            self._model_catalog_load_finished.set()
+            if not (self._closing or self._closed):
+                self.refresh_model_picker()
+                if self._model_catalog_refresh_requested:
+                    self._model_catalog_refresh_requested = False
+                    self._start_model_catalog_load()
 
     def _prompt_style(self) -> Style:
         focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
