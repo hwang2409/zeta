@@ -865,7 +865,11 @@ class _Client:
     def _begin_controller_release(self) -> asyncio.Future[object] | None:
         if self._controller_release is not None:
             return self._controller_release
-        if self.role == "controller" and self.connections.is_controller(self):
+        if (
+            self.role == "controller"
+            and self._hello_admission is not None
+            and self.connections.is_controller(self)
+        ):
             self._controller_release = asyncio.gather(*(
                 control.begin_controller_release(
                     reconnect="approval_reconnect" in self.features,
@@ -948,6 +952,10 @@ class _Client:
                         raise
                     if not claimed:
                         self.handshaken = False
+                        admission = self._hello_admission
+                        if admission is not None:
+                            self.server.controllers.abort_hello(admission)
+                            self._hello_admission = None
                         raise ProtocolError(
                             ErrorDescriptor.CONNECTION_CAPACITY,
                             "another client is already connected",

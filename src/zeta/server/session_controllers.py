@@ -170,7 +170,7 @@ class SessionControllers:
         if self._controller_members.get(admission.connection) != admission.generation:
             return
         del self._controller_members[admission.connection]
-        if not self._controller_members:
+        if not self._controller_members and self._grace_session_id is None:
             self._controller_mode = "empty"
 
     def release_connection(self, connection: Any, reason: str = "eof") -> None:
