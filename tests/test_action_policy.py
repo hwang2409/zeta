@@ -394,10 +394,7 @@ def test_existing_tool_payloads_keep_semantic_provider_contracts(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     messages = [Message(MessageRole.USER, [TextContent("go")])]
     existing_schemas = [
-        schema
-        for schema in registry.schemas
-        if schema["name"] not in {"list_attention", "request_attention"}
-
+        schema for schema in registry.schemas if schema["name"] != "request_attention"
     ]
     anthropic_payload = build_request_payload(
         messages,
