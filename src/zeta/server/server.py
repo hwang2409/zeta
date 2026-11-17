@@ -337,12 +337,14 @@ class ZetaServer:
         yield self.controllers.attached().control
         yield from self.parking.pairs()
 
-    def new_pair(self) -> SessionUse:
-        """An empty pair beside the attached one, reserved by the returned use
-        until its setup ends; it shares the session manager."""
+    def new_pair(self, owner: SessionUse | SessionController | None = None) -> SessionUse:
+        """Create a pair beside the owner's record, sharing its manager."""
         self.parking.require_room()
+        source = owner.record if isinstance(owner, SessionUse) else owner
+        if source is None:
+            source = self.controllers.attached()
         control = ServeControl(
-            self, self.controllers.attached().runtime.sibling(), self.foreground_event_publisher
+            self, source.runtime.sibling(), self.foreground_event_publisher
         )
         self._bind_pair(control)
         return self.controllers.register(control)

@@ -76,13 +76,14 @@ async def _session_swap(
     closed here."""
     server = self.server
     outgoing = controller.control
-    if not park or not outgoing.holds_work():
+    multi = server.controllers.controller_mode == "multi"
+    if (not park and not multi) or (not outgoing.holds_work() and not multi):
         with outgoing.reserve_session_swap():
             server.connections.replay_session_replaced()
             yield None
         return
     # this setup holds the new generation's reservation until it ends
-    with server.new_pair() as reservation:
+    with (server.new_pair(controller) if multi else server.new_pair()) as reservation:
         incoming = reservation.record
         with incoming.control.reserve_session_swap():
             try:
@@ -142,7 +143,10 @@ async def _new_session(
                 cwd=cwd,
             )
             if incoming is not None:
-                controller = self.server.attach(incoming)
+                if self.server.controllers.controller_mode == "multi":
+                    controller = self.server.controllers.bind_created(self, incoming)
+                else:
+                    controller = self.server.attach(incoming)
             if initial_model is not None and initial_mode is not None:
                 await model_selection.apply_rpc(
                     controller.runtime, initial_model, initial_mode
@@ -182,6 +186,7 @@ async def _new_session(
 async def _resume(
     self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
+    acquisition = None
     try:
         bindings = await mcp_bindings(self, params, controller)
         state = controller.runtime.state
@@ -195,6 +200,13 @@ async def _resume(
         async with _session_swap(self, park, controller) as incoming:
             session_id = await _resolve_session_id(self, params, controller)
             await self.server.controllers.wait_closed(session_id)
+            acquisition = None
+            multi = self.server.controllers.controller_mode == "multi"
+            if multi:
+                candidate = incoming or controller.record
+                acquisition = self.server.controllers.reserve_session(
+                    self, session_id, candidate
+                )
             unhealthy_same_session = (
                 incoming is None
                 and controller.control.unhealthy()
@@ -230,7 +242,10 @@ async def _resume(
                         str(exc),
                         {"session_id": session_id},
                     ) from exc
-            if incoming is not None:
+            if acquisition is not None:
+                committed = self.server.controllers.commit_session(acquisition)
+                controller = committed
+            if incoming is not None and not multi:
                 controller = self.server.attach(incoming)
             if bindings is not None:
                 headers, configs = bindings
@@ -258,6 +273,10 @@ async def _resume(
             await controller.control.publish_session_grant_reset()
             return {"session": session_snapshot(self, controller)}
     except BaseException:
+        if acquisition is not None:
+            closed = self.server.controllers.abort_session(acquisition)
+            if closed is not None:
+                await asyncio.shield(closed)
         if controller.runtime.state is None:
             controller.control._active_host_commands = None
             controller.control._host_binding_required = False
