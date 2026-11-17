@@ -648,12 +648,12 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
     original_mount = mount_module.mount_mcp_servers
 
     async def observe_mount(
-        registry: ToolRegistry, config=None, *, notice_sink=None, home=None
+        registry: ToolRegistry, config=None, *, notice_sink=None, home=None, telemetry=None
     ):
         nonlocal calls
         calls += 1
         return await original_mount(
-            registry, config, notice_sink=notice_sink, home=home
+            registry, config, notice_sink=notice_sink, home=home, telemetry=telemetry
         )
 
     monkeypatch.setattr(
@@ -3504,10 +3504,10 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
     calls = 0
 
     async def delayed_mount(
-        registry: ToolRegistry, config=None, *, notice_sink=None, home=None
+        registry: ToolRegistry, config=None, *, notice_sink=None, home=None, telemetry=None
     ) -> MCPMount:
         nonlocal calls
-        del notice_sink, config, home
+        del notice_sink, config, home, telemetry
         calls += 1
         started.set()
         await release.wait()
