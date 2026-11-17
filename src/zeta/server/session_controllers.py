@@ -336,6 +336,12 @@ class SessionControllers:
         self._by_session[session_id] = acquisition
         return acquisition
 
+    def use_acquisition(self, acquisition: SessionAcquisition) -> SessionUse:
+        """Hold the exact target reserved by ``acquisition`` during setup."""
+        if self._by_session.get(acquisition.session_id) is not acquisition:
+            raise RuntimeError("session acquisition is no longer current")
+        return self._use(acquisition.target)
+
     def commit_session(self, acquisition: SessionAcquisition) -> SessionUse:
         if self._by_session.get(acquisition.session_id) is not acquisition:
             raise RuntimeError("session acquisition is no longer current")
@@ -474,7 +480,8 @@ class SessionControllers:
         runtime would close (owned or not), and that close's error propagates;
         the others are logged by their close. A cancel of the shutdown does not
         cancel a close."""
-        for record in tuple(self._records.values()):
+        committed = {*self._parked.values(), *self._by_connection.values()}
+        for record in committed:
             if record is not self._attached:
                 self.retire(record, settlement_timeout)
         done = self._attached.close_task

@@ -121,6 +121,7 @@ async def _new_session(
     self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
     acquisition = None
+    target_use = None
     try:
         bindings = await mcp_bindings(self, params, controller)
         initial_model = validation.optional_string(params, "model")
@@ -148,7 +149,8 @@ async def _new_session(
                     acquisition = self.server.controllers.reserve_session(
                         self, incoming.runtime.session_id, incoming
                     )
-                    controller = incoming
+                    target_use = self.server.controllers.use_acquisition(acquisition)
+                    controller = target_use
                 else:
                     controller = self.server.attach(incoming)
             if initial_model is not None and initial_mode is not None:
@@ -197,12 +199,16 @@ async def _new_session(
             controller.control._active_host_commands = None
             controller.control._host_binding_required = False
         raise
+    finally:
+        if target_use is not None:
+            target_use.release()
 
 
 async def _resume(
     self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
     acquisition = None
+    target_use = None
     try:
         bindings = await mcp_bindings(self, params, controller)
         state = controller.runtime.state
@@ -223,6 +229,7 @@ async def _resume(
                 acquisition = self.server.controllers.reserve_session(
                     self, session_id, candidate
                 )
+                target_use = self.server.controllers.use_acquisition(acquisition)
             unhealthy_same_session = (
                 incoming is None
                 and controller.control.unhealthy()
@@ -258,8 +265,8 @@ async def _resume(
                         str(exc),
                         {"session_id": session_id},
                     ) from exc
-            if acquisition is not None:
-                controller = acquisition.target
+            if target_use is not None:
+                controller = target_use
             if incoming is not None and not multi:
                 controller = self.server.attach(incoming)
             if bindings is not None:
@@ -304,6 +311,9 @@ async def _resume(
             controller.control._active_host_commands = None
             controller.control._host_binding_required = False
         raise
+    finally:
+        if target_use is not None:
+            target_use.release()
 
 
 async def _resume_live_or_parked(
