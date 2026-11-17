@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
 
+from zeta.core.hooks import load_hooks
 from zeta.extensions.api import ExtensionAPI, ExtensionError
 from zeta.extensions.hooks import (
     CompositeToolHook,
@@ -85,6 +88,77 @@ async def test_pre_tool_denies_and_ignores_returned_replacement() -> None:
     assert args == {"safe": False}
     assert len(notices) == 1
     assert "replacement arguments; ignored" in notices[0]
+
+
+@pytest.mark.asyncio
+async def test_tool_hook_composes_file_hooks_before_extensions_and_denies(tmp_path: Path) -> None:
+    import json
+
+    marker = tmp_path / "order"
+    source = f"from pathlib import Path; Path({str(marker)!r}).open('a').write('file')"
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
+    (tmp_path / "hooks.toml").write_text(
+        "[[hook]]\nevent = \"pre_tool\"\ncommand = "
+        f"{json.dumps(command)}\n"
+        "[[hook]]\nevent = \"pre_tool\"\ncommand = "
+        f"{json.dumps(command)}\n",
+        encoding="utf-8",
+    )
+    manager = load_hooks(tmp_path)
+    events: list[str] = []
+
+    async def observe(_tool: str, _args: dict[str, object]) -> None:
+        events.append("extension-1")
+
+    async def observe_again(_tool: str, _args: dict[str, object]) -> None:
+        events.append("extension-2")
+
+    def capture(_arguments: dict[str, object]) -> str:
+        events.append("tool")
+        return "ran"
+
+    def compose(base: object, hooks: list[ExtensionHook]) -> ToolRegistry:
+        registry = ToolRegistry(
+            tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty(),
+            pre_execute_hook=CompositeToolHook(
+                base, hooks, lambda _: None, _task_owner
+            ),
+        )
+        registry.register("capture", capture)
+        return registry
+
+    registry = compose(manager.pre_tool, [
+        ExtensionHook("hooks", "pre_tool", observe),
+        ExtensionHook("hooks", "pre_tool", observe_again),
+    ])
+    try:
+        result = await registry.execute(ToolCall("order", "capture", {}))
+        assert result["isError"] is False
+        assert marker.read_text() == "filefile"
+        assert events == ["extension-1", "extension-2", "tool"]
+    finally:
+        await registry.close()
+
+    registry = compose(lambda _tool, _args: "file denied", [
+        ExtensionHook("hooks", "pre_tool", observe),
+    ])
+    try:
+        denied = await registry.execute(ToolCall("file-deny", "capture", {}))
+        assert denied["isError"] is True
+        assert events == ["extension-1", "extension-2", "tool"]
+    finally:
+        await registry.close()
+
+    async def deny(_tool: str, _args: dict[str, object]) -> str:
+        return "extension denied"
+
+    registry = compose(manager.pre_tool, [ExtensionHook("hooks", "pre_tool", deny)])
+    try:
+        denied = await registry.execute(ToolCall("extension-deny", "capture", {}))
+        assert denied["isError"] is True
+        assert events == ["extension-1", "extension-2", "tool"]
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio
