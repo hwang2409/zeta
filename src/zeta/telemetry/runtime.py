@@ -127,15 +127,12 @@ class StatusCell:
 
     def __init__(self) -> None:
         self._values: deque[str] = deque(maxlen=1)
-        self._lock = threading.Lock()
 
     def publish(self, state: str) -> None:
-        with self._lock:
-            self._values.append(state)
+        self._values.append(state)
 
     def read(self) -> str | None:
-        with self._lock:
-            return self._values.pop() if self._values else None
+        return self._values.pop() if self._values else None
 
 
 class _SpanHandle(SpanHandle):

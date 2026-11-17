@@ -131,16 +131,15 @@ def _reconcile_child_worker(
 
 def _hold_identity_publication(home: str, _project_id: str, channel: socket.socket) -> None:
     registry = ProjectRegistry(Path(home) / "projects")
-    original = registry._acquire_lock
+    original = registry._acquire_identity_lock
 
-    def gated(fd: int, mode: int) -> None:
-        original(fd, mode)
-        if mode == fcntl.LOCK_EX:
-            _send(channel, "acquired")
-            if _receive(channel) != "release":
-                raise AssertionError("release signal was not sent")
+    def gated(fd: int) -> None:
+        original(fd)
+        _send(channel, "acquired")
+        if _receive(channel) != "release":
+            raise AssertionError("release signal was not sent")
 
-    registry._acquire_lock = gated  # type: ignore[method-assign]
+    registry._acquire_identity_lock = gated  # type: ignore[method-assign]
     registry.create_project("new", "new")
     _send(channel, "identity-done")
 
