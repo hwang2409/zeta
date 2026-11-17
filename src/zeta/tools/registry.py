@@ -105,9 +105,9 @@ from .approval_gate import ApprovalGate
 if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState
     from ..skills.agent_catalog import AgentCatalog
+    from ..telemetry import SpanHandle
     from .computer.backend import ComputerBackend
     from .computer.scaling import ScreenGeometry
-    from ..telemetry import SpanHandle
 AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
