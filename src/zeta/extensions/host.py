@@ -47,6 +47,7 @@ from .hooks import (
     CompositeToolHook,
     ExtensionHook,
     HookRunner,
+    _await_owned_finalizer,
     _post,
     run_extension_hooks,
 )
@@ -308,11 +309,7 @@ class ExtensionHost:
         if self._close_task is None:
             self._closing = True
             self._close_task = asyncio.create_task(self._finalize_close())
-        try:
-            return await asyncio.shield(self._close_task)
-        except asyncio.CancelledError:
-            await asyncio.shield(self._close_task)
-            raise
+        return await _await_owned_finalizer(self._close_task)
 
     async def _finalize_close(self) -> ExtensionCloseResult:
         result = await self._runner.aclose()

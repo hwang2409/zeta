@@ -760,9 +760,9 @@ class ServeControl:
         session_id = self.runtime.session_id
         if connections is None or session_id is None or not self.attached:
             return
-        _ = await connections.publish_feature_event(
+        (await connections.publish_feature_event(
             FEATURE, EVENT, session_id, data=event_data(change, session_id)
-        )
+        )).raise_if_error()
 
     async def publish_session_grant_reset(self) -> None:
         policy = self.runtime.policy
@@ -1252,11 +1252,9 @@ class ServeControl:
             connections = self.server.connections
             if connections is None:
                 return False
-            receipt = await connections.publish_feature_event(
-                "extensions", EventDescriptor.EXTENSION_NOTICE, session_id,
-                data=dict(event.data),
+            return bool(
+                (await connections.publish_feature_event("extensions", EventDescriptor.EXTENSION_NOTICE, session_id, data=dict(event.data))).admitted_count
             )
-            return receipt.admitted_count > 0
         if kind is StreamEventType.AGENT_NOTIFICATION:
             await self.server.notification_presentations.publish(
                 session_id,
@@ -1319,19 +1317,12 @@ class ServeControl:
         )
         return controller.protocol_version if controller is not None else "1.0"
 
-    def _publish_background_event(
-        self, session_id: str, event: StreamEvent
-    ) -> bool | asyncio.Task[bool | None]:
+    def _publish_background_event(self, session_id: str, event: StreamEvent) -> object:
         """Schedule an event and return its truthful publication receipt."""
         self._maybe_idle()
-        if self.closing:
-            return False
-        try:
-            return asyncio.create_task(
-                self._event(event, session_id=session_id, background=True)
-            )
-        except RuntimeError:
-            return False
+        return False if self.closing else asyncio.create_task(
+            self._event(event, session_id=session_id, background=True)
+        )
 
     def _publish_run_work_event(self, session_id: str, event: EventDescriptor, fields: dict[str, object]) -> None:
         connections = self.server.connections

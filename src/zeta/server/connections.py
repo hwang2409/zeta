@@ -52,6 +52,12 @@ CONNECTION_FLUSH_DEADLINE_SECONDS = 1.0
 class FeaturePublicationReceipt:
     admitted_count: int = 0
     rejected_count: int = 0
+    first_error: Exception | None = None
+
+    def raise_if_error(self) -> None:
+        if self.first_error is not None:
+            raise self.first_error
+
 
 OBSERVER_REQUESTS = frozenset(
     {
@@ -566,6 +572,7 @@ class ConnectionRegistry(ReplayOutput):
         assert not isinstance(covers, DeferredFrame)
         admitted = 0
         rejected = 0
+        first_error = None
         for state in states:
             try:
                 frame = state.connection.codec.notification(event, session_id, data=data)
@@ -577,14 +584,14 @@ class ConnectionRegistry(ReplayOutput):
                         else self._publish_observer(state, frame)
                     )
                 )
-            except Exception:  # one broken recipient must not stop fanout
-                logger.exception("feature event recipient rejected %s", event.value)
+            except Exception as exc:  # noqa: BLE001 - account each recipient before return
+                first_error = first_error or exc
                 accepted = False
             if accepted:
                 admitted += 1
             else:
                 rejected += 1
-        return FeaturePublicationReceipt(admitted, rejected)
+        return FeaturePublicationReceipt(admitted, rejected, first_error)
 
     def release(self, connection: Any) -> None:
         self.invalidate_replay_connection(connection)

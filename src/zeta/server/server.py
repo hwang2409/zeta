@@ -390,12 +390,12 @@ class ZetaServer:
 
     async def publish_update(self, old_revision: str, new_revision: str) -> None:
         if self.connections is not None:
-            _ = await self.connections.publish_feature_event(
+            (await self.connections.publish_feature_event(
                 "zeta_updated",
                 EventDescriptor.ZETA_UPDATED,
                 self.runtime.session_id if self.runtime.opened is not None else None,
                 data={"old_revision": old_revision, "new_revision": new_revision},
-            )
+            )).raise_if_error()
 
     @property
     def address(self) -> str:
@@ -448,10 +448,10 @@ class ZetaServer:
                     return
                 if self.connections is None or self.runtime.opened is None:
                     return
-                _ = await self.connections.publish_feature_event(
+                (await self.connections.publish_feature_event(
                     "session_retention", EventDescriptor.SESSION_RETENTION,
                     self.runtime.opened.metadata.session_id, data=projection,
-                )
+                )).raise_if_error()
 
             self.runtime.retention_event_sink = publish_retention
             self.runtime.retention_wake = self._retention_owner.wake
@@ -479,13 +479,15 @@ class ZetaServer:
             self._client_active = False
             self.parking.close_all(approval_settlement_timeout)
             try:
+                if not self._borrowed and self.runtime.extensions is not None:
+                    await self.runtime.extensions.aclose()
                 try:
-                    if not self._borrowed:
-                        await self.runtime.close()
+                    await self.control.close()
                 finally:
                     await self._close_foreground_events()
                 try:
-                    await self.control.close()
+                    if not self._borrowed:
+                        await self.runtime.close()
                 finally:
                     try:
                         await self.control.wait_for_approval_settlement(

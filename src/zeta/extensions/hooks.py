@@ -20,6 +20,22 @@ RUNNER_CLOSE_GRACE_SECONDS = 0.25
 _THREAD_HAS_CONTEXT = "context" in inspect.signature(threading.Thread).parameters
 
 
+async def _await_owned_finalizer(task: asyncio.Task[Any]) -> Any:
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+    result = task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 @dataclass(frozen=True, slots=True)
 class HookOutcome:
     kind: str
@@ -396,11 +412,7 @@ class HookRunner:
     async def aclose(self) -> HookRunnerCloseResult:
         if self._finalizer is None:
             self._finalizer = asyncio.create_task(self._finalize_close())
-        try:
-            return await asyncio.shield(self._finalizer)
-        except asyncio.CancelledError:
-            await asyncio.shield(self._finalizer)
-            raise
+        return await _await_owned_finalizer(self._finalizer)
 
     async def _finalize_close(self) -> HookRunnerCloseResult:
         with self._lock:
