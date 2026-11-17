@@ -6,11 +6,8 @@ and an entry module. Two scopes are scanned, mirroring ``~/.zeta/tools`` and
 
 * user -- ``<home>/extensions/*/``. Imported and activated directly in a
   session (full power, the user's own machine).
-* project -- ``<project>/.zeta/extensions/*/``. TRUST BOUNDARY: code from a
-  cloned repository. Discovered and listed with a loud warning, but NOT
-  imported or activated until the user trusts them with
-  :func:`trust_project_extensions`. (A durable trust store and the ``/ext``
-  trust command are later slices; this slice stages them in memory.)
+* project -- ``<project>/.zeta/extensions/*/``. Imported only when the
+  installed digest matches its durable project-scope trust record.
 
 Import runs synchronously at compose time, exactly like ``~/.zeta/tools`` and
 ``apply_external_tools`` today, so a blocking module import delays session
@@ -38,12 +35,8 @@ from .host import (
     LoadingExtension,
     PendingExtension,
 )
-from .manifest import (
-    MANIFEST_FILENAME,
-    ExtensionManifest,
-    ExtensionManifestError,
-    parse_manifest,
-)
+from .manifest import ExtensionManifest
+from .store import ExtensionStore, InstalledExtension
 
 EXTENSIONS_DIRNAME = "extensions"
 
@@ -57,67 +50,63 @@ def apply_extensions(
     disabled: tuple[str, ...] = (),
     clock: Callable[[], float] = time.monotonic,
 ) -> ExtensionHost:
-    """Load user extensions into ``registry`` and stage project extensions.
+    """Load trusted canonical installed extensions through ``ExtensionStore``."""
 
-    ``home`` is the zeta home (``~/.zeta``); ``project_dir`` is the project
-    root (``None`` disables the project scope). ``builtin_names`` is the set of
-    tool names present before any external tool or extension loaded; a project
-    extension may never register one of them.
-    """
-
+    home_path = _as_path(home)
+    project_path = _as_path(project_dir)
     host = ExtensionHost(
         registry,  # type: ignore[arg-type]
-        home=_as_path(home),
-        project_dir=_as_path(project_dir),
+        home=home_path,
+        project_dir=project_path,
         builtin_names=builtin_names,
         clock=clock,
     )
     host._settings_disabled = set(disabled)
     host._disabled = set(disabled)
+    if home_path is None:
+        return host
     try:
         host.load_disabled_markers()
     except OSError as exc:
         host.notices.append(f"extensions · cannot read disabled markers: {exc}")
-    disabled_set = frozenset(host._disabled)
-    user_dir = _scope_dir(home, "")
-    project_scope_dir = _scope_dir(project_dir, ".zeta")
-    for directory in _extension_dirs(user_dir):
-        manifest = _manifest_or_notice(host, directory, USER_SCOPE)
-        if manifest is None or _skip(
-            host, manifest, directory, USER_SCOPE, disabled_set,
-        ):
+    store = ExtensionStore(home=home_path, project_dir=project_path)
+    for scope in (USER_SCOPE, PROJECT_SCOPE):
+        if scope == PROJECT_SCOPE and project_path is None:
             continue
-        _load_one(host, directory, manifest, USER_SCOPE)
-    if project_scope_dir is not None and project_scope_dir != user_dir:
-        pending_names: list[str] = []
-        for directory in _extension_dirs(project_scope_dir):
-            manifest = _manifest_or_notice(host, directory, PROJECT_SCOPE)
-            if manifest is None or _skip(
-                host, manifest, directory, PROJECT_SCOPE, disabled_set,
-            ):
-                continue
-            host.pending_project.append(PendingExtension(manifest, directory, PROJECT_SCOPE))
-            pending_names.append(manifest.name)
-        if pending_names:
-            host.warnings.append(
-                "extensions · untrusted project extensions present: "
-                f"{', '.join(sorted(pending_names))}; trust them to enable them "
-                "for this session"
-            )
+        result = store.discover(scope)
+        for notice in result.notices:
+            if notice.startswith("extension loading disabled"):
+                host.notify("extensions", notice, "warning")
+            else:
+                host.notices.append(f"extensions · {notice}")
+        for item in result.extensions:
+            _apply_item(host, item)
+    if host.pending_project:
+        names = ", ".join(sorted(item.manifest.name for item in host.pending_project))
+        host.warnings.append(
+            "extensions · untrusted project extensions present: "
+            f"{names}; trust them to enable them for this session"
+        )
     return host
 
 
-def trust_project_extensions(host: ExtensionHost) -> None:
-    """Import and activate the staged project extensions (the trust action).
-
-    The pending list is cleared regardless of per-extension success, so a
-    malformed one is reported once and stays dropped.
-    """
-
-    pending = list(host.pending_project)
-    host.pending_project.clear()
-    for item in pending:
-        _load_one(host, item.directory, item.manifest, item.scope)
+def _apply_item(host: ExtensionHost, item: InstalledExtension) -> None:
+    manifest = item.manifest
+    if manifest.name in host._disabled:
+        host.disabled_inventory.append(PendingExtension(manifest, item.directory, item.scope))
+        host.notices.append(f"extensions · {manifest.name} disabled by settings")
+        return
+    if manifest.api_version > EXTENSION_API_VERSION:
+        host.notices.append(
+            f"extensions · {manifest.name} ({_display(item.directory)}) built for "
+            f"extension API v{manifest.api_version}; this zeta supports "
+            f"v{EXTENSION_API_VERSION} — upgrade zeta"
+        )
+        return
+    if item.scope == PROJECT_SCOPE and not item.trusted:
+        host.pending_project.append(PendingExtension(manifest, item.directory, item.scope))
+        return
+    _load_one(host, item.directory, manifest, item.scope)
 
 
 def _skip(
@@ -235,49 +224,6 @@ def _import_entry(
     return module
 
 
-def _manifest_or_notice(
-    host: ExtensionHost, directory: Path, scope: str
-) -> ExtensionManifest | None:
-    path = directory / MANIFEST_FILENAME
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        host.notices.append(
-            f"extensions · ignored {scope} extension {_display(directory)}: "
-            f"cannot read manifest: {_short(exc)}"
-        )
-        return None
-    try:
-        return parse_manifest(text)
-    except ExtensionManifestError as exc:
-        host.notices.append(
-            f"extensions · ignored {scope} extension {_display(directory)}: "
-            f"invalid manifest: {_short(exc)}"
-        )
-        return None
-
-
-def _extension_dirs(base: Path | None) -> list[Path]:
-    if base is None:
-        return []
-    found: list[Path] = []
-    try:
-        for path in sorted(base.iterdir()):
-            if path.is_dir() and (path / MANIFEST_FILENAME).is_file():
-                found.append(path)
-    except OSError:
-        return []
-    return found
-
-
-def _scope_dir(base: str | Path | None, nested: str) -> Path | None:
-    resolved = _as_path(base)
-    if resolved is None:
-        return None
-    candidate = resolved / nested / EXTENSIONS_DIRNAME if nested else resolved / EXTENSIONS_DIRNAME
-    return candidate if candidate.is_dir() else None
-
-
 def _as_path(base: str | Path | None) -> Path | None:
     if base is None:
         return None
@@ -309,5 +255,4 @@ def _short(exc: BaseException) -> str:
 __all__ = [
     "EXTENSIONS_DIRNAME",
     "apply_extensions",
-    "trust_project_extensions",
 ]

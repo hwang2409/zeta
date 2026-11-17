@@ -336,6 +336,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_project_subcommand(commands)
     _add_inbox_subcommand(commands)
 
+    ext = commands.add_parser("ext", help="manage zeta extensions")
+    ext_commands = ext.add_subparsers(dest="ext_action", required=True)
+    install = ext_commands.add_parser("install")
+    install.add_argument("source")
+    install.add_argument("--scope", choices=("user", "project"), default="user")
+    install.add_argument("--yes", action="store_true")
+    for action in ("remove", "update", "trust", "untrust"):
+        sub = ext_commands.add_parser(action)
+        sub.add_argument("name")
+        sub.add_argument("--scope", choices=("user", "project"), default="user")
+        if action in {"update", "trust"}:
+            sub.add_argument("--yes", action="store_true")
+
     mcp = commands.add_parser("mcp", help="manage MCP servers")
     mcp_commands = mcp.add_subparsers(dest="mcp_action", required=True)
     add = mcp_commands.add_parser("add")
@@ -1076,6 +1089,10 @@ def _main(argv: list[str] | None = None) -> int:
         return _handle_login(args)
     if args.command == "accounts":
         return _handle_accounts(args)
+    if args.command == "ext":
+        from ..extensions.cli import handle
+
+        return handle(args, home=env_home())
     if args.command == "mcp":
         from ..core.project_context import discover_repo_root
         from ..mcp.management import MCPManagementError, MCPManagementService

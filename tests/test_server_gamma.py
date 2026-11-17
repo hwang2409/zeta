@@ -34,7 +34,7 @@ from tests.test_server import (
 )
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.core.session_execution import SessionOwnedError
-from zeta.extensions import trust_project_extensions
+from zeta.extensions.store import ExtensionStore
 from zeta.mcp.management import MCPManagementService
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
@@ -390,6 +390,33 @@ async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
         await close_serve(server, writer)
 
 
+@pytest.mark.asyncio
+async def test_extension_recovery_failure_is_one_real_serve_notice(tmp_path: Path) -> None:
+    transaction = tmp_path / "home" / "extensions" / ".zeta-extension-store" / "update-bad"
+    transaction.mkdir(parents=True)
+    (transaction / "owner.json").write_text("{}", encoding="utf-8")
+    server = _server(tmp_path, None, _launch(tmp_path))
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["extensions"])
+        await send(reader, writer, 2, "new_session", {"provider": "codex"})
+        frames = await read_until(reader, lambda frame: frame.get("id") == 2, what="new session response")
+        notices = [
+            frame for frame in frames
+            if frame.get("params", {}).get("event") == "extension_notice"
+        ]
+        assert [frame["params"]["data"] for frame in notices] == [{
+            "kind": "extension",
+            "extension": "extensions",
+            "text": "extension loading disabled for user scope: update recovery requires attention",
+            "level": "warning",
+        }]
+        assert frames[-1].get("result") is not None
+        assert (transaction / "owner.json").read_text(encoding="utf-8") == "{}"
+    finally:
+        await close_serve(server, writer)
+
+
 @pytest.mark.parametrize(
     ("scope", "activation", "expected_loaded"),
     [
@@ -417,6 +444,11 @@ async def test_ext_status_agrees_with_negotiated_extension_rows(
         '[extension]\nname = "listed"\nversion = "1"\napi_version = 1\nentry = "ext:activate"\n'
     )
     (extension_dir / "ext.py").write_text(activation)
+    if scope == "project":
+        await asyncio.to_thread(
+            ExtensionStore(home=tmp_path / "home", project_dir=launch).trust,
+            "listed", scope="project", accept=True,
+        )
     server = _server(tmp_path, None, launch)
     reader, writer = await _connect(server)
     request_id = 2
@@ -453,10 +485,6 @@ async def test_ext_status_agrees_with_negotiated_extension_rows(
                 f"enabled divergence: /ext={ext_enabled}, extensions_list={row['enabled']}"
             )
 
-        if scope == "project":
-            await assert_agreement(trusted=False, enabled=True)
-            assert server.runtime.extensions is not None
-            trust_project_extensions(server.runtime.extensions)
         await assert_agreement(trusted=True, enabled=True)
 
         row, _ = await surfaces()

@@ -24,11 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
 
-from ..extensions.discovery import (
-    USER_SCOPE,
-    apply_extensions,
-    trust_project_extensions,
-)
+from ..extensions.discovery import USER_SCOPE, _load_one, apply_extensions
 from ..extensions.host import PROJECT_SCOPE, ExtensionHost
 from ..protocol.types import StructuredToolResult, ToolCall
 from ..skills import SkillCatalog
@@ -52,7 +48,7 @@ class ExtensionKit:
     def trust(self) -> None:
         """Activate a staged project-scope extension (the trust action)."""
 
-        trust_project_extensions(self.host)
+        _trust_pending_for_test(self.host)
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any] | None = None
@@ -66,6 +62,13 @@ class ExtensionKit:
         self.host.close()
         await self.registry.close()
         await asyncio.to_thread(shutil.rmtree, self._root, ignore_errors=True)
+
+
+def _trust_pending_for_test(host: ExtensionHost) -> None:
+    pending = list(host.pending_project)
+    host.pending_project.clear()
+    for item in pending:
+        _load_one(host, item.directory, item.manifest, item.scope)
 
 
 def load_extension(

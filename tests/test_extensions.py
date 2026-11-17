@@ -13,25 +13,30 @@ import sys
 import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
-from tests.support.owned import await_or_fail
+from tests.support.fake_backend import FakeBackend
+from tests.support.owned import await_or_fail, owned_app
 from zeta.core.commands.slash_registry import SlashLock, SlashSurface
 from zeta.core.slash import create_slash_registry
+from zeta.core.store import ConversationStore
 from zeta.extensions import (
     EXTENSION_API_VERSION,
     ExtensionManifestError,
     apply_extensions,
     parse_manifest,
-    trust_project_extensions,
 )
 from zeta.extensions.host import USER_SCOPE
 from zeta.protocol.types import StreamEvent, StreamEventType
+from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
-from zeta.testing.extensions import load_extension
+from zeta.testing.extensions import _trust_pending_for_test, load_extension
 from zeta.tools import ToolRegistry
+from zeta.tui.app import TUIApp
 from zeta.tui.render import render_event
 
 _ECHO_MODULE = """
@@ -124,7 +129,7 @@ def activate(zx):
     home = tmp_path / "home"
     _write_extension(home / "extensions", "notify-ext", source=source)
     async with _open_registry(tmp_path) as registry:
-        host = apply_extensions(registry, home=home, project_dir=None, builtin_names=registry.registered_names)
+        host = await asyncio.to_thread(apply_extensions, registry, home=home, project_dir=None, builtin_names=registry.registered_names)
         events = []
         host.set_event_sink(events.append, asyncio.get_running_loop())
         # queued notices drain before the sink binding returns.
@@ -151,7 +156,8 @@ def activate(zx):
     home = tmp_path / "home"
     _write_extension(home / "extensions", "notify-ext", source=source)
     async with _open_registry(tmp_path) as registry:
-        host = apply_extensions(
+        host = await asyncio.to_thread(
+            apply_extensions,
             registry,
             home=home,
             project_dir=None,
@@ -175,13 +181,43 @@ def activate(zx):
 
 
 @pytest.mark.asyncio
+async def test_recovery_failure_reaches_real_tui_render_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    transaction = home / "extensions" / ".zeta-extension-store" / "update-bad"
+    transaction.mkdir(parents=True)
+    (transaction / "owner.json").write_text("{}", encoding="utf-8")
+    store = ConversationStore(tmp_path / "sessions")
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    host = await asyncio.to_thread(
+        apply_extensions, registry, home=home, project_dir=None,
+        builtin_names=registry.registered_names,
+    )
+    agent_loop = AgentLoop(FakeBackend([]), store, registry=registry, skill_catalog=SkillCatalog.empty())
+    app = TUIApp(
+        agent_loop, provider="codex", model="offline",
+        console=Console(file=StringIO(), force_terminal=False), extensions=host,
+    )
+    rendered: list[str] = []
+    # test-contract: seam the host drains into the real TUI event renderer
+    monkeypatch.setattr(app._presenter, "print_transient", lambda value: rendered.append(value.plain))
+    async with owned_app(app):
+        host.set_event_sink(app._handle_background_event_now, asyncio.get_running_loop())
+        await asyncio.sleep(0)
+        assert rendered == [
+            "extensions: extension loading disabled for user scope: update recovery requires attention"
+        ]
+
+
+@pytest.mark.asyncio
 async def test_api_version_mismatch_refused_with_notice(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_extension(
         home / "extensions", "future-ext", api_version=EXTENSION_API_VERSION + 1
     )
     async with _open_registry(tmp_path) as registry:
-        host = apply_extensions(
+        host = await asyncio.to_thread(apply_extensions,
             registry, home=home, project_dir=None,
             builtin_names=registry.registered_names,
         )
@@ -197,8 +233,8 @@ async def test_duplicate_names_keep_status_scoped(tmp_path: Path) -> None:
     _write_extension(home / "extensions", "same")
     _write_extension(project / ".zeta" / "extensions", "same", source="def activate(zx): raise RuntimeError('broken')\n")
     async with _open_registry(tmp_path) as registry:
-        host = apply_extensions(registry, home=home, project_dir=project, builtin_names=registry.registered_names)
-        trust_project_extensions(host)
+        host = await asyncio.to_thread(apply_extensions, registry, home=home, project_dir=project, builtin_names=registry.registered_names)
+        _trust_pending_for_test(host)
         rows = {(row["name"], row["scope"]): row for row in host.status_rows()}
         assert rows[("same", "user")]["loaded"] is True
         assert rows[("same", "user")]["error"] is None
@@ -209,7 +245,7 @@ async def test_duplicate_names_keep_status_scoped(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_notify_from_foreign_thread_after_loop_binding(tmp_path: Path) -> None:
     async with _open_registry(tmp_path) as registry:
-        host = apply_extensions(registry, home=tmp_path / "home", project_dir=None, builtin_names=registry.registered_names)
+        host = await asyncio.to_thread(apply_extensions, registry, home=tmp_path / "home", project_dir=None, builtin_names=registry.registered_names)
         events = []
         host.set_event_sink(events.append, asyncio.get_running_loop())
         thread = threading.Thread(target=host.notify, args=("thread-ext", "hello", "info"))
@@ -226,7 +262,7 @@ async def test_notify_from_foreign_thread_after_loop_binding(tmp_path: Path) -> 
 async def test_notify_flood_bounds_scheduled_callbacks(tmp_path: Path) -> None:
     async with _open_registry(tmp_path) as registry:
         clock = [0.0]
-        host = apply_extensions(
+        host = await asyncio.to_thread(apply_extensions,
             registry, home=tmp_path / "home", project_dir=None,
             builtin_names=registry.registered_names,
             clock=lambda: (clock.__setitem__(0, clock[0] + 0.006) or clock[0]),
@@ -254,14 +290,14 @@ async def test_project_extension_not_loaded_until_trusted(tmp_path: Path) -> Non
     _write_extension(project / ".zeta" / "extensions", "proj-ext")
     async with _open_registry(tmp_path) as registry:
         builtins = registry.registered_names
-        host = apply_extensions(
+        host = await asyncio.to_thread(apply_extensions,
             registry, home=home, project_dir=project, builtin_names=builtins
         )
         assert "ext_echo" not in registry.registered_names
         assert [p.manifest.name for p in host.pending_project] == ["proj-ext"]
         assert any("untrusted project extensions" in w for w in host.warnings)
 
-        trust_project_extensions(host)
+        _trust_pending_for_test(host)
         assert "ext_echo" in registry.registered_names
         assert host.pending_project == []
         assert [loaded.name for loaded in host.loaded] == ["proj-ext"]
@@ -283,10 +319,10 @@ def activate(zx):
     async with _open_registry(tmp_path) as registry:
         builtins = registry.registered_names
         assert "bash" in builtins
-        host = apply_extensions(
+        host = await asyncio.to_thread(apply_extensions,
             registry, home=home, project_dir=project, builtin_names=builtins
         )
-        trust_project_extensions(host)
+        _trust_pending_for_test(host)
 
         assert any("REJECTED" in n and "bash" in n for n in host.notices)
         assert "proj_only" in registry.registered_names
@@ -306,7 +342,7 @@ def activate(zx):
     home = tmp_path / "home"
     _write_extension(home / "extensions", "crashy", source=source)
     async with _open_registry(tmp_path) as registry:
-        host = apply_extensions(
+        host = await asyncio.to_thread(apply_extensions,
             registry, home=home, project_dir=None,
             builtin_names=registry.registered_names,
         )
@@ -321,7 +357,7 @@ async def test_disabled_extension_is_skipped(tmp_path: Path) -> None:
     home = tmp_path / "home"
     _write_extension(home / "extensions", "off-ext")
     async with _open_registry(tmp_path) as registry:
-        host = apply_extensions(
+        host = await asyncio.to_thread(apply_extensions,
             registry, home=home, project_dir=None,
             builtin_names=registry.registered_names, disabled=("off-ext",),
         )
@@ -366,7 +402,7 @@ def activate(zx):
     (source_dir / "ext_mod.py").write_text(entry_source, encoding="utf-8")
     (source_dir / "greeting.py").write_text('PREFIX = "hi, "\n', encoding="utf-8")
 
-    async with load_extension(source_dir, scope=USER_SCOPE) as kit:
+    async with await asyncio.to_thread(load_extension, source_dir, scope=USER_SCOPE) as kit:
         assert kit.host.notices == []
         assert "hello" in kit.registry.registered_names
         result = await kit.call_tool("hello", {"who": "zeta"})
@@ -381,7 +417,7 @@ async def test_extension_namespaces_follow_host_lifetime(tmp_path: Path) -> None
 
     before = package_names()
     success_dir = _write_extension(tmp_path / "success" / "extensions", "success")
-    async with load_extension(success_dir) as kit:
+    async with await asyncio.to_thread(load_extension, success_dir) as kit:
         assert kit.host.loaded
         assert package_names() != before
     assert package_names() == before
@@ -391,7 +427,7 @@ async def test_extension_namespaces_follow_host_lifetime(tmp_path: Path) -> None
         source="from . import helper\nraise RuntimeError('boom')\n",
     )
     (broken_dir / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
-    async with load_extension(broken_dir) as kit:
+    async with await asyncio.to_thread(load_extension, broken_dir) as kit:
         assert any("import failed" in notice for notice in kit.host.notices)
         assert package_names() == before
 
@@ -399,7 +435,7 @@ async def test_extension_namespaces_follow_host_lifetime(tmp_path: Path) -> None
         tmp_path / "crashing" / "extensions", "crashing",
         source="def activate(zx):\n    raise RuntimeError('boom')\n",
     )
-    async with load_extension(crashing_dir) as kit:
+    async with await asyncio.to_thread(load_extension, crashing_dir) as kit:
         assert any("activate raised" in notice for notice in kit.host.notices)
         assert package_names() == before
 
@@ -407,14 +443,14 @@ async def test_extension_namespaces_follow_host_lifetime(tmp_path: Path) -> None
         tmp_path / "async" / "extensions", "async",
         source="async def activate(zx):\n    return None\n",
     )
-    async with load_extension(async_dir) as kit:
+    async with await asyncio.to_thread(load_extension, async_dir) as kit:
         assert any("must be synchronous" in notice for notice in kit.host.notices)
         assert package_names() == before
 
     bad_dir = _write_extension(
         tmp_path / "bad" / "extensions", "bad", source="VALUE = 1\n"
     )
-    async with load_extension(bad_dir) as kit:
+    async with await asyncio.to_thread(load_extension, bad_dir) as kit:
         assert any("no callable" in notice for notice in kit.host.notices)
         assert package_names() == before
 
@@ -423,9 +459,9 @@ async def test_extension_namespaces_follow_host_lifetime(tmp_path: Path) -> None
         source="from . import helper\ndef activate(zx):\n    pass\n",
     )
     (repeated_dir / "helper.py").write_text("COUNT = 0\nCOUNT += 1\n", encoding="utf-8")
-    async with load_extension(repeated_dir) as _first:
+    async with await asyncio.to_thread(load_extension, repeated_dir) as _first:
         first_names = package_names() - before
-        async with load_extension(repeated_dir) as _second:
+        async with await asyncio.to_thread(load_extension, repeated_dir) as _second:
             second_names = package_names() - before - first_names
             assert first_names and second_names and first_names.isdisjoint(second_names)
     assert package_names() == before
@@ -438,7 +474,7 @@ async def test_invalid_utf8_manifest_fails_open(tmp_path: Path) -> None:
     (bad / "zeta-extension.toml").write_bytes(b"\xff")
     _write_extension(home / "extensions", "still-loads")
     async with _open_registry(tmp_path) as registry:
-        host = apply_extensions(
+        host = await asyncio.to_thread(apply_extensions,
             registry, home=home, project_dir=None,
             builtin_names=registry.registered_names,
         )
@@ -477,7 +513,7 @@ def activate(zx):
 """
     _write_extension(home / "extensions", "commands", source=source)
     async with _open_registry(tmp_path) as tools:
-        host = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names)
+        host = await asyncio.to_thread(apply_extensions, tools, home=home, project_dir=None, builtin_names=tools.registered_names)
         registry = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=host)
         class Session:
             slash_lock = SlashLock()
@@ -507,7 +543,7 @@ async def test_disabled_user_extension_keeps_user_scope(tmp_path: Path) -> None:
     (markers / "user-off").touch()
     (markers / "project-off").touch()
     async with _open_registry(tmp_path) as tools:
-        host = apply_extensions(
+        host = await asyncio.to_thread(apply_extensions,
             tools, home=home, project_dir=project, builtin_names=tools.registered_names,
             disabled=("settings-off",),
         )
@@ -616,10 +652,10 @@ async def test_concurrent_enable_is_idempotent(
     marker = markers / "shared"
     marker.touch()
     async with _open_registry(tmp_path) as tools:
-        host_a = apply_extensions(
+        host_a = await asyncio.to_thread(apply_extensions,
             tools, home=home, project_dir=None, builtin_names=tools.registered_names,
         )
-        host_b = apply_extensions(
+        host_b = await asyncio.to_thread(apply_extensions,
             tools, home=home, project_dir=None, builtin_names=tools.registered_names,
         )
         registry_a = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=host_a)
@@ -672,7 +708,7 @@ def activate(zx):
 '''
     _write_extension(home / "extensions", "commands", source=source)
     async with _open_registry(tmp_path) as tools:
-        host = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names)
+        host = await asyncio.to_thread(apply_extensions, tools, home=home, project_dir=None, builtin_names=tools.registered_names)
         tui = create_slash_registry(skill_catalog=SkillCatalog.empty(), extensions=host)
         serve = create_slash_registry(
             skill_catalog=SkillCatalog.empty(), surface=SlashSurface.SERVE, extensions=host
@@ -695,8 +731,8 @@ async def test_disabled_markers_keep_overlapping_hosts_changes(tmp_path: Path) -
     _write_extension(home / "extensions", "first")
     _write_extension(home / "extensions", "second")
     async with _open_registry(tmp_path) as tools:
-        host_a = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names)
-        host_b = apply_extensions(tools, home=home, project_dir=None, builtin_names=tools.registered_names)
+        host_a = await asyncio.to_thread(apply_extensions, tools, home=home, project_dir=None, builtin_names=tools.registered_names)
+        host_b = await asyncio.to_thread(apply_extensions, tools, home=home, project_dir=None, builtin_names=tools.registered_names)
         await asyncio.wait_for(asyncio.gather(
             asyncio.to_thread(host_a.persist_disabled, "first", False),
             asyncio.to_thread(host_b.persist_disabled, "second", False),

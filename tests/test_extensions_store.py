@@ -1,0 +1,782 @@
+"""ExtensionStore trust, publication, recovery, and concurrency behavior."""
+
+from __future__ import annotations
+
+import json
+import multiprocessing
+import os
+import shutil
+import subprocess
+from collections.abc import Iterator
+from contextlib import contextmanager
+from multiprocessing.connection import Connection
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+import zeta.extensions as extensions_package
+from tests.support.processes import (
+    reap_process,
+    recv_process_message,
+    run_with_captured_stderr,
+)
+from zeta.extensions.store import ExtensionStore, ExtensionTrustError, InstallResult
+
+
+def _extension(path: Path, name: str = "demo", marker: str = "old") -> Path:
+    path.mkdir(parents=True)
+    (path / "zeta-extension.toml").write_text(
+        f'[extension]\nname = "{name}"\nversion = "1"\napi_version = 1\nentry = "mod:activate"\n',
+        encoding="utf-8",
+    )
+    (path / "mod.py").write_text(f"# {marker}\ndef activate(zx):\n    pass\n", encoding="utf-8")
+    return path
+
+
+def _git_extension(path: Path, marker: str = "old") -> tuple[Path, str]:
+    _extension(path, marker=marker)
+    subprocess.run(["git", "init", "--quiet", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(path), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", marker],
+        check=True,
+    )
+    commit = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    return path, commit
+
+
+def _trust(home: Path) -> dict[str, str]:
+    path = home / "extensions-trust.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+class _Stop(RuntimeError):
+    pass
+
+
+class _CheckpointStore(ExtensionStore):
+    stop: str | None = None
+
+    def _checkpoint(self, name: str) -> None:
+        if name == self.stop:
+            raise _Stop(name)
+
+
+class _SecondAcquisitionFailureStore(ExtensionStore):
+    acquisitions = 0
+
+    def _checkpoint(self, name: str) -> None:
+        if name == "source_acquired":
+            self.acquisitions += 1
+            if self.acquisitions == 2:
+                raise _Stop(name)
+
+
+class _TrustPublicationFailureStore(ExtensionStore):
+    fail_after_replace = False
+
+    def _change_trust(
+        self, trust: dict[str, str], scope: str, name: str, digest: str | None,
+    ) -> None:
+        if not self.fail_after_replace:
+            raise ExtensionTrustError("injected trust publication failure")
+        super()._change_trust(trust, scope, name, digest)
+        raise ExtensionTrustError("injected trust publication failure")
+
+
+@pytest.mark.parametrize(
+    (
+        "case", "action", "starting_tree_digest", "starting_trust",
+        "confirmation", "checkpoint", "expected_result_or_exact_error",
+        "immediate_target_digest", "immediate_trust", "immediate_private_residue",
+        "post_restart_target_digest", "post_restart_trust", "post_restart_load",
+        "post_restart_private_residue",
+    ),
+    [
+        ("install-success", "install", None, None, "y", None, None, "new", "new", False, "new", "new", True, False),
+        ("install-cancel", "install", None, None, "n", None, "install cancelled", None, None, False, None, None, False, False),
+        ("install-target-published", "install", None, None, "y", "install_target_published", "install_target_published", "new", None, False, "new", None, True, False),
+        ("install-trust-published", "install", None, None, "y", "install_trust_published", "install_trust_published", "new", "new", False, "new", "new", True, False),
+        ("trust-success", "trust", "old", None, "y", None, None, "old", "old", False, "old", "old", True, False),
+        ("trust-cancel", "trust", "old", None, "n", None, "trust cancelled", "old", None, False, "old", None, True, False),
+        ("untrust-success", "untrust", "old", "old", "y", None, None, "old", None, False, "old", None, True, False),
+        ("remove-success", "remove", "old", "old", "y", None, None, None, None, False, None, None, False, False),
+        ("remove-idempotent", "remove-absent", None, None, "y", None, None, None, None, False, None, None, False, False),
+        ("install-duplicate", "install-duplicate", "old", "old", "y", None, None, "old", "old", False, "old", "old", True, False),
+        ("install-conflict", "install-conflict", "old", "old", "y", None, "extension already installed with different content: demo", "old", "old", False, "old", "old", True, False),
+        ("trust-stale", "trust-stale", "old", None, "y", None, "extension changed since review: demo", "tampered", None, False, "tampered", None, True, False),
+        ("invalid-name", "remove-invalid", None, None, "y", None, "invalid extension name: ../bad", None, None, False, None, None, False, False),
+        ("manifest-mismatch", "trust-mismatch", "mismatch", None, "y", None, "manifest name 'other' does not match folder 'demo'", "mismatch", None, False, "mismatch", None, False, False),
+        ("update-owner-published", "update", "old", "old", "y", "update_owner_published", "update_owner_published", "old", "old", True, "old", "old", True, False),
+        ("update-backup-published", "update", "old", "old", "y", "update_backup_published", "update_backup_published", None, "old", True, "old", "old", True, False),
+        ("update-target-published", "update", "old", "old", "y", "update_target_published", "update_target_published", "new", "old", True, "old", "old", True, False),
+        ("update-trust-published", "update", "old", "old", "y", "update_trust_published", "update_trust_published", "new", "new", True, "new", "new", True, False),
+        ("update-backup-cleanup", "update", "old", "old", "y", "update_backup_cleanup_progress", "update_backup_cleanup_progress", "new", "new", True, "new", "new", True, False),
+        ("update-backup-deleted", "update", "old", "old", "y", "update_backup_deleted", "update_backup_deleted", "new", "new", True, "new", "new", True, False),
+        ("update-owner-deleted", "update", "old", "old", "y", "update_owner_deleted", "update_owner_deleted", "new", "new", True, "new", "new", True, False),
+    ],
+)
+def test_public_action_outcomes(
+    tmp_path: Path,
+    case: str,
+    action: str,
+    starting_tree_digest: str | None,
+    starting_trust: str | None,
+    confirmation: str,
+    checkpoint: str | None,
+    expected_result_or_exact_error: str | None,
+    immediate_target_digest: str | None,
+    immediate_trust: str | None,
+    immediate_private_residue: bool,
+    post_restart_target_digest: str | None,
+    post_restart_trust: str | None,
+    post_restart_load: bool,
+    post_restart_private_residue: bool,
+) -> None:
+    home = tmp_path / case
+    repository: Path | None = None
+    source: str
+    if action == "update":
+        repository, _commit = _git_extension(tmp_path / f"source-{case}")
+        source = f"git+{repository}@HEAD"
+    else:
+        marker = "old" if action in {"install-duplicate", "install-conflict"} else "new"
+        source = str(_extension(tmp_path / f"source-{case}", marker=marker))
+    store = _CheckpointStore(home=home, project_dir=None)
+    digests: dict[str, str] = {}
+    if starting_tree_digest == "mismatch":
+        mismatch = _extension(home / "extensions" / "demo", name="other")
+        digests["mismatch"] = store._snapshot_existing(mismatch, mismatch.parent).digest
+    elif starting_tree_digest == "old":
+        initial = store.install(source, scope="user", accept=True)
+        digests["old"] = initial.digest
+        if repository is not None:
+            (repository / "mod.py").write_text("# new\ndef activate(zx):\n    pass\n")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "new"],
+                check=True,
+            )
+        if starting_trust is None:
+            store.untrust("demo", scope="user")
+    if action == "install-conflict":
+        (Path(source) / "mod.py").write_text("# new\ndef activate(zx):\n    pass\n")
+
+    def stale_confirmation(_prompt: str) -> str:
+        target = home / "extensions" / "demo" / "mod.py"
+        target.write_text("# tampered\ndef activate(zx):\n    pass\n")
+        return confirmation
+
+    store.stop = checkpoint
+    call = {
+        "install": lambda: store.install(source, scope="user", confirm=lambda _: confirmation),
+        "install-duplicate": lambda: store.install(source, scope="user", confirm=lambda _: confirmation),
+        "install-conflict": lambda: store.install(source, scope="user", confirm=lambda _: confirmation),
+        "update": lambda: store.update("demo", scope="user", confirm=lambda _: confirmation),
+        "trust": lambda: store.trust("demo", scope="user", confirm=lambda _: confirmation),
+        "trust-stale": lambda: store.trust("demo", scope="user", confirm=stale_confirmation),
+        "trust-mismatch": lambda: store.trust("demo", scope="user", confirm=lambda _: confirmation),
+        "untrust": lambda: store.untrust("demo", scope="user"),
+        "remove": lambda: store.remove("demo", scope="user"),
+        "remove-absent": lambda: store.remove("demo", scope="user"),
+        "remove-invalid": lambda: store.remove("../bad", scope="user"),
+    }[action]
+    if expected_result_or_exact_error:
+        expected = _Stop if checkpoint else ExtensionTrustError
+        with pytest.raises(expected, match=expected_result_or_exact_error):
+            call()
+    else:
+        result = call()
+        if isinstance(result, InstallResult):
+            digests["new" if action in {"install", "update"} else "old"] = result.digest
+
+    target = home / "extensions" / "demo"
+    if target.exists():
+        immediate = ExtensionStore(home=home, project_dir=None)._snapshot_existing(
+            target, target.parent,
+        ).digest
+        text = (target / "mod.py").read_text()
+        if "# tampered" in text:
+            marker = "tampered"
+        elif "# new" in text:
+            marker = "new"
+        else:
+            marker = "old"
+        digests.setdefault(marker, immediate)
+    else:
+        immediate = None
+    trust = _trust(home).get("user:demo")
+    assert immediate == (digests.get(immediate_target_digest) if immediate_target_digest else None)
+    assert trust == (digests.get(immediate_trust) if immediate_trust else None)
+    private = home / "extensions" / ".zeta-extension-store"
+    assert bool(list(private.glob("update-*"))) is immediate_private_residue
+
+    restarted = ExtensionStore(home=home, project_dir=None).discover("user")
+    target = home / "extensions" / "demo"
+    final = (
+        ExtensionStore(home=home, project_dir=None)._snapshot_existing(target, target.parent).digest
+        if target.exists() else None
+    )
+    final_trust = _trust(home).get("user:demo")
+    assert final == (digests.get(post_restart_target_digest) if post_restart_target_digest else None)
+    assert final_trust == (digests.get(post_restart_trust) if post_restart_trust else None)
+    assert bool(restarted.extensions) is post_restart_load
+    assert bool(list(private.glob("update-*"))) is post_restart_private_residue
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    ["stage_created", "source_acquired", "snapshot_verified", "review_accepted"],
+)
+def test_install_stage_failure_changes_no_durable_state(tmp_path: Path, checkpoint: str) -> None:
+    home = tmp_path / "home"
+    source = _extension(tmp_path / "source")
+    store = _CheckpointStore(home=home, project_dir=None)
+    store.stop = checkpoint
+    with pytest.raises(_Stop, match=checkpoint):
+        store.install(str(source), scope="user", accept=True)
+    assert not (home / "extensions" / "demo").exists()
+    assert _trust(home) == {}
+    assert not list((home / "extensions" / ".zeta-extension-store").glob("stage-*"))
+
+
+
+def test_update_current_snapshot_failure_cleans_new_snapshot(tmp_path: Path) -> None:
+    repository, _ = _git_extension(tmp_path / "repo")
+    home = tmp_path / "home"
+    source = f"git+{repository}@HEAD"
+    ExtensionStore(home=home, project_dir=None).install(source, scope="user", accept=True)
+    store = _SecondAcquisitionFailureStore(home=home, project_dir=None)
+    with pytest.raises(_Stop, match="source_acquired"):
+        store.update("demo", scope="user", accept=True)
+    assert not list((home / "extensions" / ".zeta-extension-store").glob("stage-*"))
+
+
+def test_install_uses_reviewed_stage_without_reopening_source(tmp_path: Path) -> None:
+    source = _extension(tmp_path / "source", marker="reviewed")
+    home = tmp_path / "home"
+
+    reviewed_inode: list[int] = []
+
+    def confirm(_: str) -> str:
+        stages = list((home / "extensions" / ".zeta-extension-store").glob("stage-*/tree"))
+        assert len(stages) == 1
+        reviewed_inode.append(stages[0].stat().st_ino)
+        shutil.rmtree(source)
+        return "y"
+
+    result = ExtensionStore(home=home, project_dir=None).install(str(source), scope="user", confirm=confirm)
+    target = home / "extensions" / "demo"
+    assert "reviewed" in (target / "mod.py").read_text()
+    assert target.stat().st_ino == reviewed_inode[0]
+    assert _trust(home)["user:demo"] == result.digest
+
+
+def test_install_pending_retry_requires_identical_fresh_review(tmp_path: Path) -> None:
+    source = _extension(tmp_path / "source")
+    home = tmp_path / "home"
+    broken = _CheckpointStore(home=home, project_dir=None)
+    broken.stop = "install_target_published"
+    with pytest.raises(_Stop):
+        broken.install(str(source), scope="user", accept=True)
+    store = ExtensionStore(home=home, project_dir=tmp_path / "project")
+    pending = ExtensionStore(home=home, project_dir=None).discover("user")
+    assert pending.extensions and not pending.extensions[0].trusted
+    result = store.install(str(source), scope="user", accept=True)
+    assert _trust(home)["user:demo"] == result.digest
+    (source / "mod.py").write_text("# conflict\n", encoding="utf-8")
+    with pytest.raises(ExtensionTrustError, match="extension already installed with different content: demo"):
+        store.install(str(source), scope="user", accept=True)
+    assert _trust(home)["user:demo"] == result.digest
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "update_owner_published",
+        "update_backup_published",
+        "update_target_published",
+        "update_trust_published",
+        "update_backup_cleanup_progress",
+        "update_backup_deleted",
+        "update_owner_deleted",
+    ],
+)
+def test_update_recovery_converges_at_every_checkpoint(tmp_path: Path, checkpoint: str) -> None:
+    repository, _ = _git_extension(tmp_path / "repo")
+    source = f"git+{repository}@HEAD"
+    home = tmp_path / checkpoint
+    store = _CheckpointStore(home=home, project_dir=None)
+    old = store.install(source, scope="user", accept=True)
+    (repository / "mod.py").write_text("# new\ndef activate(zx):\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "new"], check=True)
+    store.stop = checkpoint
+    with pytest.raises(_Stop):
+        store.update("demo", scope="user", accept=True)
+    recovered = ExtensionStore(home=home, project_dir=None).discover("user")
+    assert len(recovered.extensions) == 1
+    item = recovered.extensions[0]
+    assert item.trusted
+    if checkpoint in {"update_owner_published", "update_backup_published", "update_target_published"}:
+        assert item.digest == old.digest
+    else:
+        assert item.digest != old.digest
+    assert not list((home / "extensions" / ".zeta-extension-store").glob("update-*"))
+
+
+
+
+def test_rollback_tree_cleanup_resumes_without_hashing_partial_tree(tmp_path: Path) -> None:
+    repository, _ = _git_extension(tmp_path / "repo")
+    source = f"git+{repository}@HEAD"
+    home = tmp_path / "home"
+    store = _CheckpointStore(home=home, project_dir=None)
+    old = store.install(source, scope="user", accept=True)
+    (repository / "mod.py").write_text("# new\ndef activate(zx):\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "new"], check=True)
+    store.stop = "update_target_published"
+    with pytest.raises(_Stop):
+        store.update("demo", scope="user", accept=True)
+    recovery = _CheckpointStore(home=home, project_dir=None)
+    recovery.stop = "update_tree_cleanup_progress"
+    with pytest.raises(_Stop):
+        recovery.discover("user")
+    result = ExtensionStore(home=home, project_dir=None).discover("user")
+    assert result.extensions[0].digest == old.digest
+    assert result.extensions[0].trusted
+    assert not list((home / "extensions" / ".zeta-extension-store").glob("update-*"))
+
+
+def test_update_duplicate_skips_review_and_stale_review_is_rejected(tmp_path: Path) -> None:
+    repository, _ = _git_extension(tmp_path / "repo")
+    source = f"git+{repository}@HEAD"
+    home = tmp_path / "home"
+    store = ExtensionStore(home=home, project_dir=None)
+    installed = store.install(source, scope="user", accept=True)
+    duplicate = store.update(
+        "demo", scope="user", confirm=lambda _: pytest.fail("duplicate rendered review")
+    )
+    assert duplicate.digest == installed.digest
+    (repository / "mod.py").write_text("# update\ndef activate(zx):\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "update"], check=True)
+
+    def replace_target(_: str) -> str:
+        (home / "extensions" / "demo" / "mod.py").write_text("# competing\n", encoding="utf-8")
+        return "y"
+
+    with pytest.raises(ExtensionTrustError, match="extension changed since review: demo"):
+        store.update("demo", scope="user", confirm=replace_target)
+    assert (home / "extensions" / "demo" / "mod.py").read_text() == "# competing\n"
+
+
+@pytest.mark.parametrize("checkpoint", ["remove_hidden", "remove_trust_published"])
+def test_remove_stop_is_hidden_and_repeat_cleans_residue(tmp_path: Path, checkpoint: str) -> None:
+    home = tmp_path / "home"
+    source = _extension(tmp_path / "source")
+    store = _CheckpointStore(home=home, project_dir=None)
+    store.install(str(source), scope="user", accept=True)
+    store.stop = checkpoint
+    with pytest.raises(_Stop, match=checkpoint):
+        store.remove("demo", scope="user")
+    assert not (home / "extensions" / "demo").exists()
+    store.stop = None
+    store.remove("demo", scope="user")
+    assert "user:demo" not in _trust(home)
+    assert not list((home / "extensions" / ".zeta-extension-store").glob("remove-*"))
+
+
+@pytest.mark.parametrize("fail_after_replace", [False, True])
+def test_update_recovers_trust_publication_failure(
+    tmp_path: Path, fail_after_replace: bool,
+) -> None:
+    home = tmp_path / "home"
+    repository, _commit = _git_extension(tmp_path / "repo")
+    store = ExtensionStore(home=home, project_dir=None)
+    old = store.install(f"git+{repository}@HEAD", scope="user", accept=True)
+    (repository / "mod.py").write_text("# new\ndef activate(zx):\n    pass\n")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "update"],
+        check=True,
+    )
+    broken = _TrustPublicationFailureStore(home=home, project_dir=None)
+    broken.fail_after_replace = fail_after_replace
+
+    if fail_after_replace:
+        broken.update("demo", scope="user", accept=True)
+    else:
+        with pytest.raises(ExtensionTrustError, match="injected trust publication failure"):
+            broken.update("demo", scope="user", accept=True)
+
+    recovered = ExtensionStore(home=home, project_dir=None).discover("user")
+    assert len(recovered.extensions) == 1
+    final = recovered.extensions[0]
+    if fail_after_replace:
+        assert final.digest != old.digest
+    else:
+        assert final.digest == old.digest
+    assert final.trusted
+    assert not list((home / "extensions" / ".zeta-extension-store").glob("update-*"))
+
+
+@pytest.mark.parametrize(
+    "owner_text",
+    [
+        "{}",
+        '{"version":2}',
+        '{"version":1,"scope":"user","name":"../bad"}',
+        '{"version":1,"scope":"user","name":"demo","old_digest":1}',
+        '{"version":1,"version":1}',
+    ],
+)
+def test_malformed_update_suppresses_only_affected_scope(
+    tmp_path: Path, owner_text: str,
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    store = ExtensionStore(home=home, project_dir=project)
+    store.install(str(_extension(tmp_path / "user-source", name="user-good")), scope="user", accept=True)
+    store.install(str(_extension(tmp_path / "project-source", name="project-good")), scope="project", accept=True)
+    bad = home / "extensions" / ".zeta-extension-store" / "update-bad"
+    bad.mkdir()
+    shutil.copytree(home / "extensions" / "user-good", bad / "tree")
+    shutil.copytree(home / "extensions" / "user-good", bad / "backup")
+    (bad / "owner.json").write_text(owner_text)
+    before = sorted(str(path.relative_to(home)) for path in home.rglob("*"))
+    user = store.discover("user")
+    project_result = store.discover("project")
+    assert user.extensions == ()
+    assert user.notices == ("extension loading disabled for user scope: update recovery requires attention",)
+    assert [item.name for item in project_result.extensions] == ["project-good"]
+    assert sorted(str(path.relative_to(home)) for path in home.rglob("*")) == before
+
+
+@pytest.mark.parametrize("nonempty", [False, True])
+def test_ownerless_update_recovery_is_conservative(
+    tmp_path: Path, nonempty: bool,
+) -> None:
+    home = tmp_path / "home"
+    store = ExtensionStore(home=home, project_dir=None)
+    store.install(str(_extension(tmp_path / "source")), scope="user", accept=True)
+    transaction = home / "extensions" / ".zeta-extension-store" / "update-ownerless"
+    transaction.mkdir()
+    if nonempty:
+        (transaction / "unknown").write_text("preserve")
+
+    result = store.discover("user")
+
+    if nonempty:
+        assert result.extensions == ()
+        assert result.notices == (
+            "extension loading disabled for user scope: update recovery requires attention",
+        )
+        assert transaction.exists()
+    else:
+        assert [item.name for item in result.extensions] == ["demo"]
+        assert result.notices == ()
+        assert not transaction.exists()
+
+
+def _lock_holder(home: str, entered: Any, release: Any) -> None:
+    store = ExtensionStore(home=Path(home), project_dir=None)
+    with store._locked():
+        entered.set()
+        if not release.wait(10):
+            raise RuntimeError("parent did not release held extension lock")
+
+
+class _WaitingStore(ExtensionStore):
+    def __init__(self, *, connection: Connection, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.connection = connection
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        self.connection.send("locking")
+        with super()._locked():
+            self.connection.send("locked")
+            yield
+
+
+def _waiting_writer(home: str, source: str, connection: Connection) -> None:
+    store = _WaitingStore(home=Path(home), project_dir=None, connection=connection)
+    try:
+        assert recv_process_message(connection, what="start") == "start"
+        store.install(source, scope="user", accept=True)
+    finally:
+        connection.close()
+
+
+def _writer(home: str, source: str, connection: Connection) -> None:
+    store = ExtensionStore(home=Path(home), project_dir=None)
+    try:
+        connection.send("ready")
+        assert recv_process_message(connection, what="start") == "start"
+        store.install(source, scope="user", accept=True)
+    finally:
+        connection.close()
+
+
+def _exit_before_message(connection: Connection) -> None:
+    connection.close()
+    os.write(2, b"early child stderr\n")
+    os._exit(73)
+
+
+class _ExitStore(ExtensionStore):
+    stop = ""
+
+    def _checkpoint(self, name: str) -> None:
+        if name == self.stop:
+            os._exit(91)
+
+
+def _crash_update(home: str, checkpoint: str) -> None:
+    store = _ExitStore(home=Path(home), project_dir=None)
+    store.stop = checkpoint
+    store.update("demo", scope="user", accept=True)
+
+
+def test_two_process_writers_preserve_both_trust_keys(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    first = _extension(tmp_path / "first", name="first")
+    second = _extension(tmp_path / "second", name="second")
+    context = multiprocessing.get_context("spawn")
+    connections = [context.Pipe() for _ in range(2)]
+    stderr_paths = [tmp_path / f"writer-{index}.stderr" for index in range(2)]
+    processes = [
+        context.Process(
+            target=run_with_captured_stderr,
+            args=(str(stderr_path), _writer, (str(home), str(source), child)),
+        )
+        for source, (_parent, child), stderr_path in zip(
+            (first, second), connections, stderr_paths, strict=True,
+        )
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for index, (parent, child) in enumerate(connections):
+            child.close()
+            assert recv_process_message(
+                parent,
+                process=processes[index],
+                stderr_path=stderr_paths[index],
+                what="ready",
+            ) == "ready"
+        for parent, _child in connections:
+            parent.send("start")
+        for process in processes:
+            process.join(20)
+            assert process.exitcode == 0
+    finally:
+        for process in processes:
+            reap_process(process, timeout=10)
+            try:
+                process.close()
+            except ValueError:
+                pass
+        for pair in connections:
+            for connection in pair:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+    assert set(_trust(home)) == {"user:first", "user:second"}
+
+
+def test_process_receive_reports_early_exit_and_stderr(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    parent, child = context.Pipe(duplex=False)
+    stderr_path = tmp_path / "early.stderr"
+    process = context.Process(
+        target=run_with_captured_stderr,
+        args=(str(stderr_path), _exit_before_message, (child,)),
+    )
+    process.start()
+    child.close()
+
+    with pytest.raises(
+        AssertionError,
+        match="child closed its pipe; exit code 73; captured stderr: early child stderr",
+    ):
+        recv_process_message(
+            parent,
+            process=process,
+            stderr_path=stderr_path,
+            what="ready",
+        )
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "update_owner_published",
+        "update_backup_published",
+        "update_target_published",
+        "update_trust_published",
+        "update_backup_cleanup_progress",
+        "update_backup_deleted",
+        "update_owner_deleted",
+    ],
+)
+def test_real_process_stop_recovers_update(tmp_path: Path, checkpoint: str) -> None:
+    repository, _ = _git_extension(tmp_path / "repo")
+    source = f"git+{repository}@HEAD"
+    home = tmp_path / "home"
+    old = ExtensionStore(home=home, project_dir=None).install(source, scope="user", accept=True)
+    (repository / "mod.py").write_text("# new\ndef activate(zx):\n    pass\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "new"], check=True)
+    process = multiprocessing.get_context("spawn").Process(target=_crash_update, args=(str(home), checkpoint))
+    process.start()
+    process.join(20)
+    assert process.exitcode == 91
+    process.close()
+    result = ExtensionStore(home=home, project_dir=None).discover("user")
+    assert len(result.extensions) == 1 and result.extensions[0].trusted
+    expected_old = checkpoint in {"update_owner_published", "update_backup_published", "update_target_published"}
+    assert (result.extensions[0].digest == old.digest) is expected_old
+    assert not list((home / "extensions" / ".zeta-extension-store").glob("update-*"))
+
+
+def test_git_metadata_is_reviewed_and_in_digest(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repository, commit = _git_extension(tmp_path / "repo")
+    home = tmp_path / "home"
+    seen: list[str] = []
+    result = ExtensionStore(home=home, project_dir=None).install(
+        f"git+{repository}@HEAD",
+        scope="user",
+        confirm=lambda prompt: seen.append(prompt) or "y",
+    )
+    reviewed = capsys.readouterr().out
+    metadata = json.loads((home / "extensions" / "demo" / ".zeta-extension-git.json").read_text())
+    assert metadata == {"commit": commit, "source": f"git+{repository}@HEAD"}
+    assert ".zeta-extension-git.json" in reviewed
+    assert ".git/" not in reviewed
+    assert seen == ["install this extension? [y/N] "]
+    assert _trust(home)["user:demo"] == result.digest
+
+
+
+def test_real_process_writer_waits_for_held_store_lock(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    source = _extension(tmp_path / "source", name="waiter")
+    context = multiprocessing.get_context("spawn")
+    entered = context.Event()
+    release = context.Event()
+    holder = context.Process(target=_lock_holder, args=(str(home), entered, release))
+    parent, child = context.Pipe()
+    stderr_path = tmp_path / "waiter.stderr"
+    waiter = context.Process(
+        target=run_with_captured_stderr,
+        args=(str(stderr_path), _waiting_writer, (str(home), str(source), child)),
+    )
+    try:
+        holder.start()
+        assert entered.wait(10)
+        waiter.start()
+        child.close()
+        parent.send("start")
+        assert recv_process_message(
+            parent,
+            process=waiter,
+            stderr_path=stderr_path,
+            what="locking",
+        ) == "locking"
+        assert not parent.poll(0.2), "writer entered the store while another process held its lock"
+        release.set()
+        assert recv_process_message(
+            parent,
+            process=waiter,
+            stderr_path=stderr_path,
+            what="locked",
+        ) == "locked"
+        for process in (holder, waiter):
+            process.join(20)
+            assert process.exitcode == 0
+    finally:
+        release.set()
+        parent.close()
+        try:
+            child.close()
+        except OSError:
+            pass
+        for process in (holder, waiter):
+            reap_process(process, timeout=10)
+            try:
+                process.close()
+            except ValueError:
+                pass
+    assert set(_trust(home)) == {"user:waiter"}
+    assert (home / "extensions" / "waiter").is_dir()
+
+
+def test_malformed_trust_fails_closed_for_project_but_user_loads(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _extension(home / "extensions" / "user", name="user")
+    _extension(project / ".zeta" / "extensions" / "project", name="project")
+    home.mkdir(exist_ok=True)
+    (home / "extensions-trust.json").write_text('{"x":"y","x":"z"}')
+    store = ExtensionStore(home=home, project_dir=project)
+    user = store.discover("user")
+    project_result = store.discover("project")
+    assert [item.name for item in user.extensions] == ["user"]
+    assert not user.extensions[0].trusted
+    assert project_result.extensions and not project_result.extensions[0].trusted
+    assert "invalid extension trust file" in user.notices[0]
+
+
+
+def test_anonymous_stage_is_ignored_and_never_loaded(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    staged = home / "extensions" / ".zeta-extension-store" / ("stage-" + "a" * 32) / "tree"
+    _extension(staged)
+    before = sorted(path.relative_to(staged) for path in staged.rglob("*"))
+    result = ExtensionStore(home=home, project_dir=None).discover("user")
+    assert result.extensions == ()
+    assert staged.is_dir()
+    assert sorted(path.relative_to(staged) for path in staged.rglob("*")) == before
+
+
+
+def test_trust_rejects_target_changed_during_confirmation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    source = _extension(tmp_path / "source")
+    store = ExtensionStore(home=home, project_dir=project)
+    store.install(str(source), scope="project", accept=True)
+    store.untrust("demo", scope="project")
+
+    def mutate_during_review(_review: str) -> str:
+        (project / ".zeta" / "extensions" / "demo" / "mod.py").write_text("VALUE = 2\n")
+        return "y"
+
+    with pytest.raises(
+        ExtensionTrustError,
+        match="extension changed since review: demo",
+    ):
+        store.trust("demo", scope="project", confirm=mutate_during_review)
+    assert not store.discover("project").extensions[0].trusted
+
+
+def test_extension_store_is_the_only_management_route() -> None:
+    package = Path(extensions_package.__file__).parent
+    assert not (package / "trust.py").exists()
+    assert not (package / "paths.py").exists()
+    assert not hasattr(extensions_package, "trust_project_extensions")
+
+
+def test_event_loop_call_is_rejected_before_lock(tmp_path: Path) -> None:
+    import asyncio
+
+    async def call() -> None:
+        with pytest.raises(ExtensionTrustError, match="event-loop"):
+            ExtensionStore(home=tmp_path / "home", project_dir=None).discover("user")
+
+    asyncio.run(call())
