@@ -182,6 +182,24 @@ def test_shutdown_is_synchronous_and_export_failure_is_not_logged(monkeypatch: p
         assert (app_logger.disabled, app_logger.propagate, app_logger.level, list(app_logger.handlers)) == old_state
 
 
+def test_exporter_module_loggers_never_reach_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    # a stopped collector makes these module loggers warn; with no handler found,
+    # logging falls back to lastResort and prints the retry text onto the TUI or serve stderr
+    from opentelemetry.exporter.otlp.proto.http import _common, trace_exporter
+
+    records: list[logging.LogRecord] = []
+    last_resort = logging.Handler()
+    last_resort.emit = records.append
+    monkeypatch.setattr(logging, "lastResort", last_resort)
+    instance = telemetry.Telemetry.configure("http://127.0.0.1:4318/v1/traces")
+    try:
+        trace_exporter._logger.warning("Transient error encountered while exporting spans batch")
+        _common._logger.warning("Transient error encountered while exporting spans batch")
+        assert not records, "exporter module warnings fell through to logging.lastResort"
+    finally:
+        instance.shutdown()
+
+
 def test_loopback_and_one_slot() -> None:
     from zeta.telemetry.runtime import StatusCell, validate_loopback_endpoint
 
