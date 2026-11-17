@@ -91,7 +91,7 @@ _RAW_PUBLICATION = {
 }
 
 _RAW_DELETION = {
-    ("extensions/store.py", "_remove_tree", "unlink"),
+    ("extensions/store.py", "_remove_tree_entries", "unlink"),
     ("extensions/store.py", "_finish_owner", "unlink"),
     ("accounts/logout.py", "_remove_directory_files", "unlink"),
     ("accounts/publication.py", "atomic_publish", "unlink"),
