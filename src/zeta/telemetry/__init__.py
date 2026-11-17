@@ -68,6 +68,11 @@ class SpanHandle:
         if self._implementation is not None:
             self._implementation.set_sizes(argument_bytes=argument_bytes, result_bytes=result_bytes)
 
+    def set_mcp_request(self, *, request_id: int, protocol_version: str | None) -> None:
+        """Record the JSON-RPC id and negotiated protocol of one outgoing MCP request."""
+        if self._implementation is not None:
+            self._implementation.set_mcp_request(request_id=request_id, protocol_version=protocol_version)
+
     def fail(self, exc: BaseException | type[BaseException] | None) -> None:
         """Mark the span failed; ``None`` is a failure with no exception (error.type ``_OTHER``)."""
         if self._implementation is not None:
@@ -178,6 +183,15 @@ class Telemetry:
             "zeta.emergency": emergency, "zeta.tokens.before": tokens_before,
             "zeta.tokens.after": tokens_after, "zeta.marker.count": marker_count,
         })
+
+    def mcp_span(self, method: str, *, server: str, target: str | None = None) -> SpanHandle:
+        """One caller's MCP request: enriches the current ``execute_tool`` span, else one ``CLIENT`` span.
+
+        ``target`` is the tool or prompt name; resource URIs are content and are never passed.
+        """
+        if self._implementation is None:
+            return _NOOP
+        return self._implementation.mcp_span(method, server=server, target=target)
 
     def _span(self, name: str, *, kind: str = "internal", operation: str, attributes: Mapping[str, object] | None = None) -> SpanHandle:
         return self._implementation._span(name, kind=kind, operation=operation, attributes=attributes)

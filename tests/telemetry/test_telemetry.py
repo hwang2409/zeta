@@ -267,6 +267,7 @@ _VALID: dict[str, object] = {
     "marker_count": 1, "input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "attempt": 1,
     "reason": "stream_error", "delay": 2, "after": False, "decision": "allow", "scope": "once", "duration": 4,
     "finish_reason": "end_turn", "argument_bytes": 5, "result_bytes": 6,
+    "method": "tools/call", "server": "fake", "target": "echo", "request_id": 7, "protocol_version": "2025-06-18",
 }
 _RESERVED = (
     "gen_ai.input.messages", "gen_ai.output.messages", "gen_ai.system_instructions",
@@ -286,8 +287,8 @@ _ADVERSARIAL = {
     "overlong": "x" * 300,
     "unicode": "unicode-\u2603",
 }
-_HELPERS = ("agent_span", "turn_span", "inference_span", "tool_span", "context_span")
-_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "fail")
+_HELPERS = ("agent_span", "turn_span", "inference_span", "tool_span", "context_span", "mcp_span")
+_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "set_mcp_request", "fail")
 # where a shape-accepted value may appear: "<name>" is the span name.
 _SHAPE_FIELDS = {
     ("agent_span", "profile"): {"<name>"},
@@ -297,6 +298,8 @@ _SHAPE_FIELDS = {
     ("tool_span", "name"): {"<name>", "zeta.tool.name"},
     ("tool_span", "agent_name"): {"zeta.agent.name"},
     ("set_response", "model"): {"gen_ai.response.model"},
+    ("mcp_span", "server"): {"zeta.mcp.server.name"},
+    ("mcp_span", "target"): {"<name>", "gen_ai.tool.name"},
 }
 
 
@@ -440,12 +443,14 @@ def _source_finish_reasons() -> set[str]:
 
 def _source_closed_sets() -> dict[str, set[str]]:
     from zeta.core.approval import ApprovalDecision as CoreDecision
+    from zeta.mcp.client import CALLER_METHODS
     from zeta.server.protocol import APPROVAL_SCOPES
     from zeta.server.protocol import ApprovalDecision as ServeDecision
 
     return {
         "reason": _source_retry_reasons(), "finish_reason": _source_finish_reasons(),
         "decision": {*CoreDecision, *ServeDecision}, "scope": set(APPROVAL_SCOPES),
+        "method": set(CALLER_METHODS),
     }
 
 
@@ -455,6 +460,7 @@ def test_closed_set_mirrors_equal_their_sources() -> None:
     mirrors = {
         "reason": runtime._RETRY_REASONS, "finish_reason": runtime._FINISH_REASONS,
         "decision": runtime._APPROVAL_DECISIONS, "scope": runtime._APPROVAL_SCOPES,
+        "method": runtime._MCP_METHODS,
     }
     assert {name: set(values) for name, values in mirrors.items()} == _source_closed_sets()
 
@@ -476,6 +482,7 @@ def _real_values() -> list:
         "finish_reason": ("set_response", "gen_ai.response.finish_reasons"),
         "decision": ("approval_resolved", "zeta.approval.resolved.decision"),
         "scope": ("approval_requested", "zeta.approval.requested.scope"),
+        "method": ("mcp_span", "mcp.method.name"),
     }
     cases = [(location[field][0], field, value, location[field][1]) for field, values in _source_closed_sets().items() for value in sorted(values)]
     models = {model for models in PROVIDER_MODELS.values() for model in models} | {"locally-created-model", "qwen3:4b", "hf.co/user/model:Q4_K_M"}
@@ -484,6 +491,9 @@ def _real_values() -> list:
     cases += [("tool_span", "name", name, "zeta.tool.name") for name in ("bash", "web_search", "filesystem__read_file")]
     cases += [("tool_span", "tool_type", kind, "zeta.tool.type") for kind in ("function", "computer", "mcp", "agent")]
     cases += [("agent_span", "agent_name", name, "zeta.agent.name") for name in ("worker", "ux-tester")]
+    cases += [("mcp_span", "server", name, "zeta.mcp.server.name") for name in ("fake", "github-mcp", "docs.internal")]
+    cases += [("mcp_span", "target", name, "gen_ai.tool.name") for name in ("echo", "get_issue", "search-docs")]
+    cases += [("set_mcp_request", "protocol_version", version, "mcp.protocol.version") for version in ("2025-06-18", "2025-11-25")]
     cases += [("turn_span", "conversation_id", conversation, "gen_ai.conversation.id") for conversation in (_SESSION, f"{_SESSION}:1", f"{_SESSION}:12:3")]
     call_ids = ("toolu_01A09q90qw90lq917835lq9", "call_abc123XYZ", "fc_68a1b2c3d4e5", "ollama-01234567-89ab-cdef-0123-456789abcdef", "inline-0123456789abcdef0123456789abcdef")
     cases += [("tool_span", "call_id", call_id, "zeta.tool.call.id") for call_id in call_ids]
