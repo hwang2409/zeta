@@ -1,19 +1,9 @@
-"""The provider-neutral ``computer`` tool: native desktop capture and input.
-
-Opt-in: not registered unless ``[computer] enabled = true`` in settings. One
-``ComputerBackend`` is the seam to the OS; tests inject a ``FakeBackend`` on
-``registry.computer_backend``. There is no real backend yet (slice 2), so an
-enabled tool with no backend returns a clear error. Actions that change the
-screen return a fresh screenshot. Each screenshot is downscaled to a
-model-friendly size and its geometry recorded, so model coordinates map back to
-global display points through ``scaling``.
-"""
+"""provider-neutral native desktop computer tool."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
@@ -21,7 +11,7 @@ from ...media.image_normalization import normalize_image_bytes
 from ...protocol.types import StructuredToolResult
 from .._results import _error_result, text_block
 from ..registry import ToolRegistry
-from .backend import ComputerBackend, ComputerError
+from .backend import ComputerBackend, ComputerError, ScreenState
 from .scaling import (
     OutOfBounds,
     ScreenGeometry,
@@ -30,57 +20,26 @@ from .scaling import (
     to_model_point,
 )
 
-# action -> (button, click count)
-_CLICK_ACTIONS: dict[str, tuple[str, int]] = {
-    "left_click": ("left", 1),
-    "right_click": ("right", 1),
-    "middle_click": ("middle", 1),
-    "double_click": ("left", 2),
-    "triple_click": ("left", 3),
-}
-# scroll direction -> unit (dx, dy); multiplied by scroll_amount
-_SCROLL_UNIT: dict[str, tuple[int, int]] = {
-    "up": (0, -1),
-    "down": (0, 1),
-    "left": (-1, 0),
-    "right": (1, 0),
-}
-_ACTIONS = (
-    "screenshot", *(_CLICK_ACTIONS), "mouse_move", "left_click_drag",
-    "left_mouse_down", "left_mouse_up", "type", "key", "scroll",
-    "cursor_position", "wait",
-)
-# backend error code -> human reason for the per-action failure message.
-_REFUSAL_REASON: dict[str, str] = {
-    "locked": "the screen is locked",
-    "secure_input": "a password field or secure input is active",
-    "killed": "the kill switch is engaged; restart the helper to re-enable control",
-}
+_CLICK_ACTIONS = {"left_click": ("left", 1), "right_click": ("right", 1), "middle_click": ("middle", 1), "double_click": ("left", 2), "triple_click": ("left", 3)}
+_SCROLL_UNIT = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
+_REFUSAL_REASON = {"locked": "the screen is locked", "secure_input": "a password field or secure input is active", "killed": "the kill switch is engaged; restart the helper to re-enable control"}
 
 
 class _GuardError(ComputerError):
-    def __init__(self, code: str, message: str, state: Any) -> None:
+    def __init__(self, code: str, message: str, state: ScreenState) -> None:
         super().__init__(code, message)
         self.state = state
 
 
 class _BadAction(ValueError):
-    """Action-specific arguments were missing or malformed."""
+    pass
 
 
-def _point(
-    geometry: ScreenGeometry | None,
-    arguments: dict[str, Any],
-    field: str = "coordinate",
-) -> tuple[int, int]:
+def _point(geometry: ScreenGeometry | None, args: dict[str, Any], field: str = "coordinate") -> tuple[int, int]:
     if geometry is None:
         raise _BadAction("take a screenshot first")
-    value = arguments.get(field)
-    if (
-        not isinstance(value, list)
-        or len(value) != 2
-        or not all(type(component) is int for component in value)
-    ):
+    value = args.get(field)
+    if not isinstance(value, list) or len(value) != 2 or not all(type(v) is int for v in value):
         raise _BadAction(f"{field} must be an [x, y] integer pair")
     try:
         return to_backend_point(geometry, value[0], value[1])
@@ -93,194 +52,119 @@ def app_access(registry: ToolRegistry, bundle_id: str | None) -> bool:
     return config.bundle_ids.get(bundle_id or "", config.default_app_access) == "allow"
 
 
-def _state_content(action: str, state: Any, *, control: str, has_screenshot: bool) -> dict[str, Any]:
-    return {"computer": {"action": action, "control": control, "kill_switch": "ctrl+opt+cmd+esc", "frontmost_bundle_id": state.frontmost_bundle_id if state else None, "has_screenshot": has_screenshot}}
+def _state(action: str, state: ScreenState | None, control: str, screenshot: bool) -> dict[str, Any]:
+    return {"computer": {"action": action, "control": control, "kill_switch": "ctrl+opt+cmd+esc", "frontmost_bundle_id": state.frontmost_bundle_id if state else None, "has_screenshot": screenshot}}
 
 
-async def _guard(registry: ToolRegistry, backend: ComputerBackend, action: str) -> Any:
+def computer_result(action: str, *, state: ScreenState | None, control: str, content: list[dict[str, Any]], error: bool, screenshot: bool = False) -> StructuredToolResult:
+    return {"content": content, "isError": error, "structuredContent": _state(action, state, control, screenshot)}
+
+
+async def _guard(registry: ToolRegistry, backend: ComputerBackend) -> ScreenState:
     state = await backend.state()
     if state.locked:
-        raise _GuardError("locked", "the screen is locked", state)
+        raise _GuardError("locked", _REFUSAL_REASON["locked"], state)
     if state.secure_input:
-        raise _GuardError("secure_input", "a password field or secure input is active", state)
+        raise _GuardError("secure_input", _REFUSAL_REASON["secure_input"], state)
     if not app_access(registry, state.frontmost_bundle_id):
         bundle = state.frontmost_bundle_id or "<unknown>"
-        raise _GuardError("not_allowed", f'frontmost app {bundle!r} is not allowed; add [computer.macos.bundle_ids]\n"{bundle}" = "allow"', state)
+        raise _GuardError("not_allowed", f'frontmost app {bundle!r} is not allowed; add [computer.apps] "{bundle}" = "allow"', state)
     return state
 
 
-async def _screenshot(
-    registry: ToolRegistry, backend: ComputerBackend, display: int | None, action: str = "screenshot"
-) -> StructuredToolResult:
-    state = await _guard(registry, backend, action)
+async def _capture(registry: ToolRegistry, backend: ComputerBackend, display: int | None) -> tuple[dict[str, Any], ScreenState]:
+    state = await _guard(registry, backend)
     frame = await backend.screenshot(display)
-    # Downscale to the WXGA box so the model always sees one small coordinate
-    # space; the provider's own cap still applies if it is smaller.
     cap = downscale_cap(frame.width, frame.height)
     existing = registry.image_policy.max_dimension
-    policy = replace(
-        registry.image_policy,
-        max_dimension=cap if existing is None else min(cap, existing),
-    )
+    policy = replace(registry.image_policy, max_dimension=cap if existing is None else min(cap, existing))
     prepared = await normalize_image_bytes(frame.image, policy)
-    registry.computer_geometry = ScreenGeometry(
-        frame.width,
-        frame.height,
-        prepared.sent_width,
-        prepared.sent_height,
-        frame.scale,
-        frame.origin_x,
-        frame.origin_y,
-    )
-    image: dict[str, Any] = {
-        "type": "image",
-        "data": base64.b64encode(prepared.data).decode("ascii"),
-        "mimeType": prepared.media_type,
-        "size": len(prepared.data),
-    }
+    registry.computer_geometry = ScreenGeometry(frame.width, frame.height, prepared.sent_width, prepared.sent_height, frame.scale, frame.origin_x, frame.origin_y)
+    image = {"type": "image", "data": base64.b64encode(prepared.data).decode("ascii"), "mimeType": prepared.media_type, "size": len(prepared.data)}
     if prepared.sent_width is not None:
         image["width"] = prepared.sent_width
     if prepared.sent_height is not None:
         image["height"] = prepared.sent_height
-    receipt = (
-        f"screenshot {prepared.sent_width}x{prepared.sent_height} "
-        f"{prepared.media_type} scale={frame.scale} "
-        f"origin={frame.origin_x},{frame.origin_y}"
-    )
-    return {
-        "content": [text_block(receipt), image],
-        "isError": False,
-        "structuredContent": {
-            "width": prepared.sent_width,
-            "height": prepared.sent_height,
-            "scale": frame.scale,
-            "origin_x": frame.origin_x,
-            "origin_y": frame.origin_y,
-            **_state_content(action, state, control="active", has_screenshot=True),
-        },
-    }
+    receipt = f"screenshot {prepared.sent_width}x{prepared.sent_height} {prepared.media_type} scale={frame.scale} origin={frame.origin_x},{frame.origin_y}"
+    return {"content": [text_block(receipt), image], "isError": False}, state
 
 
-async def _run_input(registry: ToolRegistry, backend: ComputerBackend, action: str, arguments: dict[str, Any]) -> StructuredToolResult:
-    await _guard(registry, backend, action)
+async def _input(registry: ToolRegistry, backend: ComputerBackend, action: str, args: dict[str, Any]) -> str | None:
     geometry = registry.computer_geometry
     if action in _CLICK_ACTIONS:
-        x, y = _point(geometry, arguments); button, count = _CLICK_ACTIONS[action]
-        await backend.click(x, y, button, count)
+        x, y = _point(geometry, args); button, count = _CLICK_ACTIONS[action]; await backend.click(x, y, button, count)
     elif action == "mouse_move":
-        x, y = _point(geometry, arguments); await backend.move(x, y)
-    elif action == "left_mouse_down":
-        x, y = _point(geometry, arguments); await backend.mouse_down(x, y, "left")
-    elif action == "left_mouse_up":
-        x, y = _point(geometry, arguments); await backend.mouse_up(x, y, "left")
+        await backend.move(*_point(geometry, args))
+    elif action in {"left_mouse_down", "left_mouse_up"}:
+        await getattr(backend, "mouse_down" if action.endswith("down") else "mouse_up")(*_point(geometry, args), "left")
     elif action == "left_click_drag":
-        await backend.drag([_point(geometry, arguments, "start_coordinate"), _point(geometry, arguments)])
+        await backend.drag([_point(geometry, args, "start_coordinate"), _point(geometry, args)])
     elif action == "type":
-        text = arguments.get("text")
+        text = args.get("text")
         if type(text) is not str or not text: raise _BadAction("type requires nonempty text")
         await backend.type_text(text)
     elif action == "key":
-        combo = arguments.get("text")
-        if type(combo) is not str or not combo: raise _BadAction("key requires a nonempty key combo in text")
-        await backend.key(combo)
+        text = args.get("text")
+        if type(text) is not str or not text: raise _BadAction("key requires a nonempty key combo in text")
+        await backend.key(text)
     elif action == "scroll":
-        x, y = _point(geometry, arguments); direction = arguments.get("scroll_direction")
+        x, y = _point(geometry, args); direction = args.get("scroll_direction"); amount = args.get("scroll_amount", 1)
         if direction not in _SCROLL_UNIT: raise _BadAction("scroll_direction must be up, down, left, or right")
-        amount = arguments.get("scroll_amount", 1)
         if type(amount) is not int or amount < 1: raise _BadAction("scroll_amount must be a positive integer")
         dx, dy = _SCROLL_UNIT[direction]; await backend.scroll(x, y, dx * amount, dy * amount)
+    elif action == "cursor_position":
+        x, y = to_model_point(geometry, *await backend.cursor_position()) if geometry else (_ for _ in ()).throw(_BadAction("take a screenshot before reading the cursor position"))
+        return f"cursor_position x={x} y={y}"
+    elif action == "wait":
+        await asyncio.sleep(1)
+    return None
+
+
+_ACTIONS = ("screenshot", *(_CLICK_ACTIONS), "mouse_move", "left_click_drag", "left_mouse_down", "left_mouse_up", "type", "key", "scroll", "cursor_position", "wait")
+
+
+async def run_action(registry: ToolRegistry, backend: ComputerBackend, action: str, args: dict[str, Any]) -> StructuredToolResult:
+    state: ScreenState | None = None
+    input_done = False
+    capture_started = False
     try:
-        return await _screenshot(registry, backend, None, action)
+        state = await _guard(registry, backend)
+        input_done = action not in {"screenshot", "wait", "cursor_position"}
+        text = await _input(registry, backend, action, args)
+        if action == "cursor_position":
+            result = computer_result(action, state=state, control="idle", content=[text_block(text or "")], error=False)
+            result["structuredContent"].update({"x": int((text or "").split("x=", 1)[1].split()[0]), "y": int((text or "").split("y=", 1)[1])})
+            return result
+        capture_started = True
+        payload, capture_state = await _capture(registry, backend, args.get("display"))
+        payload["structuredContent"] = _state(action, capture_state, "idle", True)
+        return payload
+    except _GuardError as exc:
+        control = "denied" if exc.code == "not_allowed" else "killed" if exc.code == "killed" else "idle"
+        message = f"screenshot failed: {exc.message}" if input_done else f"{action} failed: {exc.message}"
+        return computer_result(action, state=exc.state, control=control, content=[text_block(message)], error=not input_done or not capture_started)
+    except _BadAction as exc:
+        return computer_result(action, state=state, control="idle", content=[text_block(str(exc))], error=True)
     except ComputerError as exc:
-        reason = _REFUSAL_REASON.get(exc.code, exc.message)
-        return {"content": [text_block(f"{action} done; screenshot failed: {reason}")], "isError": False, "structuredContent": _state_content(action, getattr(exc, "state", None), control="denied" if exc.code == "not_allowed" else ("killed" if exc.code == "killed" else "active"), has_screenshot=False)}
-
-
-async def _cursor(registry: ToolRegistry, backend: ComputerBackend, arguments: dict[str, Any]) -> StructuredToolResult:
-    state = await _guard(registry, backend, "cursor_position")
-    geometry = registry.computer_geometry
-    if geometry is None: raise _BadAction("take a screenshot before reading the cursor position")
-    x, y = to_model_point(geometry, *await backend.cursor_position())
-    return {"content": [text_block(f"cursor_position x={x} y={y}")], "isError": False, "structuredContent": {"x": x, "y": y, **_state_content("cursor_position", state, control="active", has_screenshot=False)}}
-
-
-async def _wait(registry: ToolRegistry, backend: ComputerBackend, arguments: dict[str, Any]) -> StructuredToolResult:
-    await asyncio.sleep(1)
-    return await _screenshot(registry, backend, None, "wait")
-
-
-_ACTION_HANDLERS: dict[str, Callable[[ToolRegistry, ComputerBackend, dict[str, Any]], Awaitable[StructuredToolResult]]] = {
-    "screenshot": lambda r, b, a: _screenshot(r, b, a.get("display")),
-    **{name: (lambda r, b, a, name=name: _run_input(r, b, name, a)) for name in (*_CLICK_ACTIONS, "mouse_move", "left_click_drag", "left_mouse_down", "left_mouse_up", "type", "key", "scroll")},
-    "cursor_position": _cursor,
-    "wait": _wait,
-}
-_ACTIONS = tuple(_ACTION_HANDLERS)
-
-
-async def _dispatch(registry: ToolRegistry, backend: ComputerBackend, action: str, arguments: dict[str, Any]) -> StructuredToolResult:
-    handler = _ACTION_HANDLERS.get(action)
-    if handler is None: raise _BadAction(f"unknown action {action!r}")
-    return await handler(registry, backend, arguments)
+        control = "killed" if exc.code == "killed" else "idle"
+        message = _REFUSAL_REASON.get(exc.code, exc.message)
+        prefix = f"{action} done; screenshot failed" if input_done and capture_started else f"{action} failed"
+        return computer_result(action, state=getattr(exc, "state", state), control=control, content=[text_block(f"{prefix}: {message}")], error=not input_done or not capture_started)
+    except (ValueError, OSError) as exc:
+        return computer_result(action, state=state, control="idle", content=[text_block(f"{action} failed: {exc}")], error=True)
 
 
 async def _computer(registry: ToolRegistry, arguments: dict[str, Any]) -> StructuredToolResult:
-    backend = registry.computer_backend
     action = arguments.get("action", "action")
-    if backend is None: return _error_result("no computer backend is available on this machine", kind="error")
-    try:
-        return await _dispatch(registry, backend, arguments["action"], arguments)
-    except _BadAction as exc:
-        return _error_result(str(exc), kind="invalid_arguments")
-    except ComputerError as exc:
-        reason = _REFUSAL_REASON.get(exc.code, exc.message)
-        if exc.code == "not_allowed": reason = exc.message
-        result = _error_result(f"{action} failed: {reason}", kind="error")
-        state = getattr(exc, "state", None)
-        control = "denied" if exc.code == "not_allowed" else "killed" if exc.code == "killed" else "active"
-        result["structuredContent"] = _state_content(action, state, control=control, has_screenshot=False)
-        return result
-    except ValueError as exc:
-        return _error_result(f"{action} failed: {exc}", kind="error")
+    backend = registry.computer_backend
+    if backend is None:
+        return _error_result("no computer backend is available on this machine", kind="error")
+    if action not in _ACTIONS:
+        return _error_result(f"unknown action {action!r}", kind="invalid_arguments")
+    return await run_action(registry, backend, action, arguments)
+
 
 def register(registry: ToolRegistry) -> None:
     if not registry.computer_enabled:
         return
-    registry.register_session_tool(
-        "computer",
-        _computer,
-        binding="loop",
-        approval_subject="action",
-        description=(
-            "Control the native desktop: capture a screenshot, move/click the "
-            "mouse, type, press keys, drag, and scroll. Actions that change the "
-            "screen return a fresh screenshot."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": list(_ACTIONS)},
-                "coordinate": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "minItems": 2,
-                    "maxItems": 2,
-                },
-                "start_coordinate": {
-                    "type": "array",
-                    "items": {"type": "integer"},
-                    "minItems": 2,
-                    "maxItems": 2,
-                },
-                "text": {"type": "string"},
-                "scroll_direction": {
-                    "type": "string",
-                    "enum": ["up", "down", "left", "right"],
-                },
-                "scroll_amount": {"type": "integer", "minimum": 1},
-                "display": {"type": "integer", "minimum": 0},
-            },
-            "required": ["action"],
-            "additionalProperties": False,
-        },
-    )
+    registry.register_session_tool("computer", _computer, binding="loop", approval_subject="action", description="Control the native desktop: capture a screenshot, move/click the mouse, type, press keys, drag, and scroll. Actions that change the screen return a fresh screenshot.", parameters={"type": "object", "properties": {"action": {"type": "string", "enum": list(_ACTIONS)}, "coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "start_coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "text": {"type": "string"}, "scroll_direction": {"type": "string", "enum": list(_SCROLL_UNIT)}, "scroll_amount": {"type": "integer", "minimum": 1}, "display": {"type": "integer", "minimum": 0}}, "required": ["action"], "additionalProperties": False})

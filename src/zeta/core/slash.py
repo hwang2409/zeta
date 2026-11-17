@@ -754,7 +754,7 @@ def _format_status(status: SlashStatus) -> str:
         f"compaction_marker_count: {status.compaction_marker_count}",
         f"checkpoint_count: {status.checkpoint_count}",
         "unavailable_accounts: " + (", ".join(status.unavailable_accounts) or "none"),
-        f"computer: {'enabled' if status.computer_enabled else 'disabled'}, allowed app count={status.computer_allowed_apps}" + ("; add [computer.macos.bundle_ids]\\n\\\"com.apple.Safari\\\" = \\\"allow\\\"" if status.computer_empty_allow_list else ""),
+        f"computer: {'enabled' if status.computer_enabled else 'disabled'}, allowed app count={status.computer_allowed_apps}" + ("; add [computer.apps] \\\"com.apple.Safari\\\" = \\\"allow\\\"" if status.computer_empty_allow_list else ""),
         f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
         status.mcp_summary,
         "usage:",

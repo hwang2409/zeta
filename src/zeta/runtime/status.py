@@ -36,7 +36,7 @@ def capture_slash_status(
     hooks = loop.hooks
     transcript_store = loop.store
     transcript_refs = transcript_store.branch_refs()
-    computer = getattr(getattr(loop, "registry", None), "computer_config", None)
+    computer = getattr(getattr(loop, "tool_registry", None), "computer_config", None)
     return SlashStatusSnapshot(
         base=SlashStatus(
             session_id=session_id,

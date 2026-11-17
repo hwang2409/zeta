@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import tomllib
 from contextlib import asynccontextmanager
 from pathlib import Path
 from textwrap import dedent
@@ -365,11 +364,9 @@ async def test_denied_app_guidance_is_parseable_and_allows_app(tmp_path: Path) -
     async with _computer_registry(tmp_path, backend=backend) as registry:
         registry.computer_config = ComputerUseConfig(enabled=True)
         denied = await registry.execute(ToolCall("c", "computer", {"action": "screenshot"}))
-        line = denied["content"][0]["text"].split("add ", 1)[1]
-        parsed = tomllib.loads(line)
+        assert '[computer.apps] "com.apple.Safari" = "allow"' in denied["content"][0]["text"]
         registry.computer_config = ComputerUseConfig(enabled=True, bundle_ids={"com.apple.Safari": "allow"})
         allowed = await registry.execute(ToolCall("c", "computer", {"action": "screenshot"}))
-    assert parsed["computer"]["macos"]["bundle_ids"]["com.apple.Safari"] == "allow"
     assert allowed["isError"] is False
 
 
@@ -400,3 +397,95 @@ def test_project_cannot_enable_computer(tmp_path: Path) -> None:
     _write_settings(home, 'provider = "claude"\n')
     _write_settings(project, "[computer]\nenabled = true\n")
     assert _resolved_computer_enabled(home, project) is False
+
+@pytest.mark.asyncio
+async def test_plan_1_missing_config_omits_schema_and_backend(tmp_path: Path) -> None:
+    async with _computer_registry(tmp_path, enabled=False) as registry:
+        assert "computer" not in _tool_names(registry)
+        assert registry.computer_backend is None
+
+
+def test_plan_2_project_settings_cannot_enable_or_broaden(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    _write_settings(home, """
+        [computer]
+        enabled = true
+    """)
+    _write_settings(project, """
+        [computer]
+        enabled = true
+        default_app_access = "allow"
+    """)
+    settings = load_settings(home=home, project_dir=project).settings
+    assert settings.computer.enabled is True
+    assert settings.computer.default_app_access == "deny"
+
+
+@pytest.mark.asyncio
+async def test_plan_3_default_deny_rejects_unknown_bundle_before_capture(tmp_path: Path) -> None:
+    backend = FakeBackend(frontmost_bundle_id="com.unknown.app")
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        registry.computer_config = ComputerUseConfig(enabled=True)
+        result = await registry.execute(ToolCall("c", "computer", {"action": "screenshot"}))
+    assert result["isError"] is True
+    assert not any(op[0] == "screenshot" for op in _ops(backend))
+
+
+@pytest.mark.asyncio
+async def test_plan_4_exact_allow_and_deny_override(tmp_path: Path) -> None:
+    backend = FakeBackend(frontmost_bundle_id="com.example.app")
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        registry.computer_config = ComputerUseConfig(enabled=True, default_app_access="allow", bundle_ids={"com.example.app": "deny"})
+        result = await registry.execute(ToolCall("c", "computer", {"action": "screenshot"}))
+    assert result["isError"] is True
+
+
+@pytest.mark.asyncio
+async def test_plan_5_focus_change_denies_followup_capture(tmp_path: Path) -> None:
+    class ChangingBackend(FakeBackend):
+        async def state(self):
+            result = await super().state()
+            if any(op[0] == "click" for op in self.actions):
+                self.frontmost_bundle_id = "com.denied.app"
+                return type(result)(result.locked, result.secure_input, self.frontmost_bundle_id)
+            return result
+    backend = ChangingBackend()
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        registry.computer_config = ComputerUseConfig(enabled=True, bundle_ids={"com.example.app": "allow"})
+        await registry.execute(ToolCall("s", "computer", {"action": "screenshot"}))
+        result = await registry.execute(ToolCall("c", "computer", {"action": "left_click", "coordinate": [1, 2]}))
+    assert result["isError"] is False
+    assert "screenshot failed" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_plan_6_wait_returns_guarded_screenshot(tmp_path: Path) -> None:
+    async with _computer_registry(tmp_path, backend=FakeBackend()) as registry:
+        result = await registry.execute(ToolCall("w", "computer", {"action": "wait"}))
+    assert result["isError"] is False and result["structuredContent"]["computer"]["has_screenshot"] is True
+
+
+@pytest.mark.asyncio
+async def test_plan_7_child_registry_has_no_computer_capability(tmp_path: Path) -> None:
+    async with _computer_registry(tmp_path, backend=FakeBackend()) as registry:
+        child_store = ConversationStore(tmp_path / "child")
+        child = registry.clone_for_session(child_store)
+        try:
+            assert "computer" not in _tool_names(child)
+        finally:
+            await child.close()
+            child_store.close()
+
+
+def test_plan_8_settings_reject_disabled_safety_controls(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    _write_settings(home, """
+        [computer]
+        enabled = true
+        indicator = false
+        kill_switch = false
+    """)
+    loaded = load_settings(home=home).settings
+    assert loaded.computer.indicator is True
+    assert loaded.computer.kill_switch is True
