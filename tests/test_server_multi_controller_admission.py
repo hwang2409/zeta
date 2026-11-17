@@ -492,6 +492,7 @@ async def test_cancelled_hello_transaction_public_recovery(
                 await await_or_fail(release.wait(), what="release hello response write")
             return await original_write(client, *args, **kwargs)
 
+        # test-contract: seam hold the real response writer at publication.
         monkeypatch.setattr(_Client, "_write", gated_write)
     elif row == "release_in_progress":
         _gate_async(
@@ -516,6 +517,7 @@ async def test_cancelled_hello_transaction_public_recovery(
 
             return finish()
 
+        # test-contract: seam hold the real release cleanup after its state mutation.
         monkeypatch.setattr(control, "_controller_release", held_release)
 
     request = asyncio.create_task(failed.request(1, "hello", params))
@@ -627,7 +629,7 @@ async def test_cancelled_old_cleanup_does_not_remove_concurrent_newer_multi_toke
         if not old_request.done():
             old_request.cancel()
             with contextlib.suppress(BaseException):
-                await old_request
+                await await_or_fail(old_request, what="cancel old overlap request")
         await _close_server(
             server,
             tuple(client for client in (old, newer, legacy, recovered) if client is not None),
