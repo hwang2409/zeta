@@ -16,22 +16,22 @@ from .host import (
     LoadedExtension,
     PendingExtension,
 )
-from .trust import ExtensionTrustError
 from .manifest import (
     ExtensionManifest,
     ExtensionManifestError,
     parse_manifest,
 )
+from .trust import ExtensionTrustError
 
 __all__ = [
     "EXTENSION_API_VERSION",
     "ExtensionAPI",
     "ExtensionError",
-    "ExtensionTrustError",
     "ExtensionHost",
     "ExtensionManifest",
     "ExtensionManifestError",
     "ExtensionStatus",
+    "ExtensionTrustError",
     "LoadedExtension",
     "PendingExtension",
     "apply_extensions",
