@@ -69,17 +69,6 @@ def app_access(registry: ToolRegistry, bundle_id: str | None) -> bool:
     return config.bundle_ids.get(bundle_id or "", config.default_app_access) == "allow"
 
 
-def _state(action: str, state: ScreenState | None, control: str, screenshot: bool) -> dict[str, Any]:
-    return {"computer": {"action": action, "control": control, "kill_switch": "ctrl+opt+cmd+esc", "frontmost_bundle_id": state.frontmost_bundle_id if state else None, "has_screenshot": screenshot}}
-
-
-def computer_result(action: str, *, state: ScreenState | None, control: str, content: list[dict[str, Any]], error: bool, screenshot: bool = False, structured: dict[str, Any] | None = None) -> StructuredToolResult:
-    result: StructuredToolResult = {"content": content, "isError": error, "structuredContent": _state(action, state, control, screenshot)}
-    if structured:
-        result["structuredContent"].update(structured)
-    return result
-
-
 async def _guard(registry: ToolRegistry, backend: ComputerBackend) -> ScreenState:
     state = await backend.state()
     if state.locked:
@@ -260,7 +249,10 @@ async def run_action(registry: ToolRegistry, raw_action: object, args: dict[str,
         content = [text_block(f"{prefix}: {exc}")]
         error = not completed
 
-    return computer_result(action, state=state, control=control, content=content, error=error, screenshot=screenshot, structured=structured)
+    structured_content = {"computer": {"action": action, "control": control, "kill_switch": "ctrl+opt+cmd+esc", "frontmost_bundle_id": state.frontmost_bundle_id if state else None, "has_screenshot": screenshot}}
+    if structured:
+        structured_content.update(structured)
+    return {"content": content, "isError": error, "structuredContent": structured_content}
 
 
 async def _computer(registry: ToolRegistry, arguments: dict[str, Any]) -> StructuredToolResult:
