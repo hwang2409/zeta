@@ -37,6 +37,7 @@ from ..core.slash import (
     SlashStatus,
     UsageTracker,
     _format_status,
+    build_slash_status,
     create_slash_registry,
 )
 from ..extensions.host import ExtensionHost
@@ -123,10 +124,15 @@ def _wrap_status_line(line: str, width: int) -> list[overlay.FragmentLine]:
     ]
 
 
+# Bare commands that open a picker; the other panel commands only show information.
+_PICKER_COMMANDS = frozenset({"/model", "/accounts", "/remote"})
+
+
 def _status_card_lines(
-    status: SlashStatus, width: int | None = None
+    status: SlashStatus | None, width: int | None = None
 ) -> list[overlay.FragmentLine]:
-    formatted = _format_status(status).splitlines()
+    # None: the card is open while its status is built.
+    formatted = ["loading…"] if status is None else _format_status(status).splitlines()
     body = (
         [[overlay.value(line)] for line in formatted]
         if width is None
@@ -307,10 +313,14 @@ class TUIApp(
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
+        self._model_catalog_refresh_requested = False
+        self._model_catalog_load_finished = asyncio.Event()
+        if self._model_catalog_loaded:
+            self._model_catalog_load_finished.set()
         self._model_picker: ModelPicker | None = None
-        self._model_picker_unit: Any = None
         self._accounts_picker: AccountsPicker | None = None
-        self._accounts_picker_unit: Any = None
+        self._picker_loading: asyncio.Future[Any] | None = None
+        self._picker_loading_name = ""
         self._account_switch_task: asyncio.Task[None] | None = None
         self._account_switch_pending = False
         self._account_switch_finished = asyncio.Event()
@@ -329,6 +339,7 @@ class TUIApp(
             project_eligible=project_eligible,
             skill_catalog=skill_catalog, project_registry_state=self.loop.tool_registry.project_registry_state,
             include_tui_only=True,
+            extensions=self.extensions,
         )
         self.loop.add_live_config_listener(self._slash_commands)
         self.loop.set_mcp_prompt_refresh(
@@ -441,11 +452,14 @@ class TUIApp(
 
     def _start_model_catalog_load(self) -> None:
         if self._model_catalog_task is not None:
+            self._model_catalog_refresh_requested = True
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        self._model_catalog_loaded = False
+        self._model_catalog_load_finished.clear()
         self._model_catalog_task = loop.create_task(
             self._load_model_catalog_in_background()
         )
@@ -462,7 +476,12 @@ class TUIApp(
         finally:
             self._model_catalog_loaded = True
             self._model_catalog_task = None
-            self.refresh_model_picker()
+            self._model_catalog_load_finished.set()
+            if not (self._closing or self._closed):
+                self.refresh_model_picker()
+                if self._model_catalog_refresh_requested:
+                    self._model_catalog_refresh_requested = False
+                    self._start_model_catalog_load()
 
     def _prompt_style(self) -> Style:
         focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
@@ -580,6 +599,7 @@ class TUIApp(
             on_picker_rename=lambda: app.accounts_picker_rename(),
             on_picker_refresh=lambda: app.accounts_picker_refresh(),
             picker_active=lambda: app._picker_active,
+            picker_loading=lambda: app._picker_loading is not None,
             on_agent_list_down=lambda: app._focus_agent_list(),
             agent_list_active=lambda: app._agent_navigation.list_focused(),
             on_agent_list_move=lambda delta: (
@@ -680,6 +700,10 @@ class TUIApp(
             if self._loop_state == "approval":
                 self._approval_units.clear()
                 self._present_pending_approvals()
+        # The redraw replaced the units an open finder's rows point at.
+        transcript = self._viewed_transcript()
+        if self._active_finder is transcript and transcript.finder_active:
+            self._publish_history_search_target(transcript, None, self._finder_field.text)
 
     def _request_history_edge(self, direction: str) -> None:
         """Load the page at the edge the viewed transcript met."""
@@ -784,14 +808,15 @@ class TUIApp(
         return tuple(descriptor.key for descriptor in pager.descriptors)
 
     def _finder_open(self) -> None:
-        transcript = self._transcript
+        transcript = self._viewed_transcript()
         if transcript.search_active:
             # A new search replaces the accepted one and its match keys.
             self._end_history_search()
+        # The view the finder opened on, root or child: Esc and a query whose
+        # search finds nothing return to it.
         self._finder_return = (
             None
             if getattr(self, "_agent_navigation", None) is None
-            or self._agent_navigation.child_view_active
             else (
                 transcript.follow_tail,
                 transcript.durable_scroll_anchor,
@@ -813,15 +838,16 @@ class TUIApp(
             asyncio.create_task(self._return_to_view(saved[0], saved[1]))
 
     async def _return_to_view(self, follow_tail: bool, anchor: Any) -> None:
+        transcript = self._viewed_transcript()
         if follow_tail or anchor is None:
             await self._load_transcript_page(reset=True)
-            self._transcript.scroll_to_bottom()
+            transcript.scroll_to_bottom()
         else:
             pager = self._agent_navigation.transcript_control.history_pager
             if not (await pager.reveal(anchor[0])).segments:
                 return
             self._render_active_resident_history()
-            self._transcript.restore_durable_scroll_anchor(anchor)
+            transcript.restore_durable_scroll_anchor(anchor)
         self._invalidate_prompt()
 
     def _publish_history_search_target(
@@ -846,7 +872,7 @@ class TUIApp(
                 self._scan_prompt_history(query), self._finder_accept_when_ready
             )
         transcript = self._viewed_transcript()
-        if not query or self._active_finder is not transcript:
+        if self._active_finder is not transcript:
             return
         owner.start_search(
             query,
@@ -854,9 +880,21 @@ class TUIApp(
             lambda target, value: self._publish_history_search_target(
                 transcript, target, value
             ),
+            lambda: self._return_finder_to_its_view(transcript, query),
         )
         if owner.search_task is not None:
             owner.search_task.add_done_callback(self._history_search_ended)
+
+    async def _return_finder_to_its_view(
+        self, transcript: TranscriptWidget, query: str
+    ) -> None:
+        # Pages an earlier query's search revealed do not belong to this query:
+        # rank it over the view the finder opened on, as a burst of keys would.
+        saved = getattr(self, "_finder_return", None)
+        if saved is None or saved[2] == self._resident_page_keys():
+            return
+        await self._return_to_view(saved[0], saved[1])
+        self._publish_history_search_target(transcript, None, query)
 
     def _navigate_history_search(self, delta: int) -> bool:
         transcript = self._viewed_transcript()
@@ -885,11 +923,15 @@ class TUIApp(
 
     def _finder_loading(self) -> bool:
         navigation = getattr(self, "_agent_navigation", None)
-        task = navigation.transcript_control.search_task if navigation is not None else None
-        return FinderRuntimeMixin._finder_loading(self) or (
-            task is not None
-            and not task.done()
-            and self._active_finder is self._viewed_transcript()
+        if navigation is None or self._active_finder is not self._viewed_transcript():
+            return FinderRuntimeMixin._finder_loading(self)
+        control = navigation.transcript_control
+        task = control.search_task
+        return (
+            FinderRuntimeMixin._finder_loading(self)
+            or (task is not None and not task.done())
+            # Startup has not drawn the first history page: its rows are coming.
+            or (self._startup_replay_active and not self._history_pages_resident())
         )
 
     def _end_history_search(self) -> None:
@@ -1021,17 +1063,83 @@ class TUIApp(
             self._submit_input(f"/{verb} {key}", internal=True)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> bool:
+        if not internal and self._open_panel_command(value):
+            return True
         if self._startup_replay_active and self._input_loop_active:
             self._startup_submissions.append((value, internal))
             return True
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
         if self._reject_during_startup_replay(action):
             return False
+        # A prompt is never sent with a picker on screen. Typed text closes a
+        # picker first; this catches a prompt queued before the picker opened.
+        prompt = not internal and value.strip() and not value.lstrip().startswith(("/", "!"))
+        if prompt and self._picker_active:
+            self._picker_cancel()
         if self._agent_navigation.child_view_active and not value.lstrip().startswith("/"):
             return self._send_to_child(value)
         self._paste_runtime.advance_buffer_generation()
         super()._submit_input(value, internal=internal)
         return True
+
+    def _open_panel_command(self, value: str) -> bool:
+        """Open a bare panel command's overlay from the Enter that submits it.
+
+        Through the pipeline (or the startup queue) the panel would open a loop
+        step later, after keys typed in the same read reached the composer, and
+        one more Enter would send them as a prompt.
+        """
+
+        command = value.strip()
+        open_panel = {
+            "/tasks": self.open_tasks_panel,
+            "/status": self._open_status_panel,
+            "/mcp": self.open_mcp_manager,
+            "/decisions": self.open_decisions_panel,
+            "/model": lambda: (
+                self._start_model_catalog_load(),
+                self._open_model_picker(self.model_choices(), query=""),
+            ),
+            "/accounts": lambda: self._open_loading_picker(
+                "accounts", lambda: self._slash_commands.dispatch_async(self, command)
+            ),
+            "/remote": lambda: self._open_loading_picker(
+                "remote", lambda: self._slash_commands.dispatch_async(self, command)
+            ),
+        }.get(command)
+        if (
+            open_panel is None
+            or not self._full_screen_active()
+            # A remote view is read only; /remote still picks another session.
+            or (self._remote_view is not None and command != "/remote")
+            # A picker behind a running slash command waits its turn; a panel
+            # only shows information and opens at once.
+            or (self.slash_lock.holder is not None and command in _PICKER_COMMANDS)
+            # /model answers that it cannot change the model now.
+            or (command == "/model" and (self.active or self.pending_approvals))
+        ):
+            return False
+        self._dismiss_model_picker()
+        self._paste_runtime.advance_buffer_generation()
+        self._consume_overlay_submission()
+        self._record_prompt(command)
+        open_panel()
+        return True
+
+    def _open_status_panel(self) -> None:
+        snapshot = self._status_snapshot()
+
+        async def load() -> None:
+            # Counting compactions can read the whole transcript: off the loop.
+            status = await asyncio.to_thread(build_slash_status, snapshot)
+            if self._status_card_open and not self._mcp_manager_open:
+                self._set_status_card(status)
+
+        def show() -> bool:
+            self.open_status_card(None)
+            return self._status_card_open
+
+        self._open_overlay(show, load)
 
     def _status_toolbar(self) -> list[tuple[str, str]]:
         return status_toolbar(self, get_app().output.get_size().columns)
@@ -1046,19 +1154,23 @@ class TUIApp(
     def status_card_active(self) -> bool:
         return self._status_card_open and self._full_screen_active()
 
-    def open_status_card(self, status: SlashStatus) -> None:
+    def open_status_card(self, status: SlashStatus | None) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
         buffer = session.default_buffer
         self._status_restore_text = buffer.text
         self._status_restore_cursor = buffer.cursor_position
+        self._set_status_card(status)
+        self._status_card_open = True
+        session.layout.focus(self._status_card_window)
+        self._invalidate_prompt()
+
+    def _set_status_card(self, status: SlashStatus | None) -> None:
         self._status_card.set_lines(
             _status_card_lines(status),
             line_factory=lambda width: _status_card_lines(status, width),
         )
-        self._status_card_open = True
-        session.layout.focus(self._status_card_window)
         self._invalidate_prompt()
 
     def close_status_card(self) -> None:

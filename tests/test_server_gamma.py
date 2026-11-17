@@ -34,6 +34,7 @@ from tests.test_server import (
 )
 from zeta.core.session import SessionManager, SessionMetadata
 from zeta.core.session_execution import SessionOwnedError
+from zeta.extensions import trust_project_extensions
 from zeta.mcp.management import MCPManagementService
 from zeta.protocol.types import ImageContent, TextContent, ToolCall
 from zeta.providers.anthropic_payload import build_messages_payload
@@ -389,24 +390,92 @@ async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
         await close_serve(server, writer)
 
 
+@pytest.mark.parametrize(
+    ("scope", "activation", "expected_loaded"),
+    [
+        pytest.param("user", "def activate(zx): pass\n", True, id="user-loaded"),
+        pytest.param(
+            "user", "def activate(zx): raise RuntimeError('broken')\n", False,
+            id="user-error",
+        ),
+        pytest.param("project", "def activate(zx): pass\n", True, id="project-loaded"),
+        pytest.param(
+            "project", "def activate(zx): raise RuntimeError('broken')\n", False,
+            id="project-error",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_extensions_list_returns_loaded_rows(tmp_path: Path) -> None:
-    extension_dir = tmp_path / "home" / "extensions" / "listed"
+async def test_ext_status_agrees_with_negotiated_extension_rows(
+    tmp_path: Path, scope: str, activation: str, expected_loaded: bool,
+) -> None:
+    launch = _launch(tmp_path)
+    root = tmp_path / "home" if scope == "user" else launch / ".zeta"
+    extension_dir = root / "extensions" / "listed"
     extension_dir.mkdir(parents=True)
     (extension_dir / "zeta-extension.toml").write_text(
         '[extension]\nname = "listed"\nversion = "1"\napi_version = 1\nentry = "ext:activate"\n'
     )
-    (extension_dir / "ext.py").write_text("def activate(zx): pass\n")
-    server = _server(tmp_path, None, _launch(tmp_path))
+    (extension_dir / "ext.py").write_text(activation)
+    server = _server(tmp_path, None, launch)
     reader, writer = await _connect(server)
+    request_id = 2
     try:
         await _hello(reader, writer, ["extensions"])
-        session = (await _request(reader, writer, 2, "new_session", {}))[-1]["result"]["session"]
-        rows = (await _request(reader, writer, 3, "extensions_list", {"session_id": session["session_id"]}))[-1]["result"]
-        assert rows == [{
-            "name": "listed", "scope": "user", "version": "1", "enabled": True,
-            "trusted": True, "loaded": True, "error": None,
-        }]
+        session = (await _request(reader, writer, request_id, "new_session", {}))[-1][
+            "result"
+        ]["session"]
+        session_id = session["session_id"]
+
+        async def surfaces() -> tuple[dict[str, object], str]:
+            nonlocal request_id
+            request_id += 1
+            rows = (await _request(
+                reader, writer, request_id, "extensions_list",
+                {"session_id": session_id},
+            ))[-1]["result"]
+            request_id += 1
+            status = (await _request(
+                reader, writer, request_id, "slash_run",
+                {"session_id": session_id, "text": "/ext info listed"},
+            ))[-1]["result"]["text"]
+            return next(row for row in rows if row["name"] == "listed"), status
+
+        async def assert_agreement(*, trusted: bool, enabled: bool) -> None:
+            row, status = await surfaces()
+            assert status.startswith("listed "), status
+            ext_trusted = "pending trust" not in status
+            ext_enabled = "disabled" not in status
+            assert row["trusted"] is ext_trusted is trusted, (
+                f"trusted divergence: /ext={ext_trusted}, extensions_list={row['trusted']}"
+            )
+            assert row["enabled"] is ext_enabled is enabled, (
+                f"enabled divergence: /ext={ext_enabled}, extensions_list={row['enabled']}"
+            )
+
+        if scope == "project":
+            await assert_agreement(trusted=False, enabled=True)
+            assert server.runtime.extensions is not None
+            trust_project_extensions(server.runtime.extensions)
+        await assert_agreement(trusted=True, enabled=True)
+
+        row, _ = await surfaces()
+        assert row["loaded"] is expected_loaded
+        assert (row["error"] is not None) is not expected_loaded
+
+        request_id += 1
+        await _request(
+            reader, writer, request_id, "slash_run",
+            {"session_id": session_id, "text": "/ext disable listed"},
+        )
+        await assert_agreement(trusted=True, enabled=False)
+
+        request_id += 1
+        await _request(
+            reader, writer, request_id, "slash_run",
+            {"session_id": session_id, "text": "/ext enable listed"},
+        )
+        await assert_agreement(trusted=True, enabled=True)
     finally:
         await close_serve(server, writer)
 
