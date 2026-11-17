@@ -21,6 +21,7 @@ from PIL import Image
 from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
+from tests.support.server_client import read_until, send
 from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
 from tests.test_server import (
@@ -370,11 +371,18 @@ async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
         await _hello(reader, writer, ["extensions"])
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         server.runtime.extensions.notify("notice", "hello", "info")
-        await asyncio.sleep(0)
-        frames = await _request(reader, writer, 3, "ping")
-        assert frames[-1]["id"] == 3
-        notices = await _frames_until_event(reader, "extension_notice")
-        assert notices[-1]["params"]["data"] == {
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await send(reader, writer, 3, "ping")
+        frames = await read_until(
+            reader, lambda frame: frame.get("id") == 3, what="ping response"
+        )
+        ping_index = next(i for i, frame in enumerate(frames) if frame.get("id") == 3)
+        notice_indexes = [
+            i for i, frame in enumerate(frames) if frame.get("params", {}).get("event") == "extension_notice"
+        ]
+        assert notice_indexes and notice_indexes[0] < ping_index
+        assert frames[notice_indexes[0]]["params"]["data"] == {
             "kind": "extension", "extension": "notice", "text": "hello", "level": "info"
         }
     finally:
