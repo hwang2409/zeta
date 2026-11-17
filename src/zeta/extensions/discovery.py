@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
-import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
