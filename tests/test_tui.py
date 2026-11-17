@@ -339,6 +339,61 @@ def _capture_until(
         time.sleep(0.05)
 
 
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is not installed")
+def test_activation_notice_is_on_first_screen_without_input(tmp_path: Path) -> None:
+    home = tmp_path / "zeta-home"
+    extension = home / "extensions" / "notice"
+    extension.mkdir(parents=True)
+    (extension / "zeta-extension.toml").write_text(
+        '[extension]\nname="notice"\nversion="1"\napi_version=1\nentry="ext:activate"\n'
+    )
+    (extension / "ext.py").write_text(
+        'def activate(zx):\n'
+        '    zx.ui.notify("test extension activated", level="info")\n'
+    )
+    session = f"zeta-extension-{uuid.uuid4().hex[:10]}"
+    socket_dir = Path(tempfile.mkdtemp(prefix="zeta-tmux-", dir="/tmp"))
+    socket = socket_dir / "sock"
+
+    def cleanup() -> None:
+        subprocess.run(["tmux", "-S", str(socket), "kill-server"], check=False)
+
+    try:
+        subprocess.run(
+            [
+                "tmux",
+                "-S",
+                str(socket),
+                "new-session",
+                "-d",
+                "-s",
+                session,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                "sh",
+                "-c",
+                'exec env ZETA_HOME="$1" "$2" -m tests.support.scripted_tui --provider codex',
+                "zeta-pane",
+                str(home),
+                sys.executable,
+            ],
+            cwd=Path(__file__).parents[1],
+            env=_fixed_terminal_env(home),
+            check=True,
+        )
+        capture = _capture_until(
+            socket, session, "notice: test extension activated", cleanup
+        )
+
+        assert " › type a message..." in capture
+        assert capture.count("notice: test extension activated") == 1
+    finally:
+        cleanup()
+        shutil.rmtree(socket_dir)
+
+
 def test_app_reexports_backend_helpers() -> None:
     assert callable(build_backend)
     assert callable(background_notice)
@@ -8719,6 +8774,149 @@ def test_completed_message_rerenders_text_split_by_tool(
     rendered = Text.from_ansi(app._transcript.render(120)).plain
     assert "**" not in rendered
     assert "before bold after" in rendered
+
+
+class _RecordingExtensionHost:
+    def __init__(self) -> None:
+        self.binds: list[tuple[object, asyncio.AbstractEventLoop]] = []
+
+    def set_event_sink(
+        self, sink: object, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        self.binds.append((sink, loop))
+
+    def register_commands(self, registry: object) -> None:
+        del registry
+
+    def close(self) -> None:
+        pass
+
+
+def _extension_test_app(tmp_path: Path) -> tuple[TUIApp, _RecordingExtensionHost]:
+    host = _RecordingExtensionHost()
+    app = TUIApp(
+        AgentLoop(
+            FakeBackend([]),
+            ConversationStore(tmp_path / "sessions"),
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        provider="codex",
+        model="offline",
+        extensions=host,  # type: ignore[arg-type]
+    )
+    return app, host
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_kind", ["failure", "cancel"])
+async def test_extension_first_paint_handler_is_removed_before_paint_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_kind: str
+) -> None:
+    app, host = _extension_test_app(tmp_path)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(input=pipe, output=DummyOutput())
+        handlers_before = tuple(session.app.after_render._handlers)
+
+        async def stop_before_paint(*args: object, **kwargs: object):
+            del args, kwargs
+            assert len(session.app.after_render._handlers) == len(handlers_before) + 1
+            entered.set()
+            if exit_kind == "cancel":
+                await asyncio.wait_for(release.wait(), 10)
+            raise RuntimeError("prompt startup failed")
+
+        monkeypatch.setattr(
+            prompt_runtime_module,
+            "start_prompt_during_activation",
+            stop_before_paint,
+        )
+        run_task = asyncio.create_task(app.run(session))
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            if exit_kind == "cancel":
+                run_task.cancel()
+            with pytest.raises(
+                asyncio.CancelledError if exit_kind == "cancel" else RuntimeError
+            ):
+                await asyncio.wait_for(run_task, 10)
+        finally:
+            release.set()
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.wait_for(
+                    asyncio.gather(run_task, return_exceptions=True), 10
+                )
+
+        assert tuple(session.app.after_render._handlers) == handlers_before
+        assert host.binds == []
+
+
+@pytest.mark.asyncio
+async def test_extension_sink_binds_once_across_redraw_and_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, host = _extension_test_app(tmp_path)
+    with create_pipe_input() as pipe:
+        session = FullScreenPromptSession(input=pipe, output=DummyOutput())
+        handlers_before = tuple(session.app.after_render._handlers)
+        starts = 0
+
+        async def paint_then_exit(*args: object, **kwargs: object):
+            nonlocal starts
+            del args, kwargs
+            starts += 1
+            if starts == 1:
+                session.app.after_render.fire()
+                session.app.after_render.fire()
+            assert tuple(session.app.after_render._handlers) == handlers_before
+            activation = asyncio.create_task(asyncio.sleep(0))
+            return activation, None, True
+
+        async def keep_app_open() -> None:
+            return None
+
+        monkeypatch.setattr(
+            prompt_runtime_module,
+            "start_prompt_during_activation",
+            paint_then_exit,
+        )
+        monkeypatch.setattr(app, "close", keep_app_open)
+
+        try:
+            await app.run(session)
+            await app.run(session, resume_ui=True)
+        finally:
+            await TUIApp.close(app)
+
+    assert starts == 2
+    assert len(host.binds) == 1
+
+
+@pytest.mark.asyncio
+async def test_extension_sink_binds_immediately_for_non_full_screen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, host = _extension_test_app(tmp_path)
+    observed: list[int] = []
+
+    async def observe_binding(*args: object, **kwargs: object):
+        del args, kwargs
+        observed.append(len(host.binds))
+        activation = asyncio.create_task(asyncio.sleep(0))
+        return activation, None, True
+
+    monkeypatch.setattr(
+        prompt_runtime_module,
+        "start_prompt_during_activation",
+        observe_binding,
+    )
+    with create_pipe_input() as pipe:
+        await app.run(PromptSession(input=pipe, output=DummyOutput()))
+
+    assert observed == [1]
+    assert len(host.binds) == 1
 
 
 @pytest.mark.asyncio
