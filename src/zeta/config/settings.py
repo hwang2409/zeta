@@ -129,10 +129,13 @@ class ComputerUseConfig:
     )
 
 
-def computer_allow_guidance(bundle_id: str) -> str:
-    """The settings lines that allow one app; shared by the computer tool and /status."""
+def computer_allow_guidance(bundle_id: str, *, has_existing_table: bool = False) -> str:
+    """The exact settings text that allows one app."""
 
-    return f'add to your home settings.toml:\n[computer.macos.bundle_ids]\n"{bundle_id}" = "allow"'
+    setting = f'"{bundle_id}" = "allow"'
+    if has_existing_table:
+        return f"add under [computer.macos.bundle_ids] in your home settings.toml:\n{setting}"
+    return f"add to your home settings.toml:\n[computer.macos.bundle_ids]\n{setting}"
 
 
 @dataclass(frozen=True, slots=True)
