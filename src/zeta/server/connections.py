@@ -89,6 +89,7 @@ EVENT_FEATURES = {
     EventDescriptor.TOOL_OUTPUT: NO_FEATURE,
     EventDescriptor.TOOL_END: NO_FEATURE,
     EventDescriptor.SUB_AGENT_RECEIPT: NO_FEATURE,
+    EventDescriptor.EXTENSION_NOTICE: frozenset({"extensions"}),
     EventDescriptor.CHILD_IDLE: NO_FEATURE,
     EventDescriptor.CHILD_HOLD: NO_FEATURE,
     EventDescriptor.TASK_EXIT_NOTIFICATION: NO_FEATURE,
