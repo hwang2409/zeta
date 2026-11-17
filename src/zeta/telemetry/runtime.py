@@ -22,6 +22,7 @@ _OPERATION_ATTRIBUTE_KEYS = {
     "tool": frozenset({"gen_ai.operation.name", "zeta.tool.name", "zeta.tool.type", "zeta.tool.call.id", "zeta.agent.name", "gen_ai.conversation.id"}),
     "context": frozenset({"zeta.emergency", "zeta.tokens.before", "zeta.tokens.after"}),
     "serve": frozenset({"rpc.system", "rpc.method"}),
+    "mcp": frozenset({"mcp.method.name", "zeta.mcp.server.name", "gen_ai.tool.name", "gen_ai.prompt.name", "mcp.protocol.version", "jsonrpc.request.id"}),
 }
 _EVENT_ATTRIBUTE_KEYS = {"gen_ai.client.retry": frozenset({"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after"}), "zeta.approval.requested": frozenset({"decision", "scope"}), "zeta.approval.resolved": frozenset({"decision", "scope", "duration"}), "zeta.serve.invalid_propagation": frozenset()}
 _ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.tool.count"})
@@ -53,6 +54,11 @@ def _serve_methods() -> frozenset[str]:
 
 
 _SERVE_METHODS = _serve_methods()
+# the caller methods that carry a trace context; zeta.mcp.client.CALLER_METHODS is the source.
+_MCP_METHODS = frozenset({"tools/call", "prompts/get", "resources/list", "resources/read"})
+# MCP protocol versions are dates (2025-06-18); zeta's JSON-RPC request ids are positive integers.
+_MCP_PROTOCOL = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
+_REQUEST_ID = re.compile(r"[0-9]{1,19}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 # a session id, or a child agent instance id: the root session id plus ":<n>" per nesting level.
 _SESSION_ID = re.compile(r"[0-9a-f]{32}(?::[1-9][0-9]{0,8}){0,5}\Z")
@@ -68,6 +74,8 @@ _STRING_RULES = {
     "gen_ai.response.finish_reasons": _FINISH_REASONS, "gen_ai.retry.reason": _RETRY_REASONS,
     "decision": _APPROVAL_DECISIONS, "scope": _APPROVAL_SCOPES, "error.type": _PYTHON_NAME,
     "rpc.system": frozenset({"jsonrpc"}), "rpc.method": _SERVE_METHODS,
+    "mcp.method.name": _MCP_METHODS, "zeta.mcp.server.name": _IDENTIFIER, "gen_ai.tool.name": _IDENTIFIER,
+    "gen_ai.prompt.name": _IDENTIFIER, "mcp.protocol.version": _MCP_PROTOCOL, "jsonrpc.request.id": _REQUEST_ID,
 }
 _INT_KEYS = frozenset({"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.agent.depth", "zeta.turn.number", "zeta.tool.count", "zeta.tokens.before", "zeta.tokens.after", "gen_ai.retry.attempt", "gen_ai.retry.delay", "duration"})
 _BOOL_KEYS = frozenset({"zeta.background", "zeta.notification", "zeta.stream", "zeta.emergency", "gen_ai.retry.after"})
@@ -131,15 +139,20 @@ class StatusCell:
 
 
 class _SpanHandle(SpanHandle):
-    def __init__(self, scope: object) -> None:
+    """Owns one span through ``scope``; with no scope it only enriches ``span``, whose owner ends it."""
+
+    def __init__(self, scope: object | None, span: object | None = None) -> None:
         super().__init__(self)
         self._scope = scope
-        self._span: object | None = None
+        self._span: object | None = span
 
     def enter(self) -> None:
-        self._span = self._scope.__enter__()
+        if self._scope is not None:
+            self._span = self._scope.__enter__()
 
     def exit(self, exc_type: object, exc: object, traceback: object) -> bool:
+        if self._scope is None:
+            return False
         if exc_type is not None and isinstance(exc, BaseException):
             self.fail(exc)
         self._scope.__exit__(None, None, None)
@@ -170,6 +183,14 @@ class _SpanHandle(SpanHandle):
 
     def set_compaction(self, *, tokens_after: int) -> None:
         self._set("zeta.tokens.after", tokens_after)
+
+    def set_mcp_request(self, *, request_id: int, protocol_version: str | None) -> None:
+        # the transport writes from the operation task, which can outlive a caller that stopped waiting
+        if not self._span.is_recording():
+            return
+        self._set("jsonrpc.request.id", str(request_id))
+        if protocol_version is not None:
+            self._set("mcp.protocol.version", protocol_version)
 
     def retry(self, *, attempt: int, reason: str, delay: int, after: bool) -> None:
         self._span.add_event("gen_ai.client.retry", attributes=_safe_attributes({
@@ -261,6 +282,23 @@ class _Runtime:
             name = f"{prefix} {_field_value(key, suffix)}"
         safe_attributes = _safe_attributes(attributes, _OPERATION_ATTRIBUTE_KEYS[operation])
         return _SpanHandle(self._tracer.start_as_current_span(name, kind=span_kind, attributes=safe_attributes, record_exception=False, set_status_on_exception=False))
+
+    def mcp_span(self, method: str, *, server: str, target: str | None) -> _SpanHandle:
+        from opentelemetry import trace
+
+        method = _field_value("mcp.method.name", method)
+        target_key = "gen_ai.prompt.name" if method == "prompts/get" else "gen_ai.tool.name"
+        attributes = {"mcp.method.name": method, "zeta.mcp.server.name": server}
+        if method in {"tools/call", "prompts/get"} and target is not None:
+            attributes[target_key] = target
+        safe_attributes = _safe_attributes(attributes, _OPERATION_ATTRIBUTE_KEYS["mcp"])
+        current = trace.get_current_span()
+        if current.is_recording() and getattr(current, "attributes", {}).get("gen_ai.operation.name") == "execute_tool":
+            # a model-issued call: its execute_tool span is the one span for this work
+            current.set_attributes(safe_attributes)
+            return _SpanHandle(None, current)
+        name = f"{method} {safe_attributes[target_key]}" if target_key in safe_attributes else method
+        return _SpanHandle(self._tracer.start_as_current_span(name, kind=trace.SpanKind.CLIENT, attributes=safe_attributes, record_exception=False, set_status_on_exception=False))
 
     def current_trace_context(self) -> dict[str, str]:
         carrier: dict[str, str] = {}

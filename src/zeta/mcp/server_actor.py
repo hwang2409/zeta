@@ -14,6 +14,7 @@ from weakref import WeakKeyDictionary, WeakSet
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..protocol.types import StructuredToolResult
+from ..telemetry import Telemetry
 from .abandoned_closes import AbandonedCloses, live_abandoned_closes
 from .call_deadline import MCPCallDeadline, finish_call_cleanup
 from .client import (
@@ -69,6 +70,7 @@ from .actors.prompt import (
     cancel_request as _cancel_request,
     cancel_prompt_request,
     CancelRequest as _CancelRequest,
+    create_caller_task as _create_caller_task,
     PromptFinished as _PromptFinished,
     PromptRequest as _PromptRequest,
     discover_prompts,
@@ -153,8 +155,10 @@ class MCPServerActor(MCPDefinitionPublisher):
         auto_max_delay: float = AUTO_RECONNECT_MAX_DELAY_SECONDS,
         deadline_clock: Callable[[], float] | None = None,
         limits: MCPCallLimits | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self.config = config
+        self._telemetry = telemetry or Telemetry.disabled()
         self.source = source
         self._registry = registry
         self._owned_registries: WeakSet[ToolRegistry] = WeakSet(
@@ -326,26 +330,30 @@ class MCPServerActor(MCPDefinitionPublisher):
         *,
         generation: int,
     ) -> StructuredToolResult:
-        future: asyncio.Future[StructuredToolResult] = (
-            asyncio.get_running_loop().create_future()
-        )
-        self._next_identifier += 1
-        request = _CallRequest(
-            self._next_identifier,
-            tool_name,
-            dict(arguments),
-            abort_signal,
-            generation,
-            future,
-        )
-        if self.is_terminal:
-            return _unavailable_result(self.name)
-        self._queue.put_nowait(request)
-        try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            await _cancel_request(self, request.identifier)
-            raise
+        telemetry = self._telemetry
+        with telemetry.mcp_span("tools/call", server=self.name, target=tool_name) as span:
+            future: asyncio.Future[StructuredToolResult] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._next_identifier += 1
+            request = _CallRequest(
+                self._next_identifier,
+                tool_name,
+                dict(arguments),
+                abort_signal,
+                generation,
+                future,
+                telemetry.current_trace_context(),
+                span,
+            )
+            if self.is_terminal:
+                return _unavailable_result(self.name)
+            self._queue.put_nowait(request)
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                await _cancel_request(self, request.identifier)
+                raise
 
     async def get_prompt(
         self, prompt_name: str, arguments: dict[str, str], *, generation: int
@@ -914,7 +922,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         client: MCPClient,
     ) -> None:
         request.client = client
-        request.task = asyncio.create_task(self._invoke_call(request, client))
+        request.task = _create_caller_task(
+            self, request, self._invoke_call(request, client)
+        )
         self._requests[request.identifier] = request
         self._children.add(request.task)
         request.task.add_done_callback(
