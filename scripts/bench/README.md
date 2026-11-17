@@ -54,15 +54,16 @@ uv run python scripts/bench/bench.py --tree .worktrees/main-ref \
 the tui probe uses the real console entry point on a controlling pty. it uses a
 local ollama stub through `ZETA_OLLAMA_BASE_URL` and measures prompt startup,
 turn start, key input, idle, rendering, and the stubbed stream. the serve probe
-uses the real serve protocol. store and context probes call the production
-session store and context assembler; scaling repeats store work at 10%, 50%,
-and 100% transcript sizes.
+uses the real serve protocol. the store probe reports `open_resume`, `snapshot`,
+and `snapshot_rows`; the context probe calls the production context assembler.
+scaling reports `snapshot_ms_per_mb` and `snapshot_us_per_row` at 10%, 50%, and
+100% transcript sizes.
 
 ## `store_probes.py` and `store_probes_more.py`
 
 `store_probes.py` is the command-line entry point. it supports these probes:
 
-- `open`: session open and replay work;
+- `open`: session open and public transcript snapshot reads;
 - `append`: synchronous and asynchronous append paths;
 - `evict`: context eviction;
 - `context`: turn-start context assembly;

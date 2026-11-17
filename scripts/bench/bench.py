@@ -188,17 +188,17 @@ def store_probe(home: Path, sid: str, name: str, repeats: int = 10) -> dict[str,
     opened = SessionManager(home).open(sid, _read_only=True)
     store = opened.store
     try:
-        replay_times = [timed(store.replay)[1] for _ in range(repeats)]
-        message_times = [timed(store.messages)[1] for _ in range(repeats)]
-        profile, top = profile_call(f"replay-{name}", store.replay)
+        def snapshot() -> Any:
+            return store.transcript_rows(store.resident_refs()).read()
+
+        snapshot_times = [timed(snapshot)[1] for _ in range(repeats)]
+        profile, top = profile_call(f"snapshot-{name}", snapshot)
         return {
             "open_resume": summary(open_times),
-            "replay": summary(replay_times),
-            "messages": summary(message_times),
-            "rows_replayed": len(store.replay()),
-            "messages_count": len(store.messages()),
-            "profile": profile,
-            "profile_top": top,
+            "snapshot": summary(snapshot_times),
+            "snapshot_rows": len(snapshot()),
+            "snapshot_profile": profile,
+            "snapshot_profile_top": top,
         }
     finally:
         store.close()
@@ -784,12 +784,12 @@ def scaling_probe(box: Sandbox, home: Path, sid: str, name: str) -> dict[str, An
         curves[str(fraction)] = {
             "rows_in_file": scaled_rows,
             "bytes": scaled_bytes,
-            "rows_replayed": store["rows_replayed"],
-            "replay_ms_per_mb": round(
-                store["replay"]["p50_ms"] / (scaled_bytes / 1e6), 3
+            "snapshot_rows": store["snapshot_rows"],
+            "snapshot_ms_per_mb": round(
+                store["snapshot"]["p50_ms"] / (scaled_bytes / 1e6), 3
             ),
-            "replay_us_per_row": round(
-                store["replay"]["p50_ms"] * 1000 / scaled_rows, 2
+            "snapshot_us_per_row": round(
+                store["snapshot"]["p50_ms"] * 1000 / scaled_rows, 2
             ),
             "store": store,
         }

@@ -137,9 +137,7 @@ class Ops:
     - entry_from_dict / message_from_dict: model decodes
     - deepcopy: top-level copy.deepcopy calls
     - active_branch / active_branch_rows: branch walks and rows walked
-    - snapshot_log_state_rows: rows copied by ConversationStore._snapshot_log_state
-    - validate_entries_rows: rows walked by ConversationStore._validate_entries
-    - load_full: full transcript reloads; fsync; sleep (cooperative yields)
+    - fsync; sleep (cooperative yields)
     """
 
     def __init__(self) -> None:
@@ -178,8 +176,6 @@ class Ops:
             self.counts["read_open_bytes"] += os.fstat(fd).st_size
 
     def install(self) -> None:
-        from zeta.core.store import ConversationStore
-
         counts = self.counts
         ops = self
 
@@ -304,22 +300,6 @@ class Ops:
             return result
 
         self._patch_everywhere(original_branch, active_branch)
-
-        def method_rows(name: str, key: str) -> None:
-            original = getattr(ConversationStore, name)
-
-            def method(store: Any, *args: Any, **kwargs: Any) -> Any:
-                if ops.active:
-                    counts[key] += len(store._entries)
-                    counts[key.replace("_rows", "_calls")] += 1
-                return original(store, *args, **kwargs)
-
-            setattr(ConversationStore, name, method)
-            self._undo.append(lambda: setattr(ConversationStore, name, original))
-
-        method_rows("_snapshot_log_state", "snapshot_log_state_rows")
-        method_rows("_validate_entries", "validate_entries_rows")
-        method_rows("_load_full", "load_full_rows_before")
 
     def uninstall(self) -> None:
         while self._undo:
@@ -453,13 +433,12 @@ def fractions_for(args: argparse.Namespace) -> list[float]:
 
 
 def probe_open(args: argparse.Namespace) -> dict[str, Any]:
-    """SessionManager.open(sid) (writable resume), store.replay(), store.messages()."""
+    """SessionManager.open(sid) and public transcript snapshot reads."""
 
     out: dict[str, Any] = {
         "functions": [
             "zeta.core.session.SessionManager.open (writable, fresh manager each sample)",
-            "ConversationStore.replay",
-            "ConversationStore.messages",
+            "ConversationStore.transcript_rows(...).read",
         ]
     }
     for fraction in fractions_for(args):
@@ -482,14 +461,14 @@ def _open_row(args: argparse.Namespace, fraction: float) -> dict[str, Any]:
     opened = SessionManager(home).open(sid)
     store = opened.store
     try:
-        row["replay"], entries = sample(store.replay, args.n)
-        row["replay_rows"] = len(entries)
-        row["replay_ops"] = count_ops(store.replay)
-        row["messages"], messages = sample(store.messages, args.n)
-        row["messages_count"] = len(messages)
-        row["messages_ops"] = count_ops(store.messages)
+        def snapshot() -> Any:
+            return store.transcript_rows(store.resident_refs()).read()
+
+        row["snapshot"], entries = sample(snapshot, args.n)
+        row["snapshot_rows"] = len(entries)
+        row["snapshot_ops"] = count_ops(snapshot)
         if fraction == 1.0:
-            row["replay_profile"] = profile(f"replay-{args.session}", store.replay)
+            row["snapshot_profile"] = profile(f"snapshot-{args.session}", snapshot)
     finally:
         store.close()
     if fraction == 1.0:
@@ -545,7 +524,6 @@ def _append_row(args: argparse.Namespace, fraction: float) -> dict[str, Any]:
 
         async def run_async() -> dict[str, Any]:
             store.bind_owner_thread()
-            store._prepare_durable_writer_snapshot()
             # First write builds the persistent durable writer (one full load).
             first_started = time.perf_counter_ns()
             with OPS.measure() as first_ops:
@@ -566,7 +544,6 @@ def _append_row(args: argparse.Namespace, fraction: float) -> dict[str, Any]:
             }
 
         row.update(asyncio.run(run_async()))
-        store._owner_thread_id = None
         if fraction == 1.0:
             row["append_sync_profile"] = profile(
                 f"append-sync-{args.session}",
