@@ -194,16 +194,23 @@ class SessionControllers:
         return record is None or record.closing
 
     def retire(
-        self,
-        record: SessionController,
-        settlement_timeout: float | None = None,
-        runtime_close: Callable[[], Awaitable[None]] | None = None,
+        self, record: SessionController, settlement_timeout: float | None = None
     ) -> asyncio.Task[None]:
         """The one close of a resident record; a second call returns the same
-        close. Resolution stops now; the control closes, then the runtime
-        (``runtime_close`` when the caller owns more of its teardown), only
+        close. Resolution stops now; the control closes, then the runtime, only
         once no use holds the record; approval settlement is verified last;
-        only then does the record leave ``records()``."""
+        only then does the record leave ``records()``. A failed close is
+        logged, since nobody need await it."""
+        return self._begin_close(record, settlement_timeout, None)
+
+    def _begin_close(
+        self,
+        record: SessionController,
+        settlement_timeout: float | None,
+        runtime_close: Callable[[], Awaitable[None]] | None,
+        *,
+        report: bool = True,
+    ) -> asyncio.Task[None]:
         if record.close_task is not None:
             return record.close_task
         assert self._records.get(record.control) is record, "retire of a foreign record"
@@ -215,7 +222,8 @@ class SessionControllers:
         task = asyncio.create_task(
             self._close(record, settlement_timeout, runtime_close or runtime.close)
         )
-        task.add_done_callback(lambda done: _report_close(done, record.closing_session_id))
+        if report:
+            task.add_done_callback(lambda done: _report_close(done, record.closing_session_id))
         record.close_task = task
         return task
 
@@ -252,11 +260,23 @@ class SessionControllers:
         attached_runtime_close: Callable[[], Awaitable[None]],
     ) -> None:
         """Server shutdown: close every resident record and wait for every close.
-        The attached record's close error propagates; the others are logged by
-        their close. A cancel of the shutdown does not cancel a close."""
+        The attached record's runtime ends through ``attached_runtime_close``
+        and its close error propagates; the others are logged by their close. A
+        cancel of the shutdown does not cancel a close."""
         for record in tuple(self._parked.values()):
             self.retire(record, settlement_timeout)
-        attached = self.retire(self._attached, settlement_timeout, attached_runtime_close)
+        done = self._attached.close_task
+        if done is not None and done.done():
+            # a repeated shutdown: the first one already reported this close
+            await asyncio.gather(
+                *(record.close_task for record in self._records.values() if record.close_task),
+                return_exceptions=True,
+            )
+            return
+        # its close error reaches the caller, so it is not logged as well
+        attached = self._begin_close(
+            self._attached, settlement_timeout, attached_runtime_close, report=False
+        )
         others = [
             record.close_task
             for record in self._records.values()

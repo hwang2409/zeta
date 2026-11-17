@@ -1030,6 +1030,11 @@ async def test_cancelled_send_images_publishes_nothing(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(request, 10)
         await asyncio.wait_for(asyncio.to_thread(worker_finished.wait), 10)
+        # the cancel drops only the response: the delivery's own cleanup still
+        # holds the session until it ends
+        async with asyncio.timeout(10):
+            while server.controllers.attached().uses:
+                await asyncio.sleep(0)
 
         assert branch_messages(server.controllers.attached().runtime.opened.store) == []
         assert not (server.controllers.attached().runtime.opened.store.session_dir / "attachments").exists()

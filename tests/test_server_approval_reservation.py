@@ -52,6 +52,12 @@ from zeta.tools.agent.approval import ChildApprovalPolicy
 pytest_plugins = ("tests.support.socket_fixtures",)
 
 
+async def _deliver(server: ZetaServer, method: str, params: dict[str, object], features: frozenset[str]) -> dict[str, object]:
+    """``send``/``steer`` through the attached record's use, as the serve request does."""
+    with server.controllers.owned(None) as use:
+        return await getattr(use.control.deliveries, method)(use, params, features)
+
+
 async def _decide(server: ZetaServer, method: str, request_id: str, scope: str = "once") -> dict[str, object]:
     """Decide through the attached record's use, as the serve request does."""
     with server.controllers.owned(None) as use:
@@ -1122,10 +1128,12 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
             lambda *args, **kwargs: effects.append("steer"),
         )
 
-        assert await deliveries.send(
+        assert await _deliver(
+            server, "send",
             {"text": "retry", "delivery_id": "retained-send"}, features
         ) == {"accepted": True, "session_id": session_id, "duplicate": True}
-        assert await deliveries.steer(
+        assert await _deliver(
+            server, "steer",
             {"text": "retry", "delivery_id": "retained-steer"}, features
         ) == {"accepted": True, "duplicate": True}
         for method, params in (
@@ -1133,7 +1141,7 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
             ("steer", {"text": "retry", "delivery_id": "evicted-id"}),
         ):
             with pytest.raises(ProtocolError) as error:
-                await getattr(deliveries, method)(params, features)
+                await _deliver(server, method, params, features)
             assert error.value.code == -32010
         assert (
             deliveries.status({"delivery_id": "retained-send"}, features)["status"]
@@ -1152,7 +1160,7 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
             {"text": "unkeyed"},
         ):
             with pytest.raises(ProtocolError) as error:
-                await deliveries.send(params, features)
+                await _deliver(server, "send", params, features)
             assert error.value.code == -32000
         assert effects == []
 
@@ -1161,7 +1169,8 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
         )[-1]
         assert "result" in response
         assert not server.controllers.attached().control.unhealthy()
-        result = await deliveries.send(
+        result = await _deliver(
+            server, "send",
             {"text": "recovered", "delivery_id": "recovered-id"}, features
         )
         assert result == {"accepted": True, "session_id": session_id}
