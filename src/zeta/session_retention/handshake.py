@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from ..core.session_files import require_off_loop_lock
-from ..locking import RETENTION_HOME_ID, domain_lock_name
+from ..locking import RETENTION_HOME_ID, domain_lock_name, open_created
 
 
 def _lock_file(home: Path, name: str) -> int:
@@ -25,16 +25,12 @@ def _lock_file(home: Path, name: str) -> int:
             ".domain-locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd
         )
         try:
-            try:
-                fd = os.open(
-                    name,
-                    os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                    0o600,
-                    dir_fd=locks_fd,
-                )
-            except FileNotFoundError:
-                # Another owner can publish the lock directory concurrently.
-                return _lock_file(home, name)
+            fd = open_created(
+                name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+                dir_fd=locks_fd,
+            )
         finally:
             os.close(locks_fd)
     finally:

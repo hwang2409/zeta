@@ -22,7 +22,7 @@ from ..core.session_files import (
     quarantine_path,
     reservation_path,
 )
-from ..locking import RETENTION_HOME_ID, domain_lock_name
+from ..locking import _CREATE_RACE_RETRIES, RETENTION_HOME_ID, domain_lock_name
 from ..storage_format import (
     ACCEPTED_KEY_SETS,
     FEATURE_EPOCHS,
@@ -300,6 +300,7 @@ _SESSION_REFERENCE_GATE = _REMOTE_WRITER_EPOCH + rf'''
 _SESSION_RETENTION_EPOCH = {FEATURE_EPOCHS[StorageFeature.SESSION_RETENTION]}
 _GENERATION_NAME = {SESSION_REFERENCE_GENERATION!r}
 _REFERENCE_LOCK_NAME = {domain_lock_name(RETENTION_HOME_ID, REFERENCES_DOMAIN)!r}
+_CREATE_RACE_RETRIES = {_CREATE_RACE_RETRIES}
 _RETENTION_PIN_FILENAME = {RETENTION_PIN_FILENAME!r}
 _RESERVATION_RELATIVE = {_RESERVATION_RELATIVE!r}
 _QUARANTINE_RELATIVE = {_QUARANTINE_RELATIVE!r}
@@ -357,7 +358,12 @@ def _reference_gate(home, installed_ids, referenced_ids):
         lock_dir_fd = os.open(".domain-locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd)
         try:
             lock_name = _REFERENCE_LOCK_NAME
-            fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=lock_dir_fd)
+            for attempt in range(_CREATE_RACE_RETRIES):  # Darwin: a racing first create can report ENOENT
+                try:
+                    fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=lock_dir_fd)
+                    break
+                except FileNotFoundError:
+                    if attempt + 1 == _CREATE_RACE_RETRIES: raise
             try:
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:

@@ -15,7 +15,13 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-from ..locking import RETENTION_HOME_ID, domain_authority, execution_lock, shape_lock
+from ..locking import (
+    RETENTION_HOME_ID,
+    domain_authority,
+    execution_lock,
+    open_created,
+    shape_lock,
+)
 from ..storage_format import (
     StorageFeature,
     WriterLease,
@@ -614,7 +620,7 @@ def open_session_file(directory_fd: int, name: str, flags: int) -> int:
     """Open one regular, unshared file without following a link or blocking on a FIFO."""
     _component(name)
     for attempt in range(_READ_RETRIES):
-        fd = os.open(
+        fd = open_created(
             name,
             (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_NONBLOCK,
             0o600,
