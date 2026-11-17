@@ -1979,6 +1979,7 @@ async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
 async def test_model_catalog_refreshes_after_a_previous_load(tmp_path: Path) -> None:
     calls: list[str] = []
     started = [asyncio.Event() for _ in range(3)]
+    completed = [threading.Event() for _ in range(3)]
     release_second = threading.Event()
     loop = asyncio.get_running_loop()
 
@@ -1987,6 +1988,7 @@ async def test_model_catalog_refreshes_after_a_previous_load(tmp_path: Path) -> 
         loop.call_soon_threadsafe(started[len(calls) - 1].set)
         if len(calls) == 2:
             release_second.wait()
+        completed[len(calls) - 1].set()
         return (
             frozenset({"claude-opus-4-7"})
             if len(calls) == 1
@@ -2011,7 +2013,7 @@ async def test_model_catalog_refreshes_after_a_previous_load(tmp_path: Path) -> 
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model claude-new")
     await await_or_fail(
-        app._model_catalog_load_finished.wait(), what="first model catalog load"
+        asyncio.to_thread(completed[0].wait), what="first model catalog load"
     )
     second = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
@@ -2023,7 +2025,7 @@ async def test_model_catalog_refreshes_after_a_previous_load(tmp_path: Path) -> 
     release_second.set()
     await await_or_fail(started[2].wait(), what="third model catalog load start")
     await await_or_fail(
-        app._model_catalog_load_finished.wait(), what="third model catalog load"
+        asyncio.to_thread(completed[2].wait), what="third model catalog load"
     )
     fourth = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
