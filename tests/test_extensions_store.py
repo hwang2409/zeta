@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 import zeta.extensions as extensions_package
-from zeta.extensions.store import ExtensionStore, ExtensionTrustError
+from zeta.extensions.store import ExtensionStore, ExtensionTrustError, InstallResult
 
 
 def _extension(path: Path, name: str = "demo", marker: str = "old") -> Path:
@@ -81,58 +81,143 @@ class _TrustPublicationFailureStore(ExtensionStore):
 
 
 @pytest.mark.parametrize(
-    ("case", "action", "confirmation", "checkpoint", "error", "installed", "trusted"),
+    (
+        "case", "action", "starting_tree_digest", "starting_trust",
+        "confirmation", "checkpoint", "expected_result_or_exact_error",
+        "immediate_target_digest", "immediate_trust", "immediate_private_residue",
+        "post_restart_target_digest", "post_restart_trust", "post_restart_load",
+        "post_restart_private_residue",
+    ),
     [
-        ("install-success", "install", "y", None, None, True, True),
-        ("install-cancel", "install", "n", None, "install cancelled", False, False),
-        ("install-stop-after-target", "install", "y", "install_target_published", "install_target_published", True, False),
-        ("trust-success", "trust", "y", None, None, True, True),
-        ("trust-cancel", "trust", "n", None, "trust cancelled", True, False),
-        ("untrust-success", "untrust", "y", None, None, True, False),
-        ("remove-success", "remove", "y", None, None, False, False),
-        ("remove-idempotent", "remove-absent", "y", None, None, False, False),
+        ("install-success", "install", None, None, "y", None, None, "new", "new", False, "new", "new", True, False),
+        ("install-cancel", "install", None, None, "n", None, "install cancelled", None, None, False, None, None, False, False),
+        ("install-target-published", "install", None, None, "y", "install_target_published", "install_target_published", "new", None, False, "new", None, True, False),
+        ("install-trust-published", "install", None, None, "y", "install_trust_published", "install_trust_published", "new", "new", False, "new", "new", True, False),
+        ("trust-success", "trust", "old", None, "y", None, None, "old", "old", False, "old", "old", True, False),
+        ("trust-cancel", "trust", "old", None, "n", None, "trust cancelled", "old", None, False, "old", None, True, False),
+        ("untrust-success", "untrust", "old", "old", "y", None, None, "old", None, False, "old", None, True, False),
+        ("remove-success", "remove", "old", "old", "y", None, None, None, None, False, None, None, False, False),
+        ("remove-idempotent", "remove-absent", None, None, "y", None, None, None, None, False, None, None, False, False),
+        ("install-duplicate", "install-duplicate", "old", "old", "y", None, None, "old", "old", False, "old", "old", True, False),
+        ("install-conflict", "install-conflict", "old", "old", "y", None, "extension already installed with different content: demo", "old", "old", False, "old", "old", True, False),
+        ("trust-stale", "trust-stale", "old", None, "y", None, "extension changed since review: demo", "tampered", None, False, "tampered", None, True, False),
+        ("invalid-name", "remove-invalid", None, None, "y", None, "invalid extension name: ../bad", None, None, False, None, None, False, False),
+        ("manifest-mismatch", "trust-mismatch", "mismatch", None, "y", None, "manifest name 'other' does not match folder 'demo'", "mismatch", None, False, "mismatch", None, False, False),
+        ("update-owner-published", "update", "old", "old", "y", "update_owner_published", "update_owner_published", "old", "old", True, "old", "old", True, False),
+        ("update-backup-published", "update", "old", "old", "y", "update_backup_published", "update_backup_published", None, "old", True, "old", "old", True, False),
+        ("update-target-published", "update", "old", "old", "y", "update_target_published", "update_target_published", "new", "old", True, "old", "old", True, False),
+        ("update-trust-published", "update", "old", "old", "y", "update_trust_published", "update_trust_published", "new", "new", True, "new", "new", True, False),
+        ("update-backup-cleanup", "update", "old", "old", "y", "update_backup_cleanup_progress", "update_backup_cleanup_progress", "new", "new", True, "new", "new", True, False),
+        ("update-backup-deleted", "update", "old", "old", "y", "update_backup_deleted", "update_backup_deleted", "new", "new", True, "new", "new", True, False),
+        ("update-owner-deleted", "update", "old", "old", "y", "update_owner_deleted", "update_owner_deleted", "new", "new", True, "new", "new", True, False),
     ],
 )
 def test_public_action_outcomes(
     tmp_path: Path,
     case: str,
     action: str,
+    starting_tree_digest: str | None,
+    starting_trust: str | None,
     confirmation: str,
     checkpoint: str | None,
-    error: str | None,
-    installed: bool,
-    trusted: bool,
+    expected_result_or_exact_error: str | None,
+    immediate_target_digest: str | None,
+    immediate_trust: str | None,
+    immediate_private_residue: bool,
+    post_restart_target_digest: str | None,
+    post_restart_trust: str | None,
+    post_restart_load: bool,
+    post_restart_private_residue: bool,
 ) -> None:
     home = tmp_path / case
-    source = _extension(tmp_path / f"source-{case}")
+    repository: Path | None = None
+    source: str
+    if action == "update":
+        repository, _commit = _git_extension(tmp_path / f"source-{case}")
+        source = f"git+{repository}@HEAD"
+    else:
+        marker = "old" if action in {"install-duplicate", "install-conflict"} else "new"
+        source = str(_extension(tmp_path / f"source-{case}", marker=marker))
     store = _CheckpointStore(home=home, project_dir=None)
-    if action not in {"install", "remove-absent"}:
-        store.install(str(source), scope="user", accept=True)
-        store.untrust("demo", scope="user")
+    digests: dict[str, str] = {}
+    if starting_tree_digest == "mismatch":
+        mismatch = _extension(home / "extensions" / "demo", name="other")
+        digests["mismatch"] = store._snapshot_existing(mismatch, mismatch.parent).digest
+    elif starting_tree_digest == "old":
+        initial = store.install(source, scope="user", accept=True)
+        digests["old"] = initial.digest
+        if repository is not None:
+            (repository / "mod.py").write_text("# new\ndef activate(zx):\n    pass\n")
+            subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+            subprocess.run(
+                ["git", "-C", str(repository), "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--quiet", "-m", "new"],
+                check=True,
+            )
+        if starting_trust is None:
+            store.untrust("demo", scope="user")
+    if action == "install-conflict":
+        (Path(source) / "mod.py").write_text("# new\ndef activate(zx):\n    pass\n")
+
+    def stale_confirmation(_prompt: str) -> str:
+        target = home / "extensions" / "demo" / "mod.py"
+        target.write_text("# tampered\ndef activate(zx):\n    pass\n")
+        return confirmation
+
     store.stop = checkpoint
     call = {
-        "install": lambda: store.install(str(source), scope="user", confirm=lambda _: confirmation),
+        "install": lambda: store.install(source, scope="user", confirm=lambda _: confirmation),
+        "install-duplicate": lambda: store.install(source, scope="user", confirm=lambda _: confirmation),
+        "install-conflict": lambda: store.install(source, scope="user", confirm=lambda _: confirmation),
+        "update": lambda: store.update("demo", scope="user", confirm=lambda _: confirmation),
         "trust": lambda: store.trust("demo", scope="user", confirm=lambda _: confirmation),
+        "trust-stale": lambda: store.trust("demo", scope="user", confirm=stale_confirmation),
+        "trust-mismatch": lambda: store.trust("demo", scope="user", confirm=lambda _: confirmation),
         "untrust": lambda: store.untrust("demo", scope="user"),
         "remove": lambda: store.remove("demo", scope="user"),
         "remove-absent": lambda: store.remove("demo", scope="user"),
+        "remove-invalid": lambda: store.remove("../bad", scope="user"),
     }[action]
-    if error:
+    if expected_result_or_exact_error:
         expected = _Stop if checkpoint else ExtensionTrustError
-        with pytest.raises(expected, match=error):
+        with pytest.raises(expected, match=expected_result_or_exact_error):
             call()
     else:
-        call()
+        result = call()
+        if isinstance(result, InstallResult):
+            digests["new" if action in {"install", "update"} else "old"] = result.digest
+
     target = home / "extensions" / "demo"
-    assert target.exists() is installed
-    values = _trust(home)
-    assert ("user:demo" in values) is trusted
-    result = ExtensionStore(home=home, project_dir=None).discover("user")
-    assert bool(result.extensions) is installed
-    if result.extensions:
-        assert result.extensions[0].trusted is trusted
+    if target.exists():
+        immediate = ExtensionStore(home=home, project_dir=None)._snapshot_existing(
+            target, target.parent,
+        ).digest
+        text = (target / "mod.py").read_text()
+        if "# tampered" in text:
+            marker = "tampered"
+        elif "# new" in text:
+            marker = "new"
+        else:
+            marker = "old"
+        digests.setdefault(marker, immediate)
+    else:
+        immediate = None
+    trust = _trust(home).get("user:demo")
+    assert immediate == (digests.get(immediate_target_digest) if immediate_target_digest else None)
+    assert trust == (digests.get(immediate_trust) if immediate_trust else None)
     private = home / "extensions" / ".zeta-extension-store"
-    assert not [path for path in private.glob("*") if path.name != "lost+found"]
+    assert bool(list(private.glob("update-*"))) is immediate_private_residue
+
+    restarted = ExtensionStore(home=home, project_dir=None).discover("user")
+    target = home / "extensions" / "demo"
+    final = (
+        ExtensionStore(home=home, project_dir=None)._snapshot_existing(target, target.parent).digest
+        if target.exists() else None
+    )
+    final_trust = _trust(home).get("user:demo")
+    assert final == (digests.get(post_restart_target_digest) if post_restart_target_digest else None)
+    assert final_trust == (digests.get(post_restart_trust) if post_restart_trust else None)
+    assert bool(restarted.extensions) is post_restart_load
+    assert bool(list(private.glob("update-*"))) is post_restart_private_residue
 
 
 @pytest.mark.parametrize(
