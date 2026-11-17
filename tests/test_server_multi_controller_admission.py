@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 from pathlib import Path
 
@@ -112,6 +113,20 @@ async def test_multi_reconnect_requires_matching_session_id(
         assert "result" in admitted
     finally:
         await _close_server(server, (wrong, right))
+
+
+def test_production_sources_do_not_supply_private_feature_override() -> None:
+    root = Path(__file__).parents[1] / "src" / "zeta"
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id != "ZetaServer":
+                continue
+            assert all(
+                keyword.arg != "_supported_features_for_test" for keyword in node.keywords
+            ), path
 
 
 @pytest.mark.asyncio
