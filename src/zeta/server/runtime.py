@@ -833,7 +833,12 @@ class ServerRuntime:
             if extension_sink is None
             else lambda message: extension_sink(state.session_id, message)
         )
-        state.loop.set_mcp_notice_sink(extension_notice)
+        memory_notice = (
+            None
+            if memory_sink is None
+            else lambda message: memory_sink(state.session_id, message)
+        )
+        state.loop.set_mcp_notice_sink(memory_notice)
         if state.loop.extensions is not None:
             state.loop.extensions.set_notice_sink(extension_notice)
         reconciler = state.loop.memory_reconciler
