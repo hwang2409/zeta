@@ -35,11 +35,9 @@ agent_cleanup() {
     launchctl bootout "gui/$UID/$AGENT_LABEL" >/dev/null 2>&1 || true
   fi
   if [ -n "$dir" ]; then
+    rm -rf "$dir"
     if [ "$dry_run" -eq 1 ]; then
-      rm -rf "$dir"
       printf 'dry-run: rm -rf %s\n' "$dir"
-    else
-      rm -rf "$dir"
     fi
   fi
   if [ "$active" -eq 1 ] && [ "$dry_run" -eq 1 ]; then
@@ -197,7 +195,7 @@ cmd_selftest() {
   trap 'agent_cleanup; rm -f "${selftest_results:-}"' EXIT
   RESULTS="$selftest_results"
 
-  local name input expected expected_status values actual status
+  local name input expected expected_status values actual status removed_dir
   while IFS='|' read -r name input expected expected_status; do
     values="$(_preflight_values "$input")"
     if actual="$(classify_rebuild_result "$values" old new 0)"; then status=0; else status=$?; fi
@@ -217,14 +215,21 @@ EOF
   # real two-line output rejected as malformed.
   local real_helper_output='responsible_pid=123 executable=/usr/bin/cuspike bundle_id=com.henry.zeta.cuspike
 screen_recording=true accessibility=true'
-  for name in real-helper-old-rebuild real-helper-agent-rebuild; do
-    if actual="$(classify_rebuild_result "$(_preflight_values "$real_helper_output")" old new 0)"; then status=0; else status=$?; fi
-    printf '%-18s %-12s status=%s\n' "$name" "$actual" "$status"
-    if [ "$actual" != SURVIVED ] || [ "$status" -ne 0 ]; then
-      printf 'FAIL classify %s: expected SURVIVED/status=0, got %s/status=%s\n' "$name" "$actual" "$status"
-      return 1
-    fi
-  done
+  local command_output
+  if command_output="$(CUSPIKE_SELFTEST_HELPER_OUTPUT="$real_helper_output" AGENT_DRY_RUN=1 cmd_rebuild adhoc)"; then status=0; else status=$?; fi
+  actual="$(printf '%s\n' "$command_output" | grep -o 'SURVIVED' | tail -1)"
+  printf '%-18s %-12s status=%s\n' real-helper-old-rebuild "$actual" "$status"
+  if [ "$actual" != SURVIVED ] || [ "$status" -ne 0 ]; then
+    printf 'FAIL classify real-helper-old-rebuild: expected SURVIVED/status=0, got %s/status=%s\n' "$actual" "$status"
+    return 1
+  fi
+  if command_output="$(CUSPIKE_SELFTEST_HELPER_OUTPUT="$real_helper_output" AGENT_DRY_RUN=1 cmd_agent_rebuild adhoc)"; then status=0; else status=$?; fi
+  actual="$(printf '%s\n' "$command_output" | grep -o 'SURVIVED' | tail -1)"
+  printf '%-18s %-12s status=%s\n' real-helper-agent-rebuild "$actual" "$status"
+  if [ "$actual" != SURVIVED ] || [ "$status" -ne 0 ]; then
+    printf 'FAIL classify real-helper-agent-rebuild: expected SURVIVED/status=0, got %s/status=%s\n' "$actual" "$status"
+    return 1
+  fi
   # The last two cases exercise the same failure gates used by rebuild commands.
   if actual="$(classify_rebuild_result "true true" same same 0)"; then status=0; else status=$?; fi
   printf '%-18s %-12s status=%s\n' unchanged-cdhash "$actual" "$status"
@@ -264,6 +269,11 @@ screen_recording=true accessibility=true'
         END { exit !(removed && booted && booted > removed) }
       ' "$output"; then
         printf 'FAIL %s %s: cleanup order is invalid\n' "$path" "$mode"
+        return 1
+      fi
+      removed_dir="$(sed -n 's/^dry-run: rm -rf //p' "$output")"
+      if [ -z "$removed_dir" ] || [ -e "$removed_dir" ]; then
+        printf 'FAIL %s %s: cleanup directory remains\n' "$path" "$mode"
         return 1
       fi
       if [ -n "$AGENT_DIR" ]; then
@@ -321,16 +331,29 @@ cmd_input() {
 
 cmd_rebuild() {
   local mode="${1:-adhoc}"
-  need_bin || return 1
+  if [ -z "${CUSPIKE_SELFTEST_HELPER_OUTPUT:-}" ]; then
+    need_bin || return 1
+  fi
   log ""
   log "## rebuild @ $(ts)   mode=$mode  (does the grant survive a cdhash change?)"
-  local before; before="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
-  local build_rc=0; cmd_build "$mode" >/dev/null || build_rc=$?
-  local after; after="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
+  local before after build_rc=0
+  if [ -n "${CUSPIKE_SELFTEST_HELPER_OUTPUT:-}" ]; then
+    before=old; after=new
+  else
+    before="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
+    cmd_build "$mode" >/dev/null || build_rc=$?
+    after="$(codesign -dvvv "$BIN" 2>&1 | sed -nE 's/.*CDHash=(.*)/\1/p' | head -1)"
+  fi
   log "cdhash before=$before after=$after"
-  swift_identity
+  if [ -z "${CUSPIKE_SELFTEST_HELPER_OUTPUT:-}" ]; then
+    swift_identity
+  fi
   local swout values outcome outcome_rc
-  swout="$([ -x "$BIN" ] && "$BIN" preflight 2>&1 || true)"
+  if [ -n "${CUSPIKE_SELFTEST_HELPER_OUTPUT:-}" ]; then
+    swout="$CUSPIKE_SELFTEST_HELPER_OUTPUT"
+  else
+    swout="$([ -x "$BIN" ] && "$BIN" preflight 2>&1 || true)"
+  fi
   values="$(_preflight_values "$swout")"
   if outcome="$(classify_rebuild_result "$values" "$before" "$after" "$build_rc")"; then outcome_rc=0; else outcome_rc=$?; fi
   log "[$([ "$outcome" = SURVIVED ] && echo PASS || echo "$outcome")] grant $outcome after rebuild (mode=$mode): ${values:-malformed}"
@@ -434,6 +457,7 @@ EOF
   AGENT_ACTIVE=1
   if [ "$AGENT_DRY_RUN" -eq 1 ]; then
     case "${AGENT_DRY_RUN_MODE:-success}" in
+      helper) printf '%s\n' "$CUSPIKE_SELFTEST_HELPER_OUTPUT" >"$AGENT_DIR/stdout"; printf '0\n' >"$AGENT_DIR/done" ;;
       success) printf 'screen_recording=true accessibility=true\n' >"$AGENT_DIR/stdout"; printf '0\n' >"$AGENT_DIR/done" ;;
       failure) printf 'helper failed\n' >"$AGENT_DIR/stderr"; printf '7\n' >"$AGENT_DIR/done" ;;
       timeout) : ;;
@@ -473,7 +497,11 @@ cmd_agent_rebuild() {
   local out values outcome outcome_rc
   out="${TMPDIR:-/tmp}/com.henry.zeta.cuspike-rebuild-output.$$"
   : >"$out"
-  cmd_agent check >"$out" 2>&1 || true
+  if [ -n "${CUSPIKE_SELFTEST_HELPER_OUTPUT:-}" ]; then
+    AGENT_DRY_RUN=1 AGENT_DRY_RUN_MODE=helper cmd_agent check >"$out" 2>&1 || true
+  else
+    cmd_agent check >"$out" 2>&1 || true
+  fi
   values="$(_preflight_values "$(cat "$out")")"
   cat "$out"
   rm -f "$out"
