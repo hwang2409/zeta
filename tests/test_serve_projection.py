@@ -148,8 +148,26 @@ def test_computer_start_end_frame_projection_is_bounded_and_uses_existing_names(
 
 def test_computer_projection_omits_malformed_optional_values_and_extras() -> None:
     event = _computer_event("denied", bundle="b" * 20_000, shortcut={"bad": True})
+    oversized = _wire(event, start=False)
+    assert oversized["computer"] == {"action": "type", "control": "denied"}
+    assert event.tool_result is not None
+    event = StreamEvent(
+        event.type,
+        tool_call=event.tool_call,
+        tool_result=ToolResult(
+            event.tool_result.tool_call_id,
+            event.tool_result.content,
+            event.tool_result.is_error,
+            content_blocks=event.tool_result.content_blocks,
+            structured_content={
+                "computer": "malformed",
+                "oversized": "x" * 20_000,
+                "thumbnail": "raw-base64",
+            },
+        ),
+    )
     params = _wire(event, start=False)
-    assert params["computer"] == {"action": "type", "control": "denied"}
+    assert params["computer"] == {"action": "type", "control": "idle"}
     assert len(json.dumps(params)) < 1000
 
 
@@ -183,7 +201,9 @@ def test_computer_history_matches_live_state_and_stubs_images() -> None:
     assert history_result["content_blocks"] == [
         {"type": "image", "mimeType": "image/png", "size": 7, "data_omitted": True}
     ]
-    assert "raw-base64" not in json.dumps(rows)
+    history_wire = json.dumps(rows)
+    assert "raw-base64" not in history_wire
+    assert "private result" not in history_wire
 
 
 def test_child_history_does_not_inherit_parent_computer_state() -> None:

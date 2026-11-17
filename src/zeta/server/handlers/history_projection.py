@@ -621,6 +621,7 @@ def _history_entry_rows(
         structured = result.get("structured_content")
         state = computer_state(None, {}, structured, running=False)
         if fidelity and state is not None:
+            result["content"] = ""
             result["structured_content"] = {"computer": state}
             result["structured_content_truncated"] = False
         elif fidelity and structured is not None:

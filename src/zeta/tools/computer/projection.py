@@ -25,11 +25,12 @@ def computer_state(
     """Return the fixed public state for one computer call, or ``None``."""
 
     structured = structured_content if isinstance(structured_content, Mapping) else {}
+    has_computer_state = "computer" in structured
     raw_state = structured.get("computer")
     state = raw_state if isinstance(raw_state, Mapping) else {}
     if not (
         isinstance(tool_name, str) and tool_name.strip().lower() == "computer"
-    ) and not state:
+    ) and not has_computer_state:
         return None
 
     args = arguments if isinstance(arguments, Mapping) else {}
