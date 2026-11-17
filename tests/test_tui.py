@@ -1737,9 +1737,11 @@ def _assert_tool_contract(name: str) -> None:
     assert all(item is not None for item in rendered), name
     plain = [terminal_plain(item).lower() for item in rendered]
     assert name.lower() in plain[0], name
-    assert "sample" in plain[0], name
+    if name != "computer":
+        assert "sample" in plain[0], name
     assert "contract result" in plain[1] or name.lower() in plain[1], name
-    assert "contract error" in plain[2], name
+    if name != "computer":
+        assert "contract error" in plain[2], name
     assert any(marker in plain[2] for marker in ("error", "failed", "denied")), name
 
 
@@ -1867,6 +1869,7 @@ async def test_tool_card_registry_only_names_real_or_supported_alias_tools(
             "exec",
             "finish",
             "agent_handoff",
+            "computer",
         }
     finally:
         await registry.close()
@@ -17855,3 +17858,92 @@ async def test_child_activation_discards_stale_slow_target_and_returns_to_root(
         assert navigation.transcript_control._history_pager.source is app._history_source
         assert "root owner row" in rendered
         assert "first row" not in rendered and "second row" not in rendered
+
+@pytest.mark.parametrize(
+    ("running", "control", "bundle", "shortcut", "expected"),
+    [
+        (True, "active", None, "ctrl+opt+cmd+esc", ("computer", "screenshot", "active", "ctrl+opt+cmd+esc")),
+        (False, "idle", None, None, ("computer", "screenshot", "idle")),
+        (False, "denied", "com.denied.exact", None, ("computer", "denied", "com.denied.exact", "screenshot")),
+        (False, "killed", None, "ctrl+opt+cmd+esc", ("computer", "killed", "screenshot", "ctrl+opt+cmd+esc")),
+    ],
+)
+def test_computer_card_renders_bounded_state_at_normal_and_narrow_widths(
+    running: bool,
+    control: str,
+    bundle: str | None,
+    shortcut: str | None,
+    expected: tuple[str, ...],
+) -> None:
+    call = ToolCall("computer-call", "computer", {"action": "screenshot", "text": "secret input"})
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_START if running else StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=None if running else ToolResult(
+            "computer-call",
+            "unrelated result",
+            control != "idle",
+            content_blocks=[
+                {"type": "text", "text": "unrelated result"},
+                {"type": "image", "data": "raw-base64", "mimeType": "image/png"},
+            ],
+            structured_content={
+                "computer": {
+                    "action": "screenshot",
+                    "control": control,
+                    "kill_switch": shortcut,
+                    "frontmost_bundle_id": bundle,
+                    "thumbnail": "raw-base64",
+                },
+                "unrelated": "secret output",
+            },
+        ),
+    )
+    rendered = render_event(event)
+    assert rendered is not None
+    semantic = renderable_plain(rendered)
+    assert all(value in semantic for value in expected)
+    assert all(value not in semantic for value in ("secret input", "unrelated result", "raw-base64", "secret output", "thumbnail"))
+
+    for width in (100, 40):
+        output = StringIO()
+        Console(file=output, force_terminal=False, width=width).print(rendered)
+        snapshot = output.getvalue().strip()
+        assert "computer" in snapshot
+        assert control in snapshot
+        if control == "denied":
+            assert "com.denied.exact" in snapshot
+
+
+def test_computer_card_and_serve_state_values_stay_fixed() -> None:
+    for control in ("active", "idle", "denied", "killed"):
+        event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=ToolCall("call", "computer", {"action": "wait"}),
+            tool_result=ToolResult(
+                "call",
+                "ignored",
+                False,
+                structured_content={"computer": {"action": "wait", "control": control}},
+            ),
+        )
+        rendered = render_event(event)
+        assert rendered is not None
+        assert control in renderable_plain(rendered)
+
+
+def test_child_registry_has_no_computer_tool(tmp_path: Path) -> None:
+    registry = ToolRegistry(
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        computer=ComputerUseConfig(enabled=True, default_app_access="allow"),
+    )
+    child_store = ConversationStore(tmp_path / "child.jsonl")
+    child = registry.clone_for_session(child_store)
+    try:
+        assert "computer" in registry.registered_names
+        assert "computer" not in child.registered_names
+    finally:
+        asyncio.run(child.close(background_task_cause="test cleanup"))
+        asyncio.run(registry.close(background_task_cause="test cleanup"))
+        child_store.close()

@@ -6,6 +6,7 @@ from enum import Enum, auto
 from ..core.checkpoints import ConversationEntry
 from ..core.retention.computer import public_tool_result
 from ..protocol.types import Message, StreamEvent, StreamEventType
+from ..tools.computer.projection import computer_state
 from .protocol import TOOL_OUTPUT_MAX_BYTES, EventDescriptor, bounded
 
 
@@ -180,12 +181,45 @@ def structured_content_truncated(
     return None
 
 
+def _computer_event_state(
+    event: StreamEvent,
+    *,
+    running: bool,
+    public_result: Mapping[str, object] | None = None,
+) -> dict[str, str] | None:
+    call = event.tool_call
+    if call is None:
+        return None
+    return computer_state(
+        call.name,
+        call.arguments,
+        public_result.get("structured_content") if public_result is not None else None,
+        running=running,
+    )
+
+
+def _computer_tool_call(event: StreamEvent, state: Mapping[str, str]) -> dict[str, object]:
+    assert event.tool_call is not None
+    return {
+        "id": event.tool_call.id,
+        "name": event.tool_call.name,
+        "arguments": {"action": state["action"]},
+    }
+
+
 def tool_start(
     event: StreamEvent,
     *,
     fidelity: bool = False,
     approval_origin: bool = False,
 ) -> dict[str, object]:
+    computer = _computer_event_state(event, running=True)
+    if computer is not None:
+        return {
+            "tool_call": _computer_tool_call(event, computer),
+            "computer": computer,
+            "data": {},
+        }
     tool_call = _tool_call(event)
     data = dict(event.data)
     origin = data.pop("approval_origin", None)
@@ -261,8 +295,38 @@ def shape_approval_history_rows(
 
 
 def tool_end(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
-    tool_call = _tool_call(event)
     result = public_tool_result(event.tool_result) if event.tool_result else None
+    computer = _computer_event_state(
+        event,
+        running=False,
+        public_result=result,
+    )
+    if computer is not None:
+        public_blocks = result.get("content_blocks", []) if result is not None else []
+        image_stubs = [
+            block
+            for block in public_blocks
+            if isinstance(block, dict)
+            and block.get("type") == "image"
+            and block.get("data_omitted") is True
+        ]
+        safe_result = (
+            {
+                "tool_call_id": result["tool_call_id"],
+                "is_error": result["is_error"],
+            }
+            if result is not None
+            else None
+        )
+        if safe_result is not None and image_stubs:
+            safe_result["content_blocks"] = image_stubs
+        return {
+            "tool_call": _computer_tool_call(event, computer),
+            "tool_result": safe_result,
+            "computer": computer,
+            "data": {},
+        }
+    tool_call = _tool_call(event)
     if fidelity:
         tool_call = _project_tool_call(tool_call)
         if result is not None:

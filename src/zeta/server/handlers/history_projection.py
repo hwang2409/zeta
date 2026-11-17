@@ -18,6 +18,7 @@ from ...protocol.types import (
     is_passive_harness_message,
     is_visible_harness_notice,
 )
+from ...tools.computer.projection import computer_state
 from .. import event_contract
 from ..protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec, bounded
 from . import child_run_lifecycle
@@ -618,7 +619,18 @@ def _history_entry_rows(
             "content_blocks": blocks,
         }
         structured = result.get("structured_content")
-        if fidelity and structured is not None:
+        state = computer_state(None, {}, structured, running=False)
+        if fidelity and state is not None:
+            computer = structured.get("computer") if isinstance(structured, dict) else None
+            screenshot = (
+                computer.get("screenshot") if isinstance(computer, dict) else None
+            )
+            if isinstance(screenshot, dict) and screenshot.get("type") == "image":
+                blocks.append(event_contract.image_stub(screenshot))
+            result["content"] = ""
+            result["structured_content"] = {"computer": state}
+            result["structured_content_truncated"] = False
+        elif fidelity and structured is not None:
             projected, wire_truncated = event_contract.project_tool_value(structured)
             result["structured_content"] = projected
             result["structured_content_truncated"] = (
