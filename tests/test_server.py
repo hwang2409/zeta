@@ -806,6 +806,82 @@ def test_serve_maps_account_state_unknown() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_serve_maps_real_list_attention_tool_result(tmp_path: Path) -> None:
+    def prepare():
+        manager = SessionManager(tmp_path)
+        project = manager.project_registry.create_project("alpha", "Alpha")
+        current = manager.create(
+            provider="codex", model="fake", project_id=project.project_id
+        )
+        predecessor = manager.create(
+            provider="codex", model="fake", project_id=project.project_id
+        )
+        record = AttentionStore(
+            predecessor.store.session_dir, writer_epoch=5
+        ).request(
+            session_id=predecessor.store.session_id,
+            project_id=project.project_id,
+            entry_id=None,
+            entry_seq=None,
+            title="Choose a path",
+            why="The predecessor stopped.",
+        )
+        predecessor.store.close()
+        return manager, project, current, predecessor.store.session_id, record
+
+    manager, project, current, predecessor_id, record = await asyncio.to_thread(
+        prepare
+    )
+    loop = AgentLoop(
+        FakeBackend([]),
+        current.store,
+        max_turns=1,
+        skill_catalog=SkillCatalog.empty(),
+        root_project_id=project.project_id,
+        project_registry=manager.project_registry,
+    )
+    call = ToolCall("attention-list", "list_attention", {})
+    result = await loop.tool_registry.execute(call)
+    policy_store = ConversationStore(tmp_path / "serve")
+    policy = ApprovalPolicy(store=policy_store)
+    client = ServeControl(
+        SimpleNamespace(),
+        SimpleNamespace(policy=policy, state=None),
+        ForegroundEventPublisher(),
+    )
+    notifications: list[tuple[str, dict[str, object]]] = []
+
+    async def notify(
+        event: str, session_id: str | None, **fields: object
+    ) -> None:
+        del session_id
+        notifications.append((event, fields))
+
+    client._notify = notify
+    await client._event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                result["content"][0]["text"],
+                structured_content=result["structuredContent"],
+            ),
+        ),
+        session_id=current.store.session_id,
+        background=True,
+    )
+
+    wire_result = notifications[0][1]["tool_result"]
+    item = wire_result["structured_content"]["items"][0]
+    assert item["id"] == record.id
+    assert item["owning_session"] == predecessor_id
+    await loop.close()
+    policy_store.close()
+    current.store.close()
+
+
 def test_agent_status_lost_reason_survives_serve_tool_mapping() -> None:
     event = StreamEvent(
         StreamEventType.TOOL_EXECUTION_END,

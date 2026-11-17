@@ -290,6 +290,7 @@ FEATURES = (
     "turn_reconnect",
     "in_flight_replay",
     "session_park",
+    "tool_approval_origin",
 )
 
 # Dormant until multi-controller admission is complete in a later slice.
