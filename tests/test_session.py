@@ -24,7 +24,7 @@ from rich.text import Text
 import zeta.tui.app as tui_app
 from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.owned import owned_app
+from tests.support.owned import await_or_fail, owned_app
 from zeta.cli.main import build_parser, main
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -1909,7 +1909,7 @@ async def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) ->
     output = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model offline")
-    await wait_until(lambda: app._model_catalog_loaded)
+    await await_or_fail(app._model_catalog_load_finished.wait(), what="model catalog load")
 
     assert (
         output == "model: offline (model catalog unavailable for claude — using anyway)"
@@ -1937,7 +1937,7 @@ async def test_unknown_model_with_provider_prefix_warns_before_state_change(
     output = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model claude-definitely-not-real")
-    await wait_until(lambda: app._model_catalog_loaded)
+    await await_or_fail(app._model_catalog_load_finished.wait(), what="model catalog load")
 
     assert output == (
         "model: claude-definitely-not-real "
@@ -1964,7 +1964,7 @@ async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
     first = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model claude-opus-4-7")
-    await wait_until(lambda: app._model_catalog_loaded)
+    await await_or_fail(app._model_catalog_load_finished.wait(), what="model catalog load")
     output = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model claude-opus-4-7")
@@ -1978,9 +1978,15 @@ async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_model_catalog_refreshes_after_a_previous_load(tmp_path: Path) -> None:
     calls: list[str] = []
+    started = [asyncio.Event() for _ in range(3)]
+    release_second = threading.Event()
+    loop = asyncio.get_running_loop()
 
     def load_catalog(provider: str) -> frozenset[str] | None:
         calls.append(provider)
+        loop.call_soon_threadsafe(started[len(calls) - 1].set)
+        if len(calls) == 2:
+            release_second.wait()
         return (
             frozenset({"claude-opus-4-7"})
             if len(calls) == 1
@@ -2004,15 +2010,21 @@ async def test_model_catalog_refreshes_after_a_previous_load(tmp_path: Path) -> 
     first = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model claude-new")
-    await wait_until(lambda: app._model_catalog_loaded)
+    await await_or_fail(
+        app._model_catalog_load_finished.wait(), what="first model catalog load"
+    )
     second = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model claude-other")
-    await wait_until(lambda: len(calls) == 2)
+    await await_or_fail(started[1].wait(), what="second model catalog load start")
     third = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model claude-new")
-    await wait_until(lambda: len(calls) == 3)
+    release_second.set()
+    await await_or_fail(started[2].wait(), what="third model catalog load start")
+    await await_or_fail(
+        app._model_catalog_load_finished.wait(), what="third model catalog load"
+    )
     fourth = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model claude-new")
@@ -2060,7 +2072,7 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
     assert first == (
         "model: claude-opus-4-7 (model catalog unavailable for claude — using anyway)"
     )
-    await wait_until(lambda: app._model_catalog_loaded)
+    await await_or_fail(app._model_catalog_load_finished.wait(), what="model catalog load")
     assert loader_threads
     assert input_thread not in loader_threads
     assert await create_slash_registry(
@@ -2085,7 +2097,7 @@ async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
     output = await create_slash_registry(
         skill_catalog=SkillCatalog.empty()
     ).dispatch_async(app, "/model gpt-5.6-sol")
-    await wait_until(lambda: app._model_catalog_loaded)
+    await await_or_fail(app._model_catalog_load_finished.wait(), what="model catalog load")
 
     assert (
         output
