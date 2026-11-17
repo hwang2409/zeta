@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import shutil
 import subprocess
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -134,7 +135,7 @@ def test_install_uses_reviewed_stage_without_reopening_source(tmp_path: Path) ->
         stages = list((home / "extensions" / ".zeta-extension-store").glob("stage-*/tree"))
         assert len(stages) == 1
         reviewed_inode.append(stages[0].stat().st_ino)
-        (source / "mod.py").write_text("raise AssertionError('source reopened')\n", encoding="utf-8")
+        shutil.rmtree(source)
         return "y"
 
     result = ExtensionStore(home=home, project_dir=None).install(str(source), scope="user", confirm=confirm)
