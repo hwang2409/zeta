@@ -330,13 +330,15 @@ def test_list_attention_pages_and_keeps_broken_timestamps_visible(tmp_path: Path
     )
     first_items = first["structuredContent"]["items"]
     second_items = second["structuredContent"]["items"]
+    # mutation: omit Broken rows from _list_attention_sync(); the visibility assertion fails.
+    assert all(item["broken"] is True for item in first_items[:3])
+    # mutation: change the list page size from 100 to 101; the paging assertions fail.
     assert first["structuredContent"]["total"] == 101
     assert first["structuredContent"]["next_offset"] == 100
     assert len(first_items) == 100 and len(second_items) == 1
     assert [item["id"] for item in first_items[:3]] == sorted(
         record.id for record in records[:3]
     )
-    assert all(item["broken"] is True for item in first_items[:3])
     assert "next_offset" not in second["structuredContent"]
     asyncio.run(registry.close())
     current.store.close()
@@ -446,6 +448,7 @@ def test_resolve_attention_rejects_ambiguous_predecessor_id(tmp_path: Path) -> N
         project_registry=manager.project_registry,
     )
 
+    # mutation: bypass the len(matches) ambiguity refusal; this assertion fails after a write.
     with pytest.raises(ValueError, match="ambiguous") as error:
         asyncio.run(
             registry.definitions_by_name["resolve_attention"].handler(
@@ -454,6 +457,51 @@ def test_resolve_attention_rejects_ambiguous_predecessor_id(tmp_path: Path) -> N
         )
     assert first.store.session_id in str(error.value)
     assert second.store.session_id in str(error.value)
+    asyncio.run(registry.close())
+    current.store.close()
+
+
+def test_resolve_attention_rejects_current_and_predecessor_duplicate_id(
+    tmp_path: Path,
+) -> None:
+    manager = SessionManager(tmp_path)
+    project = manager.project_registry.create_project("alpha", "Alpha")
+    current = _project_session(tmp_path, project.project_id)
+    predecessor = _project_session(tmp_path, project.project_id)
+    current_store = AttentionStore(current.store.session_dir, writer_epoch=5)
+    record = current_store.request(
+        session_id=current.store.session_id,
+        project_id=project.project_id,
+        entry_id=None,
+        entry_seq=None,
+        title="Current copy",
+        why="This id was copied into a predecessor.",
+    )
+    AttentionStore(predecessor.store.session_dir, writer_epoch=5).replace(
+        replace(record, session_id=predecessor.store.session_id), create_directory=True
+    )
+    predecessor.store.close()
+    registry = ToolRegistry(
+        tmp_path,
+        session_store=current.store,
+        skill_catalog=SkillCatalog.empty(),
+        project_id=project.project_id,
+        project_registry=manager.project_registry,
+    )
+
+    # mutation: return after resolving own before _foreign_matches(); this assertion fails after a write.
+    with pytest.raises(ValueError, match="ambiguous") as error:
+        asyncio.run(
+            registry.definitions_by_name["resolve_attention"].handler(
+                {"attention_id": record.id, "decision": "must not write"}
+            )
+        )
+    assert current.store.session_id in str(error.value)
+    assert predecessor.store.session_id in str(error.value)
+    assert current_store.get(record.id).status == "open"
+    assert AttentionStore(
+        tmp_path / "sessions" / predecessor.store.session_id, writer_epoch=5
+    ).get(record.id).status == "open"
     asyncio.run(registry.close())
     current.store.close()
 
@@ -502,6 +550,7 @@ def test_resolve_attention_refuses_owner_that_starts_after_lookup(
         project_registry=manager.project_registry,
     )
     try:
+        # mutation: remove SessionExecutionLease.acquire(); this assertion fails without the live-owner refusal.
         with pytest.raises(ValueError, match="live session"):
             asyncio.run(
                 registry.definitions_by_name["resolve_attention"].handler(

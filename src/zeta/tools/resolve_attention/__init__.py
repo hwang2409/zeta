@@ -78,19 +78,23 @@ def _close_attention_sync(
         own = None
     except (OSError, ValueError) as exc:
         raise ValueError("attention record in the current session is broken") from exc
+    if own is not None and (
+        own.session_id != store.session_id
+        or (registry.project_id is not None and own.project_id != registry.project_id)
+    ):
+        raise ValueError("attention record ownership does not match the current project")
+
+    matches = _foreign_matches(registry, attention_id)
+    if own is not None and matches:
+        owners = ", ".join((store.session_id, *(session_id for session_id, _ in matches)))
+        raise ValueError(f"attention item is ambiguous across predecessor sessions: {owners}")
+    if own is None and not matches:
+        raise ValueError("attention item was not found in a dead predecessor session")
     if own is not None:
-        if own.session_id != store.session_id or (
-            registry.project_id is not None and own.project_id != registry.project_id
-        ):
-            raise ValueError("attention record ownership does not match the current project")
         outcome = AttentionReplies(
             home, store.session_id, registry_state=registry.project_registry_state
         ).resolve_local(attention_id, decision)
         return outcome, own_store.get(attention_id)
-
-    matches = _foreign_matches(registry, attention_id)
-    if not matches:
-        raise ValueError("attention item was not found in a dead predecessor session")
     if len(matches) > 1:
         owners = ", ".join(session_id for session_id, _ in matches)
         raise ValueError(
