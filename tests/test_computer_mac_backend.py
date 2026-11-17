@@ -166,7 +166,9 @@ class _RefusingBackend:
 @pytest.mark.asyncio
 async def test_tool_reports_action_specific_refusal(tmp_path: Path) -> None:
     registry = ToolRegistry(
-        tmp_path, skill_catalog=SkillCatalog.empty(), computer_enabled=True
+        tmp_path,
+        skill_catalog=SkillCatalog.empty(),
+        computer=ComputerUseConfig(enabled=True, default_app_access="allow"),
     )
     registry.computer_backend = _RefusingBackend()  # type: ignore[assignment]
     registry.computer_geometry = ScreenGeometry(100, 100, 100, 100, 1.0, 0, 0)

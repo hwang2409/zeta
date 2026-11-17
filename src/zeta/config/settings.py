@@ -127,6 +127,7 @@ class ComputerUseConfig:
     bundle_ids: Mapping[str, Literal["allow", "deny"]] = field(
         default_factory=lambda: _EMPTY_MAPPING
     )
+    bundle_ids_table_present: bool = False
 
 
 def computer_allow_guidance(bundle_id: str, *, has_existing_table: bool = False) -> str:
@@ -729,6 +730,7 @@ def _validated_computer(
         default = "deny"
     macos = table.get("macos", {})
     bundles: dict[str, Literal["allow", "deny"]] = {}
+    bundle_ids_table_present = False
     if not isinstance(macos, Mapping):
         notices.append("settings · ignored key 'computer.macos': expected table")
     else:
@@ -738,6 +740,7 @@ def _validated_computer(
         if not isinstance(raw, Mapping):
             notices.append("settings · ignored key 'computer.macos.bundle_ids': expected table")
         else:
+            bundle_ids_table_present = "bundle_ids" in macos
             for bundle, access in raw.items():
                 if not isinstance(bundle, str) or not bundle or not isinstance(access, str) or access not in {"allow", "deny"}:
                     notices.append(f"settings · ignored invalid computer bundle rule {bundle!r}")
@@ -750,6 +753,7 @@ def _validated_computer(
         kill_switch=True,
         default_app_access=cast(Literal["allow", "deny"], default),
         bundle_ids=MappingProxyType(bundles),
+        bundle_ids_table_present=bundle_ids_table_present,
     )
 
 

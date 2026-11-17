@@ -225,7 +225,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         project_registry: Any = None,
         inbox_enabled: bool = True,
         computer: Any = None,
-        computer_enabled: bool = False,
         tool_allow: Sequence[str] | None = None,
         tool_deny: Sequence[str] = (),
         tool_allow_layers: Sequence[Sequence[str]] = (),
@@ -266,7 +265,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         self.inbox_target_ids: frozenset[str] | None = None
         if computer is None:
             from ..config.settings import ComputerUseConfig
-            computer = ComputerUseConfig(enabled=computer_enabled, default_app_access="allow")
+            computer = ComputerUseConfig()
         self.computer_config = computer
         self.computer_enabled = self.computer_config.enabled
         # The one OS seam for the computer tool; set by composition when a real

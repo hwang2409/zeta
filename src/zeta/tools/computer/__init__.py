@@ -78,7 +78,10 @@ async def _guard(registry: ToolRegistry, backend: ComputerBackend) -> ScreenStat
     if not app_access(registry, state.frontmost_bundle_id):
         bundle = state.frontmost_bundle_id or "<unknown>"
         reason = "the computer allow-list is empty, so every app is denied" if not registry.computer_config.bundle_ids else f"frontmost app {bundle!r} is not allowed"
-        guidance = computer_allow_guidance(bundle, has_existing_table=bool(registry.computer_config.bundle_ids))
+        guidance = computer_allow_guidance(
+            bundle,
+            has_existing_table=registry.computer_config.bundle_ids_table_present,
+        )
         raise _GuardError("not_allowed", f"{reason}. {guidance}", state)
     return state
 
@@ -208,12 +211,6 @@ async def run_action(registry: ToolRegistry, raw_action: object, args: dict[str,
     try:
         if not isinstance(raw_action, str):
             raise _BadAction("action must be a string")
-        unknown = set(args) - {"action", "coordinate", "start_coordinate", "text", "scroll_direction", "scroll_amount", "display"}
-        if unknown:
-            raise _BadAction(f"unknown argument {min(unknown)!r}")
-        display = args.get("display")
-        if display is not None and (type(display) is not int or display < 0):
-            raise _BadAction("display must be a nonnegative integer")
         if backend is None:
             raise _BadAction("no computer backend is available on this machine")
         if spec is None:
@@ -262,4 +259,4 @@ async def _computer(registry: ToolRegistry, arguments: dict[str, Any]) -> Struct
 def register(registry: ToolRegistry) -> None:
     if not registry.computer_enabled:
         return
-    registry.register_session_tool("computer", _computer, binding="loop", approval_subject="action", description="Control the native desktop: capture a screenshot, move/click the mouse, type, press keys, drag, and scroll. Actions that change the screen return a fresh screenshot.", parameters={"type": "object", "properties": {"action": {"type": "string", "enum": list(_ACTION_HANDLERS)}, "coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "start_coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "text": {"type": "string"}, "scroll_direction": {"type": "string", "enum": list(_SCROLL_UNIT)}, "scroll_amount": {"type": "integer", "minimum": 1}, "display": {"type": "integer", "minimum": 0}}, "required": ["action"], "additionalProperties": False}, validate_arguments=False)
+    registry.register_session_tool("computer", _computer, binding="loop", approval_subject="action", description="Control the native desktop: capture a screenshot, move/click the mouse, type, press keys, drag, and scroll. Actions that change the screen return a fresh screenshot.", parameters={"type": "object", "properties": {"action": {"type": "string", "enum": list(_ACTION_HANDLERS)}, "coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "start_coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "text": {"type": "string"}, "scroll_direction": {"type": "string", "enum": list(_SCROLL_UNIT)}, "scroll_amount": {"type": "integer", "minimum": 1}, "display": {"type": "integer", "minimum": 0}}, "required": ["action"], "additionalProperties": False})

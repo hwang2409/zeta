@@ -112,8 +112,6 @@ async def test_computer_action_acceptance_table(tmp_path: Path, monkeypatch: pyt
     ("case", "arguments", "frontmost", "control", "is_error", "expected_actions", "message"),
     [
         ("no_backend", {"action": "screenshot"}, None, "idle", True, [], "no computer backend"),
-        ("unknown", {"action": "bogus"}, None, "idle", True, [], "unknown action"),
-        ("malformed", {"action": 7}, None, "idle", True, [], "action must be a string"),
         ("absent_bundle", {"action": "screenshot"}, None, "denied", True, [("state",)], "not allowed"),
         ("empty_bundle", {"action": "screenshot"}, "", "denied", True, [("state",)], "not allowed"),
         ("unknown_bundle", {"action": "screenshot"}, "com.unknown.app", "denied", True, [("state",)], "not allowed"),
@@ -169,6 +167,28 @@ async def test_computer_exit_acceptance_table(tmp_path: Path, case: str, argumen
     assert actual_actions == expected_actions
     assert Counter(op[0] for op in actual_actions) == Counter(op[0] for op in expected_actions)
     assert message in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"action": "bogus"},
+        {"action": 7},
+        {"action": "screenshot", "coordinate": "not-an-array"},
+        {"action": "screenshot", "scroll_amount": 0},
+    ],
+)
+async def test_schema_rejects_irrelevant_malformed_fields_before_desktop(
+    tmp_path: Path, arguments: dict
+) -> None:
+    backend = FakeBackend()
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        result = await registry.execute(ToolCall("c", "computer", arguments))
+
+    assert result["isError"] is True
+    assert result["structuredContent"]["error"]["kind"] == "invalid_arguments"
+    assert backend.actions == []
 
 
 @pytest.mark.asyncio
@@ -252,7 +272,9 @@ async def test_child_registry_does_not_inherit_parent_screenshot(
     backend = FakeBackend()
     (tmp_path / "parent").mkdir()
     parent = ToolRegistry(
-        tmp_path / "parent", skill_catalog=SkillCatalog.empty(), computer_enabled=True
+        tmp_path / "parent",
+        skill_catalog=SkillCatalog.empty(),
+        computer=ComputerUseConfig(enabled=True, default_app_access="allow"),
     )
     child_store = ConversationStore(tmp_path / "child", cwd=tmp_path)
     child: ToolRegistry | None = None
@@ -350,19 +372,38 @@ def _write_settings(base: Path, body: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("existing_bundle", [False, True], ids=["empty", "nonempty"])
-async def test_denied_app_guidance_is_parseable_and_allows_app(tmp_path: Path, existing_bundle: bool) -> None:
+@pytest.mark.parametrize(
+    ("table", "existing"),
+    [
+        ("", {}),
+        ("[computer.macos.bundle_ids]\n", {}),
+        ('[computer.macos.bundle_ids]\n"com.apple.finder" = "allow"\n', {"com.apple.finder": "allow"}),
+    ],
+    ids=["missing", "empty", "nonempty"],
+)
+async def test_denied_app_guidance_is_parseable_and_allows_app(
+    tmp_path: Path, table: str, existing: dict[str, str]
+) -> None:
+    home = tmp_path / "home"
+    _write_settings(home, "[computer]\nenabled = true\n" + table)
+    initial = load_settings(home=home).settings.computer
     backend = FakeBackend(frontmost_bundle_id="com.apple.Safari")
-    existing = {"com.apple.finder": "allow"} if existing_bundle else {}
     async with _computer_registry(tmp_path, backend=backend) as registry:
-        registry.computer_config = ComputerUseConfig(enabled=True, bundle_ids=existing)
+        registry.computer_config = initial
         denied = await registry.execute(ToolCall("c", "computer", {"action": "screenshot"}))
         text = denied["content"][0]["text"]
-        assert text.endswith(computer_allow_guidance("com.apple.Safari", has_existing_table=existing_bundle))
+        assert text.endswith(
+            computer_allow_guidance(
+                "com.apple.Safari",
+                has_existing_table=initial.bundle_ids_table_present,
+            )
+        )
         suggestion = text.split("settings.toml:\n", 1)[1]
-        table = '[computer.macos.bundle_ids]\n"com.apple.finder" = "allow"\n' if existing_bundle else ""
-        home = tmp_path / "home"
-        _write_settings(home, "[computer]\nenabled = true\n" + table + suggestion + "\n")
+        settings_path = home / SETTINGS_FILENAME
+        settings_path.write_text(
+            settings_path.read_text(encoding="utf-8") + suggestion + "\n",
+            encoding="utf-8",
+        )
         registry.computer_config = resolve(
             load_settings(home=home).settings,
             cli_provider="claude",
