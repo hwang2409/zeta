@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 
@@ -15,6 +16,9 @@ from ..core.approval import (
     canceled_result,
 )
 from ..protocol.types import ToolCall, ToolResult
+from ..telemetry import SpanHandle
+
+_NO_SPAN = SpanHandle()
 
 ApprovalHook = Callable[
     [str, dict[str, object]], bool | str | Awaitable[bool | str] | None
@@ -52,8 +56,10 @@ class ApprovalGate:
         persist_request: bool = True,
         execution_token: str | None = None,
         capability: ApprovalCapability,
+        span: SpanHandle | None = None,
     ) -> ApprovalGateResult:
         execution_signal = signal
+        span = span or _NO_SPAN
         approval_origin: ApprovalOrigin = "automatic"
 
         def done(result: ToolResult | None, signal: AbortSignal | None = None) -> ApprovalGateResult:
@@ -76,10 +82,13 @@ class ApprovalGate:
                 and self.policy.decide(capability) is ApprovalDecision.ASK
             )
             slot_acquired = False
+            decision: ApprovalDecision | None = None
             if approval_started:
                 slot_acquired = await self.policy.acquire_approval_slot()
                 if lifecycle is not None:
                     lifecycle("approval_start")
+                span.approval_requested(decision=ApprovalDecision.ASK.value)
+                asked_at = time.monotonic()
 
             try:
                 authorize = self.policy.authorize
@@ -100,6 +109,10 @@ class ApprovalGate:
                 ))
             finally:
                 if approval_started:
+                    span.approval_resolved(
+                        decision=None if decision is None else str(decision),
+                        duration=round((time.monotonic() - asked_at) * 1000),
+                    )
                     if lifecycle is not None:
                         lifecycle("approval_end")
                     if slot_acquired:
