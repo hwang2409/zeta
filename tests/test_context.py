@@ -195,16 +195,27 @@ async def test_computer_screenshots_are_live_latest_only_and_not_persisted(
     del first
     second = _computer_result("shot-2", _SECOND_SCREENSHOT_DATA)
     _append_computer_result(loop, second)
-    before = branch_messages(loop.store)
+    stored = branch_messages(loop.store)
+    before = json.dumps(
+        [message.to_dict() for message in stored],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    projected = loop.computer_screenshot_retention.project(stored)
+    after = json.dumps(
+        [message.to_dict() for message in stored],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     assembled = await loop.context_assembler.assemble_context()
-    after = branch_messages(loop.store)
     session_json = (loop.store.session_dir / "conversation.jsonl").read_text()
     try:
         gc.collect()
+        assert after == before
         assert _SCREENSHOT_DATA not in session_json
+        assert _context_image_data(projected) == [_SECOND_SCREENSHOT_DATA]
         assert _context_image_data(assembled.messages) == [_SECOND_SCREENSHOT_DATA]
         assert first_owner() is None
-        assert before == after
     finally:
         await loop.close()
         loop.store.close()

@@ -83,6 +83,8 @@ async def test_computer_screenshot_does_not_resurrect_across_evictions(
     try:
         sizes: list[int] = []
         image_counts: list[int] = []
+        retained_floor_rows: list[int] = []
+        retained_floor_bytes: list[int] = []
         for cycle in range(3):
             store.append_message(text(MessageRole.ASSISTANT, f"old {cycle} " * 200))
             store.append_message(text(MessageRole.USER, f"latest {cycle}"))
@@ -94,9 +96,23 @@ async def test_computer_screenshot_does_not_resurrect_across_evictions(
             )
             sizes.append(len(encoded))
             image_counts.append(encoded.count(_COMPUTER_IMAGE))
+            marker = ContextAssembler._active_markers(branch_entries(store))[0]
+            retained_floor = marker.data["view"]
+            retained_floor_rows.append(len(retained_floor))
+            retained_floor_bytes.append(
+                len(
+                    json.dumps(
+                        retained_floor,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                )
+            )
         assert image_counts[0] <= 1
         assert image_counts[1:] == [0, 0]
         assert max(sizes) < 20_000
+        assert retained_floor_rows == [2, 2, 2]
+        assert max(retained_floor_bytes) <= 800
         assert len(ContextAssembler._active_markers(branch_entries(store))) == 1
         assert _COMPUTER_IMAGE not in (
             store.session_dir / "conversation.jsonl"

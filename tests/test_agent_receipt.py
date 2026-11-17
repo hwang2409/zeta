@@ -10,31 +10,51 @@ from zeta.core.retention.computer import ComputerScreenshotRetention
 from zeta.protocol.types import ToolCall, ToolResult
 
 
-def test_computer_screenshot_is_not_retained_when_durable_append_fails() -> None:
-    class FailingStore:
+def test_failed_screenshot_append_preserves_previous_retained_owner() -> None:
+    class FailingSecondStore:
+        def __init__(self) -> None:
+            self.messages = []
+
         def append_message(self, message):  # type: ignore[no-untyped-def]
-            raise OSError("append failed")
+            if self.messages:
+                raise OSError("append failed")
+            self.messages.append(message)
+            return message
 
     class Owner:
-        store = FailingStore()
+        store = FailingSecondStore()
         computer_screenshot_retention = ComputerScreenshotRetention()
         tool_registry = None
 
-    marker = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAHnOcQAAAAABJRU5ErkJggg=="
-    result = ToolResult(
-        "shot",
+    first_marker = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAHnOcQAAAAABJRU5ErkJggg=="
+    second_marker = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNg+M8AAAAEAAEBouDEsAAAAABJRU5ErkJggg=="
+    owner = Owner()
+    first = ToolResult(
+        "shot-1",
         "screenshot",
-        content_blocks=[{"type": "image", "data": marker, "mimeType": "image/png"}],
+        content_blocks=[{"type": "image", "data": first_marker, "mimeType": "image/png"}],
         structured_content={"computer": {"has_screenshot": True}},
     )
-    owner = Owner()
+    second = ToolResult(
+        "shot-2",
+        "screenshot",
+        content_blocks=[{"type": "image", "data": second_marker, "mimeType": "image/png"}],
+        structured_content={"computer": {"has_screenshot": True}},
+    )
 
+    _append_tool_result(
+        owner, ToolCall("shot-1", "computer", {"action": "screenshot"}), first
+    )
+    first_owner = owner.computer_screenshot_retention._latest
     with pytest.raises(OSError, match="append failed"):
         _append_tool_result(
-            owner, ToolCall("shot", "computer", {"action": "screenshot"}), result
+            owner, ToolCall("shot-2", "computer", {"action": "screenshot"}), second
         )
 
-    assert owner.computer_screenshot_retention._latest is None
+    projected = owner.computer_screenshot_retention.project(owner.store.messages)
+    assert owner.computer_screenshot_retention._latest is first_owner
+    assert len(owner.store.messages) == 1
+    assert projected[0].tool_result.content_blocks[-1]["data"] == first_marker
 
 
 def test_explicit_finish_multibyte_summary_fits_exact_envelope_limit() -> None:
