@@ -1987,7 +1987,7 @@ async def test_model_catalog_refreshes_after_a_previous_load(tmp_path: Path) -> 
         calls.append(provider)
         loop.call_soon_threadsafe(started[len(calls) - 1].set)
         if len(calls) == 2:
-            release_second.wait()
+            assert release_second.wait(10)
         completed[len(calls) - 1].set()
         return (
             frozenset({"claude-opus-4-7"})
