@@ -157,6 +157,9 @@ def test_runner_cross_loop_posts_have_one_empty_context_helper() -> None:
     assert len(callback_tasks) == 1
     assert any(keyword.arg == "context" for keyword in callback_tasks[0].keywords)
     assert "run_coroutine_threadsafe" not in combined
+    assert "asyncio.run(" not in combined
+    assert "asyncio.Runner" not in combined
+    assert ".join(" not in (extension_sources / "hooks.py").read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
