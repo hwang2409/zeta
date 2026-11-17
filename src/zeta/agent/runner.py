@@ -500,6 +500,7 @@ async def _build_child_loop(
             live_config_home=child_home,
             live_config_project_dir=child_project_dir,
             freeze_live_config=child_scope is None,
+            telemetry=loop.telemetry,
         )
 
         await child_loop.refresh_live_config(publish=False)
@@ -830,6 +831,8 @@ async def run_agent_tool(
         loop._background_owner.project_context_loops[child_store.session_id] = (
             child_loop
         )
+        child_loop.agent_profile = preset.name
+        child_loop.agent_background = background
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - setup failures become receipts

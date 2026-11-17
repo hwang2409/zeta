@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ...core.abort import AbortSignal
 from ...protocol.types import StructuredToolResult
-from ..client import MCPClient, MCPPrompt, degrades_server
+from ...telemetry import SpanHandle
+from ..client import CALLER_TRACE, CallerTrace, MCPClient, MCPPrompt, degrades_server
 
 if TYPE_CHECKING:
     from ..server_actor import MCPServerActor
+    from .resource import ResourceRequest
 
 
 @dataclass(slots=True)
@@ -22,6 +24,8 @@ class PromptRequest:
     arguments: dict[str, str]
     generation: int
     result: asyncio.Future[str]
+    trace_context: dict[str, str]
+    span: SpanHandle
     task: asyncio.Task[str] | None = None
     client: MCPClient | None = None
 
@@ -36,6 +40,8 @@ class CallRequest:
     abort_signal: AbortSignal
     generation: int
     result: asyncio.Future[StructuredToolResult]
+    trace_context: dict[str, str]
+    span: SpanHandle
     task: asyncio.Task[StructuredToolResult] | None = None
     client: MCPClient | None = None
 
@@ -73,6 +79,25 @@ async def cancel_request(actor: MCPServerActor, identifier: int) -> None:
         await asyncio.shield(acknowledged)
 
 
+def create_caller_task[T](
+    actor: MCPServerActor,
+    request: CallRequest | PromptRequest | ResourceRequest,
+    coroutine: Coroutine[object, object, T],
+) -> asyncio.Task[T]:
+    """Create a caller request's operation task in that caller's trace context.
+
+    The task copies the context at creation, so both are restored only for the
+    creation; the actor task keeps its own context.
+    """
+
+    token = CALLER_TRACE.set(CallerTrace(actor._telemetry, request.span))
+    try:
+        with actor._telemetry.use_trace_context(request.trace_context):
+            return asyncio.create_task(coroutine)
+    finally:
+        CALLER_TRACE.reset(token)
+
+
 async def get_prompt(
     actor: MCPServerActor,
     prompt_name: str,
@@ -82,23 +107,27 @@ async def get_prompt(
 ) -> str:
     """Queue one prompt request with actor-owned cancellation."""
 
-    future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-    actor._next_identifier += 1
-    request = PromptRequest(
-        actor._next_identifier,
-        prompt_name,
-        dict(arguments),
-        generation,
-        future,
-    )
-    if actor.is_terminal:
-        raise RuntimeError(prompt_unavailable(actor.name))
-    actor._queue.put_nowait(request)
-    try:
-        return await asyncio.shield(future)
-    except asyncio.CancelledError:
-        await cancel_request(actor, request.identifier)
-        raise
+    telemetry = actor._telemetry
+    with telemetry.mcp_span("prompts/get", server=actor.name, target=prompt_name) as span:
+        future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        actor._next_identifier += 1
+        request = PromptRequest(
+            actor._next_identifier,
+            prompt_name,
+            dict(arguments),
+            generation,
+            future,
+            telemetry.current_trace_context(),
+            span,
+        )
+        if actor.is_terminal:
+            raise RuntimeError(prompt_unavailable(actor.name))
+        actor._queue.put_nowait(request)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            await cancel_request(actor, request.identifier)
+            raise
 
 
 def handle_prompt(actor: MCPServerActor, request: PromptRequest) -> None:
@@ -109,8 +138,8 @@ def handle_prompt(actor: MCPServerActor, request: PromptRequest) -> None:
         set_exception(request.result, RuntimeError(prompt_unavailable(actor.name)))
         return
     request.client = actor._client
-    request.task = asyncio.create_task(
-        invoke_prompt(actor, request, actor._client)
+    request.task = create_caller_task(
+        actor, request, invoke_prompt(actor, request, actor._client)
     )
     actor._requests[request.identifier] = request
     actor._children.add(request.task)

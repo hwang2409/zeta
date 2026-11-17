@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -15,6 +16,7 @@ from ..protocol.types import (
     ToolCall,
     ToolResult,
 )
+from ..telemetry import SpanHandle, Telemetry
 from .abort import AbortSignal
 from .agent_progress import read_agent_lifecycle
 
@@ -40,11 +42,17 @@ class _ToolRegistry(Protocol):
         _retain_approval_origin: bool = False,
         _host_environment: Mapping[str, str] | None = None,
         _pending_execution_owner: asyncio.Task[object] | None = None,
+        _span: SpanHandle | None = None,
     ) -> Coroutine[Any, Any, StructuredToolResult]: ...
+
+    def is_mcp_tool(self, name: str) -> bool: ...
 
 
 class _AgentLoop(Protocol):
     tool_registry: _ToolRegistry | None
+    telemetry: Telemetry
+    agent_profile: str
+    conversation_id: str
 
     def plan_mode_allows(self, tool_call: ToolCall) -> bool: ...
 
@@ -78,6 +86,45 @@ async def _prepare_tool_result(call: ToolCall, result: ToolResult) -> ToolResult
         result,
         lifecycle_projection=lifecycle if type(lifecycle) is dict else {},
     )
+
+
+async def _traced_execute(
+    loop: _AgentLoop, tool_call: ToolCall, **options: Any
+) -> StructuredToolResult:
+    """Run one call under its ``execute_tool`` span.
+
+    Callers start this inside the call's own task, so parallel calls are
+    sibling spans. The ``with`` is the span's one owner: it ends the span once
+    on return, error, or cancellation.
+    """
+
+    registry = loop.tool_registry
+    name = tool_call.name
+    tool_type = (
+        "agent" if name.casefold() == "agent"
+        else "mcp" if registry.is_mcp_tool(name)
+        else "function"
+    )
+    with loop.telemetry.tool_span(
+        name,
+        tool_type=tool_type,
+        call_id=tool_call.id,
+        agent_name=loop.agent_profile,
+        conversation_id=loop.conversation_id,
+    ) as span:
+        result = await registry.execute(tool_call, _span=span, **options)
+        if result.get("isError"):
+            span.fail(None)
+        if loop.telemetry.enabled():
+            span.set_sizes(
+                argument_bytes=_json_bytes(tool_call.arguments),
+                result_bytes=_json_bytes(result.get("content")),
+            )
+        return result
+
+
+def _json_bytes(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str).encode())
 
 
 async def dispatch_tool_calls(
@@ -177,7 +224,8 @@ async def dispatch_tool_calls(
             if len(parallel_calls) > 1:
                 parallel_tasks = {
                     loop._create_task(
-                        loop.tool_registry.execute(
+                        _traced_execute(
+                            loop,
                             tool_call,
                             abort_signal=abort_signal,
                             _scope_signal=abort_signal,
@@ -253,7 +301,8 @@ async def dispatch_tool_calls(
 
             tool_call = calls[call_index]
             active_task = loop._create_task(
-                loop.tool_registry.execute(
+                _traced_execute(
+                    loop,
                     tool_call,
                     abort_signal=abort_signal,
                     _scope_signal=abort_signal,

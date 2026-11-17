@@ -98,6 +98,7 @@ class MCPSession:
             self._mcp_mount = await mount_mcp_servers(
                 self.tool_registry, config, notice_sink=self._mcp_notice_sink,
                 home=self._mcp_home_hint,
+                telemetry=self.telemetry,
                 **(
                     {
                         "bindings": self._mcp_bindings,
@@ -111,7 +112,8 @@ class MCPSession:
         except (MCPConfigError, MCPManagementError) as exc:
             self._mcp_config_error = str(exc)
             self._mcp_mount = MCPMount(
-                self.tool_registry, {}, {}, home=self._mcp_home_hint
+                self.tool_registry, {}, {}, home=self._mcp_home_hint,
+                telemetry=self.telemetry,
             )
         self._mcp_mount.set_schema_refresh(self._refresh_mcp_tool_schemas)
         if self._mcp_prompt_refresh is not None:
