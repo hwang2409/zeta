@@ -480,7 +480,11 @@ class SessionControllers:
         runtime would close (owned or not), and that close's error propagates;
         the others are logged by their close. A cancel of the shutdown does not
         cancel a close."""
-        committed = {*self._parked.values(), *self._by_connection.values()}
+        committed = {
+            *self._parked.values(),
+            *self._by_connection.values(),
+            *(record for record in self._records.values() if not record.uses),
+        }
         for record in committed:
             if record is not self._attached:
                 self.retire(record, settlement_timeout)
