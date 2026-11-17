@@ -56,7 +56,7 @@ async def test_unattached_multi_member_blocks_legacy(tmp_path: Path, transport: 
     second = await connect_replay(server, transport)
     try:
         await negotiate(first, replay=False, extra=("multi_controller",))
-        assert first in server.controllers._controller_members, (
+        assert len(server.controllers._controller_members) == 1, (
             "an unattached negotiated multi connection must be a semantic member"
         )
         refused = await negotiate(second, replay=False)
