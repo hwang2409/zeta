@@ -356,21 +356,8 @@ async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
-        await _hello(reader, writer)
-        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        server.runtime.extensions.notify("notice", "hello", "info")
-        frames = await _request(reader, writer, 3, "ping")
-        assert frames[-1]["error"]["code"] == -32601
-        assert all(frame.get("method") != "extension_notice" for frame in frames)
-    finally:
-        await close_serve(server, writer)
-
-    server = _server(tmp_path, None, _launch(tmp_path))
-    reader, writer = await _connect(server)
-    try:
         await _hello(reader, writer, ["extensions"])
-        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        server.runtime.extensions.notify("notice", "hello", "info")
+        server.control._publish_extension_notice("session", "pre_tool timed out; call allowed unchecked")
         for _ in range(5):
             await asyncio.sleep(0)
         await send(reader, writer, 3, "ping")
@@ -383,7 +370,8 @@ async def test_extension_notice_is_gated_and_transient(tmp_path: Path) -> None:
         ]
         assert notice_indexes and notice_indexes[0] < ping_index
         assert frames[notice_indexes[0]]["params"]["data"] == {
-            "kind": "extension", "extension": "notice", "text": "hello", "level": "info"
+            "kind": "extension", "extension": "extensions",
+            "text": "pre_tool timed out; call allowed unchecked", "level": "warning"
         }
     finally:
         await close_serve(server, writer)

@@ -238,6 +238,7 @@ class ServerRuntime:
         self._background_wake_sink: SessionWakeSink | None = None
         self._approval_control_binder: ApprovalControlBinder | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
+        self._extension_notice_sink: MemoryNoticeSink | None = None
         self._run_work_event_sink: RunWorkEventSink | None = None
         self._work_changed_sink: Callable[[], None] | None = None
         self._setup_reapers: set[asyncio.Task[None]] = set()
@@ -436,6 +437,12 @@ class ServerRuntime:
     def set_memory_notice_sink(self, sink: MemoryNoticeSink | None) -> None:
         """Attach the frontend callback for automatic memory updates."""
         self._memory_notice_sink = sink
+        if self._state is not None:
+            self._bind_background_event_sink(self._state)
+
+    def set_extension_notice_sink(self, sink: MemoryNoticeSink | None) -> None:
+        """Attach the frontend callback for transient extension warnings."""
+        self._extension_notice_sink = sink
         if self._state is not None:
             self._bind_background_event_sink(self._state)
 
@@ -820,10 +827,11 @@ class ServerRuntime:
             session_id = state.session_id
             state.loop.set_background_event_sink(lambda event: sink(session_id, event))
         memory_sink = self._memory_notice_sink
+        extension_sink = self._extension_notice_sink
         extension_notice = (
             None
-            if memory_sink is None
-            else lambda message: memory_sink(state.session_id, message)
+            if extension_sink is None
+            else lambda message: extension_sink(state.session_id, message)
         )
         state.loop.set_mcp_notice_sink(extension_notice)
         if state.loop.extensions is not None:
