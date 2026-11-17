@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -195,6 +195,30 @@ _ACTION_HANDLERS: dict[str, _ActionSpec] = {
 }
 
 
+def _result(
+    action: str,
+    *,
+    state: ScreenState | None = None,
+    control: str = "idle",
+    content: list[dict[str, Any]] | None = None,
+    structured: dict[str, Any] | None = None,
+    screenshot: bool = False,
+    error: bool = True,
+) -> StructuredToolResult:
+    structured_content = {"computer": {"action": action, "control": control, "kill_switch": "ctrl+opt+cmd+esc", "frontmost_bundle_id": state.frontmost_bundle_id if state else None, "has_screenshot": screenshot}}
+    if structured:
+        structured_content.update(structured)
+    return {"content": content or [], "isError": error, "structuredContent": structured_content}
+
+
+def _validation_error_result(
+    arguments: Mapping[str, object], message: str
+) -> StructuredToolResult:
+    raw_action = arguments.get("action")
+    action = raw_action if isinstance(raw_action, str) else "action"
+    return _result(action, content=[text_block(message)])
+
+
 async def run_action(registry: ToolRegistry, raw_action: object, args: dict[str, Any]) -> StructuredToolResult:
     action = raw_action if isinstance(raw_action, str) else "action"
     state: ScreenState | None = None
@@ -246,10 +270,15 @@ async def run_action(registry: ToolRegistry, raw_action: object, args: dict[str,
         content = [text_block(f"{prefix}: {exc}")]
         error = not completed
 
-    structured_content = {"computer": {"action": action, "control": control, "kill_switch": "ctrl+opt+cmd+esc", "frontmost_bundle_id": state.frontmost_bundle_id if state else None, "has_screenshot": screenshot}}
-    if structured:
-        structured_content.update(structured)
-    return {"content": content, "isError": error, "structuredContent": structured_content}
+    return _result(
+        action,
+        state=state,
+        control=control,
+        content=content,
+        structured=structured,
+        screenshot=screenshot,
+        error=error,
+    )
 
 
 async def _computer(registry: ToolRegistry, arguments: dict[str, Any]) -> StructuredToolResult:
@@ -259,4 +288,4 @@ async def _computer(registry: ToolRegistry, arguments: dict[str, Any]) -> Struct
 def register(registry: ToolRegistry) -> None:
     if not registry.computer_enabled:
         return
-    registry.register_session_tool("computer", _computer, binding="loop", approval_subject="action", description="Control the native desktop: capture a screenshot, move/click the mouse, type, press keys, drag, and scroll. Actions that change the screen return a fresh screenshot.", parameters={"type": "object", "properties": {"action": {"type": "string", "enum": list(_ACTION_HANDLERS)}, "coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "start_coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "text": {"type": "string"}, "scroll_direction": {"type": "string", "enum": list(_SCROLL_UNIT)}, "scroll_amount": {"type": "integer", "minimum": 1}, "display": {"type": "integer", "minimum": 0}}, "required": ["action"], "additionalProperties": False})
+    registry.register_session_tool("computer", _computer, binding="loop", approval_subject="action", description="Control the native desktop: capture a screenshot, move/click the mouse, type, press keys, drag, and scroll. Actions that change the screen return a fresh screenshot.", parameters={"type": "object", "properties": {"action": {"type": "string", "enum": list(_ACTION_HANDLERS)}, "coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "start_coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "text": {"type": "string"}, "scroll_direction": {"type": "string", "enum": list(_SCROLL_UNIT)}, "scroll_amount": {"type": "integer", "minimum": 1}, "display": {"type": "integer", "minimum": 0}}, "required": ["action"], "additionalProperties": False}, validation_error_result=_validation_error_result)

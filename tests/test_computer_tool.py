@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from collections import Counter
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -188,7 +189,62 @@ async def test_schema_rejects_irrelevant_malformed_fields_before_desktop(
 
     assert result["isError"] is True
     assert result["structuredContent"]["error"]["kind"] == "invalid_arguments"
+    assert result["structuredContent"]["computer"] == {
+        "action": arguments["action"] if isinstance(arguments["action"], str) else "action",
+        "control": "idle",
+        "kill_switch": "ctrl+opt+cmd+esc",
+        "frontmost_bundle_id": None,
+        "has_screenshot": False,
+    }
+    assert "invalid arguments:" in result["content"][0]["text"]
     assert backend.actions == []
+
+
+@pytest.mark.asyncio
+async def test_non_computer_registry_validation_error_is_byte_identical(
+    tmp_path: Path,
+) -> None:
+    async def unused(_arguments: dict) -> dict:
+        raise AssertionError("invalid arguments reached the handler")
+
+    async with _computer_registry(tmp_path) as registry:
+        registry.register(
+            "schema_test",
+            unused,
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "integer"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            },
+        )
+        result = await registry.execute(
+            ToolCall("schema", "schema_test", {"value": "wrong"})
+        )
+
+    message = "invalid arguments: arguments.value must be integer"
+    expected = {
+        "content": [
+            {
+                "type": "text",
+                "text": message,
+                "truncated": False,
+                "full_size": len(message.encode()),
+            }
+        ],
+        "isError": True,
+        "structuredContent": {
+            "error": {
+                "kind": "invalid_arguments",
+                "hint": "reread the tool schema and retry with correct arguments",
+                "message": message,
+                "tool": "schema_test",
+            }
+        },
+    }
+    assert json.dumps(result, sort_keys=True, separators=(",", ":")).encode() == json.dumps(
+        expected, sort_keys=True, separators=(",", ":")
+    ).encode()
 
 
 @pytest.mark.asyncio
