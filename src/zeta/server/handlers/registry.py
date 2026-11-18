@@ -24,10 +24,10 @@ from . import (
     path_completion,
     session,
     settings,
-    telemetry,
     validation,
 )
 from .run_work import cancel_background_task, list_run_work
+from .telemetry import telemetry_sessions, telemetry_status, telemetry_trace
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
 
@@ -473,9 +473,9 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.CHILD_RUN_LIST: child_run_list,
     MethodDescriptor.CHILD_RUN_SEND: child_run_send,
     MethodDescriptor.MCP_REFRESH_TOOLS: mcp_refresh_tools,
-    MethodDescriptor.TELEMETRY_STATUS: telemetry.telemetry_status,
-    MethodDescriptor.TELEMETRY_SESSIONS: telemetry.telemetry_sessions,
-    MethodDescriptor.TELEMETRY_TRACE: telemetry.telemetry_trace,
+    MethodDescriptor.TELEMETRY_STATUS: telemetry_status,
+    MethodDescriptor.TELEMETRY_SESSIONS: telemetry_sessions,
+    MethodDescriptor.TELEMETRY_TRACE: telemetry_trace,
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
