@@ -63,6 +63,7 @@ def test_rollups_survive_raw_age_pruning_and_duplicates_do_not_change_them(tmp_p
         assert db.execute("SELECT count(*) FROM spans").fetchone()[0] == 1
         before = db.execute("SELECT sum(calls), sum(duration_ns) FROM hourly_rollups WHERE dimension='operation'").fetchone()
         assert before == (2, 60)
+        assert db.execute("SELECT calls, duration_ns FROM hourly_rollups WHERE dimension='operation' ORDER BY hour_ns").fetchall() == [(1, 20), (1, 40)]
     asyncio.run(write(path, [old], now))
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT sum(calls), sum(duration_ns) FROM hourly_rollups WHERE dimension='operation'").fetchone() == before
