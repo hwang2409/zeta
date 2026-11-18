@@ -107,6 +107,7 @@ _RAW_DELETION = {
     ("core/store/_history_index.py", "_remove_file", "unlink"),
     ("tui/stderr_capture.py", "_open_capture", "unlink"),
     ("tui/stderr_capture.py", "_retain_logs", "unlink"),
+    ("telemetry/receiver/process.py", "_home_id", "unlink"),
     ("core/transcript_recovery/__init__.py", "_unlink_if_present", "unlink"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "unlink"),
     ("mcp/management.py", "_atomic_json", "unlink"),

@@ -152,6 +152,15 @@ class ErrorDescriptor(Enum):
         "mcp_tool_refresh_failed",
         "an MCP tools/list refresh failed",
     )
+    INVALID_TELEMETRY_PARAMS = (-32602, "invalid_params", "telemetry read parameters or cursor are invalid")
+    TRACE_NOT_FOUND = (-32602, "trace_not_found", "the requested trace does not exist")
+    TELEMETRY_OFF = (-32005, "telemetry_off", "no telemetry database exists")
+    TELEMETRY_SCHEMA_MISMATCH = (
+        -32000,
+        "telemetry_schema_mismatch",
+        "the telemetry database schema is not the one this zeta reads",
+    )
+    RESULT_TOO_LARGE = (-32007, "result_too_large", "not even one item fits one frame")
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
         self.code = code
@@ -290,6 +299,7 @@ FEATURES = (
     "in_flight_replay",
     "session_park",
     "tool_approval_origin",
+    "telemetry_read_v1",
 )
 
 
@@ -390,6 +400,9 @@ class MethodDescriptor(Enum):
         "mcp_refresh_tools",
         Access.SESSION_MUTATION,
     )
+    TELEMETRY_STATUS = ("telemetry_status", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_SESSIONS = ("telemetry_sessions", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_TRACE = ("telemetry_trace", None, "telemetry_read_v1", Access.READ)
 
     def __init__(
         self, wire: str, since: str | None, feature: str | None, access: Access

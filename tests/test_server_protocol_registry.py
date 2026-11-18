@@ -1133,6 +1133,36 @@ STRUCTURED_ERROR_FIXTURES = (
         {"home_epoch": 2, "required_epoch": 4},
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32013,"message":"transcript repair needs the stored-format upgrade (home epoch 2, needs 4)","data":{"code":"transcript_repair_requires_upgrade","home_epoch":2,"required_epoch":4}}}\n',
     ),
+    (
+        ErrorDescriptor.INVALID_TELEMETRY_PARAMS,
+        "invalid params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
+    ),
+    (
+        ErrorDescriptor.TRACE_NOT_FOUND,
+        "resource not found",
+        {"id": "00112233445566778899aabbccddeeff"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"resource not found","data":{"code":"trace_not_found","id":"00112233445566778899aabbccddeeff"}}}\n',
+    ),
+    (
+        ErrorDescriptor.TELEMETRY_OFF,
+        "state unavailable",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32005,"message":"state unavailable","data":{"code":"telemetry_off","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.TELEMETRY_SCHEMA_MISMATCH,
+        "telemetry schema is unsupported",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"telemetry schema is unsupported","data":{"code":"telemetry_schema_mismatch"}}}\n',
+    ),
+    (
+        ErrorDescriptor.RESULT_TOO_LARGE,
+        "result exceeds frame limit",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}}\n',
+    ),
 )
 
 
