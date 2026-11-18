@@ -20,6 +20,7 @@ from zeta.core.approval import (
     ApprovalRule,
 )
 from zeta.core.store import ConversationStore
+from zeta.core.tool_dispatch import ToolDispatchCoordinator
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -359,7 +360,8 @@ async def test_nested_grants(tmp_path, mode):
 
         if mode == "parent-grant":
             policy.remember_allow(ApprovalRequest("prior", ToolCall("prior", "write", {"path": "other"})))
-        execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None)
+        execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None,
+                                                      coordinator=ToolDispatchCoordinator(8))
         call = ToolCall("outer:code:1", "write", {"path": "first", "content": "written"})
         task = asyncio.create_task(execute(call, NestedToolParent(outer.id, 1)))
         try:
@@ -427,7 +429,8 @@ async def test_nested_overlap(tmp_path, monkeypatch, case):
                 first_ask.set()
 
         registry.set_pre_execute_hook(hook)
-        execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None)
+        execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None,
+                                                      coordinator=ToolDispatchCoordinator(8))
         first = ToolCall("outer:code:1", "write", {"path": "first", "content": "written"})
         second = ToolCall("outer:code:2", "write", {"path": "second", "content": "written"})
 
@@ -441,7 +444,7 @@ async def test_nested_overlap(tmp_path, monkeypatch, case):
         try:
             await await_or_fail(first_ask.wait(), what="first call holds admission through its approval")
             waiting = asyncio.create_task(queued())
-            await await_or_fail(second_entered.wait(), what="second call reaches admission lock")
+            await await_or_fail(second_entered.wait(), what="second call reaches dispatch queue")
             if case == "duplicate":
                 duplicate = asyncio.create_task(execute(second, NestedToolParent(outer.id, 2)))
                 assert (await await_or_fail(duplicate, what="reject duplicate of queued call")).content == "duplicate_tool_call"
@@ -511,7 +514,8 @@ async def test_nested_publication_failure(tmp_path, failure):
             if event.type is StreamEventType.TOOL_EXECUTION_END:
                 raise RuntimeError("later failure must not replace the first")
 
-        execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None)
+        execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None,
+                                                      coordinator=ToolDispatchCoordinator(8))
         task = asyncio.create_task(execute(call, NestedToolParent(outer.id, 1)))
         try:
             await await_or_fail(asked.wait(), what="approval was published before the injected error")
@@ -526,3 +530,155 @@ async def test_nested_publication_failure(tmp_path, failure):
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await await_or_fail(task, what="drain publication-fault call")
+
+
+async def test_parallel_limit_and_exclusive_fence(tmp_path):
+    first_wave, ninth, exclusive = (asyncio.Event() for _ in range(3))
+    release_first, release_reads, release_write = (asyncio.Event() for _ in range(3))
+    entered = []
+    completed_reads = set()
+    predecessors_at_write = []
+    following_at_write_end = []
+
+    async def hook(name, arguments):
+        if name == 'code':
+            return True
+        path = str(arguments['path']).rsplit('/', 1)[-1]
+        entered.append(path)
+        if name == 'write':
+            predecessors_at_write.extend(completed_reads)
+            exclusive.set()
+            await await_or_fail(release_write.wait(), what='hold the exclusive write')
+            following_at_write_end.extend(entered)
+        elif path != 'after':
+            if len(entered) == 8:
+                first_wave.set()
+            if path == 'r9':
+                ninth.set()
+            gate = release_first if path == 'r1' else release_reads
+            await await_or_fail(gate.wait(), what=f'release parallel read {path}')
+            completed_reads.add(path)
+        return True
+
+    paths = [f'r{i}' for i in range(1, 10)] + ['after']
+    for path in paths:
+        (tmp_path / path).write_text(path)
+    task = asyncio.create_task(run_script(tmp_path, '''
+        const replies = await Promise.all([
+            ...Array.from({length: 9}, (_, i) => tools.read({path: `r${i+1}`})),
+            tools.write({path: 'fence', content: 'exclusive'}),
+            tools.read({path: 'after'}),
+        ]);
+        output(replies.map(r => r.structuredContent?.text ?? r.content));
+    ''', configure=lambda registry: registry.set_pre_execute_hook(hook)))
+    try:
+        await await_or_fail(first_wave.wait(), what='eight reads run at the same time')
+        assert sorted(entered) == sorted(paths[:8])
+        release_first.set()
+        await await_or_fail(ninth.wait(), what='ninth read starts after one slot is released')
+        # If the write bypasses its predecessors, it starts as soon as another slot opens.
+        release_reads.set()
+        await await_or_fail(exclusive.wait(), what='exclusive write starts after reads finish')
+        assert set(predecessors_at_write) == set(paths[:9])
+        release_write.set()
+        result, events, _ = await await_or_fail(task, what='settle all calls in the parallel batch')
+        assert not result.is_error, result.content
+        assert 'after' not in following_at_write_end
+        replies = json.loads(result.content)
+        assert all(path in replies[index] for index, path in enumerate(paths[:9]))
+        assert 'after' in replies[10]
+        ends = [tool_end(event) for event in events if event.type is StreamEventType.TOOL_EXECUTION_END
+                and event.data.get('code_parent_id') == 'outer']
+        assert {row['data']['code_call_index'] for row in ends} == set(range(1, 12))
+        assert len(ends) == 11
+        console = Console(file=io.StringIO(), width=120, no_color=True, force_terminal=False)
+        presenter = TranscriptPresenter(TranscriptWidget(), console, lambda: False, console.print)
+        for event in events:
+            presenter.handle_tool_event(event, aborted=False)
+        presenter.commit_tool_region()
+        rendered = console.file.getvalue()
+        assert '11 calls' in rendered and 'fence' in rendered and 'after' in rendered
+    finally:
+        for gate in (release_first, release_reads, release_write):
+            gate.set()
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(task, what='drain the parallel code invocation')
+
+
+async def test_exclusive_inner_call_completes_in_outer_slot(tmp_path):
+    import threading
+
+    try:
+        result, _, _ = await run_script(tmp_path, "await tools.write({path: 'receipt', content: 'ok'}); output(true);")
+        assert result.content == 'true'
+        assert (tmp_path / 'receipt').read_text() == 'ok'
+    finally:
+        assert not any(thread.name == 'zeta-code-guest' for thread in threading.enumerate())
+
+
+@pytest.mark.parametrize('delegated', [False, True], ids=['direct', 'delegated'])
+async def test_parallel_asks_are_independent(tmp_path, delegated):
+    policy = ApprovalPolicy()
+    requests = []
+    (tmp_path / 'deny').write_text('private')
+    (tmp_path / 'allow').write_text('public')
+
+    def decide(event):
+        if event.type is not StreamEventType.TOOL_APPROVAL_START:
+            return
+        requests.append(event.tool_call)
+        if len(requests) == 2:
+            child = 'code-child' if delegated else None
+            for call in requests:
+                decision = 'deny' if call.id == 'outer:code:1' else 'allow'
+                assert policy.resolve(call.id, decision, child_instance_id=child)
+
+    result, events, _ = await run_script(tmp_path, '''
+        const replies = await Promise.allSettled([tools.read({path: 'deny'}), tools.read({path: 'allow'})]);
+        output([replies[0].reason.name, replies[1].value.content]);
+    ''', policy=policy, delegated=delegated, on_event=decide)
+    assert not result.is_error, result.content
+    denied, allowed = json.loads(result.content)
+    assert denied == 'ToolDenied' and 'public' in allowed
+    assert sorted(call.id for call in requests) == ['outer:code:1', 'outer:code:2']
+    started = [event.tool_call.id for event in events if event.type is StreamEventType.TOOL_EXECUTION_START]
+    assert started == ['outer', 'outer:code:2']
+    if delegated:
+        with ConversationStore(tmp_path / 'session', session_id='test') as store:
+            denied_call, allowed_call = sorted(requests, key=lambda call: call.id)
+            assert_settled_once(store, denied_call, 'deny')
+            assert_settled_once(store, allowed_call, 'allow')
+
+
+async def test_abort_parallel_asks_settles_started_calls_only(tmp_path):
+    policy = ApprovalPolicy()
+    requests = []
+    registry = None
+    head = "tools.read({path: 'first'}), tools.read({path: 'second'})"
+
+    def configure(owner):
+        nonlocal registry
+        registry = owner
+
+    def abort(event):
+        if event.type is StreamEventType.TOOL_APPROVAL_START:
+            requests.append(event.tool_call)
+            if len(requests) == 2:
+                registry.abort()
+
+    result, events, _ = await run_script(tmp_path, f'''
+        await Promise.allSettled([{head}, tools.write({{path: 'never', content: 'no'}}),
+                                  tools.read({{path: 'later'}})]);
+        output(true);
+    ''', policy=policy, delegated=True, configure=configure, on_event=abort)
+    assert result.is_canceled
+    assert sorted(call.id for call in requests) == ['outer:code:1', 'outer:code:2']
+    assert sorted(event.tool_call.id for event in events if event.type is StreamEventType.TOOL_EXECUTION_END
+                  and event.data.get('code_parent_id') == 'outer') == ['outer:code:1', 'outer:code:2']
+    with ConversationStore(tmp_path / 'session', session_id='test') as store:
+        for call in requests:
+            assert_settled_once(store, call, 'abort', canceled=True)
+        assert store.approval_state_now('outer:code:3') is None
+    assert not (tmp_path / 'never').exists()
