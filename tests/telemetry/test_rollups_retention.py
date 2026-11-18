@@ -33,6 +33,10 @@ async def write(path: Path, rows: list[dict], clock: int) -> None:
         await asyncio.to_thread(writer.close)
 
 
+async def submit(writer: Writer, rows: list[dict], what: str) -> int:
+    return await await_or_fail(writer.submit(rows), what=what)
+
+
 def test_schema_v2_migrates_to_v3_without_losing_rows(tmp_path: Path) -> None:
     path = tmp_path / "telemetry.sqlite3"
     open_database(path)
@@ -101,6 +105,111 @@ def test_size_cap_counts_wal_bytes(tmp_path: Path, monkeypatch) -> None:
     cap = path.stat().st_size + 1
     monkeypatch.setattr(store, "MAX_BYTES", cap)
     asyncio.run(_cap_write(path, 200 * DAY, cap))
+
+
+def test_cap_below_sqlite_minimum_stalls_without_deleting_rows(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "telemetry.sqlite3"
+    open_database(path)
+    now = 200 * DAY
+    writer = Writer(path, clock_ns=lambda: now)
+    writer.start()
+    try:
+        asyncio.run(submit(writer, [span(1, now - DAY)], "cap minimum commit"))
+        monkeypatch.setattr(store, "MAX_BYTES", 1)
+        result = writer.maintenance_step(now)
+        assert result["over_cap"] is True
+        assert result["stalled"] is True
+        assert writer._connection.execute("SELECT count(*) FROM spans").fetchone()[0] == 1
+    finally:
+        asyncio.run(asyncio.to_thread(writer.close))
+
+
+def test_size_cap_deletes_raw_before_fingerprints(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "telemetry.sqlite3"
+    open_database(path)
+    now = 200 * DAY
+    writer = Writer(path, clock_ns=lambda: now)
+    writer.start()
+    try:
+        asyncio.run(submit(writer, [span(1, now - DAY), span(2, now - DAY)], "size order commit"))
+        monkeypatch.setattr(store, "MAX_BYTES", store._database_bytes(path) - 1)
+        monkeypatch.setattr(store, "PRUNE_CHUNK", 1)
+        result = writer.maintenance_step(now)
+        assert result["size_family"] == "raw"
+        assert writer._connection.execute("SELECT count(*) FROM spans").fetchone()[0] == 1
+    finally:
+        asyncio.run(asyncio.to_thread(writer.close))
+
+
+def test_startup_keeps_pruning_until_caught_up(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "telemetry.sqlite3"
+    open_database(path)
+    old = 100 * DAY
+    now = 200 * DAY
+    monkeypatch.setattr(store, "PRUNE_CHUNK", 1)
+    asyncio.run(write(path, [span(i, old) for i in range(1, 4)], old))
+    writer = Writer(path, clock_ns=lambda: now)
+    writer.start()
+    try:
+        assert writer._connection.execute("SELECT count(*) FROM spans").fetchone()[0] == 0
+    finally:
+        asyncio.run(asyncio.to_thread(writer.close))
+
+
+def test_last_trace_removes_its_session_projection(tmp_path: Path) -> None:
+    path = tmp_path / "telemetry.sqlite3"
+    open_database(path)
+    old = 100 * DAY
+    now = 200 * DAY
+    row = span(1, old)
+    row["session_id"] = "a" * 32
+    clock = [old]
+    writer = Writer(path, clock_ns=lambda: clock[0])
+    writer.start()
+    try:
+        asyncio.run(submit(writer, [row], "session cleanup commit"))
+        assert writer._connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
+        clock[0] = now
+        writer.maintenance_step(now)
+        assert writer._connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        asyncio.run(asyncio.to_thread(writer.close))
+
+
+def test_migration_fingerprint_deduplicates_after_raw_pruning(tmp_path: Path) -> None:
+    path = tmp_path / "telemetry.sqlite3"
+    open_database(path)
+    old = 100 * DAY
+    row = span(1, old)
+    asyncio.run(write(path, [row], old))
+    with sqlite3.connect(path) as db:
+        for table in ("hourly_series", "hourly_distinct", "hourly_models", "hourly_tools", "hourly_latency", "span_fingerprints"):
+            db.execute(f"DROP TABLE {table}")
+        db.execute("PRAGMA user_version = 2")
+        db.execute("UPDATE viewer_meta SET schema_version = 2")
+        db.commit()
+    open_database(path)
+    now = 150 * DAY
+    writer = Writer(path, clock_ns=lambda: now)
+    writer.start()
+    try:
+        asyncio.run(submit(writer, [row], "post-migration duplicate"))
+        assert writer._connection.execute("SELECT sum(spans) FROM hourly_series WHERE group_by='operation'").fetchone()[0] == 1
+    finally:
+        asyncio.run(asyncio.to_thread(writer.close))
+
+
+def test_non_chat_model_metadata_does_not_create_model_rows(tmp_path: Path) -> None:
+    path = tmp_path / "telemetry.sqlite3"
+    open_database(path)
+    row = span(1, 1, operation="turn")
+    writer = Writer(path, clock_ns=lambda: 1)
+    writer.start()
+    try:
+        asyncio.run(submit(writer, [row], "family purity commit"))
+        assert writer._connection.execute("SELECT count(*) FROM hourly_models").fetchone()[0] == 0
+    finally:
+        asyncio.run(asyncio.to_thread(writer.close))
 
 
 def test_rollup_dimensions_and_histogram_are_bounded(tmp_path: Path) -> None:
