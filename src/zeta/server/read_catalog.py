@@ -76,12 +76,12 @@ def _stable_snapshot[T](generation: Callable[[], object], read: Callable[[], T])
 
 
 def validated_state_read[T](
-    home: Path, kind: str, generation: Callable[[], object], owner_read: Callable[[], T],
+    home: Path, kind: str, generation: Callable[[], object], owner_read: Callable[[int], T],
 ) -> T:
     def read() -> T:
         try:
-            with storage_format.open_reader(home):
-                return owner_read()
+            with storage_format.open_reader(home) as epoch:
+                return owner_read(epoch)
         except storage_format.MissingManifest:
             raise ProtocolError(
                 ErrorDescriptor.STATE_READ_UNAVAILABLE, "state unavailable", {"retryable": True}
@@ -104,7 +104,7 @@ def validated_state_read[T](
 
 
 def _snapshot(home: Path, kind: str) -> list[dict[str, str]]:
-    rows = validated_state_read(home, kind, lambda: _generation(home, kind), lambda: _owner_rows(home, kind))
+    rows = validated_state_read(home, kind, lambda: _generation(home, kind), lambda _epoch: _owner_rows(home, kind))
     return sorted(rows, key=_position)[:_MAX_ITEMS]
 
 

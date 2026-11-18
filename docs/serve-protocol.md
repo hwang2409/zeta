@@ -1000,7 +1000,7 @@ or task command is returned.
 | request | params | order (descending) |
 |---|---|---|
 | `state_sessions` | optional `project_id`, `status` | `updated_ns`, `session_id` |
-| `state_session` | required `session_id`, `collection` (`agents` or `background_tasks`) | same as the selected list |
+| `state_session` | required `session_id`, `collection` (`agents`, `background_tasks`, or `attention`) | `attention`: `updated_ns`, `attention_id`; otherwise same as the selected list |
 | `state_agents` | optional `session_id`, `status` | `started_ns` (null last), `run_id` |
 | `state_background_tasks` | optional `session_id`, `status` | `started_ns` (null last), `task_id` |
 
@@ -1015,7 +1015,7 @@ nanoseconds; missing times are null.
 - Session rows contain `session_id`, `project_id`, `title`, `profile`, `model`,
   `created_ns`, `updated_ns`, `status` (`idle`, `running`, `approval`, `failed`,
   or `unknown`), `child_count` (direct child slots), `background_count` (session
-  tasks), and `bytes` (top-level transcript size, read from file metadata).
+  tasks), `attention_count` (stored attention records), and `bytes` (top-level transcript size, read from file metadata).
 - Agent rows contain `run_id`, `session_id`, `parent_run_id`, `profile`, `status`
   (`running`, `idle`, `waiting`, `finished`, `failed`, `cancelled`, or `unknown`),
   `background`, `started_ns`, and `ended_ns`. The owning `session_id` joins to
@@ -1024,6 +1024,8 @@ nanoseconds; missing times are null.
 - Task rows contain `task_id`, `session_id`, `kind`, `status` (`running`,
   `finished`, `failed`, `cancelled`, or `unknown`), `started_ns`, `ended_ns`,
   and `summary`. Durable task clocks are monotonic, so Unix times are null.
+- Attention rows use the `Attention` shape in project state above, scoped
+  to the selected session.
 
 Session state uses the same state read errors as the catalog. A missing
 `state_session` target returns `-32602` with `data.code` `session_not_found`.

@@ -7,6 +7,7 @@ import stat
 import time
 from datetime import UTC, datetime
 
+from .. import attention_records
 from ..core.child_runs import (
     child_run_directories,
     read_child_run_metadata,
@@ -32,7 +33,11 @@ from .read_catalog import validated_state_read
 _SESSION_STATES = {"idle", "running", "approval", "failed", "unknown"}
 _AGENT_STATES = {"running", "idle", "waiting", "finished", "failed", "cancelled", "unknown"}
 _TASK_STATES = {"running", "finished", "failed", "cancelled", "unknown"}
-_COLLECTIONS = {"agents": ("started_ns", "run_id"), "background_tasks": ("started_ns", "task_id")}
+_COLLECTIONS = {
+    "agents": ("started_ns", "run_id"),
+    "background_tasks": ("started_ns", "task_id"),
+    "attention": ("updated_ns", "attention_id"),
+}
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
@@ -142,6 +147,8 @@ def read_session_page(home, method, params, fits, active, *, collection=None, de
         paths = [home / "storage-format.json", root]
         if not sessions and select is not None:
             paths.append(root / select)
+            if detail:
+                paths.append(root / select / "attention")
         result = []
         for path in paths:
             try:
@@ -152,7 +159,16 @@ def read_session_page(home, method, params, fits, active, *, collection=None, de
                 result.append((info.st_ino, info.st_ctime_ns, info.st_mtime_ns))
         return result
 
-    def read_sessions():
+    def read_sessions(_epoch):
+        rows, more = read_session_candidates()
+        # Count only the limit-selected rows, before fitting exact frame sizes.
+        if rows:
+            counts = attention_records.state_attention_counts(root, [row["session_id"] for row in rows])
+            for row in rows:
+                row["attention_count"] = counts[row["session_id"]]
+        return None, rows, more
+
+    def read_session_candidates():
         candidates = []
         for item in list_session_metadata_read_only(root):
             if select is not None and item.project_id != select:
@@ -167,17 +183,20 @@ def read_session_page(home, method, params, fits, active, *, collection=None, de
             with session_root(root) as root_fd:
                 for (updated, sid), item in candidates:
                     if status is None and len(rows) == room:
-                        return None, rows, True
+                        return rows, True
                     with child_directory(root_fd, sid) as fd:
                         item_status = _session_status(sid, fd, active)
                         if status is not None and item_status != status:
                             continue
                         if len(rows) == room:
-                            return None, rows, True
+                            return rows, True
                         rows.append(_session_row(item, fd, item_status, updated - 1))
-        return None, rows, False
+        return rows, False
 
-    def read():
+    def detail_shape(session, items, cursor):
+        return {"session": session, "collection": collection, "items": items, "next_cursor": cursor}
+
+    def read(epoch):
         session = None
         rows = []
         if select is not None:
@@ -197,13 +216,22 @@ def read_session_page(home, method, params, fits, active, *, collection=None, de
                 with child_directory(root_fd, sid) as fd:
                     if detail:
                         session = _session_row(item, fd, _session_status(sid, fd, active), _ns(item.updated_at) or 0)
+                        session["attention_count"] = attention_records.state_attention_counts(root, [sid])[sid]
+                    if collection == "attention":
+                        return attention_records.state_attention_page(
+                            root / sid, epoch, start, limit, fits=fits,
+                            shape=lambda items, cursor, session=session: detail_shape(session, items, cursor),
+                        )
                     if collection == "agents":
                         rows.extend(_agent_rows(fd, root / sid, sid))
                     else:
                         rows.extend(_task_rows(fd, sid, sid in active or session_owner_status(fd)[0]))
         return session, rows, False
 
-    session, rows, more = validated_state_read(home, "sessions", generation, read_sessions if sessions else read)
+    result = validated_state_read(home, "sessions", generation, read_sessions if sessions else read)
+    if collection == "attention":
+        return result
+    session, rows, more = result
 
     def position(row):
         # Zero is the null sentinel; shift real values so even the Unix epoch sorts first.
@@ -214,9 +242,15 @@ def read_session_page(home, method, params, fits, active, *, collection=None, de
          and (start.position is None or position(row) < start.position)),
         key=position, reverse=True,
     )
-    head = {"session": session, "collection": collection} if detail else {"as_of_ns": time.time_ns()}
+    as_of_ns = time.time_ns()
+
+    def shape(items, cursor):
+        if detail:
+            return detail_shape(session, items, cursor)
+        return {"items": items, "next_cursor": cursor, "as_of_ns": as_of_ns}
+
     return page_result(
         after[:room], lambda index: position(after[index]), start, more=more or len(after) > room,
         total=total, fits=fits,
-        shape=lambda items, cursor: {**head, "items": items, "next_cursor": cursor},
+        shape=shape,
     )
