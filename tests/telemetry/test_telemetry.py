@@ -175,7 +175,8 @@ def test_shutdown_is_synchronous_and_export_failure_is_not_logged(monkeypatch: p
         instance.shutdown()
         instance.shutdown()
         assert stopped.is_set()
-        assert instance.status() == telemetry.TelemetryStatus(True, "degraded", "export_unavailable")
+        status = instance.status()
+        assert (status.enabled, status.state, status.reason, status.last_export) == (True, "degraded", "export_unavailable", "error")
         assert not records
     finally:
         app_logger.removeHandler(handler)
