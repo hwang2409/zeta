@@ -33,6 +33,32 @@ class SafariOwnership:
     prior_frontmost_bundle: str
 
 
+@dataclasses.dataclass(frozen=True)
+class SafariObservedState:
+    frontmost_bundle: str
+    front_window_id: str | None
+    owned_window_id: str | None
+    tab_ids: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class SafariAction:
+    kind: str
+    identifier: str
+
+
+def plan_cleanup(observed_state: SafariObservedState, token: SafariOwnership) -> list[SafariAction]:
+    actions: list[SafariAction] = []
+    if observed_state.owned_window_id == token.window_id:
+        if observed_state.tab_ids == (token.tab_id,):
+            actions.append(SafariAction("close_window", token.window_id))
+        elif token.tab_id in observed_state.tab_ids:
+            actions.append(SafariAction("close_tab", token.tab_id))
+    if observed_state.frontmost_bundle == "com.apple.Safari" and observed_state.front_window_id == token.window_id:
+        actions.append(SafariAction("restore_focus", token.prior_frontmost_bundle))
+    return actions
+
+
 class BrowserAdapter(Protocol):
     async def open_owned(self, url: str) -> SafariOwnership: ...
     async def cleanup_owned(self, ownership: SafariOwnership) -> dict[str, Any]: ...
@@ -196,46 +222,63 @@ class MacSafari:
             raise RuntimeError("Safari did not return an ownership token")
         return SafariOwnership(parts[1], parts[2], parts[0])
 
-    async def cleanup_owned(self, ownership: SafariOwnership) -> dict[str, Any]:
-        bundle = ownership.prior_frontmost_bundle.replace('"', '\\\\"')
-        output = await self._osascript(f"""set removed to false
-set restored to false
-set safariGlobalFront to false
-set exactFront to false
-tell application "Safari"
- set ownedWindow to window id {ownership.window_id}
- set tabsInWindow to tabs of ownedWindow
- if (count of tabsInWindow) is 1 and (id of item 1 of tabsInWindow as text) is "{ownership.tab_id}" then
-   close ownedWindow
-   set removed to true
- else
-   repeat with candidate in tabsInWindow
-     if (id of candidate as text) is "{ownership.tab_id}" then
-       close candidate
-       set removed to true
-       exit repeat
-     end if
-   end repeat
- end if
-end tell
-tell application "System Events"
- set safariGlobalFront to frontmost of first application process whose bundle identifier is "com.apple.Safari"
-end tell
-tell application "Safari"
- set exactFront to ((id of front window as text) is "{ownership.window_id}")
-end tell
-if safariGlobalFront and exactFront then
- tell application "System Events" to set frontmost of first application process whose bundle identifier is "{bundle}" to true
- set restored to true
-end if
-return (removed as text) & tab & (restored as text) & tab & (safariGlobalFront as text) & tab & (exactFront as text)""")
+    async def _observe_cleanup(self, ownership: SafariOwnership) -> SafariObservedState:
+        output = await self._osascript(f"""tell application "System Events" to set frontmostBundle to bundle identifier of first application process whose frontmost is true
+ tell application "Safari"
+   set frontWindowId to ""
+   if (count of windows) > 0 then set frontWindowId to id of front window as text
+   set ownedWindowId to ""
+   set ownedTabIds to ""
+   try
+     set ownedWindow to window id {ownership.window_id}
+     set ownedWindowId to id of ownedWindow as text
+     repeat with candidate in tabs of ownedWindow
+       if ownedTabIds is not "" then set ownedTabIds to ownedTabIds & ","
+       set ownedTabIds to ownedTabIds & (id of candidate as text)
+     end repeat
+   end try
+   return frontmostBundle & tab & frontWindowId & tab & ownedWindowId & tab & ownedTabIds
+ end tell""")
         parts = output.strip().split("\t")
-        if len(parts) != 4:
-            raise RuntimeError("Safari cleanup did not return evidence")
+        if len(parts) != 4 or not parts[0]:
+            raise RuntimeError("Safari cleanup observation was invalid")
+        return SafariObservedState(parts[0], parts[1] or None, parts[2] or None, tuple(filter(None, parts[3].split(","))))
+
+    async def _execute_action(self, action: SafariAction) -> None:
+        if action.kind == "close_window":
+            source = f'tell application "Safari" to close window id {action.identifier}'
+        elif action.kind == "close_tab":
+            source = f'tell application "Safari" to close tab id {action.identifier} of window id {self._active_window_id}'
+        elif action.kind == "restore_focus":
+            bundle = action.identifier.replace('"', '\\"')
+            source = f'tell application "System Events" to set frontmost of first application process whose bundle identifier is "{bundle}" to true'
+        else:
+            raise ValueError(f"unknown Safari cleanup action: {action.kind}")
+        await self._osascript(source)
+
+    async def cleanup_owned(self, ownership: SafariOwnership) -> dict[str, Any]:
+        observed = await self._observe_cleanup(ownership)
+        actions = plan_cleanup(observed, ownership)
+        removed = False
+        restored = False
+        error: str | None = None
+        self._active_window_id = ownership.window_id
+        for action in actions:
+            try:
+                await self._execute_action(action)
+                if action.kind in {"close_window", "close_tab"}:
+                    removed = True
+                elif action.kind == "restore_focus":
+                    restored = True
+            except BaseException as exc:  # noqa: BLE001 - retain truthful partial evidence
+                error = str(exc) or type(exc).__name__
+                break
         return {
-            "owned_browser_state_removed": parts[0].lower() == "true",
-            "prior_state_restored": parts[1].lower() == "true",
-            "focus_restore_safe": True,
+            "owned_browser_state_removed": removed,
+            "prior_state_restored": restored,
+            "focus_restore_safe": not any(action.kind == "restore_focus" for action in actions) or restored,
+            "error": error,
+            "actions": [action.kind for action in actions],
         }
 
 
@@ -269,8 +312,13 @@ async def _run_zeta_loop(provider: ProviderAdapter, backend: Any, run_dir: Path)
             if event.type is StreamEventType.ERROR:
                 raise RuntimeError(event.error.message if event.error else "provider failed")
     finally:
-        await loop.close()
-        await registry.close()
+        for close in (loop.close, registry.close):
+            task = asyncio.create_task(close())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                asyncio.current_task().uncancel()
+                await task
         session.close()
     return _event_metrics(events)
 
@@ -349,7 +397,7 @@ async def run_trial(
             ownership = await browser.open_owned(url)
         if provider.provider != EXPECTED_PROVIDER or provider.model != EXPECTED_MODEL:
             raise RuntimeError(f"provider/model contract mismatch: {provider.provider}/{provider.model}")
-        metrics = await _run_zeta_loop(provider, backend, run_dir)
+        metrics = await _bounded(_run_zeta_loop(provider, backend, run_dir), TRIAL_DEADLINE)
         grade = grade_trial(trial_state(run_dir / "fixture", trial))
         if not grade["pass"]:
             raise RuntimeError(f"trial {trial} grade failed")
