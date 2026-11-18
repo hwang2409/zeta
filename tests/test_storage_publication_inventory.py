@@ -58,6 +58,8 @@ _RAW_PUBLICATION = {
     ("core/session_links.py", "_quarantine_entry", "os.rename"),
     ("core/session_files.py", "write_session_file", "os.replace"),
     ("core/session_files.py", "bump_generation", "os.replace"),
+    # immutable model cache: published only after its pinned sha256 matches
+    ("voice/whisper_cpp.py", "download_model", "os.replace"),
     ("core/transcript_recovery/__init__.py", "repair_transcript", "os.replace"),
     ("memory/reconciliation_state.py", "_write_receipt_archive", "os.replace"),
     ("memory/reconciliation_state.py", "_publish_bytes", "os.replace"),
@@ -157,6 +159,9 @@ _RAW_DELETION = {
     ("transcript_search/index.py", "_temporary_database", "unlink"),
     ("transcript_search/index.py", "_clear_building_path", "unlink"),
     ("tui/paste_runtime/__init__.py", "_delete_staged", "unlink"),
+    # private capture files and a failed model download's partial file
+    ("voice/audio.py", "remove_file", "unlink"),
+    ("voice/whisper_cpp.py", "download_model", "unlink"),
 }
 
 _VARIANT_APPEND_SEAMS = {

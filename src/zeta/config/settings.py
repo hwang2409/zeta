@@ -57,6 +57,8 @@ from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR, provider_for_mod
 from .tool_policy import parse_tool_patterns, validate_tool_patterns
 
 SETTINGS_FILENAME = "settings.toml"
+DEFAULT_VOICE_ENGINE = "whisper.cpp"
+DEFAULT_VOICE_MODEL = "small.en"
 
 
 class SettingsError(ValueError):
@@ -93,6 +95,7 @@ _TOP_KEYS = frozenset(
         "mcp",
         "retention",
         "otel",
+        "voice",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -111,6 +114,7 @@ _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _INBOX_KEYS = frozenset({"enabled"})
 _ANTHROPIC_KEYS = frozenset({"oauth_compat"})
 _COMMAND_KEYS = frozenset({"command_niceness"})
+_VOICE_KEYS = frozenset({"engine", "model"})
 _AGENTS_KEYS = frozenset({"explicit_finish", "max_depth"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
 
@@ -152,6 +156,8 @@ class Settings:
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
     otel_endpoint: str | None = None
+    voice_engine: str = DEFAULT_VOICE_ENGINE
+    voice_model: str = DEFAULT_VOICE_MODEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +195,8 @@ class ResolvedConfig:
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
     otel_endpoint: str | None = None
+    voice_engine: str = DEFAULT_VOICE_ENGINE
+    voice_model: str = DEFAULT_VOICE_MODEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +372,8 @@ def resolve(
         mcp_max_wire_bytes=settings.mcp_max_wire_bytes,
         mcp_spill_after_bytes=settings.mcp_spill_after_bytes,
         otel_endpoint=settings.otel_endpoint,
+        voice_engine=settings.voice_engine,
+        voice_model=settings.voice_model,
     )
 
 
@@ -541,6 +551,18 @@ def _validated_mcp_limits(value: object) -> MCPCallLimits:
         raise SettingsError(f"invalid mcp settings: {exc}") from exc
 
 
+def _validated_voice(voice: object) -> tuple[str, str]:
+    if not isinstance(voice, Mapping) or set(voice) - _VOICE_KEYS:
+        raise SettingsError("invalid voice settings")
+    voice_engine = voice.get("engine", DEFAULT_VOICE_ENGINE)
+    voice_model = voice.get("model", DEFAULT_VOICE_MODEL)
+    if type(voice_engine) is not str or voice_engine != DEFAULT_VOICE_ENGINE:
+        raise SettingsError(f"voice.engine must be '{DEFAULT_VOICE_ENGINE}'")
+    if type(voice_model) is not str or voice_model != DEFAULT_VOICE_MODEL:
+        raise SettingsError(f"voice.model must be '{DEFAULT_VOICE_MODEL}'")
+    return voice_engine, voice_model
+
+
 def _validate(
     data: Mapping[str, Any], notices: list[str], warnings: list[str]
 ) -> Settings:
@@ -623,6 +645,7 @@ def _validate(
             validate_loopback_endpoint(otel_endpoint)
         except TelemetryError as exc:
             raise SettingsError(str(exc)) from None
+    voice_engine, voice_model = _validated_voice(data.get("voice", {}))
     mcp = data.get("mcp", {})
     mcp_limits = _validated_mcp_limits(mcp)
     mcp = cast(Mapping[str, Any], mcp)
@@ -668,6 +691,8 @@ def _validate(
         mcp_max_wire_bytes=mcp_limits.max_wire_bytes,
         mcp_spill_after_bytes=mcp_limits.spill_after_bytes,
         otel_endpoint=otel_endpoint,
+        voice_engine=voice_engine,
+        voice_model=voice_model,
     )
 
 
