@@ -336,6 +336,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_project_subcommand(commands)
     _add_inbox_subcommand(commands)
 
+    otel = commands.add_parser("otel", help="OpenTelemetry tools")
+    otel_commands = otel.add_subparsers(dest="otel_action", required=True)
+    otel_view = otel_commands.add_parser("view", help="view local telemetry")
+    otel_view.add_argument("--no-open", action="store_true")
+
     mcp = commands.add_parser("mcp", help="manage MCP servers")
     mcp_commands = mcp.add_subparsers(dest="mcp_action", required=True)
     add = mcp_commands.add_parser("add")
@@ -1181,6 +1186,9 @@ def _main(argv: list[str] | None = None) -> int:
         except (MCPManagementError, OSError, ValueError, KeyError) as exc:
             print(f"mcp error: {exc}", file=sys.stderr)
             return 2
+    if args.command == "otel" and args.otel_action == "view":
+        from ..telemetry.viewer import run_viewer
+        return run_viewer(env_home(), args.no_open)
     if args.command == "session":
         from .session import run as _run_session
 
