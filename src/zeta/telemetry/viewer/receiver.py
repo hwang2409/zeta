@@ -1,66 +1,236 @@
+"""The one trust seam: OTLP protobuf in, fixed allowlisted span rows out.
+
+Nothing outside the rows this module returns is retained. Adding a retained key means
+changing ``_SPAN_COLUMNS`` or ``_EVENT_COLUMNS`` here and its privacy test.
+"""
+
 from __future__ import annotations
 
 import importlib.metadata
-import re
 from typing import Any
 
-MAX_BODY = 8 * 1024 * 1024
+from ..runtime import (
+    _ALLOWED_ATTRIBUTE_KEYS,
+    _EVENT_ATTRIBUTE_KEYS,
+    _IDENTIFIER,
+    _MCP_METHODS,
+    _MODEL,
+    _SERVE_METHODS,
+    _SESSION_ID,
+    _TOOL_NAME,
+    _field_value,
+)
+
+MAX_BODY_BYTES = 8 * 1024 * 1024
 MAX_SPANS = 10_000
-OPS = {"invoke_agent", "turn", "chat", "execute_tool", "context_compact", "serve", "mcp"}
-SESSION = re.compile(r"[0-9a-f]{32}(?::[1-9][0-9]{0,8}){0,5}\Z")
+MAX_EVENTS_PER_SPAN = 128
+MAX_ATTRIBUTES_PER_OBJECT = 128
+MAX_STRING_BYTES = 256
+_MAX_NS = 2**63 - 1
+_INVALID = "_invalid"
 
-class Reject(ValueError): pass
+# OTLP attribute key -> spans column. Allowlisted keys without a column are dropped.
+_SPAN_COLUMNS = {
+    "error.type": "error_type",
+    "gen_ai.conversation.id": "session_id",
+    "zeta.agent.name": "agent_name",
+    "zeta.agent.depth": "agent_depth",
+    "zeta.background": "background",
+    "zeta.turn.number": "turn_number",
+    "zeta.notification": "notification",
+    "gen_ai.provider.name": "provider",
+    "gen_ai.request.model": "request_model",
+    "gen_ai.response.model": "response_model",
+    "zeta.stream": "stream",
+    "gen_ai.usage.input_tokens": "input_tokens",
+    "gen_ai.usage.output_tokens": "output_tokens",
+    "gen_ai.usage.total_tokens": "total_tokens",
+    "gen_ai.response.finish_reasons": "finish_reason",
+    "zeta.tool.name": "tool_name",
+    "zeta.tool.type": "tool_type",
+    "zeta.tool.call.id": "tool_call_id",
+    "zeta.tool.call.arguments.size": "tool_argument_bytes",
+    "zeta.tool.call.result.size": "tool_result_bytes",
+    "zeta.tool.count": "tool_count",
+    "zeta.emergency": "emergency",
+    "zeta.tokens.before": "tokens_before",
+    "zeta.tokens.after": "tokens_after",
+    "rpc.method": "rpc_method",
+    "mcp.method.name": "mcp_method",
+    "zeta.mcp.server.name": "mcp_server",
+    "gen_ai.tool.name": "mcp_tool",
+    "gen_ai.prompt.name": "mcp_prompt",
+    "mcp.protocol.version": "mcp_protocol",
+    "jsonrpc.request.id": "request_id",
+}
+_EVENT_COLUMNS = {
+    "gen_ai.retry.attempt": "retry_attempt",
+    "gen_ai.retry.reason": "retry_reason",
+    "gen_ai.retry.delay": "retry_delay",
+    "gen_ai.retry.after": "retry_after",
+    "decision": "decision",
+    "scope": "scope",
+    "duration": "duration_ns",
+}
+SPAN_COLUMNS = (
+    "trace_id", "span_id", "parent_span_id", "operation", "kind", "start_ns", "end_ns",
+    "duration_ns", "status", "service_version", "scope_version", *_SPAN_COLUMNS.values(),
+)
+EVENT_COLUMNS = ("trace_id", "span_id", "event_index", "name", "time_ns", *_EVENT_COLUMNS.values())
+_STATUSES = {0: "unset", 1: "ok", 2: "error"}
 
-def _attrs(items: Any) -> dict[str, Any]:
-    result={}
-    for item in items:
-        value=item.value
-        kind=value.WhichOneof("value")
-        result[item.key] = getattr(value, kind) if kind and kind != "kvlist_value" else None
-    return result
+# "<prefix> <suffix>" span names: operation, suffix rule, and the attribute the suffix must equal.
+_NAMED_OPERATIONS = {
+    "invoke_agent": ("invoke_agent", _IDENTIFIER, "zeta.agent.name"),
+    "chat": ("chat", _MODEL, "gen_ai.request.model"),
+    "execute_tool": ("execute_tool", _TOOL_NAME, "zeta.tool.name"),
+    "serve": ("serve", _SERVE_METHODS, "rpc.method"),
+}
+_FIXED_OPERATIONS = {"zeta.turn": "turn", "zeta.context.compact": "context_compact"}
 
-def _op(name: str, attrs: dict[str, Any]) -> str:
-    if name == "zeta.turn": return "turn"
-    if name == "zeta.context.compact": return "context_compact"
-    for prefix, op in (("invoke_agent ","invoke_agent"),("chat ","chat"),("execute_tool ","execute_tool"),("serve ","serve")):
-        if name == prefix.rstrip() or name.startswith(prefix): return op
-    if name in OPS: return name
-    if attrs.get("gen_ai.operation.name") == "invoke_agent": return "invoke_agent"
-    raise Reject("unknown operation")
 
-def project(body: bytes) -> list[dict[str, Any]]:
+class Reject(ValueError):
+    """The whole OTLP request is refused; nothing from it is written."""
+
+
+def project_request(body: bytes) -> list[dict[str, Any]]:
+    """Decode one ExportTraceServiceRequest into projected span rows, or raise ``Reject``."""
+    from google.protobuf.message import DecodeError
     from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
         ExportTraceServiceRequest,
     )
-    request=ExportTraceServiceRequest()
-    try: request.ParseFromString(body)
-    except Exception as exc: raise Reject("malformed protobuf") from exc
-    rows=[]
-    version=importlib.metadata.version("zeta")
-    for resource in request.resource_spans:
-        ra=_attrs(resource.resource.attributes)
-        if ra.get("service.name") != "zeta": raise Reject("invalid service")
-        service_version=ra.get("service.version", version)
-        if service_version != version: service_version="_invalid"
-        for scope in resource.scope_spans:
-            scope_version=scope.scope.version or version
-            if scope.scope.name not in ("", "zeta"): raise Reject("invalid scope")
-            if scope_version != version: scope_version="_invalid"
-            for span in scope.spans:
-                if len(span.trace_id)!=16 or not any(span.trace_id) or len(span.span_id)!=8 or not any(span.span_id): raise Reject("invalid id")
-                if span.parent_span_id and (len(span.parent_span_id)!=8 or not any(span.parent_span_id)): raise Reject("invalid parent")
-                if span.end_time_unix_nano < span.start_time_unix_nano: raise Reject("invalid time")
-                attrs=_attrs(span.attributes); operation=_op(span.name,attrs)
-                session=attrs.get("gen_ai.conversation.id")
-                if session is not None and (not isinstance(session,str) or not SESSION.fullmatch(session)): session=None
-                root=session.split(":",1)[0] if session else None
-                status={0:"unset",1:"ok",2:"error"}.get(span.status.code,"unset")
-                row={"trace_id":bytes(span.trace_id),"span_id":bytes(span.span_id),"parent_span_id":bytes(span.parent_span_id) if span.parent_span_id else None,"operation":operation,"kind":int(span.kind),"start_ns":span.start_time_unix_nano,"end_ns":span.end_time_unix_nano,"duration_ns":span.end_time_unix_nano-span.start_time_unix_nano,"status":status,"error_type":attrs.get("error.type") if status=="error" else None,"session_id":session,"root_session_id":root,"service_version":service_version,"scope_version":scope_version,"events":[]}
-                mapping={"zeta.agent.name":"agent_name","zeta.agent.depth":"agent_depth","zeta.background":"background","zeta.turn.number":"turn_number","zeta.notification":"notification","gen_ai.provider.name":"provider","gen_ai.request.model":"request_model","gen_ai.response.model":"response_model","zeta.stream":"stream","gen_ai.usage.input_tokens":"input_tokens","gen_ai.usage.output_tokens":"output_tokens","gen_ai.usage.total_tokens":"total_tokens","gen_ai.response.finish_reasons":"finish_reason","zeta.tool.name":"tool_name","zeta.tool.type":"tool_type","zeta.tool.call.id":"tool_call_id","zeta.tool.call.arguments.size":"tool_argument_bytes","zeta.tool.call.result.size":"tool_result_bytes","zeta.tool.count":"tool_count","zeta.emergency":"emergency","zeta.tokens.before":"tokens_before","zeta.tokens.after":"tokens_after","rpc.method":"rpc_method","mcp.method.name":"mcp_method","zeta.mcp.server.name":"mcp_server","gen_ai.tool.name":"mcp_tool","gen_ai.prompt.name":"mcp_prompt","mcp.protocol.version":"mcp_protocol","jsonrpc.request.id":"request_id"}
-                row.update({dest:attrs[key] for key,dest in mapping.items() if key in attrs and isinstance(attrs[key],(str,int,bool))})
-                for index,event in enumerate(span.events):
-                    if event.name not in {"gen_ai.client.retry","zeta.approval.requested","zeta.approval.resolved","zeta.serve.invalid_propagation"}: continue
-                    ea=_attrs(event.attributes); row["events"].append({"event_index":index,"name":event.name,"time_ns":event.time_unix_nano,"retry_attempt":ea.get("gen_ai.retry.attempt"),"retry_reason":ea.get("gen_ai.retry.reason"),"retry_delay":ea.get("gen_ai.retry.delay"),"retry_after":ea.get("gen_ai.retry.after"),"decision":ea.get("decision"),"scope":ea.get("scope"),"duration_ns":ea.get("duration")})
-                rows.append(row)
-                if len(rows)>MAX_SPANS: raise Reject("too many spans")
+
+    request = ExportTraceServiceRequest()
+    try:
+        request.ParseFromString(body)
+    except (DecodeError, RecursionError, ValueError):
+        raise Reject("malformed protobuf") from None
+    if sum(len(scope.spans) for resource in request.resource_spans for scope in resource.scope_spans) > MAX_SPANS:
+        raise Reject("too many spans")
+    zeta_version = importlib.metadata.version("zeta")
+    rows: list[dict[str, Any]] = []
+    for resource_spans in request.resource_spans:
+        resource = _attributes(resource_spans.resource.attributes)
+        service_version = _version(resource.get("service.version"), zeta_version)
+        for scope_spans in resource_spans.scope_spans:
+            scope = scope_spans.scope
+            _attributes(scope.attributes)  # enforces the per-object cap; scope attributes are dropped
+            if scope.name != "zeta":
+                raise Reject("unknown instrumentation scope")
+            scope_version = _version(scope.version, zeta_version)
+            for span in scope_spans.spans:
+                rows.append(_project_span(span, service_version, scope_version))
     return rows
+
+
+def _version(value: object, zeta_version: str) -> str:
+    return zeta_version if value == zeta_version else _INVALID
+
+
+def _attributes(items: Any) -> dict[str, object]:
+    """Scalar view of OTLP attributes; non-scalar values become ``None`` and later ``_invalid``."""
+    if len(items) > MAX_ATTRIBUTES_PER_OBJECT:
+        raise Reject("too many attributes")
+    result: dict[str, object] = {}
+    for item in items:
+        kind = item.value.WhichOneof("value")
+        result[item.key] = getattr(item.value, kind) if kind in {"string_value", "bool_value", "int_value"} else None
+    return result
+
+
+def _retained(attributes: dict[str, object], allowed: frozenset[str] | set[str]) -> dict[str, object]:
+    retained = {}
+    for key, value in attributes.items():
+        if key not in allowed:
+            continue
+        if isinstance(value, str) and len(value.encode()) > MAX_STRING_BYTES:
+            raise Reject("attribute value too long")
+        retained[key] = _field_value(key, value)
+    return retained
+
+
+def _span_id(value: bytes, size: int) -> bytes:
+    if len(value) != size or not any(value):
+        raise Reject("invalid id")
+    return bytes(value)
+
+
+def _timestamp(value: int) -> int:
+    if not 0 <= value <= _MAX_NS:
+        raise Reject("invalid timestamp")
+    return value
+
+
+def _operation(name: str, attributes: dict[str, object]) -> str:
+    if name in _FIXED_OPERATIONS:
+        return _FIXED_OPERATIONS[name]
+    prefix, _, suffix = name.partition(" ")
+    if prefix in _NAMED_OPERATIONS and suffix:
+        operation, rule, key = _NAMED_OPERATIONS[prefix]
+        _check_suffix(suffix, rule, attributes.get(key))
+        return operation
+    if prefix in _MCP_METHODS or (prefix == _INVALID and not suffix):
+        _check_suffix(prefix, _MCP_METHODS, attributes.get("mcp.method.name"))
+        if suffix:
+            target = attributes.get("gen_ai.prompt.name" if prefix == "prompts/get" else "gen_ai.tool.name")
+            _check_suffix(suffix, _IDENTIFIER, target)
+        return "mcp"
+    raise Reject("unknown operation")
+
+
+def _check_suffix(suffix: str, rule: Any, projected: object) -> None:
+    valid = suffix == _INVALID or (suffix in rule if isinstance(rule, frozenset) else rule.fullmatch(suffix))
+    if not valid or (projected is not None and projected != suffix):
+        raise Reject("unknown operation")
+
+
+def _project_span(span: Any, service_version: str, scope_version: str) -> dict[str, Any]:
+    trace_id = _span_id(span.trace_id, 16)
+    span_id = _span_id(span.span_id, 8)
+    parent_span_id = _span_id(span.parent_span_id, 8) if span.parent_span_id else None
+    start_ns = _timestamp(span.start_time_unix_nano)
+    end_ns = _timestamp(span.end_time_unix_nano)
+    if end_ns < start_ns:
+        raise Reject("invalid timestamp")
+    if span.status.code not in _STATUSES or span.kind not in range(6):
+        raise Reject("invalid span status or kind")
+    if len(span.events) > MAX_EVENTS_PER_SPAN:
+        raise Reject("too many events")
+    attributes = _retained(_attributes(span.attributes), _ALLOWED_ATTRIBUTE_KEYS)
+    row: dict[str, Any] = dict.fromkeys(_SPAN_COLUMNS.values())
+    for key, value in attributes.items():
+        if key in _SPAN_COLUMNS:
+            row[_SPAN_COLUMNS[key]] = int(value) if isinstance(value, bool) else value
+    row.update(
+        trace_id=trace_id,
+        span_id=span_id,
+        parent_span_id=parent_span_id,
+        operation=_operation(span.name, attributes),
+        kind=span.kind,
+        start_ns=start_ns,
+        end_ns=end_ns,
+        duration_ns=end_ns - start_ns,
+        status=_STATUSES[span.status.code],
+        service_version=service_version,
+        scope_version=scope_version,
+    )
+    events = []
+    for index, event in enumerate(span.events):
+        event_attributes = _attributes(event.attributes)
+        time_ns = _timestamp(event.time_unix_nano)
+        if event.name not in _EVENT_ATTRIBUTE_KEYS:
+            continue  # unknown event names: drop the event, keep the span
+        projected = dict.fromkeys(_EVENT_COLUMNS.values())
+        for key, value in _retained(event_attributes, _EVENT_ATTRIBUTE_KEYS[event.name]).items():
+            projected[_EVENT_COLUMNS[key]] = int(value) if isinstance(value, bool) else value
+        projected.update(trace_id=trace_id, span_id=span_id, event_index=index, name=event.name, time_ns=time_ns)
+        events.append(projected)
+    row["events"] = events
+    return row
+
+
+def root_session_id(session_id: str | None) -> str | None:
+    """The 32-hex root of a valid conversation id, without its ``:<n>`` child segments."""
+    if session_id is None or not _SESSION_ID.fullmatch(session_id):
+        return None
+    return session_id.split(":", 1)[0]

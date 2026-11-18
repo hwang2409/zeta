@@ -1,6 +1,5 @@
-"""standalone otlp receiver and viewer."""
+"""Standalone OTLP receiver and telemetry viewer (``zeta otel view``)."""
 
-from .app import run_viewer
-from .store import ViewerStore
+from .process import run_viewer
 
-__all__ = ["ViewerStore", "run_viewer"]
+__all__ = ["run_viewer"]
