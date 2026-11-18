@@ -19,15 +19,12 @@ from typing import Any
 from ...read_page import InvalidParams, Key, resume
 from ..runtime import _SESSION_ID
 from .page import keyset_page
-from .paths import database_path, used_bytes
+from .paths import MAX_BYTES, RAW_DAYS, ROLLUP_DAYS, database_path, used_bytes
 from .process import OTLP_URL, receiver_ready
 from .store import (
     BUSY_TIMEOUT_MS,
     DAY_NS,
     HOUR_NS,
-    MAX_BYTES,
-    RAW_DAYS,
-    ROLLUP_DAYS,
     SCHEMA_VERSION,
 )
 
