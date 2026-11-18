@@ -573,7 +573,7 @@ async def test_parallel_limit_and_exclusive_fence(tmp_path):
     ''', configure=lambda registry: registry.set_pre_execute_hook(hook)))
     try:
         await await_or_fail(first_wave.wait(), what='eight reads run at the same time')
-        assert entered == paths[:8]
+        assert sorted(entered) == sorted(paths[:8])
         release_first.set()
         await await_or_fail(ninth.wait(), what='ninth read starts after one slot is released')
         # If the write bypasses its predecessors, it starts as soon as another slot opens.
@@ -631,8 +631,9 @@ async def test_parallel_asks_are_independent(tmp_path, delegated):
         requests.append(event.tool_call)
         if len(requests) == 2:
             child = 'code-child' if delegated else None
-            assert policy.resolve(requests[0].id, 'deny', child_instance_id=child)
-            assert policy.resolve(requests[1].id, 'allow', child_instance_id=child)
+            for call in requests:
+                decision = 'deny' if call.id == 'outer:code:1' else 'allow'
+                assert policy.resolve(call.id, decision, child_instance_id=child)
 
     result, events, _ = await run_script(tmp_path, '''
         const replies = await Promise.allSettled([tools.read({path: 'deny'}), tools.read({path: 'allow'})]);
@@ -641,13 +642,14 @@ async def test_parallel_asks_are_independent(tmp_path, delegated):
     assert not result.is_error, result.content
     denied, allowed = json.loads(result.content)
     assert denied == 'ToolDenied' and 'public' in allowed
-    assert [call.id for call in requests] == ['outer:code:1', 'outer:code:2']
+    assert sorted(call.id for call in requests) == ['outer:code:1', 'outer:code:2']
     started = [event.tool_call.id for event in events if event.type is StreamEventType.TOOL_EXECUTION_START]
     assert started == ['outer', 'outer:code:2']
     if delegated:
         with ConversationStore(tmp_path / 'session', session_id='test') as store:
-            assert_settled_once(store, requests[0], 'deny')
-            assert_settled_once(store, requests[1], 'allow')
+            denied_call, allowed_call = sorted(requests, key=lambda call: call.id)
+            assert_settled_once(store, denied_call, 'deny')
+            assert_settled_once(store, allowed_call, 'allow')
 
 
 async def test_abort_parallel_asks_settles_started_calls_only(tmp_path):
@@ -672,7 +674,7 @@ async def test_abort_parallel_asks_settles_started_calls_only(tmp_path):
         output(true);
     ''', policy=policy, delegated=True, configure=configure, on_event=abort)
     assert result.is_canceled
-    assert [call.id for call in requests] == ['outer:code:1', 'outer:code:2']
+    assert sorted(call.id for call in requests) == ['outer:code:1', 'outer:code:2']
     assert sorted(event.tool_call.id for event in events if event.type is StreamEventType.TOOL_EXECUTION_END
                   and event.data.get('code_parent_id') == 'outer') == ['outer:code:1', 'outer:code:2']
     with ConversationStore(tmp_path / 'session', session_id='test') as store:

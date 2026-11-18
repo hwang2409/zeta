@@ -201,8 +201,8 @@ async def dispatch_tool_calls(
             "_host_environment": host_environment,
             "_pending_execution_owner": execution_owner,
             "_stream_sink": enqueue_tool_update,
-            "_lifecycle_sink": lambda kind, data=None, tool_result=None: enqueue_tool_lifecycle(
-                kind, call, data, tool_result
+            "_lifecycle_sink": lambda kind, event_call=call, data=None, tool_result=None: enqueue_tool_lifecycle(
+                kind, event_call, data, tool_result
             ),
             "_lifecycle_payload_sink": lambda kind, data: enqueue_tool_lifecycle(kind, call, data),
             "_retain_approval_origin": True,
