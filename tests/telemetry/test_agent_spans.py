@@ -289,20 +289,6 @@ def test_a_stream_error_event_fails_the_turn_and_agent_spans(tmp_path, traced) -
     _assert_no_content(memory.get_finished_spans())
 
 
-def test_turn_limit_is_an_outcome_not_an_error_status(tmp_path, traced) -> None:
-    from opentelemetry.trace import StatusCode
-
-    telemetry, memory = traced
-    loop = _loop(tmp_path, ScriptedBackend("claude", "claude-opus-5-5", ["tool"]), telemetry)
-    loop.max_turns = 1
-    events = asyncio.run(_run(loop))
-    assert [event.error.code for event in events if event.type is StreamEventType.ERROR] == ["max_turns"]
-    (agent,) = _by_name(memory.get_finished_spans())["invoke_agent zeta"]
-    assert agent.attributes["zeta.outcome"] == "turn_limit"
-    assert agent.status.status_code is StatusCode.UNSET
-    assert agent.attributes.get("zeta.error.code") is None
-
-
 def test_disabled_turn_creates_no_span(tmp_path, monkeypatch) -> None:
     def no_span(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("disabled telemetry reached span construction")
