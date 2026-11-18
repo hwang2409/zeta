@@ -15,6 +15,7 @@ from evals.computer_macos.run import (
     EXPECTED_PROVIDER,
     MacSafari,
     SafariOwnership,
+    _bounded,
     phase0,
     pilot,
 )
@@ -77,15 +78,20 @@ class Browser:
         self.before = {"frontmost": "com.apple.Safari", "tabs": [{"wid": "1", "tid": "1", "u": "about:blank"}]}
         self.after = dict(self.before)
         self.cleaned = False
+        self.open_tokens = []
+        self.cleanup_tokens = []
 
     async def open_owned(self, url):
         self.after = {"frontmost": "com.apple.Safari", "tabs": [*self.before["tabs"], {"wid": "2", "tid": "2", "u": url}]}
-        return SafariOwnership("2", "2", "com.apple.Safari")
+        token = SafariOwnership("2", "2", "com.apple.Safari")
+        self.open_tokens.append(token)
+        return token
 
     async def cleanup_owned(self, ownership):
         self.cleaned = True
+        self.cleanup_tokens.append(ownership)
         self.after = self.before
-        return {"owned_browser_state_removed": True, "prior_state_restored": ownership.prior_frontmost_bundle == "com.apple.Safari"}
+        return {"owned_browser_state_removed": True, "prior_state_restored": ownership.prior_frontmost_bundle == "com.apple.Safari", "focus_restore_safe": True}
 
 
 def provider(x: int = 301, y: int = 201) -> ProviderBackend:
@@ -158,7 +164,11 @@ async def test_fake_provider_crosses_public_loop_three_trials_and_cleans_each_tr
     assert all(backend.closed for backend in backends)
     assert all(fixture.closed for fixture in fixtures)
     assert all(browser.cleaned for browser in browsers)
-    assert json.loads((tmp_path / "pilot.json").read_text())["cleanup"]["disposable_home_removed"]
+    assert all(browser.cleanup_tokens == browser.open_tokens for browser in browsers)
+    artifact = json.loads((tmp_path / "pilot.json").read_text())
+    assert artifact["cleanup"]["disposable_home_removed"]
+    assert artifact["cleanup"]["owned_browser_state_removed"]
+    assert artifact["cleanup"]["prior_state_restored"]
 
 
 @pytest.mark.asyncio
@@ -211,9 +221,68 @@ def test_prepare_home_restores_set_and_unset_environment(tmp_path: Path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_safari_cleanup_state_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    ownership = SafariOwnership("42", "99", "com.example.Editor")
+    cases = [
+        ("replacement", "false\tfalse\tfalse\ttrue\n", False, False, "id of item 1 of tabsInWindow"),
+        ("second-tab", "true\ttrue\ttrue\ttrue\n", True, True, "close candidate"),
+        ("switched-app", "true\tfalse\tfalse\ttrue\n", True, False, "safariGlobalFront"),
+        ("happy", "true\ttrue\ttrue\ttrue\n", True, True, "close ownedWindow"),
+    ]
+    for name, response, removed, restored, required in cases:
+        scripts: list[str] = []
+
+        async def fake_osascript(source: str, *, response=response) -> str:
+            scripts.append(source)
+            return response
+
+        # test-contract: seam models scripted Safari state responses; no live Safari is allowed.
+        monkeypatch.setattr(MacSafari, "_osascript", staticmethod(fake_osascript))
+        result = await MacSafari().cleanup_owned(ownership)
+        assert result["owned_browser_state_removed"] is removed, name
+        assert result["prior_state_restored"] is restored, name
+        assert result["focus_restore_safe"] is True, name
+        assert required in scripts[0], name
+    assert 'frontmost of first application process whose bundle identifier is "com.apple.Safari"' in scripts[0]
+
+
+@pytest.mark.asyncio
+async def test_osascript_timeout_kills_and_waits_before_cleanup_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    class HangingProcess:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.killed = False
+            self.waited = False
+            self.released = asyncio.Event()
+
+        async def communicate(self):
+            await self.released.wait()
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            self.released.set()
+
+        async def wait(self):
+            self.waited = True
+
+    process = HangingProcess()
+
+    async def create(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    with pytest.raises(asyncio.TimeoutError):
+        await _bounded(MacSafari._osascript("return 1"), 0.01)
+    assert process.killed
+    assert process.waited
+
+
+@pytest.mark.asyncio
 async def test_safari_ownership_token_and_cleanup_use_owned_window_only(monkeypatch: pytest.MonkeyPatch) -> None:
     scripts: list[str] = []
-    responses = iter(["com.example.Editor\t42\t99\n", "2\tfalse\n"])
+    responses = iter(["com.example.Editor\t42\t99\n", "false\tfalse\tfalse\ttrue\n"])
 
     async def fake_osascript(source: str) -> str:
         scripts.append(source)
@@ -225,10 +294,11 @@ async def test_safari_ownership_token_and_cleanup_use_owned_window_only(monkeypa
     ownership = await safari.open_owned("http://127.0.0.1:8765/")
     assert ownership == SafariOwnership("42", "99", "com.example.Editor")
     result = await safari.cleanup_owned(ownership)
-    assert result == {"owned_browser_state_removed": True, "prior_state_restored": False}
+    assert result == {"owned_browser_state_removed": False, "prior_state_restored": False, "focus_restore_safe": True}
     # test-contract: seam validates the production AppleScript boundary without live Safari.
     assert "window id 42" in scripts[1]
-    assert "close tab id 99 of ownedWindow" in scripts[1]
+    assert 'id of candidate as text' in scripts[1]
+    assert 'frontmost of first application process whose bundle identifier is "com.apple.Safari"' in scripts[1]
     assert "repeat with w in windows" not in scripts[1]
 
 

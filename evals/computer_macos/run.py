@@ -38,6 +38,20 @@ class BrowserAdapter(Protocol):
     async def cleanup_owned(self, ownership: SafariOwnership) -> dict[str, Any]: ...
 
 
+CleanupEvidence = dict[str, Any]
+
+
+def _empty_cleanup() -> CleanupEvidence:
+    return {
+        "fixture_dead": False,
+        "backend_closed": False,
+        "owned_browser_state_removed": False,
+        "prior_state_restored": False,
+        "focus_restore_safe": False,
+        "error": None,
+    }
+
+
 class ProviderAdapter(Protocol):
     provider: str
     model: str
@@ -183,27 +197,46 @@ class MacSafari:
         return SafariOwnership(parts[1], parts[2], parts[0])
 
     async def cleanup_owned(self, ownership: SafariOwnership) -> dict[str, Any]:
-        bundle = ownership.prior_frontmost_bundle.replace('\"', '\\\\"')
-        output = await self._osascript(f"""tell application \"Safari\"
+        bundle = ownership.prior_frontmost_bundle.replace('"', '\\\\"')
+        output = await self._osascript(f"""set removed to false
+set restored to false
+set safariGlobalFront to false
+set exactFront to false
+tell application "Safari"
  set ownedWindow to window id {ownership.window_id}
- set stillFront to (front window is ownedWindow)
- set tabCount to count of tabs of ownedWindow
- if tabCount is 1 then
+ set tabsInWindow to tabs of ownedWindow
+ if (count of tabsInWindow) is 1 and (id of item 1 of tabsInWindow as text) is "{ownership.tab_id}" then
    close ownedWindow
+   set removed to true
  else
-   close tab id {ownership.tab_id} of ownedWindow
+   repeat with candidate in tabsInWindow
+     if (id of candidate as text) is "{ownership.tab_id}" then
+       close candidate
+       set removed to true
+       exit repeat
+     end if
+   end repeat
  end if
 end tell
-set restored to false
-if stillFront then
- tell application \"System Events\" to set frontmost of first application process whose bundle identifier is \"{bundle}\" to true
+tell application "System Events"
+ set safariGlobalFront to frontmost of first application process whose bundle identifier is "com.apple.Safari"
+end tell
+tell application "Safari"
+ set exactFront to ((id of front window as text) is "{ownership.window_id}")
+end tell
+if safariGlobalFront and exactFront then
+ tell application "System Events" to set frontmost of first application process whose bundle identifier is "{bundle}" to true
  set restored to true
 end if
-return (tabCount as text) & tab & (restored as text)""")
+return (removed as text) & tab & (restored as text) & tab & (safariGlobalFront as text) & tab & (exactFront as text)""")
         parts = output.strip().split("\t")
-        if len(parts) != 2:
+        if len(parts) != 4:
             raise RuntimeError("Safari cleanup did not return evidence")
-        return {"owned_browser_state_removed": True, "prior_state_restored": parts[1].lower() == "true"}
+        return {
+            "owned_browser_state_removed": parts[0].lower() == "true",
+            "prior_state_restored": parts[1].lower() == "true",
+            "focus_restore_safe": True,
+        }
 
 
 async def _close_backend(backend: Any) -> bool:
@@ -256,6 +289,37 @@ async def _bounded(awaitable: Any, timeout: float) -> Any:
         raise
 
 
+async def _cleanup_trial(
+    backend: Any,
+    fixture: Any | None,
+    browser: BrowserAdapter | None,
+    ownership: SafariOwnership | None,
+) -> CleanupEvidence:
+    evidence = _empty_cleanup()
+    steps: list[tuple[str, Callable[[], Any]]] = []
+    if browser is not None and ownership is not None:
+        steps.append(("browser", lambda: browser.cleanup_owned(ownership)))
+    steps.append(("backend", lambda: _close_backend(backend)))
+    if fixture is not None:
+        steps.append(("fixture", lambda: _close_fixture(fixture)))
+    for name, action in steps:
+        try:
+            observed = action()
+            if hasattr(observed, "__await__"):
+                observed = await _bounded(observed, 10)
+            if name == "backend":
+                evidence["backend_closed"] = bool(observed)
+            elif name == "fixture":
+                evidence["fixture_dead"] = bool(observed)
+            elif isinstance(observed, dict):
+                for key in ("owned_browser_state_removed", "prior_state_restored", "focus_restore_safe"):
+                    if key in observed:
+                        evidence[key] = bool(observed[key])
+        except BaseException as exc:  # noqa: BLE001 - cleanup continues after cancellation/failure
+            evidence["error"] = str(exc) or type(exc).__name__
+    return evidence
+
+
 async def run_trial(
     run_dir: Path,
     trial: int,
@@ -268,7 +332,8 @@ async def run_trial(
     """Own one complete trial, including all resources and verified cleanup."""
     fixture: Any | None = None
     ownership: SafariOwnership | None = None
-    cleanup: dict[str, Any] = {"fixture_dead": False, "backend_closed": False, "owned_browser_state_removed": True, "prior_state_restored": True}
+    result: dict[str, Any] | None = None
+    failure: BaseException | None = None
     try:
         state = trial_state(run_dir / "fixture", trial)
         fixture = fixture_factory(run_dir / "fixture", trial) if fixture_factory else await _start_fixture(run_dir / "fixture", trial)
@@ -288,36 +353,21 @@ async def run_trial(
         grade = grade_trial(trial_state(run_dir / "fixture", trial))
         if not grade["pass"]:
             raise RuntimeError(f"trial {trial} grade failed")
-        return {"trial": trial, "provider": provider.provider, "model": provider.model, "metrics": metrics, "grade": {"trial": trial, "pass": grade["pass"], "clicks": grade["clicks"], "valid_clicks": grade["valid_clicks"]}, "status": "complete"}
-    finally:
-        steps: list[tuple[str, Callable[[], Any]]] = []
-        if browser is not None and ownership is not None:
-            steps.append(("browser", lambda: browser.cleanup_owned(ownership)))
-        steps.append(("backend", lambda: _close_backend(backend)))
-        if fixture is not None:
-            steps.append(("fixture", lambda: _close_fixture(fixture)))
-        for name, action in steps:
-            try:
-                observed = action()
-                if hasattr(observed, "__await__"):
-                    observed = await _bounded(observed, 10)
-                if name == "backend":
-                    cleanup["backend_closed"] = bool(observed)
-                elif name == "fixture":
-                    cleanup["fixture_dead"] = bool(observed)
-                elif isinstance(observed, dict):
-                    cleanup.update({key: bool(value) for key, value in observed.items() if key in cleanup})
-            except BaseException as exc:  # noqa: BLE001 - cleanup continues after cancellation/failure
-                cleanup[f"{name}_error"] = str(exc) or type(exc).__name__
-                if name == "browser":
-                    cleanup["owned_browser_state_removed"] = False
-                    cleanup["prior_state_restored"] = False
-                elif name == "backend":
-                    cleanup["backend_closed"] = False
-                elif name == "fixture":
-                    cleanup["fixture_dead"] = False
-        if not all(value for key, value in cleanup.items() if key in {"fixture_dead", "backend_closed", "owned_browser_state_removed", "prior_state_restored"}):
-            raise RuntimeError(f"trial cleanup failed: {cleanup}") from None
+        result = {"trial": trial, "provider": provider.provider, "model": provider.model, "metrics": metrics, "grade": {"trial": trial, "pass": grade["pass"], "clicks": grade["clicks"], "valid_clicks": grade["valid_clicks"]}, "status": "complete"}
+    except BaseException as exc:
+        failure = exc
+    cleanup = await _cleanup_trial(backend, fixture, browser, ownership)
+    if result is not None:
+        if not all(cleanup[key] for key in ("fixture_dead", "backend_closed", "owned_browser_state_removed", "focus_restore_safe")):
+            failure = RuntimeError(f"trial cleanup failed: {cleanup}")
+            setattr(failure, "cleanup", cleanup)
+            raise failure
+        result["cleanup"] = cleanup
+        return result
+    if isinstance(failure, asyncio.CancelledError):
+        failure = TimeoutError("trial cleanup cancelled")
+    setattr(failure, "cleanup", cleanup)
+    raise failure
 
 
 async def _close_fixture(fixture: Any) -> bool:
@@ -365,6 +415,7 @@ async def _pilot(
     timeout_factory: Callable[[float], Any],
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
+    trial_cleanup: list[CleanupEvidence] = []
     status = "failed"
     error: str | None = None
     try:
@@ -375,18 +426,38 @@ async def _pilot(
                 browser = browser_factory() if browser_factory else (MacSafari() if platform.system() == "Darwin" else None)
                 async with timeout_factory(TRIAL_DEADLINE):
                     results.append(await run_trial(run_dir, trial, provider, backend, fixture_factory=fixture_factory, browser=browser))
+                    trial_cleanup.append(results[-1]["cleanup"])
         status = "complete"
     except asyncio.CancelledError as exc:
         status, error = "cancelled", type(exc).__name__
+        cleanup = getattr(exc, "cleanup", None)
+        if cleanup is not None:
+            trial_cleanup.append(cleanup)
         raise
     except TimeoutError as exc:
         status, error = "timeout", type(exc).__name__
+        cleanup = getattr(exc, "cleanup", None)
+        if cleanup is not None:
+            trial_cleanup.append(cleanup)
         raise
     except Exception as exc:
         error = str(exc) or type(exc).__name__
+        cleanup = getattr(exc, "cleanup", None)
+        if cleanup is not None:
+            trial_cleanup.append(cleanup)
         raise
     finally:
-        cleanup = {"fixture_dead": True, "backend_closed": True, "owned_browser_state_removed": True, "prior_state_restored": True, "disposable_home_removed": False}
+        cleanup = {
+            "fixture_dead": all(item["fixture_dead"] for item in trial_cleanup),
+            "backend_closed": all(item["backend_closed"] for item in trial_cleanup),
+            "owned_browser_state_removed": all(item["owned_browser_state_removed"] for item in trial_cleanup),
+            "prior_state_restored": all(item["prior_state_restored"] for item in trial_cleanup),
+            "focus_restore_safe": all(item["focus_restore_safe"] for item in trial_cleanup),
+            "errors": [item["error"] for item in trial_cleanup if item["error"]],
+            "disposable_home_removed": False,
+        }
+        if not trial_cleanup:
+            cleanup.update({"fixture_dead": False, "backend_closed": False, "owned_browser_state_removed": False, "prior_state_restored": False, "focus_restore_safe": False})
         home = run_dir / "zeta-home"
         try:
             if home.exists():
