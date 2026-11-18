@@ -136,7 +136,7 @@ CASES = (
     Case("orphan sweep is bounded by the chunk", orphans=3, chunk=1, steps=1, expect={"traces": 2, "sessions": 2}),
     Case("orphan sweep completes over steps", orphans=3, chunk=1, steps=3, expect={"traces": 0, "sessions": 0}),
     Case("expired span removes its session projection in the same step",
-         seed=(span(1, NOW - 15 * DAY, session=B), span(3, NOW - DAY, session=A)), chunk=1, steps=1,
+         seed=(span(1, NOW - 15 * DAY, session=A), span(3, NOW - DAY, session=B)), chunk=1, steps=1,
          expect={"spans": 1, "traces": 1, "sessions": 1}),
     Case("schema 1 migrates to incremental vacuum", schema=1, seed=(span(1, NOW - DAY),),
          expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 3, "spans": 1, "hourly_series": 3}),
@@ -169,15 +169,20 @@ def _old_database(path: Path, schema: int, rows: tuple[dict, ...]) -> None:
         db.close()
 
 
-async def _drive(case: Case, directory: Path, monkeypatch) -> tuple[dict | None, list[threading.Thread], threading.Thread]:
+async def _drive(case: Case, directory: Path, monkeypatch) -> tuple[dict | None, list[tuple[bool, bool]]]:
     from zeta.telemetry.receiver.app import create_app
 
     path = directory / "telemetry.sqlite3"
-    threads: list[threading.Thread] = []
+    loop, loop_thread = asyncio.get_running_loop(), threading.current_thread()
+    calls: list[tuple[bool, bool]] = []  # per startup call: (off the loop thread, the loop ran a callback meanwhile)
 
     def recorded(function: Callable[..., Any]) -> Callable[..., Any]:
         def call(*args: Any) -> Any:
-            threads.append(threading.current_thread())
+            off_loop, loop_ran = threading.current_thread() is not loop_thread, False
+            if off_loop:
+                with contextlib.suppress(TimeoutError):
+                    loop_ran = asyncio.run_coroutine_threadsafe(asyncio.sleep(0, True), loop).result(timeout=10)
+            calls.append((off_loop, loop_ran))
             return function(*args)
         return call
 
@@ -188,7 +193,7 @@ async def _drive(case: Case, directory: Path, monkeypatch) -> tuple[dict | None,
     writer._clock_ns = lambda: NOW if case.start_at_now else 0
     result = None
     async with app.router.lifespan_context(app):
-        startup_threads = list(threads)
+        startup_calls = list(calls)
         connection = writer._connection
         for index in range(case.orphans):
             trace = (1_000 + index).to_bytes(16, "big")
@@ -202,7 +207,7 @@ async def _drive(case: Case, directory: Path, monkeypatch) -> tuple[dict | None,
             result = writer.maintenance_step(NOW)
         if case.late:
             await submit(writer, list(case.late), "late duplicate commit")
-    return result, startup_threads, threading.current_thread()
+    return result, startup_calls
 
 
 @pytest.mark.parametrize("case", CASES, ids=[case.id for case in CASES])
@@ -214,12 +219,12 @@ def test_storage_bounds_contract(case: Case, tmp_path: Path, monkeypatch) -> Non
         _old_database(path, case.schema, case.seed)
     elif case.seed:
         asyncio.run(write(path, list(case.seed), 0))
-    result, startup_threads, loop_thread = asyncio.run(_drive(case, tmp_path, monkeypatch))
+    result, startup_calls = asyncio.run(_drive(case, tmp_path, monkeypatch))
     if case.result:
         assert result is not None and {key: result[key] for key in case.result} == case.result
     with contextlib.closing(sqlite3.connect(path)) as db:
         actual = {key: db.execute(key if key.startswith(("PRAGMA", "SELECT")) else f"SELECT count(*) FROM {key}").fetchone()[0]
                   for key in case.expect}
     assert actual == case.expect
-    # migration and catch-up ran on the writer thread, never on the event loop that serves requests
-    assert startup_threads and loop_thread not in startup_threads
+    # migration and catch-up ran on the writer thread, never on the event loop, and the loop kept running meanwhile
+    assert startup_calls and set(startup_calls) == {(True, True)}
