@@ -413,6 +413,12 @@ class MethodDescriptor(Enum):
         Access.SESSION_MUTATION,
     )
     STATE_CATALOG = ("state_catalog", None, "state_read_v1", Access.READ)
+    STATE_PROJECTS = ("state_projects", None, "state_read_v1", Access.READ)
+    STATE_MEMORY = ("state_memory", None, "state_read_v1", Access.READ)
+    STATE_MEMORY_DETAIL = ("state_memory_detail", None, "state_read_v1", Access.CONTROLLER_READ)
+    STATE_INBOX = ("state_inbox", None, "state_read_v1", Access.READ)
+    STATE_INBOX_DETAIL = ("state_inbox_detail", None, "state_read_v1", Access.CONTROLLER_READ)
+    STATE_ATTENTION = ("state_attention", None, "state_read_v1", Access.READ)
     TELEMETRY_STATUS = ("telemetry_status", None, "telemetry_read_v1", Access.READ)
     TELEMETRY_SESSIONS = ("telemetry_sessions", None, "telemetry_read_v1", Access.READ)
     TELEMETRY_TRACE = ("telemetry_trace", None, "telemetry_read_v1", Access.READ)

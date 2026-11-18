@@ -10,7 +10,7 @@ from .storage_format import StorageFeature, feature_enabled
 
 def delegation_enabled(registry: ProjectRegistry) -> bool:
     return feature_enabled(
-        registry._storage_lease.observed_epoch, StorageFeature.INBOX_DELEGATION
+        registry.observed_storage_epoch, StorageFeature.INBOX_DELEGATION
     )
 
 

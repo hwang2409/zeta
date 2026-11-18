@@ -115,6 +115,26 @@ def page_result(
     raise TooLarge("one item does not fit the frame")
 
 
+def descending_page(
+    rows: list[dict[str, Any]], order: Sequence[Key], start: Resume, limit: int,
+    *, fits: Callable[[dict[str, Any]], bool], shape: Callable[[list[Any], str | None], dict[str, Any]],
+    total: int | None = None,
+) -> dict[str, Any]:
+    """Page in descending key order, without copying cursor or frame rules."""
+    def position(row: dict[str, Any]) -> tuple[Any, ...]:
+        return tuple(row[key.column] for key in order)
+
+    after = sorted(
+        (row for row in rows if start.position is None or position(row) < start.position),
+        key=position, reverse=True,
+    )
+    room = page_room(start, limit, total)
+    return page_result(
+        after[:room], lambda index: position(after[index]), start,
+        more=len(after) > room, total=total, fits=fits, shape=shape,
+    )
+
+
 def _encode(start: Resume, keys: Sequence[object], emitted: int) -> str:
     position = [key.hex() if isinstance(key, bytes) else key for key in keys]
     text = json.dumps([_VERSION, list(start.scope), list(start.pinned), position, emitted], separators=(",", ":"))

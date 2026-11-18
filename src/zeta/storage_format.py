@@ -832,14 +832,14 @@ def _bootstrap_empty_home(fd: int, home: Path) -> None:
 
 
 @contextmanager
-def open_reader(home: str | Path) -> Iterator[None]:
+def open_reader(home: str | Path) -> Iterator[int]:
     """Validate an existing home without a lease, bootstrapping, or writes."""
     epoch = _read_manifest(_canonical_home(home))
     if epoch > WRITER_EPOCH:
         raise StorageFormatError(
             f"stored format {epoch} is newer than reader capability {WRITER_EPOCH}"
         )
-    yield
+    yield epoch
 
 
 def open_writer(home: str | Path, *, capability: int | None = None) -> WriterLease:

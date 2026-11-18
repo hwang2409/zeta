@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import datetime as dt
 import hashlib
 import json
@@ -107,8 +108,12 @@ def _reply_id(message_id: str) -> str:
     return hashlib.sha256(f"project-inbox-reply:{message_id}".encode()).hexdigest()[:32]
 
 
+def is_message_id(value: object) -> bool:
+    return isinstance(value, str) and _ID.fullmatch(value) is not None
+
+
 def _id(value: object, field: str = "message id") -> str:
-    if not isinstance(value, str) or not _ID.fullmatch(value):
+    if not isinstance(value, str) or not is_message_id(value):
         raise InboxError(f"invalid {field}")
     return value
 
@@ -180,6 +185,17 @@ def _validate_inbox_fields(value: dict[str, Any]) -> None:
         _id(value["in_reply_to"], "in_reply_to")
 
 
+def _spilled_body(bodies_fd: int, message_id: str, *, resolve: bool = True, cap: int | None = None) -> tuple[str, bool]:
+    with os.fdopen(open_session_file(bodies_fd, f"{message_id}.txt", os.O_RDONLY), "rb") as stream:
+        if not resolve:
+            return "", False
+        if cap is None:
+            return stream.read().decode("utf-8"), False
+        data = stream.read(cap + 1)
+    truncated = len(data) > cap
+    return codecs.getincrementaldecoder("utf-8")().decode(data[:cap], final=not truncated), truncated
+
+
 def _validate_inbox_body(value, message_id, bodies_fd, resolve_body) -> None:
     body = value["body"]
     if not isinstance(body, dict):
@@ -188,11 +204,9 @@ def _validate_inbox_body(value, message_id, bodies_fd, resolve_body) -> None:
     if body != {"file": f"bodies/{message_id}.txt"} or bodies_fd is None:
         raise InboxError("invalid body reference")
     try:
-        with os.fdopen(
-            open_session_file(bodies_fd, f"{message_id}.txt", os.O_RDONLY), "rb"
-        ) as stream:
-            if resolve_body:
-                value["body"] = stream.read().decode("utf-8")
+        text, _ = _spilled_body(bodies_fd, message_id, resolve=resolve_body)
+        if resolve_body:
+            value["body"] = text
     except (OSError, SessionError, UnicodeDecodeError) as exc:
         raise InboxError("unsafe or missing message body") from exc
 
@@ -654,6 +668,64 @@ class ProjectInbox:
 
         with _storage_errors(), self._lock(target.project_id, exclusive=False) as project_fd:
             return read(project_fd)
+
+    def state_generation(self, project_id: str) -> object:
+        from .state_snapshot import stamps
+
+        project = self.registry.root / project_id
+        inbox = project / "inbox"
+        return (
+            self.generation.project_generation(project_id),
+            stamps([project, project / "project.json", inbox, inbox / "delegations.json",
+                    *(inbox / status for status in ("new", "claimed", "done", "bodies"))]),
+        )
+
+    def state_rows(
+        self, project_id: str, *, status: str | None = None, message_id: str | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any] | None:
+        """Read metadata or one explicit body without claim recovery or locks."""
+        from .state_snapshot import BODY_BYTES, clip, timestamp_ns
+
+        if message_id is not None:
+            _id(message_id)
+        try:
+            with self.registry.state_project_fd(project_id) as fd, self._directory_handles(fd, create=False) as dirs:
+                delegations = self._delegations(project_id)
+                rows = []
+                for index, state in enumerate(("new", "claimed", "done")):
+                    if status is not None and state != status:
+                        continue
+                    names = os.listdir(dirs[index]) if message_id is None else [f"{message_id}.json"]
+                    for name in names:
+                        if not name.endswith(".json"):
+                            continue
+                        try:
+                            record = self._read_record(dirs[index], name, dirs[3], resolve_body=False)
+                        except FileNotFoundError:
+                            continue
+                        if record["to_project"] != project_id:
+                            raise InboxError("inbox recipient does not match project")
+                        body = record["body"]
+                        decorated = decorate(self.registry, project_id, record, delegations)
+                        row = {
+                            "message_id": record["id"], "project_id": project_id,
+                            "kind": record["kind"], "status": state,
+                            "sender": record["from"]["project"], "summary": clip(record["title"], 512)[0],
+                            "created_ns": timestamp_ns(record["created_at"]),
+                            "updated_ns": timestamp_ns(record.get("done_at", record.get("claimed_at", record["created_at"]))),
+                            "trusted_assignment": decorated.get("authority") == "trusted_assignment",
+                            "has_body": bool(body),
+                        }
+                        if message_id is not None:
+                            if isinstance(body, dict):
+                                body, truncated = _spilled_body(dirs[3], message_id, cap=BODY_BYTES)
+                            else:
+                                body, truncated = clip(body, BODY_BYTES)
+                            return {"message": row, "body": body, "truncated": truncated}
+                        rows.append(row)
+                return rows if message_id is None else None
+        except _InboxNotFound:
+            return [] if message_id is None else None
 
     def _read_tracked_message(
         self,
