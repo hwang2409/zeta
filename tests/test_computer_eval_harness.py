@@ -232,7 +232,7 @@ async def test_safari_cleanup_state_table(monkeypatch: pytest.MonkeyPatch) -> No
     for name, response, removed, restored, required in cases:
         scripts: list[str] = []
 
-        async def fake_osascript(source: str, *, response=response) -> str:
+        async def fake_osascript(source: str, *, response=response, scripts=scripts) -> str:
             scripts.append(source)
             return response
 
@@ -256,7 +256,7 @@ async def test_osascript_timeout_kills_and_waits_before_cleanup_evidence(monkeyp
             self.released = asyncio.Event()
 
         async def communicate(self):
-            await self.released.wait()
+            await asyncio.wait_for(self.released.wait(), 10)
             return b"", b""
 
         def kill(self):

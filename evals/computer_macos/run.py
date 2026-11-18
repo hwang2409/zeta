@@ -354,19 +354,19 @@ async def run_trial(
         if not grade["pass"]:
             raise RuntimeError(f"trial {trial} grade failed")
         result = {"trial": trial, "provider": provider.provider, "model": provider.model, "metrics": metrics, "grade": {"trial": trial, "pass": grade["pass"], "clicks": grade["clicks"], "valid_clicks": grade["valid_clicks"]}, "status": "complete"}
-    except BaseException as exc:
+    except BaseException as exc:  # noqa: BLE001 - cleanup must run for cancellation and timeout
         failure = exc
     cleanup = await _cleanup_trial(backend, fixture, browser, ownership)
     if result is not None:
         if not all(cleanup[key] for key in ("fixture_dead", "backend_closed", "owned_browser_state_removed", "focus_restore_safe")):
             failure = RuntimeError(f"trial cleanup failed: {cleanup}")
-            setattr(failure, "cleanup", cleanup)
+            failure.cleanup = cleanup
             raise failure
         result["cleanup"] = cleanup
         return result
     if isinstance(failure, asyncio.CancelledError):
         failure = TimeoutError("trial cleanup cancelled")
-    setattr(failure, "cleanup", cleanup)
+    failure.cleanup = cleanup
     raise failure
 
 
