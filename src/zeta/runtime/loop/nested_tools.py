@@ -1,4 +1,4 @@
-"""The session loop's exclusive, per-code-call admission and settlement."""
+"""The session loop's per-code-call admission and settlement."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Final
 
 from ...agent.tool_results import validated_tool_result
 from ...core.abort import AbortSignal
-from ...core.tool_dispatch import execute_owned_tool
+from ...core.tool_dispatch import ToolDispatchCoordinator, execute_owned_tool
 from ...protocol.types import (
     StreamEvent,
     StreamEventType,
@@ -53,7 +53,8 @@ def describe_code(registry: ToolRegistry, schemas: Sequence[ToolSchema]) -> None
         f"Available tools: {names}. "
         "Only output(value), called once, sends JSON to the model. "
         "Inner approvals still apply; catch ToolDenied or ToolError. "
-        "Use at most 50 sequential calls, 64 KiB of script and 60 seconds of active JavaScript. "
+        "Use Promise.all for independent calls (up to 8 run at once). "
+        "Use at most 50 calls, 64 KiB of script and 60 seconds of active JavaScript. "
         "No filesystem, network, clocks, timers or persistent state except through tools. "
         "Use ordinary calls for one tool or shell commands that already return selective output."
     )
@@ -61,7 +62,8 @@ def describe_code(registry: ToolRegistry, schemas: Sequence[ToolSchema]) -> None
 
 class LoopNestedToolExecutor:
     def __init__(self, loop: AgentLoop, outer: ToolCall, abort: AbortSignal,
-                 publish: Callable[[StreamEvent], None], environment: Mapping[str, str] | None) -> None:
+                 publish: Callable[[StreamEvent], None], environment: Mapping[str, str] | None,
+                 *, coordinator: ToolDispatchCoordinator) -> None:
         self.loop = loop
         self.outer = outer
         self.abort = abort
@@ -71,7 +73,7 @@ class LoopNestedToolExecutor:
         self.authority = authority_snapshot(registry, loop._active_tool_schemas())
         self.exposed_names = CODE_MODE_ALLOWED_NAMES.intersection(self.authority)
         self._seen: set[str] = set()
-        self._serial = asyncio.Lock()
+        self._coordinator = coordinator
 
     async def __call__(self, call: ToolCall, parent: NestedToolParent) -> ToolResult:
         call_id = f"{self.outer.id}:code:{parent.call_index}"
@@ -80,7 +82,8 @@ class LoopNestedToolExecutor:
         if call.id in self._seen:
             return ToolResult(call.id, "duplicate_tool_call", True)
         self._seen.add(call.id)
-        async with self._serial:
+        expected = self.authority.get(call.name)
+        async with self._coordinator.slot(parallel_safe=bool(expected and expected.parallel_safe)):
             if self.abort.is_set():
                 return ToolResult(call.id, "tool execution canceled", True, is_canceled=True)
             definition = self.loop.tool_registry.definition_reference(call.name)
