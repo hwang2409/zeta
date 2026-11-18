@@ -24,6 +24,22 @@ TRIAL_DEADLINE = 300
 PILOT_DEADLINE = 1200
 TASK = "Open the local zeta fixture in Safari and click the blue target exactly once."
 
+# Public contract used by scripted lifecycle tests; cleanup never changes the primary state.
+TERMINAL_STATE_TABLE = {
+    "success": {"grade": True, "cleanup": True},
+    "provider_failure": {"grade": False, "cleanup": True},
+    "provider_nonzero": {"grade": False, "cleanup": True},
+    "cancelled": {"grade": False, "cleanup": True},
+    "trial_timeout": {"grade": False, "cleanup": True},
+    "pilot_timeout": {"grade": False, "cleanup": True},
+    "fixture_partial_startup": {"grade": False, "cleanup": True},
+    "browser_partial_startup": {"grade": False, "cleanup": True},
+    "restoration_failure": {"grade": False, "cleanup": False},
+    "cleanup_failure": {"grade": False, "cleanup": False},
+    "restart_next_trial": {"grade": True, "cleanup": True},
+    "duplicate_input": {"grade": False, "cleanup": True},
+}
+
 
 class BrowserAdapter(Protocol):
     async def snapshot(self) -> dict[str, Any]: ...
