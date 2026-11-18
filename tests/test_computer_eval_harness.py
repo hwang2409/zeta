@@ -286,6 +286,7 @@ async def test_safari_not_running_is_reported_without_targeting_safari(monkeypat
             fake_model["safari_targeted"] = True
         return "false\tcom.apple.Terminal\n"
 
+    # test-contract: seam replaces the subprocess boundary; no live Safari is allowed.
     monkeypatch.setattr(MacSafari, "_osascript", staticmethod(fake_osascript))
     result = await MacSafari().cleanup_owned(SafariOwnership("42", "99"))
     assert result["owned_window_missing"]
