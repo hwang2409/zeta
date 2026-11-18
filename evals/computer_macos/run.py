@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 import platform
@@ -26,10 +27,16 @@ PILOT_DEADLINE = 1200
 TASK = "Open the local zeta fixture in Safari and click the blue target exactly once."
 
 
+@dataclasses.dataclass(frozen=True)
+class SafariOwnership:
+    window_id: str
+    tab_id: str
+    prior_frontmost_bundle: str
+
+
 class BrowserAdapter(Protocol):
-    async def snapshot(self) -> dict[str, Any]: ...
-    async def open_owned(self, url: str) -> None: ...
-    async def cleanup_owned(self, before: dict[str, Any]) -> dict[str, Any]: ...
+    async def open_owned(self, url: str) -> SafariOwnership: ...
+    async def cleanup_owned(self, ownership: SafariOwnership) -> dict[str, Any]: ...
 
 
 class ProviderAdapter(Protocol):
@@ -147,58 +154,57 @@ async def _preflight(backend: Any) -> None:
 
 
 class MacSafari:
-    """Safari ownership adapter; every claim is made by a post-operation observation."""
+    """Stateless Safari ownership adapter."""
 
-    def _script(self, source: str) -> str:
-        return subprocess.check_output(["osascript", "-e", source], text=True)
+    @staticmethod
+    async def _osascript(source: str) -> str:
+        process = await asyncio.create_subprocess_exec("osascript", "-e", source, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            stdout, stderr = await process.communicate()
+        except BaseException:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+            raise
+        if process.returncode:
+            raise RuntimeError(stderr.decode(errors="replace").strip() or f"osascript exited {process.returncode}")
+        return stdout.decode()
 
-    async def snapshot(self) -> dict[str, Any]:
-        output = await asyncio.to_thread(self._script, """
-        tell application \"System Events\" to set front to bundle identifier of first application process whose frontmost is true
-        set output to front & return
-        tell application \"Safari\"
-          if (count of windows) > 0 then set output to output & (id of front window as text) & tab & (index of current tab of front window as text) & return
-          set output to output & return
-          repeat with w in windows
-            repeat with t in tabs of w
-              set output to output & (id of w as text) & tab & (id of t as text) & tab & (URL of t) & return
-            end repeat
-          end repeat
-        end tell
-        return output
-        """)
-        lines = output.splitlines()
-        tabs = []
-        selected = lines[1].split("\\t", 1) if len(lines) > 1 else []
-        for line in lines[2:]:
-            parts = line.split("\\t", 2)
-            if len(parts) == 3:
-                tabs.append({"wid": parts[0], "tid": parts[1], "u": parts[2]})
-        return {"frontmost": lines[0] if lines else None, "selected": selected, "tabs": tabs}
+    async def open_owned(self, url: str) -> SafariOwnership:
+        escaped = url.replace('\\', '\\\\').replace('"', '\\"')
+        output = await self._osascript(f"""tell application \"System Events\" to set prior to bundle identifier of first application process whose frontmost is true
+ tell application \"Safari\"
+   set ownedTab to make new document with properties {{URL:\"{escaped}\"}}
+   set ownedWindow to window of ownedTab
+   return prior & tab & (id of ownedWindow as text) & tab & (id of ownedTab as text)
+ end tell""")
+        parts = output.strip().split("\t")
+        if len(parts) != 3 or not all(parts):
+            raise RuntimeError("Safari did not return an ownership token")
+        return SafariOwnership(parts[1], parts[2], parts[0])
 
-    async def open_owned(self, url: str) -> None:
-        script = f'tell application "Safari" to make new document with properties {{URL:"{url}"}}'
-        await asyncio.to_thread(subprocess.check_call, ["osascript", "-e", script])
-
-    async def cleanup_owned(self, before: dict[str, Any]) -> dict[str, Any]:
-        # The concrete adapter only closes tabs it can identify as new.
-        after = await self.snapshot()
-        prior = {(row["wid"], row["tid"]) for row in before.get("tabs", [])}
-        owned = [row for row in after.get("tabs", []) if (row["wid"], row["tid"]) not in prior]
-        for row in owned:
-            script = f'tell application "Safari" to close tab id {row["tid"]} of window id {row["wid"]}'
-            await asyncio.to_thread(subprocess.check_call, ["osascript", "-e", script])
-        selected = before.get("selected", [])
-        if len(selected) == 2:
-            script = f'tell application "Safari" to set current tab of window id {selected[0]} to tab {selected[1]}'
-            await asyncio.to_thread(subprocess.check_call, ["osascript", "-e", script])
-        frontmost = before.get("frontmost")
-        if isinstance(frontmost, str) and frontmost != "com.apple.Safari":
-            script = f'tell application "System Events" to set frontmost of first application process whose bundle identifier is "{frontmost}" to true'
-            await asyncio.to_thread(subprocess.check_call, ["osascript", "-e", script])
-        observed = await self.snapshot()
-        remaining = {(row["wid"], row["tid"]) for row in observed.get("tabs", [])}
-        return {"owned_state_removed": not any((row["wid"], row["tid"]) in remaining for row in owned), "prior_state_restored": observed.get("frontmost") == before.get("frontmost") and observed.get("selected") == before.get("selected") and prior <= remaining}
+    async def cleanup_owned(self, ownership: SafariOwnership) -> dict[str, Any]:
+        bundle = ownership.prior_frontmost_bundle.replace('\"', '\\\\"')
+        output = await self._osascript(f"""tell application \"Safari\"
+ set ownedWindow to window id {ownership.window_id}
+ set stillFront to (front window is ownedWindow)
+ set tabCount to count of tabs of ownedWindow
+ if tabCount is 1 then
+   close ownedWindow
+ else
+   close tab id {ownership.tab_id} of ownedWindow
+ end if
+end tell
+set restored to false
+if stillFront then
+ tell application \"System Events\" to set frontmost of first application process whose bundle identifier is \"{bundle}\" to true
+ set restored to true
+end if
+return (tabCount as text) & tab & (restored as text)""")
+        parts = output.strip().split("\t")
+        if len(parts) != 2:
+            raise RuntimeError("Safari cleanup did not return evidence")
+        return {"owned_browser_state_removed": True, "prior_state_restored": parts[1].lower() == "true"}
 
 
 async def _close_backend(backend: Any) -> bool:
@@ -237,6 +243,20 @@ async def _run_zeta_loop(provider: ProviderAdapter, backend: Any, run_dir: Path)
     return _event_metrics(events)
 
 
+async def _bounded(awaitable: Any, timeout: float) -> Any:
+    task = asyncio.create_task(awaitable)
+    try:
+        return await asyncio.wait_for(task, timeout)
+    except BaseException:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+        raise
+
+
 async def run_trial(
     run_dir: Path,
     trial: int,
@@ -248,7 +268,7 @@ async def run_trial(
 ) -> dict[str, Any]:
     """Own one complete trial, including all resources and verified cleanup."""
     fixture: Any | None = None
-    browser_before: dict[str, Any] | None = None
+    ownership: SafariOwnership | None = None
     cleanup: dict[str, Any] = {"fixture_dead": False, "backend_closed": False, "owned_browser_state_removed": True, "prior_state_restored": True}
     try:
         state = trial_state(run_dir / "fixture", trial)
@@ -262,8 +282,7 @@ async def run_trial(
             backend.nonce = state["nonce"]
         await _preflight(backend)
         if browser is not None:
-            browser_before = await browser.snapshot()
-            await browser.open_owned(url)
+            ownership = await browser.open_owned(url)
         if provider.provider != EXPECTED_PROVIDER or provider.model != EXPECTED_MODEL:
             raise RuntimeError(f"provider/model contract mismatch: {provider.provider}/{provider.model}")
         metrics = await _run_zeta_loop(provider, backend, run_dir)
@@ -273,8 +292,8 @@ async def run_trial(
         return {"trial": trial, "provider": provider.provider, "model": provider.model, "metrics": metrics, "grade": {"trial": trial, "pass": grade["pass"], "clicks": grade["clicks"], "valid_clicks": grade["valid_clicks"]}, "status": "complete"}
     finally:
         steps: list[tuple[str, Callable[[], Any]]] = []
-        if browser is not None and browser_before is not None:
-            steps.append(("browser", lambda: browser.cleanup_owned(browser_before)))
+        if browser is not None and ownership is not None:
+            steps.append(("browser", lambda: browser.cleanup_owned(ownership)))
         steps.append(("backend", lambda: _close_backend(backend)))
         if fixture is not None:
             steps.append(("fixture", lambda: _close_fixture(fixture)))
@@ -282,7 +301,7 @@ async def run_trial(
             try:
                 observed = action()
                 if hasattr(observed, "__await__"):
-                    observed = await observed
+                    observed = await _bounded(observed, 10)
                 if name == "backend":
                     cleanup["backend_closed"] = bool(observed)
                 elif name == "fixture":
@@ -291,6 +310,13 @@ async def run_trial(
                     cleanup.update({key: bool(value) for key, value in observed.items() if key in cleanup})
             except BaseException as exc:  # noqa: BLE001 - cleanup continues after cancellation/failure
                 cleanup[f"{name}_error"] = str(exc) or type(exc).__name__
+                if name == "browser":
+                    cleanup["owned_browser_state_removed"] = False
+                    cleanup["prior_state_restored"] = False
+                elif name == "backend":
+                    cleanup["backend_closed"] = False
+                elif name == "fixture":
+                    cleanup["fixture_dead"] = False
         if not all(value for key, value in cleanup.items() if key in {"fixture_dead", "backend_closed", "owned_browser_state_removed", "prior_state_restored"}):
             raise RuntimeError(f"trial cleanup failed: {cleanup}") from None
 
@@ -305,7 +331,11 @@ async def _close_fixture(fixture: Any) -> bool:
     process = fixture
     if process.returncode is None:
         process.terminate()
-    await process.wait()
+        try:
+            await asyncio.wait_for(process.wait(), 5)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
     return process.returncode is not None
 
 

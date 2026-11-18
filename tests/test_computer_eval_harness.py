@@ -10,7 +10,7 @@ import pytest
 
 from evals.computer_macos.fixture import FixtureServer, trial_state
 from evals.computer_macos.reset import reset
-from evals.computer_macos.run import EXPECTED_MODEL, EXPECTED_PROVIDER, phase0, pilot
+from evals.computer_macos.run import EXPECTED_MODEL, EXPECTED_PROVIDER, MacSafari, SafariOwnership, phase0, pilot
 from tests.support.fake_backend import FakeBackend as ProviderBackend
 from tests.support.fake_backend import ScriptedTurn
 from zeta.protocol.types import TextContent, ToolCall
@@ -71,16 +71,14 @@ class Browser:
         self.after = dict(self.before)
         self.cleaned = False
 
-    async def snapshot(self):
-        return self.before if not self.cleaned else self.after
-
     async def open_owned(self, url):
         self.after = {"frontmost": "com.apple.Safari", "tabs": [*self.before["tabs"], {"wid": "2", "tid": "2", "u": url}]}
+        return SafariOwnership("2", "2", "com.apple.Safari")
 
-    async def cleanup_owned(self, before):
+    async def cleanup_owned(self, ownership):
         self.cleaned = True
-        self.after = before
-        return {"owned_browser_state_removed": True, "prior_state_restored": self.after == before}
+        self.after = self.before
+        return {"owned_browser_state_removed": True, "prior_state_restored": ownership.prior_frontmost_bundle == "com.apple.Safari"}
 
 
 def provider(x: int = 301, y: int = 201) -> ProviderBackend:
@@ -203,6 +201,28 @@ def test_prepare_home_restores_set_and_unset_environment(tmp_path: Path, monkeyp
         assert os.environ["ZETA_ACCOUNT_HOME"] == str(Path.home() / ".zeta")
         raise OSError("artifact write failed")
     assert dict(os.environ) == before
+
+
+@pytest.mark.asyncio
+async def test_safari_ownership_token_and_cleanup_use_owned_window_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    scripts: list[str] = []
+    responses = iter(["com.example.Editor\t42\t99\n", "2\tfalse\n"])
+
+    async def fake_osascript(source: str) -> str:
+        scripts.append(source)
+        return next(responses)
+
+    # test-contract: seam replaces the subprocess boundary; no live Safari is allowed.
+    monkeypatch.setattr(MacSafari, "_osascript", staticmethod(fake_osascript))
+    safari = MacSafari()
+    ownership = await safari.open_owned("http://127.0.0.1:8765/")
+    assert ownership == SafariOwnership("42", "99", "com.example.Editor")
+    result = await safari.cleanup_owned(ownership)
+    assert result == {"owned_browser_state_removed": True, "prior_state_restored": False}
+    # test-contract: seam validates the production AppleScript boundary without live Safari.
+    assert "window id 42" in scripts[1]
+    assert "close tab id 99 of ownedWindow" in scripts[1]
+    assert "repeat with w in windows" not in scripts[1]
 
 
 def test_reset_removes_only_run_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
