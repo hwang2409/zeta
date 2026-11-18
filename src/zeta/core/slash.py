@@ -554,6 +554,7 @@ class SlashStatus:
     unavailable_accounts: tuple[str, ...] = ()
     computer_enabled: bool = False
     computer_allowed_apps: int = 0
+    computer_default_app_access: str = "deny"
     computer_empty_allow_list: bool = False
     otel_status: str = "off"
 
@@ -734,6 +735,11 @@ def _format_status(status: SlashStatus) -> str:
         and status.model_window is not None
         else "unknown"
     )
+    computer_policy = (
+        f"; default app access={status.computer_default_app_access}"
+        if status.computer_enabled and status.computer_default_app_access == "allow"
+        else ""
+    )
     lines = [
         f"session_id: {status.session_id}",
         f"provider: {status.provider}",
@@ -757,7 +763,7 @@ def _format_status(status: SlashStatus) -> str:
         f"compaction_marker_count: {status.compaction_marker_count}",
         f"checkpoint_count: {status.checkpoint_count}",
         "unavailable_accounts: " + (", ".join(status.unavailable_accounts) or "none"),
-        f"computer: {'enabled' if status.computer_enabled else 'disabled'}, allowed app count={status.computer_allowed_apps}" + (f"; the allow-list is empty, so every app is denied. {computer_allow_guidance('com.apple.Safari')}" if status.computer_empty_allow_list else ""),
+        f"computer: {'enabled' if status.computer_enabled else 'disabled'}, allowed app count={status.computer_allowed_apps}{computer_policy}" + (f"; the allow-list is empty, so every app is denied. {computer_allow_guidance('com.apple.Safari')}" if status.computer_empty_allow_list else ""),
         f"live_pending_approvals: {len(status.pending_approvals)} ({pending})",
         status.mcp_summary,
         "usage:",
