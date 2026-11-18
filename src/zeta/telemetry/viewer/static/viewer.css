@@ -95,7 +95,7 @@ th {
 }
 td { padding: 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
 tbody tr:hover { background: var(--bg-raised); }
-th.num { text-align: right; }
+th.num { text-align: right; font-family: var(--sans); }
 
 .who { display: flex; flex-direction: column; gap: 2px; }
 .profile { font-family: var(--mono); color: var(--fg-strong); font-weight: 600; }
@@ -112,7 +112,7 @@ th.num { text-align: right; }
 
 .waterfall th.timeline { display: table-cell; }
 .waterfall th.timeline span:last-child { float: right; }
-.waterfall td.timeline { width: 42%; min-width: 220px; vertical-align: middle; }
+.waterfall td.timeline { width: 42%; min-width: 220px; padding-top: 16px; }
 .span-cell { padding-left: calc(12px + var(--depth, 0) * 18px); }
 .span-name { display: flex; align-items: center; gap: 8px; color: var(--fg-strong); }
 .span-meta { color: var(--fg-dim); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
@@ -160,11 +160,12 @@ tr.is-error .span-name { color: var(--red); }
   table.sessions td[data-label="Session"] .who { text-align: left; }
   table.sessions td[data-label="Session"] .id { overflow-wrap: anywhere; }
   table.sessions td[data-label="Last activity"] { order: -1; }
+  table.sessions td[data-label="Model"] { grid-column: 1 / -1; order: -1; }
   table.sessions td[data-label="Trace"] { grid-column: 1 / -1; justify-content: flex-start; padding-top: 6px; }
 
   table.waterfall tbody tr { display: grid; grid-template-columns: 1fr auto auto; column-gap: 12px; align-items: center; }
   .waterfall td.span-cell { grid-column: 1 / -1; padding-left: calc(var(--depth, 0) * 12px); }
-  .waterfall td.timeline { grid-column: 1; width: auto; min-width: 0; }
+  .waterfall td.timeline { grid-column: 1; width: auto; min-width: 0; padding-top: 2px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

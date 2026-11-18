@@ -29,7 +29,7 @@ from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue
 from opentelemetry.proto.trace.v1.trace_pb2 import Span, Status
 
 with warnings.catch_warnings():  # starlette warns that its test client prefers httpx2
-    warnings.simplefilter("ignore", DeprecationWarning)
+    warnings.simplefilter("ignore")
     from starlette.testclient import TestClient
 
 from zeta.telemetry.viewer import store as store_module
