@@ -476,6 +476,7 @@ def test_only_the_auto_started_receiver_idle_exits(tmp_path, monkeypatch, argume
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
     create_server = socket.create_server
     monkeypatch.setattr(process.socket, "create_server", lambda address: create_server(("127.0.0.1", 0)))  # not the fixed port
+    # test-contract: seam _serve takes the idle timeout the CLI chose; a manual receiver can only be shown not to expire
     monkeypatch.setattr(process, "_serve", lambda listener, directory, home_id, idle_seconds: served.append(idle_seconds) or 0)
 
     assert main(["otel", "receiver", *arguments]) == 0
