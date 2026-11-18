@@ -17,6 +17,7 @@ class TelemetryStatus:
     state: str
     reason: str | None = None
     last_export_ns: int | None = None  # when the latest export batch finished; None before the first
+    over_cap: bool = False
 
     @property
     def last_export(self) -> str | None:

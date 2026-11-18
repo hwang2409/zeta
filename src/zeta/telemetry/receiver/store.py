@@ -158,9 +158,22 @@ CREATE INDEX sessions_profile_last ON sessions(profile, last_ns DESC, root_sessi
 CREATE INDEX sessions_model_last ON sessions(model, last_ns DESC, root_session_id DESC);
 """
 
-# MIGRATIONS[n] moves a database from schema n - 1 to n.
-MIGRATIONS = {
-    2: (
+# v3 replaces the unreleased rollup table with family-specific projections.
+V3_SCHEMA = (  # noqa: SIM905
+"""CREATE TABLE span_fingerprints(trace_id BLOB NOT NULL, span_id BLOB NOT NULL, seen_ns INTEGER NOT NULL CHECK(seen_ns>=0), PRIMARY KEY(trace_id,span_id)) STRICT;
+CREATE INDEX span_fingerprints_seen ON span_fingerprints(seen_ns,trace_id,span_id);
+CREATE TABLE hourly_series(hour_ns INTEGER NOT NULL, group_by TEXT NOT NULL CHECK(group_by IN('none','model','tool','operation')), group_key TEXT NOT NULL, spans INTEGER NOT NULL CHECK(spans>=0), errors INTEGER NOT NULL CHECK(errors>=0), model_calls INTEGER NOT NULL CHECK(model_calls>=0), tool_calls INTEGER NOT NULL CHECK(tool_calls>=0), input_tokens INTEGER NOT NULL CHECK(input_tokens>=0), output_tokens INTEGER NOT NULL CHECK(output_tokens>=0), total_tokens INTEGER NOT NULL CHECK(total_tokens>=0), duration_ns INTEGER NOT NULL CHECK(duration_ns>=0), PRIMARY KEY(hour_ns,group_by,group_key)) STRICT;
+CREATE TABLE hourly_distinct(hour_ns INTEGER NOT NULL, group_by TEXT NOT NULL CHECK(group_by IN('none','model','tool','operation')), group_key TEXT NOT NULL, identity_kind TEXT NOT NULL CHECK(identity_kind IN('session','trace')), identity_key BLOB NOT NULL, PRIMARY KEY(hour_ns,group_by,group_key,identity_kind,identity_key)) STRICT;
+CREATE TABLE hourly_models(hour_ns INTEGER NOT NULL, model_key TEXT NOT NULL, provider TEXT, model TEXT NOT NULL, calls INTEGER NOT NULL CHECK(calls>=0), errors INTEGER NOT NULL CHECK(errors>=0), duration_ns INTEGER NOT NULL CHECK(duration_ns>=0), input_tokens INTEGER NOT NULL CHECK(input_tokens>=0), output_tokens INTEGER NOT NULL CHECK(output_tokens>=0), total_tokens INTEGER NOT NULL CHECK(total_tokens>=0), last_ns INTEGER NOT NULL CHECK(last_ns>=0), PRIMARY KEY(hour_ns,model_key)) STRICT;
+CREATE TABLE hourly_tools(hour_ns INTEGER NOT NULL, tool_key TEXT NOT NULL, tool_name TEXT NOT NULL, tool_type TEXT, calls INTEGER NOT NULL CHECK(calls>=0), errors INTEGER NOT NULL CHECK(errors>=0), duration_ns INTEGER NOT NULL CHECK(duration_ns>=0), argument_bytes INTEGER NOT NULL CHECK(argument_bytes>=0), result_bytes INTEGER NOT NULL CHECK(result_bytes>=0), last_ns INTEGER NOT NULL CHECK(last_ns>=0), PRIMARY KEY(hour_ns,tool_key)) STRICT;
+CREATE TABLE hourly_latency(hour_ns INTEGER NOT NULL, family TEXT NOT NULL CHECK(family IN('model','tool')), family_key TEXT NOT NULL, bucket INTEGER NOT NULL CHECK(bucket BETWEEN 0 AND 63), calls INTEGER NOT NULL CHECK(calls>=0), PRIMARY KEY(hour_ns,family,family_key,bucket)) STRICT;
+CREATE INDEX hourly_distinct_range ON hourly_distinct(group_by,group_key,hour_ns,identity_kind);
+CREATE INDEX hourly_models_range ON hourly_models(hour_ns,provider,model);
+CREATE INDEX hourly_tools_range ON hourly_tools(hour_ns,tool_name,tool_type);
+CREATE INDEX hourly_latency_range ON hourly_latency(family,family_key,hour_ns,bucket);""").split(';')
+
+MIGRATIONS_2 = (
+
         "ALTER TABLE spans ADD COLUMN error_code TEXT",
         "ALTER TABLE spans ADD COLUMN run_id TEXT",
         "ALTER TABLE spans ADD COLUMN parent_run_id TEXT",
@@ -169,33 +182,8 @@ MIGRATIONS = {
         "ALTER TABLE spans ADD COLUMN cache_write_tokens INTEGER CHECK (cache_write_tokens IS NULL OR cache_write_tokens >= 0)",
         "ALTER TABLE spans ADD COLUMN ttft_ns INTEGER CHECK (ttft_ns IS NULL OR ttft_ns >= 0)",
         "ALTER TABLE spans ADD COLUMN retry_count INTEGER CHECK (retry_count IS NULL OR retry_count >= 0)",
-    ),
-    3: (
-        """CREATE TABLE span_fingerprints (
-            trace_id BLOB NOT NULL CHECK (length(trace_id) = 16),
-            span_id BLOB NOT NULL CHECK (length(span_id) = 8),
-            seen_ns INTEGER NOT NULL CHECK (seen_ns >= 0),
-            PRIMARY KEY (trace_id, span_id)
-        ) STRICT""",
-        "CREATE INDEX span_fingerprints_seen ON span_fingerprints(seen_ns)",
-        """CREATE TABLE hourly_rollups (
-            hour_ns INTEGER NOT NULL CHECK (hour_ns >= 0),
-            dimension TEXT NOT NULL CHECK (dimension IN ('kind','operation','model','tool')),
-            dimension_key TEXT NOT NULL,
-            calls INTEGER NOT NULL CHECK (calls >= 0),
-            errors INTEGER NOT NULL CHECK (errors >= 0),
-            duration_ns INTEGER NOT NULL CHECK (duration_ns >= 0),
-            histogram TEXT NOT NULL,
-            input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
-            output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
-            total_tokens INTEGER NOT NULL CHECK (total_tokens >= 0),
-            last_ns INTEGER NOT NULL CHECK (last_ns >= 0),
-            PRIMARY KEY (hour_ns, dimension, dimension_key)
-        ) STRICT""",
-        "CREATE INDEX hourly_rollups_time ON hourly_rollups(hour_ns, dimension, dimension_key)",
-    ),
-}
 
+)
 _TRACE_UPSERT = """
 INSERT INTO traces (
     trace_id, first_ns, last_ns, root_span_id, root_session_id,
@@ -373,8 +361,9 @@ def _session_candidate(span: dict[str, Any], root: str, error_count: int) -> dic
     return session
 
 
+
 def _database_bytes(path: Path) -> int:
-    return sum((path, Path(f"{path}-wal"), Path(f"{path}-shm"))[i].stat().st_size for i in range(3) if (path, Path(f"{path}-wal"), Path(f"{path}-shm"))[i].exists())
+    return sum(p.stat().st_size for p in (path, Path(f"{path}-wal"), Path(f"{path}-shm")) if p.exists())
 
 
 def _connect(path: Path, **options: Any) -> sqlite3.Connection:
@@ -385,199 +374,174 @@ def _connect(path: Path, **options: Any) -> sqlite3.Connection:
     return connection
 
 
+def _set_v3_tables(connection: sqlite3.Connection) -> None:
+    for statement in V3_SCHEMA:
+        if statement.strip():
+            connection.execute(statement)
+
+
+def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
+    result = dict(row)
+    result.setdefault("events", [])
+    return result
+
+
+def _model_key(row: dict[str, Any]) -> str:
+    return json.dumps([row.get("provider"), row.get("response_model") or row.get("request_model")], separators=(",", ":"))
+
+
+def _tool_key(row: dict[str, Any]) -> str:
+    return json.dumps([row.get("tool_name"), row.get("tool_type")], separators=(",", ":"))
+
+
+def _upsert_series(connection: sqlite3.Connection, row: dict[str, Any], hour: int, group: str, key: str) -> None:
+    model = row["operation"] == "chat" and (row.get("response_model") or row.get("request_model")) is not None
+    tool = row["operation"] == "execute_tool" and row.get("tool_name") is not None
+    connection.execute("""INSERT INTO hourly_series VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hour_ns,group_by,group_key) DO UPDATE SET spans=spans+1,errors=errors+excluded.errors,model_calls=model_calls+excluded.model_calls,tool_calls=tool_calls+excluded.tool_calls,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,total_tokens=total_tokens+excluded.total_tokens,duration_ns=duration_ns+excluded.duration_ns""", (hour, group, key, 1, int(row["status"] == "error"), int(model), int(tool), row.get("input_tokens") or 0 if model else 0, row.get("output_tokens") or 0 if model else 0, row.get("total_tokens") or 0 if model else 0, row["duration_ns"]))
+    for kind, identity in (("trace", row["trace_id"]), ("session", row.get("root_session_id") or row.get("session_id"))):
+        if identity is not None:
+            connection.execute("INSERT OR IGNORE INTO hourly_distinct VALUES(?,?,?,?,?)", (hour, group, key, kind, identity.encode() if isinstance(identity, str) else identity))
+
+
+def _project_rollup(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    hour = row["start_ns"] // 3_600_000_000_000 * 3_600_000_000_000
+    _upsert_series(connection, row, hour, "none", "")
+    _upsert_series(connection, row, hour, "operation", row["operation"])
+    model = row["operation"] == "chat" and (row.get("response_model") or row.get("request_model")) is not None
+    tool = row["operation"] == "execute_tool" and row.get("tool_name") is not None
+    if model:
+        key = _model_key(row)
+        connection.execute("""INSERT INTO hourly_models VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hour_ns,model_key) DO UPDATE SET calls=calls+1,errors=errors+excluded.errors,duration_ns=duration_ns+excluded.duration_ns,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,total_tokens=total_tokens+excluded.total_tokens,last_ns=MAX(last_ns,excluded.last_ns)""", (hour,key,row.get("provider"),row.get("response_model") or row.get("request_model"),1,int(row["status"]=="error"),row["duration_ns"],row.get("input_tokens") or 0,row.get("output_tokens") or 0,row.get("total_tokens") or 0,row["end_ns"]))
+        bucket = _histogram_bucket(row["duration_ns"])
+        connection.execute("INSERT INTO hourly_latency VALUES(?,?,?,?,1) ON CONFLICT(hour_ns,family,family_key,bucket) DO UPDATE SET calls=calls+1", (hour,"model",key,bucket))
+        _upsert_series(connection, row, hour, "model", key)
+    if tool:
+        key = _tool_key(row)
+        connection.execute("""INSERT INTO hourly_tools VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hour_ns,tool_key) DO UPDATE SET calls=calls+1,errors=errors+excluded.errors,duration_ns=duration_ns+excluded.duration_ns,argument_bytes=argument_bytes+excluded.argument_bytes,result_bytes=result_bytes+excluded.result_bytes,last_ns=MAX(last_ns,excluded.last_ns)""", (hour,key,row["tool_name"],row.get("tool_type"),1,int(row["status"]=="error"),row["duration_ns"],row.get("tool_argument_bytes") or 0,row.get("tool_result_bytes") or 0,row["end_ns"]))
+        bucket = _histogram_bucket(row["duration_ns"])
+        connection.execute("INSERT INTO hourly_latency VALUES(?,?,?,?,1) ON CONFLICT(hour_ns,family,family_key,bucket) DO UPDATE SET calls=calls+1", (hour,"tool",key,bucket))
+        _upsert_series(connection, row, hour, "tool", key)
+
+
 def open_database(path: Path) -> None:
-    """Create or migrate the database; the caller holds the receiver lock. Fails closed."""
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    os.close(descriptor)
-    os.chmod(path, 0o600)
+    os.close(descriptor); os.chmod(path, 0o600)
     connection = _connect(path)
     try:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version == SCHEMA_VERSION:
-            return
-        if not 0 <= version < SCHEMA_VERSION:
-            raise RuntimeError(f"telemetry database schema {version} is not supported (expected {SCHEMA_VERSION})")
+        if version == SCHEMA_VERSION: return
+        if not 0 <= version < SCHEMA_VERSION: raise RuntimeError(f"telemetry database schema {version} is not supported (expected {SCHEMA_VERSION})")
         connection.execute("PRAGMA journal_mode = WAL")
+        if version == 0:
+            connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+        elif version == 2:
+            connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+            connection.commit(); connection.execute("VACUUM")
         connection.execute("BEGIN IMMEDIATE")
         try:
             if version == 0:
                 for statement in SCHEMA.split(";"):
-                    if statement.strip():
-                        connection.execute(statement)
-                connection.execute("INSERT INTO viewer_meta (singleton, schema_version) VALUES (1, 1)")
-                version = 1
-            # one transaction: a crash leaves the old schema whole, never a half-migrated one
-            for target in range(version + 1, SCHEMA_VERSION + 1):
-                for statement in MIGRATIONS[target]:
+                    if statement.strip(): connection.execute(statement)
+                connection.execute("INSERT INTO viewer_meta (singleton,schema_version) VALUES (1,1)"); version = 1
+            if version == 1:
+                for statement in MIGRATIONS_2:
                     connection.execute(statement)
-            connection.execute("UPDATE viewer_meta SET schema_version = ? WHERE singleton = 1", (SCHEMA_VERSION,))
-            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-            connection.commit()
+                version = 2
+            if version == 2:
+                _set_v3_tables(connection)
+                connection.row_factory = sqlite3.Row
+                for raw in connection.execute("SELECT * FROM spans"):
+                    row = _row_dict(raw)
+                    connection.execute("INSERT OR IGNORE INTO span_fingerprints VALUES(?,?,?)", (row["trace_id"],row["span_id"],row["start_ns"]))
+                    _project_rollup(connection, row)
+            connection.execute("UPDATE viewer_meta SET schema_version=3 WHERE singleton=1")
+            connection.execute("PRAGMA user_version=3"); connection.commit()
         except BaseException:
-            connection.rollback()
-            raise
-    finally:
-        connection.close()
+            connection.rollback(); raise
+    finally: connection.close()
 
 
 def _histogram_bucket(duration_ns: int) -> int:
-    # 64 logarithmic buckets are bounded while retaining useful latency shape.
-    return min(63, max(0, duration_ns.bit_length() - 1))
-
-
-def _rollup_dimensions(row: dict[str, Any]) -> tuple[tuple[str, str], ...]:
-    model = row["response_model"] or row["request_model"]
-    return (
-        ("kind", str(row["kind"])),
-        ("operation", row["operation"]),
-        ("model", json.dumps([row["provider"], model], separators=(",", ":"))),
-        ("tool", row["tool_name"] or ""),
-    )
+    return 0 if duration_ns == 0 else min(63, duration_ns.bit_length())
 
 
 class Writer:
-    """One thread and one connection; a bounded queue of batches feeds it."""
-
     def __init__(self, path: Path, *, clock_ns: Callable[[], int] = time.time_ns) -> None:
-        self._connection = _connect(path)
-        self._path = path
-        self._clock_ns = clock_ns
-        self._queue: queue.Queue[tuple[list[dict[str, Any]], Callable[[object], None]] | None] = queue.Queue(
-            INGEST_QUEUE_CAPACITY
-        )
+        self._connection = _connect(path); self._path = path; self._clock_ns = clock_ns
+        self._queue: queue.Queue[tuple[list[dict[str, Any]], Callable[[object], None]] | None] = queue.Queue(INGEST_QUEUE_CAPACITY)
         self._thread = threading.Thread(target=self._run, name="zeta-otel-receiver-writer", daemon=True)
-        # the last committed sequence; set only after its transaction commits
         self.committed_sequence = self._connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
 
     def start(self) -> None:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            result = self.maintenance_step(self._clock_ns())
+            if result["caught_up"] or result["stalled"]:
+                break
         self._thread.start()
 
     def submit(self, rows: list[dict[str, Any]]) -> asyncio.Future[int]:
-        """Queue one batch; the future resolves after commit. Raises ``queue.Full``."""
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[int] = loop.create_future()
-
+        loop = asyncio.get_running_loop(); future: asyncio.Future[int] = loop.create_future()
         def settle(outcome: object) -> None:
-            if future.done():
-                return
-            if isinstance(outcome, BaseException):
-                future.set_exception(outcome)
-            else:
-                future.set_result(outcome)
-
-        self._queue.put_nowait((rows, lambda outcome: loop.call_soon_threadsafe(settle, outcome)))
-        return future
-
+            if future.done(): return
+            future.set_exception(outcome) if isinstance(outcome, BaseException) else future.set_result(outcome)
+        self._queue.put_nowait((rows, lambda outcome: loop.call_soon_threadsafe(settle, outcome))); return future
     def close(self) -> None:
-        """Let queued batches commit for up to the graceful timeout, then stop."""
-        try:
-            self._queue.put(None, timeout=GRACEFUL_COMMIT_TIMEOUT_SECONDS)
-        except queue.Full:
-            return
+        try: self._queue.put(None, timeout=GRACEFUL_COMMIT_TIMEOUT_SECONDS)
+        except queue.Full: return
         self._thread.join(GRACEFUL_COMMIT_TIMEOUT_SECONDS)
-
     def _run(self) -> None:
         try:
             while (item := self._queue.get()) is not None:
                 rows, reply = item
-                try:
-                    outcome: object = self._commit(rows)
-                except Exception as exc:  # noqa: BLE001 - a failed batch fails its request; the writer keeps running
+                try: outcome = self._commit(rows)
+                except Exception as exc:  # noqa: BLE001
                     outcome = exc
                 reply(outcome)
-        finally:
-            self._connection.close()
+        finally: self._connection.close()
 
     def _commit(self, rows: list[dict[str, Any]]) -> int:
-        connection = self._connection
-        connection.execute("BEGIN IMMEDIATE")
+        c = self._connection; c.execute("BEGIN IMMEDIATE")
         try:
             inserted = 0
             for row in rows:
-                connection.execute(_FINGERPRINT_INSERT, (row["trace_id"], row["span_id"], row["start_ns"]))
-                if connection.execute("SELECT changes()").fetchone()[0] != 1:
-                    continue  # a duplicate span changes nothing, even after raw pruning
-                connection.execute(_SPAN_INSERT, row)
-                if connection.execute("SELECT changes()").fetchone()[0] != 1:
-                    continue
-                inserted += 1
-                connection.executemany(_EVENT_INSERT, row["events"])
-                trace, session = project_span(row)
-                connection.execute(_TRACE_UPSERT, trace)
-                if session is not None:
-                    connection.execute(_SESSION_UPSERT, session)
-                hour_ns = row["start_ns"] // 3_600_000_000_000 * 3_600_000_000_000
-                bucket = _histogram_bucket(row["duration_ns"])
-                for dimension, dimension_key in _rollup_dimensions(row):
-                    histogram = [0] * 64
-                    histogram[bucket] = 1
-                    connection.execute(
-                        """INSERT INTO hourly_rollups
-                        (hour_ns, dimension, dimension_key, calls, errors, duration_ns, histogram,
-                         input_tokens, output_tokens, total_tokens, last_ns)
-                        VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(hour_ns, dimension, dimension_key) DO UPDATE SET
-                          calls = calls + 1, errors = errors + excluded.errors,
-                          duration_ns = duration_ns + excluded.duration_ns,
-                          histogram = json_set(histogram, '$[' || ? || ']',
-                            COALESCE(json_extract(histogram, '$[' || ? || ']'), 0) + 1),
-                          input_tokens = input_tokens + excluded.input_tokens,
-                          output_tokens = output_tokens + excluded.output_tokens,
-                          total_tokens = total_tokens + excluded.total_tokens,
-                          last_ns = MAX(last_ns, excluded.last_ns)""",
-                        (hour_ns, dimension, dimension_key, int(row["status"] == "error"), row["duration_ns"],
-                         json.dumps(histogram), row["input_tokens"] or 0, row["output_tokens"] or 0,
-                         row["total_tokens"] or 0, row["end_ns"], bucket, bucket),
-                    )
-            if inserted:
-                connection.execute("UPDATE viewer_meta SET committed_sequence = committed_sequence + 1 WHERE singleton = 1")
-            sequence = connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-        self.committed_sequence = sequence
-        self._prune()
-        return sequence
+                c.execute(_FINGERPRINT_INSERT, (row["trace_id"],row["span_id"],row["start_ns"]))
+                if c.execute("SELECT changes()").fetchone()[0] != 1: continue
+                c.execute(_SPAN_INSERT, row)
+                if c.execute("SELECT changes()").fetchone()[0] != 1: continue
+                inserted += 1; c.executemany(_EVENT_INSERT, row["events"])
+                trace, session = project_span(row); c.execute(_TRACE_UPSERT, trace)
+                if session is not None: c.execute(_SESSION_UPSERT, session)
+                _project_rollup(c, row)
+            if inserted: c.execute("UPDATE viewer_meta SET committed_sequence=committed_sequence+1 WHERE singleton=1")
+            sequence = c.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]; c.commit()
+        except BaseException: c.rollback(); raise
+        self.committed_sequence = sequence; self.maintenance_step(self._clock_ns()); return sequence
 
-    def _prune(self) -> None:
-        """Delete bounded oldest chunks after ingest, never sharing its ingest transaction."""
-        now = self._clock_ns()
-        connection = self._connection
-        self._delete_rollups_before(connection, now - ROLLUP_DAYS * 86_400 * 10**9)
-        connection.execute("DELETE FROM span_fingerprints WHERE seen_ns < ?", (now - ROLLUP_DAYS * 86_400 * 10**9,))
-        connection.commit()
-        self._delete_spans_before(connection, now - RAW_DAYS * 86_400 * 10**9)
-        self._enforce_size(connection)
+    def _reclaim(self) -> None:
+        self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._connection.execute("PRAGMA incremental_vacuum(1000)")
+        self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
-    @staticmethod
-    def _delete_rollups_before(connection: sqlite3.Connection, cutoff: int) -> None:
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            connection.execute("DELETE FROM hourly_rollups WHERE rowid IN (SELECT rowid FROM hourly_rollups WHERE hour_ns < ? ORDER BY hour_ns LIMIT ?)", (cutoff, PRUNE_CHUNK))
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
+    def maintenance_step(self, now_ns: int) -> dict[str, Any]:
+        before = _database_bytes(self._path); age_family = size_family = None; age_rows = size_rows = 0
+        cutoff_raw = now_ns - RAW_DAYS * 86_400 * 10**9; cutoff_roll = now_ns - ROLLUP_DAYS * 86_400 * 10**9
+        c = self._connection
+        def delete(table: str, where: str, args: tuple[Any,...], order: str) -> int:
+            c.execute("BEGIN IMMEDIATE"); rows = c.execute(f"SELECT rowid FROM {table} WHERE {where} ORDER BY {order} LIMIT ?", (*args, PRUNE_CHUNK)).fetchall()
+            if rows: c.executemany(f"DELETE FROM {table} WHERE rowid=?", rows)
+            c.commit(); return len(rows)
+        for table, where, args, order, family in (("spans","start_ns < ?",(cutoff_raw,),"start_ns,trace_id,span_id","spans"),("span_fingerprints","seen_ns < ?",(cutoff_roll,),"seen_ns,trace_id,span_id","fingerprints"),("hourly_series","hour_ns < ?",(cutoff_roll,),"hour_ns,group_by,group_key","rollups"),("hourly_distinct","hour_ns < ?",(cutoff_roll,),"hour_ns,group_by,group_key,identity_kind,identity_key","rollups"),("hourly_models","hour_ns < ?",(cutoff_roll,),"hour_ns,model_key","rollups"),("hourly_tools","hour_ns < ?",(cutoff_roll,),"hour_ns,tool_key","rollups"),("hourly_latency","hour_ns < ?",(cutoff_roll,),"hour_ns,family,family_key,bucket","rollups")):
+            age_rows = delete(table, where, args, order)
+            if age_rows: age_family = family; break
+        c.execute("BEGIN IMMEDIATE"); c.execute("DELETE FROM traces WHERE NOT EXISTS(SELECT 1 FROM spans WHERE spans.trace_id=traces.trace_id)"); c.execute("DELETE FROM sessions WHERE NOT EXISTS(SELECT 1 FROM spans WHERE spans.session_id=sessions.root_session_id OR spans.session_id LIKE sessions.root_session_id || ':%')"); c.commit()
+        self._reclaim(); after = _database_bytes(self._path); over = after > MAX_BYTES
+        if over:
+            for table, order, family in (("spans","start_ns,trace_id,span_id","raw"),("span_fingerprints","seen_ns,trace_id,span_id","fingerprints"),("hourly_series","hour_ns,group_by,group_key","rollups"),("hourly_distinct","hour_ns,group_by,group_key,identity_kind,identity_key","rollups"),("hourly_models","hour_ns,model_key","rollups"),("hourly_tools","hour_ns,tool_key","rollups"),("hourly_latency","hour_ns,family,family_key,bucket","rollups")):
+                n = delete(table, "1", (), order)
+                if n: size_family,size_rows=family,n; break
+            self._reclaim(); after = _database_bytes(self._path); over = after > MAX_BYTES
+        return {"age_family":age_family,"age_rows":age_rows,"size_family":size_family,"size_rows":size_rows,"bytes_before":before,"bytes_after":after,"caught_up":not age_family and not over,"over_cap":over,"stalled":over and size_rows == 0}
 
-    @staticmethod
-    def _delete_spans_before(connection: sqlite3.Connection, cutoff: int) -> None:
-        connection.execute("BEGIN IMMEDIATE")
-        try:
-            connection.execute("DELETE FROM spans WHERE rowid IN (SELECT rowid FROM spans WHERE end_ns < ? ORDER BY end_ns, trace_id, span_id LIMIT ?)", (cutoff, PRUNE_CHUNK))
-            connection.execute("SELECT changes()")
-            connection.execute("DELETE FROM traces WHERE NOT EXISTS (SELECT 1 FROM spans WHERE spans.trace_id = traces.trace_id)")
-            connection.commit()
-        except BaseException:
-            connection.rollback()
-            raise
-
-    def _enforce_size(self, connection: sqlite3.Connection) -> None:
-        while _database_bytes(self._path) > MAX_BYTES:
-            self._delete_spans_before(connection, 2**63 - 1)
-            if _database_bytes(self._path) <= MAX_BYTES:
-                break
-            self._delete_rollups_before(connection, 2**63 - 1)
-            if not connection.execute("SELECT 1 FROM spans LIMIT 1").fetchone() and not connection.execute("SELECT 1 FROM hourly_rollups LIMIT 1").fetchone():
-                break
-        connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    def _prune(self) -> None: self.maintenance_step(self._clock_ns())
+    def _enforce_size(self, connection: sqlite3.Connection) -> None: self.maintenance_step(self._clock_ns())

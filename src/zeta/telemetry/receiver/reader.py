@@ -92,7 +92,7 @@ def status(home: Path, endpoint: str | None, live: dict[str, Any]) -> dict[str, 
             home,
             lambda connection: (
                 connection.execute("SELECT MIN(start_ns) FROM spans").fetchone()[0],
-                connection.execute("SELECT MIN(hour_ns) FROM hourly_rollups").fetchone()[0],
+                connection.execute("SELECT MIN(hour_ns) FROM hourly_series").fetchone()[0],
             ),
         )
     except Unavailable:
@@ -109,6 +109,7 @@ def status(home: Path, endpoint: str | None, live: dict[str, Any]) -> dict[str, 
         "used_bytes": _used_bytes(database_path(home)),
         "oldest_raw_ns": oldest,
         "oldest_rollup_ns": oldest_rollup,
+        "over_cap": _used_bytes(database_path(home)) > MAX_BYTES,
     }
 
 

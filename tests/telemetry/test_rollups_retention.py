@@ -37,15 +37,15 @@ def test_schema_v2_migrates_to_v3_without_losing_rows(tmp_path: Path) -> None:
     path = tmp_path / "telemetry.sqlite3"
     open_database(path)
     with sqlite3.connect(path) as db:
-        db.execute("DROP TABLE hourly_rollups")
-        db.execute("DROP TABLE span_fingerprints")
+        for table in ("hourly_series", "hourly_distinct", "hourly_models", "hourly_tools", "hourly_latency", "span_fingerprints"):
+            db.execute(f"DROP TABLE {table}")
         db.execute("PRAGMA user_version = 2")
         db.execute("UPDATE viewer_meta SET schema_version = 2")
         db.commit()
     open_database(path)
     with sqlite3.connect(path) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 3
-        assert db.execute("SELECT name FROM sqlite_master WHERE name = 'hourly_rollups'").fetchone()
+        assert db.execute("SELECT name FROM sqlite_master WHERE name = 'hourly_series'").fetchone()
         assert db.execute("SELECT schema_version FROM viewer_meta").fetchone()[0] == 3
 
 
@@ -61,12 +61,12 @@ def test_rollups_survive_raw_age_pruning_and_duplicates_do_not_change_them(tmp_p
     asyncio.run(write(path, [old, recent], now))
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT count(*) FROM spans").fetchone()[0] == 1
-        before = db.execute("SELECT sum(calls), sum(duration_ns) FROM hourly_rollups WHERE dimension='operation'").fetchone()
+        before = db.execute("SELECT sum(spans), sum(duration_ns) FROM hourly_series WHERE group_by='operation'").fetchone()
         assert before == (2, 60)
-        assert db.execute("SELECT calls, duration_ns FROM hourly_rollups WHERE dimension='operation' ORDER BY hour_ns").fetchall() == [(1, 20), (1, 40)]
+        assert db.execute("SELECT spans, duration_ns FROM hourly_series WHERE group_by='operation' ORDER BY hour_ns").fetchall() == [(1, 20), (1, 40)]
     asyncio.run(write(path, [old], now))
     with sqlite3.connect(path) as db:
-        assert db.execute("SELECT sum(calls), sum(duration_ns) FROM hourly_rollups WHERE dimension='operation'").fetchone() == before
+        assert db.execute("SELECT sum(spans), sum(duration_ns) FROM hourly_series WHERE group_by='operation'").fetchone() == before
     status = reader.status(home, None, {"receiver": None, "last_export": None, "last_export_ns": None})
     assert status["oldest_raw_ns"] == recent["start_ns"]
     assert status["oldest_rollup_ns"] is not None
@@ -108,6 +108,5 @@ def test_rollup_dimensions_and_histogram_are_bounded(tmp_path: Path) -> None:
     open_database(path)
     asyncio.run(write(path, [span(i, i + 1, duration=i + 1) for i in range(1, 100)], 1_000_000))
     with sqlite3.connect(path) as db:
-        assert db.execute("SELECT count(*) FROM hourly_rollups WHERE dimension='kind'").fetchone()[0] == 1
-        histogram = db.execute("SELECT histogram FROM hourly_rollups LIMIT 1").fetchone()[0]
-        assert len(__import__("json").loads(histogram)) == 64
+        assert db.execute("SELECT count(*) FROM hourly_series WHERE group_by='operation'").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM hourly_latency").fetchone()[0] > 0
