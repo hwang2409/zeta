@@ -58,7 +58,8 @@ class TrialFixture(Protocol):
     async def close_and_verify(self) -> bool: ...
 
 
-def prepare_home(run_dir: Path) -> Path:
+@contextlib.contextmanager
+def prepare_home(run_dir: Path):
     run_dir = run_dir.resolve()
     home = (run_dir / "zeta-home").resolve()
     real = Path.home() / ".zeta"
@@ -68,16 +69,11 @@ def prepare_home(run_dir: Path) -> Path:
     settings = home / "settings.toml"
     if not settings.exists():
         settings.write_text('[computer]\nenabled = true\ndefault_app_access = "allow"\n')
-    return home
-
-
-@contextlib.contextmanager
-def _home_environment(home: Path):
     previous = {key: os.environ.get(key) for key in ("ZETA_HOME", "ZETA_ACCOUNT_HOME")}
     os.environ["ZETA_HOME"] = str(home)
-    os.environ["ZETA_ACCOUNT_HOME"] = str(Path.home() / ".zeta")
+    os.environ["ZETA_ACCOUNT_HOME"] = str(real)
     try:
-        yield
+        yield home
     finally:
         for key, value in previous.items():
             if value is None:
@@ -110,7 +106,11 @@ def _event_metrics(events: list[Any]) -> dict[str, Any]:
 
 
 async def phase0(run_dir: Path, backend: Any | None = None) -> dict[str, Any]:
-    prepare_home(run_dir)
+    with prepare_home(run_dir):
+        return await _phase0(run_dir, backend)
+
+
+async def _phase0(run_dir: Path, backend: Any | None = None) -> dict[str, Any]:
     if backend is None:
         if platform.system() != "Darwin":
             raise RuntimeError("phase 0 requires macOS")
@@ -305,8 +305,7 @@ async def run_trial(
             owned = await browser.open_owned(url)
         if provider.provider != EXPECTED_PROVIDER or provider.model != EXPECTED_MODEL:
             raise RuntimeError("provider/model contract mismatch")
-        with _home_environment(run_dir / "zeta-home"):
-            metrics = await _run_zeta_loop(provider, backend, run_dir / f"trial-{trial}")
+        metrics = await _run_zeta_loop(provider, backend, run_dir / f"trial-{trial}")
         grade = grade_trial(trial_state(fixture_dir, trial))
         terminal.update({"provider": provider.provider, "model": provider.model, "metrics": metrics,
                          "grade": {"trial": trial, **grade}, "status": "complete" if grade["pass"] else "failed"})
@@ -388,8 +387,9 @@ async def pilot(
         raise ValueError("the pilot is exactly three trials")
     results: list[dict[str, Any]] = []
     status, error = "failed", None
+    home_context = prepare_home(run_dir)
+    home_context.__enter__()
     try:
-        prepare_home(run_dir)
         async with timeout_factory(PILOT_DEADLINE):
             for trial in range(1, 4):
                 provider = provider_factory(trial) if provider_factory else _production_provider(run_dir)
@@ -435,6 +435,7 @@ async def pilot(
                    "trials": results, "cleanup": cleanup}
         _atomic_json(run_dir / "cleanup.json", cleanup)
         _atomic_json(run_dir / "pilot.json", payload)
+        home_context.__exit__(None, None, None)
     return payload
 
 def _production_backend() -> Any:

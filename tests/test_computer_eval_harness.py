@@ -167,7 +167,8 @@ def test_prepare_home_does_not_change_process_environment(tmp_path: Path, monkey
     monkeypatch.setenv("ZETA_HOME", "sentinel-home")
     monkeypatch.setenv("ZETA_ACCOUNT_HOME", "sentinel-account")
     before = {key: os.environ.get(key) for key in ("ZETA_HOME", "ZETA_ACCOUNT_HOME")}
-    run_module.prepare_home(tmp_path)
+    with run_module.prepare_home(tmp_path):
+        pass
     after = {key: os.environ.get(key) for key in before}
     assert after == before
 
@@ -175,8 +176,8 @@ def test_prepare_home_does_not_change_process_environment(tmp_path: Path, monkey
 def test_reset_removes_only_run_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "outer-home"))
     from evals.computer_macos.run import prepare_home
-    home = prepare_home(tmp_path)
-    (home / "settings.toml").write_text("safe")
+    with prepare_home(tmp_path) as home:
+        (home / "settings.toml").write_text("safe")
     result = reset(tmp_path, verify=True)
     assert result["pass"]
     assert not home.exists()
