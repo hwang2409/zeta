@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import os
+import signal
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -65,6 +67,7 @@ class VoiceRuntime:
             generation = self._generation
             self._set_state(VoiceState.STARTING)
             root = self._home / "tmp" / "voice"
+            await asyncio.to_thread(self._cleanup_stale, root)
             await asyncio.to_thread(root.mkdir, parents=True, exist_ok=True, mode=0o700)
             directory = Path(tempfile.mkdtemp(prefix="", dir=root))
             self._path = directory / "capture.wav"
@@ -129,6 +132,22 @@ class VoiceRuntime:
         if path is None:
             return
         await asyncio.to_thread(self._remove_path, path)
+
+    @staticmethod
+    def _cleanup_stale(root: Path) -> None:
+        if not root.is_dir():
+            return
+        for directory in root.iterdir():
+            record = directory / "process.pid"
+            try:
+                pid = int(record.read_text().strip())
+                os.kill(pid, signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+            record.unlink(missing_ok=True)
+            for child in directory.iterdir():
+                child.unlink(missing_ok=True)
+            directory.rmdir()
 
     @staticmethod
     def _remove_path(path: Path) -> None:

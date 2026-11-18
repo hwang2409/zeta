@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import subprocess
+import urllib.request
 from pathlib import Path
 from typing import Protocol
 
@@ -24,12 +26,19 @@ class WhisperCpp:
         self._model = model
 
     async def transcribe(self, wav: Path) -> str:
+        model = self._home / "cache" / "voice" / "whisper.cpp" / f"ggml-{self._model}.bin"
+        await self._ensure_model(model)
         return await asyncio.to_thread(self._transcribe_blocking, wav)
+
+    async def _ensure_model(self, model: Path) -> None:
+        if await verify_model(model):
+            return
+        await asyncio.to_thread(_download_model, model)
+        if not await verify_model(model):
+            raise RuntimeError("downloaded voice model failed sha256 verification")
 
     def _transcribe_blocking(self, wav: Path) -> str:
         model = self._home / "cache" / "voice" / "whisper.cpp" / f"ggml-{self._model}.bin"
-        if not model.is_file():
-            raise RuntimeError("voice model is missing; download the pinned small.en model")
         try:
             proc = subprocess.run(
                 ["whisper-cli", "-m", str(model), "-l", "en", "-nt", "-np", str(wav)],
@@ -41,6 +50,26 @@ class WhisperCpp:
 
     async def close(self) -> None:
         return None
+
+
+def _download_model(path: Path) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.partial")
+    try:
+        with urllib.request.urlopen(MODEL_URL, timeout=60) as response, temporary.open("wb", opener=lambda p, f: os.open(p, f, 0o600)) as output:
+            total = 0
+            while chunk := response.read(1024 * 1024):
+                total += len(chunk)
+                if total > MAX_MODEL_BYTES:
+                    raise RuntimeError("voice model download exceeds 500 MB")
+                output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        if not _verify_model(temporary):
+            raise RuntimeError("downloaded voice model failed sha256 verification")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 async def verify_model(path: Path) -> bool:

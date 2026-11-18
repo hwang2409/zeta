@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import struct
 import subprocess
 from pathlib import Path
@@ -33,17 +34,19 @@ class MicrophoneSource:
     def _start_blocking(self, path: Path) -> None:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.touch(mode=0o600, exist_ok=False)
+        fixture = os.environ.get("ZETA_VOICE_INPUT_FILE")
+        input_args = ["-re", "-i", fixture] if fixture else ["-f", "avfoundation", "-i", ":0"]
         self._process = subprocess.Popen(
             [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-f",
-                "avfoundation", "-i", ":0", "-t", "125", "-ac", "1",
-                "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", str(path),
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *input_args,
+                "-t", "125", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", "-f", "wav", str(path),
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        (path.parent / "process.pid").write_text(f"{self._process.pid}\n")
 
     async def stop(self) -> None:
         await asyncio.to_thread(self._stop_blocking)
@@ -55,9 +58,8 @@ class MicrophoneSource:
             return
         if process.stdin is not None:
             try:
-                process.stdin.write(b"q")
                 process.stdin.close()
-            except (BrokenPipeError, OSError):
+            except OSError:
                 pass
         try:
             process.wait(timeout=3)
