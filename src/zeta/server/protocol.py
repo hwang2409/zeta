@@ -412,6 +412,10 @@ class MethodDescriptor(Enum):
         "mcp_refresh_tools",
         Access.SESSION_MUTATION,
     )
+    STATE_SESSIONS = ("state_sessions", None, "state_read_v1", Access.READ)
+    STATE_SESSION = ("state_session", None, "state_read_v1", Access.READ)
+    STATE_AGENTS = ("state_agents", None, "state_read_v1", Access.READ)
+    STATE_BACKGROUND_TASKS = ("state_background_tasks", None, "state_read_v1", Access.READ)
     STATE_CATALOG = ("state_catalog", None, "state_read_v1", Access.READ)
     STATE_PROJECTS = ("state_projects", None, "state_read_v1", Access.READ)
     STATE_MEMORY = ("state_memory", None, "state_read_v1", Access.READ)

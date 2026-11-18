@@ -987,29 +987,14 @@ class BackgroundTaskRegistry:
         if self._directory_fd is None:
             return
         try:
-            rows = load_session_json(
-                read_session_file(self._directory_fd, "background_tasks.json")
-            )
-        except FileNotFoundError:
-            return
+            rows = read_background_task_records(self._directory_fd)
         except (OSError, ValueError):
             self._persistence_corrupt = True
             return
-        if type(rows) is not list:
-            self._persistence_corrupt = True
-            return
         for row in rows:
-            if type(row) is not dict:
-                continue
-            task_id = row.get("task_id")
-            command = row.get("command")
-            pid = row.get("pid")
-            if (
-                type(task_id) is not str
-                or type(command) is not str
-                or type(pid) is not int
-            ):
-                continue
+            task_id = row["task_id"]
+            command = row["command"]
+            pid = row["pid"]
             was_running = row.get("running") is True
             archived_length = self._archived_lengths.get(task_id, 0)
             note = row.get("note")
@@ -1135,6 +1120,23 @@ class BackgroundTaskRegistry:
             delete_ids=(),
             publish=write_session_file,
         )
+
+
+def read_background_task_records(directory_fd: int) -> list[dict[str, object]]:
+    """Read the task catalog without recovering tasks or opening output logs."""
+    try:
+        rows = load_session_json(read_session_file(directory_fd, "background_tasks.json"))
+    except FileNotFoundError:
+        return []
+    if type(rows) is not list:
+        raise ValueError("invalid background task catalog")
+    return [
+        row for row in rows
+        if type(row) is dict
+        and type(row.get("task_id")) is str
+        and type(row.get("command")) is str
+        and type(row.get("pid")) is int
+    ]
 
 
 def background_tasks_for_session(

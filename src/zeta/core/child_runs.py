@@ -17,14 +17,15 @@ from .agent_state import (
     BrokenAgentLifecycle,
     LoadedAgentLifecycle,
     MissingAgentLifecycle,
+    _parse_agent_state,
     read_agent_lifecycle_state,
 )
-from .checkpoints import ConversationEntry
+from .checkpoints import ConversationEntry, load_session_json
 from .child_lifecycle import select_legacy_child_lifecycle
 from .session_execution import execution_owner_state
-from .session_files import child_directory
+from .session_files import child_directory, read_session_file
 from .store import ConversationStore
-from .store._child_runs import run_row_identity
+from .store._child_runs import parse_child_run_id, run_row_identity
 
 TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
@@ -402,3 +403,49 @@ def child_run_rows(
         )
         rows.append(row)
     return rows
+
+
+def child_run_directories(directory_fd: int) -> list[str]:
+    """List the numeric child slots without opening any child transcript."""
+    try:
+        with child_directory(directory_fd, "agents") as agents_fd, os.scandir(agents_fd) as entries:
+            return [
+                entry.name for entry in entries
+                if entry.name.isascii() and entry.name.isdecimal()
+                and not entry.name.startswith("0") and entry.is_dir(follow_symlinks=False)
+            ]
+    except FileNotFoundError:
+        return []
+
+
+def read_child_run_metadata(directory_fd: int, session_dir: Path, session_id: str):
+    """Yield child metadata from lifecycle files, using the same live/durable selection as /runs."""
+    def descend(parent_fd: int, parent_dir: Path, parent_id: str):
+        children = child_run_directories(parent_fd)
+        if not children:
+            return
+        try:
+            value = load_session_json(read_session_file(parent_fd, "session_state.json"))
+            markers = _parse_agent_state(value, parent_dir / "session_state.json")["agent_children"]
+        except FileNotFoundError:
+            markers = {}
+        background_ids = {
+            marker.get("child_instance_id") for marker in markers.values()
+            if marker.get("background") is True
+        }
+        with child_directory(parent_fd, "agents") as agents_fd:
+            for name in children:
+                run_id = f"{parent_id}:{name}"
+                parse_child_run_id(session_id, run_id)
+                path = parent_dir / "agents" / name
+                with child_directory(agents_fd, name) as child_fd:
+                    loaded = read_agent_lifecycle_state(child_fd, path / "agent_lifecycle.json")
+                    if isinstance(loaded, LoadedAgentLifecycle) and loaded.value.get("handle") == run_id:
+                        lifecycle = select_legacy_child_lifecycle(
+                            loaded.value, live_agent_lifecycle(path / "agent_lifecycle.json")
+                        )
+                        if isinstance(lifecycle, dict) and lifecycle.get("handle") == run_id:
+                            yield run_id, lifecycle, run_id in background_ids
+                    yield from descend(child_fd, path, run_id)
+
+    yield from descend(directory_fd, session_dir, session_id)

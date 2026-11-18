@@ -119,6 +119,74 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def validate_session_id(session_id: str) -> None:
+    path = Path(session_id)
+    if (
+        not session_id
+        or session_id in {".", ".."}
+        or "\x00" in session_id
+        or path.is_absolute()
+        or path.parts != (session_id,)
+    ):
+        raise SessionError(f"invalid session id: {session_id!r}")
+
+
+def read_session_metadata(
+    sessions_dir: Path, session_id: str, *, directory_fd: int | None = None
+) -> SessionMetadata:
+    """Read the session owner metadata without a writer lease or session lock."""
+    validate_session_id(session_id)
+    if directory_fd is None:
+        with session_root(sessions_dir) as root_fd:
+            try:
+                with child_directory(root_fd, session_id) as opened_fd:
+                    return read_session_metadata(sessions_dir, session_id, directory_fd=opened_fd)
+            except FileNotFoundError as exc:
+                raise SessionNotFoundError(f"session {session_id} was not found") from exc
+            except OSError as exc:
+                raise SessionError(f"session {session_id} could not be accessed") from exc
+    path = sessions_dir / session_id / "meta.json"
+    try:
+        with os.fdopen(
+            open_session_file(directory_fd, "meta.json", os.O_RDONLY), "rb"
+        ) as handle:
+            value = load_session_json(handle.read())
+    except FileNotFoundError as exc:
+        raise SessionError(f"session {session_id} has no meta.json") from exc
+    except (ConversationIntegrityError, OSError) as exc:
+        raise SessionError(f"session metadata could not be read: {path}") from exc
+    if not isinstance(value, Mapping):
+        raise SessionError(f"session metadata is not an object: {path}")
+    metadata = SessionMetadata.from_dict(value, path=path)
+    if metadata.session_id != session_id:
+        raise SessionError(
+            f"session metadata id mismatch for {session_id}: {metadata.session_id}"
+        )
+    return metadata
+
+
+def list_session_metadata_read_only(sessions_dir: Path) -> list[SessionMetadata]:
+    """List valid sessions from metadata without opening conversation stores."""
+    sessions: list[SessionMetadata] = []
+    with ExitStack() as root:
+        try:
+            root_fd = root.enter_context(session_root(sessions_dir))
+        except FileNotFoundError:
+            return []
+        for name in os.listdir(root_fd):
+            with ExitStack() as child:
+                try:
+                    fd = child.enter_context(child_directory(root_fd, name))
+                except (OSError, SessionError):
+                    logger.warning("Skipping unreadable session directory")
+                    continue
+                try:
+                    sessions.append(read_session_metadata(sessions_dir, name, directory_fd=fd))
+                except (SessionError, ConversationIntegrityError):
+                    logger.warning("Skipping session with unreadable metadata")
+    return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
+
+
 class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     """Create, validate, open, and discover zeta sessions."""
 
@@ -352,7 +420,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
 
     def read_metadata(self, session_id: str, *, lock_timeout: float | None = None) -> SessionMetadata:
         """Read validated metadata without opening or repairing the conversation."""
-        self._validate_id(session_id)
+        validate_session_id(session_id)
         if lock_timeout is None:
             return self._read(session_id)
         with self._metadata_lock(session_id, timeout=lock_timeout) as directory_fd:
@@ -366,7 +434,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         _read_only: bool = False,
         _reference_authority: SessionReferenceAuthority | None = None,
     ) -> OpenedSession:
-        self._validate_id(session_id)
+        validate_session_id(session_id)
         if _reference_authority is not None and not _read_only:
             raise SessionError("an already-gated open must be read-only")
         if _read_only:
@@ -628,9 +696,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
                     if valid_pending_link(value):
                         pending = value
                     else:
-                        metadata = self._read(
-                            session_id, directory_fd=directory_fd
-                        )
+                        metadata = self._read(session_id, directory_fd=directory_fd)
                         if metadata.project_id is None:
                             return
                         pending = {
@@ -749,19 +815,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         return sessions
 
     def list_sessions_read_only(self) -> list[SessionMetadata]:
-        """List valid sessions from metadata without opening conversation stores."""
-        try:
-            with session_root(self.sessions_dir) as root_fd:
-                names = os.listdir(root_fd)
-        except FileNotFoundError:
-            return []
-        sessions: list[SessionMetadata] = []
-        for name in names:
-            try:
-                sessions.append(self.read_metadata(name))
-            except (SessionError, ConversationIntegrityError) as exc:
-                logger.warning("Skipping session %s: %s", name, exc)
-        return sorted(sessions, key=lambda item: item.updated_at, reverse=True)
+        return list_session_metadata_read_only(self.sessions_dir)
 
     def list_session_previews(
         self, *, limit: int = 20, sessions: list[SessionMetadata] | None = None
@@ -964,7 +1018,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     ) -> SessionMetadata:
         """Set a display name; whitespace clears it to the derived preview."""
         full_id = self.resolve_id(session_id)
-        metadata = self.read_metadata(full_id)
+        metadata = self._read(full_id)
         metadata._execution_lease = execution_lease
         self.record_name(
             metadata, name=normalize_session_name(name) if name.strip() else ""
@@ -976,7 +1030,7 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
     ) -> str:
         """Return the full id for an exact match or unambiguous prefix."""
 
-        self._validate_id(session_id)
+        validate_session_id(session_id)
         try:
             with (
                 session_root(self.sessions_dir) as root_fd,
@@ -1163,26 +1217,9 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         self, session_id: str, *, directory_fd: int | None = None
     ) -> SessionMetadata:
         if directory_fd is None:
-            with session_directory(self.sessions_dir, session_id) as (_, opened_fd):
-                return self._read(session_id, directory_fd=opened_fd)
-        path = self.sessions_dir / session_id / "meta.json"
-        try:
-            with os.fdopen(
-                open_session_file(directory_fd, "meta.json", os.O_RDONLY), "rb"
-            ) as handle:
-                value = load_session_json(handle.read())
-        except FileNotFoundError as exc:
-            raise SessionError(f"session {session_id} has no meta.json") from exc
-        except (ConversationIntegrityError, OSError) as exc:
-            raise SessionError(f"session metadata could not be read: {path}") from exc
-        if not isinstance(value, Mapping):
-            raise SessionError(f"session metadata is not an object: {path}")
-        metadata = SessionMetadata.from_dict(value, path=path)
-        if metadata.session_id != session_id:
-            raise SessionError(
-                f"session metadata id mismatch for {session_id}: {metadata.session_id}"
-            )
-        return metadata
+            with session_directory(self.sessions_dir, session_id) as (_, fd):
+                return read_session_metadata(self.sessions_dir, session_id, directory_fd=fd)
+        return read_session_metadata(self.sessions_dir, session_id, directory_fd=directory_fd)
 
     def _write(self, metadata: SessionMetadata) -> None:
         with (
@@ -1216,25 +1253,13 @@ class SessionManager(PromptCompositionMixin, SessionPreferenceMixin):
         )
 
     def _metadata_lock(self, session_id: str, **kwargs):
-        self._validate_id(session_id)
+        validate_session_id(session_id)
         return session_metadata_lock(
             self.sessions_dir, session_id, loop_error=SessionLoopThreadLockError,
             blocking=kwargs.pop("blocking", True), timeout=kwargs.pop("timeout", None),
             authority=kwargs.pop("authority", None),
             after_shape=kwargs.pop("after_shape", None),
         )
-
-    @staticmethod
-    def _validate_id(session_id: str) -> None:
-        path = Path(session_id)
-        if (
-            not session_id
-            or session_id in {".", ".."}
-            or "\x00" in session_id
-            or path.is_absolute()
-            or path.parts != (session_id,)
-        ):
-            raise SessionError(f"invalid session id: {session_id!r}")
 
 
 async def persist_metadata_change(

@@ -29,13 +29,17 @@ from . import (
 from .run_work import cancel_background_task, list_run_work
 from .settings import home_settings_get, home_settings_update
 from .state import (
+    state_agents,
     state_attention,
+    state_background_tasks,
     state_catalog,
     state_inbox,
     state_inbox_detail,
     state_memory,
     state_memory_detail,
     state_projects,
+    state_session,
+    state_sessions,
 )
 from .telemetry import (
     telemetry_agent_tree,
@@ -493,6 +497,10 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.CHILD_RUN_LIST: child_run_list,
     MethodDescriptor.CHILD_RUN_SEND: child_run_send,
     MethodDescriptor.MCP_REFRESH_TOOLS: mcp_refresh_tools,
+    MethodDescriptor.STATE_SESSIONS: state_sessions,
+    MethodDescriptor.STATE_SESSION: state_session,
+    MethodDescriptor.STATE_AGENTS: state_agents,
+    MethodDescriptor.STATE_BACKGROUND_TASKS: state_background_tasks,
     MethodDescriptor.STATE_CATALOG: state_catalog,
     MethodDescriptor.STATE_PROJECTS: state_projects,
     MethodDescriptor.STATE_MEMORY: state_memory,
