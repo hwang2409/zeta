@@ -34,6 +34,7 @@ def stable_terminal_defaults(
             kwargs.setdefault("no_color", False)
         original_init(self, *args, **kwargs)
 
+    # test-contract: seam every Console the tests build gets the same colour defaults
     monkeypatch.setattr(Console, "__init__", init_with_stable_defaults)
 
     yield
