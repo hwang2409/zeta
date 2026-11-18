@@ -199,6 +199,7 @@ feature. Observer connections receive only methods with `read` access.
 | `child_run_list` | `1.0` | `child_runs` | `read` |
 | `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 | `mcp_refresh_tools` | `1.0` | `mcp_refresh_tools` | `session_mutation` |
+| `state_catalog` | `1.0` | `state_read_v1` | `read` |
 | `telemetry_status` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_sessions` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_trace` | `1.0` | `telemetry_read_v1` | `read` |
@@ -1833,6 +1834,10 @@ Error descriptors are:
 | `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
 | `mcp_tool_refresh_failed` | `-32005` | `mcp_tool_refresh_failed` | an MCP tools/list refresh failed |
 | `invalid_telemetry_params` | `-32602` | `invalid_params` | telemetry read parameters or cursor are invalid |
+| `invalid_state_params` | `-32602` | `invalid_params` | state read parameters or cursor are invalid |
+| `state_read_unavailable` | `-32005` | `state_unavailable` | stored state is not available to read |
+| `corrupt_state` | `-32000` | `corrupt_state` | stored state is invalid or unsupported |
+| `stale_state_snapshot` | `-32009` | `stale_state_snapshot` | the stored state changed during the read |
 | `trace_not_found` | `-32602` | `trace_not_found` | the requested trace does not exist |
 | `telemetry_off` | `-32005` | `telemetry_off` | no telemetry database exists |
 | `telemetry_schema_mismatch` | `-32000` | `telemetry_schema_mismatch` | the telemetry database schema is not the one this zeta reads |
