@@ -7,6 +7,7 @@ import errno
 import fcntl
 import json
 import os
+import shutil
 import signal
 import stat
 import struct
@@ -22,9 +23,19 @@ from .process import OwnedProcess
 MAX_PCM_BYTES = 3_840_000  # 120 s of 16 kHz mono s16le; the writer stops storing past it
 CAPTURE_NAME = "capture.wav"
 PID_NAME = "ffmpeg.json"
+_PID_PARTIAL = ".ffmpeg.json.partial"
 LOCK_NAME = "lock"
-_KNOWN_NAMES = (CAPTURE_NAME, PID_NAME, LOCK_NAME)
+_KNOWN_NAMES = (CAPTURE_NAME, PID_NAME, _PID_PARTIAL, LOCK_NAME)
 _STOP_GRACE = 3.0
+_RECORDED_NAMES = ("ffmpeg", "sh")  # sh only before its exec into ffmpeg
+# The shell publishes its own pid and start time, then execs ffmpeg in place.
+# exec keeps both, so the record exists before ffmpeg can open the device.
+# $1 is the runtime directory and the rest is the ffmpeg argv; nothing is interpolated.
+_LAUNCH = (
+    "set -e; umask 077; t=$(LC_ALL=C ps -o lstart= -p $$); "
+    f"printf '{{\"pid\": %d, \"start\": \"%s\"}}' $$ \"$t\" > \"$1/{_PID_PARTIAL}\"; "
+    f"mv \"$1/{_PID_PARTIAL}\" \"$1/{PID_NAME}\"; shift; exec \"$@\""
+)
 
 
 class AudioSource(Protocol):
@@ -40,7 +51,9 @@ class MicrophoneSource:
     flow, ffmpeg gets EPIPE/SIGPIPE on its next write and exits. Accepted
     residual: if zeta is SIGKILLed while the device gives no frames (for example
     a pending TCC prompt), an idle ffmpeg that captured nothing stays until the
-    next voice start, whose stale cleanup ends it through the pid record.
+    next voice start, whose stale cleanup ends it through the pid record. The
+    launch shell writes that record before it execs ffmpeg, so no ffmpeg runs
+    without one.
     """
 
     def __init__(self) -> None:
@@ -48,21 +61,23 @@ class MicrophoneSource:
         self._writer: WavWriter | None = None
 
     async def start(self, path: Path) -> None:
+        ffmpeg = await asyncio.to_thread(shutil.which, "ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError("ffmpeg is missing; run brew install whisper-cpp ffmpeg")
         loop = asyncio.get_running_loop()
         ready = loop.create_future()
         writer = await asyncio.to_thread(WavWriter, path, lambda: loop.call_soon_threadsafe(_resolve, ready))
         self._writer = writer
         fixture = os.environ.get("ZETA_VOICE_INPUT_FILE")
         source = ["-re", "-i", fixture] if fixture else ["-f", "avfoundation", "-i", ":0"]
-        argv = ["ffmpeg", "-hide_banner", "-loglevel", "error", *source]
+        argv = ["/bin/sh", "-c", _LAUNCH, "sh", str(path.parent), ffmpeg, "-hide_banner", "-loglevel", "error", *source]
         # -t 125 caps media time (120 s accepted plus margin); it is not a wall clock
         argv += ["-t", "125", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"]
         try:
             self._process = await OwnedProcess.spawn(argv, stdout_sink=writer)
-        except FileNotFoundError as exc:
+        except OSError:
             await asyncio.to_thread(writer.close)
-            raise RuntimeError("ffmpeg is missing; run brew install whisper-cpp ffmpeg") from exc
-        await asyncio.to_thread(write_pid_record, path.parent / PID_NAME, self._process.pid)
+            raise
         await ready
         if not writer.received:
             await self.close()
@@ -162,18 +177,20 @@ def process_identity(pid: int) -> str | None:
     try:
         result = subprocess.run(
             ["ps", "-o", "lstart=,comm=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=5, check=False,
+            capture_output=True, text=True, timeout=5, check=False, env={**os.environ, "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    return result.stdout.strip() or None
+    return " ".join(result.stdout.split()) or None
 
 
-def write_pid_record(path: Path, pid: int) -> None:
+def is_recorded_process(pid: int, start: str) -> bool:
+    """True while pid has the recorded start time and runs ffmpeg (or its launch shell)."""
+    start = " ".join(start.split())
     identity = process_identity(pid)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w") as record:
-        json.dump({"pid": pid, "identity": identity}, record)
+    if not start or identity is None or not identity.startswith(start + " "):
+        return False
+    return os.path.basename(identity[len(start) + 1 :]) in _RECORDED_NAMES
 
 
 def claim_directory(root: Path) -> tuple[Path, int]:
@@ -231,11 +248,11 @@ def _end_recorded_process(record: Path) -> None:
         fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(fd) as stream:
             data = json.load(stream)
-        pid, identity = int(data["pid"]), data["identity"]
+        pid, start = int(data["pid"]), str(data["start"])
     except (OSError, ValueError, KeyError, TypeError):
         return
     # signal only the same process: start time and executable must still match
-    if identity is None or process_identity(pid) != identity:
+    if not is_recorded_process(pid, start):
         return
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
@@ -244,7 +261,7 @@ def _end_recorded_process(record: Path) -> None:
             return
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
-            if process_identity(pid) != identity:
+            if not is_recorded_process(pid, start):
                 return
             time.sleep(0.05)  # not our child, so there is no wait() to block on
 

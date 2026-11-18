@@ -549,6 +549,18 @@ def _validated_mcp_limits(value: object) -> MCPCallLimits:
         raise SettingsError(f"invalid mcp settings: {exc}") from exc
 
 
+def _validated_voice(voice: object) -> tuple[str, str]:
+    if not isinstance(voice, Mapping) or set(voice) - _VOICE_KEYS:
+        raise SettingsError("invalid voice settings")
+    voice_engine = voice.get("engine", "whisper.cpp")
+    voice_model = voice.get("model", "small.en")
+    if type(voice_engine) is not str or voice_engine != "whisper.cpp":
+        raise SettingsError("voice.engine must be 'whisper.cpp'")
+    if type(voice_model) is not str or voice_model != "small.en":
+        raise SettingsError("voice.model must be 'small.en'")
+    return voice_engine, voice_model
+
+
 def _validate(
     data: Mapping[str, Any], notices: list[str], warnings: list[str]
 ) -> Settings:
@@ -631,15 +643,7 @@ def _validate(
             validate_loopback_endpoint(otel_endpoint)
         except TelemetryError as exc:
             raise SettingsError(str(exc)) from None
-    voice = data.get("voice", {})
-    if not isinstance(voice, Mapping) or set(voice) - _VOICE_KEYS:
-        raise SettingsError("invalid voice settings")
-    voice_engine = voice.get("engine", "whisper.cpp")
-    voice_model = voice.get("model", "small.en")
-    if type(voice_engine) is not str or voice_engine != "whisper.cpp":
-        raise SettingsError("voice.engine must be 'whisper.cpp'")
-    if type(voice_model) is not str or voice_model != "small.en":
-        raise SettingsError("voice.model must be 'small.en'")
+    voice_engine, voice_model = _validated_voice(data.get("voice", {}))
     mcp = data.get("mcp", {})
     mcp_limits = _validated_mcp_limits(mcp)
     mcp = cast(Mapping[str, Any], mcp)
