@@ -64,3 +64,16 @@ async def test_guest_memory_and_missing_output():
     assert result == b"true"
     with pytest.raises(GuestError, match=r"finish with one output"):
         await await_or_fail(run_guest("42;", [], None), what="guest requires explicit output")
+
+
+async def test_missing_extra_does_not_prevent_loading_tool(monkeypatch):
+    from zeta.tools.code import _guest
+
+    def missing(name):
+        assert name == "wasmtime"
+        raise ModuleNotFoundError(name)
+
+    _guest.load_guest.cache_clear()
+    monkeypatch.setattr(_guest, "import_module", missing)
+    with pytest.raises(GuestError, match=r"uv pip install 'zeta\[code\]'"):
+        await await_or_fail(run_guest("output(1);", [], None), what="missing optional runtime")

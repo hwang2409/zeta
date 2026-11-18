@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from ..protocol.types import ASSISTANT_RESPONSE_SYNTHETIC
 from .store import ConversationEntry
@@ -29,3 +29,16 @@ def nested_approval_anchors(entries: Sequence[ConversationEntry]) -> dict[str, s
                     and any(row.get("request_id") == call_id for row in entry.data.get("approval_requests", ()))):
                 anchors[call_id] = entry.id
     return anchors
+
+
+def nested_call_data(call_id: str, parent: str) -> dict[str, object]:
+    prefix = parent + ":code:"
+    index = call_id.removeprefix(prefix)
+    if call_id.startswith(prefix) and re.fullmatch(r"(?:[1-9]|[1-4][0-9]|50)", index):
+        return {"code_parent_id": parent, "code_call_index": int(index)}
+    return {}
+
+
+def code_projection(structured: Mapping[str, object] | None) -> Mapping[str, object]:
+    code = (structured or {}).get("code_mode")
+    return code if isinstance(code, dict) and code.get("version") == 1 else {}

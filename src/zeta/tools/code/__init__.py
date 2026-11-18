@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Final
 
 from ...protocol.types import ToolCall, ToolResult, ToolSchema
 from ...runtime.execution import NestedToolParent, ToolExecutionContext
+from .._results import text_block
 from ._guest import FRAME, GuestError, run_guest
 
 if TYPE_CHECKING:
@@ -68,7 +69,7 @@ def _bounded_output(data: bytes) -> str:
         size //= 2
 
 
-async def _code(arguments, abort_signal, *, execution_context: ToolExecutionContext) -> ToolResult:
+async def _code(arguments, abort_signal, *, execution_context: ToolExecutionContext):
     call = execution_context.tool_call
     execute = execution_context.nested_tool_executor
     if execute is None:
@@ -116,7 +117,8 @@ async def _code(arguments, abort_signal, *, execution_context: ToolExecutionCont
     while summaries and len(json.dumps(projection).encode()) > FRAME:
         summaries.pop()
         projection["omitted_calls"] += 1
-    return ToolResult(call.id, content, is_error=error, structured_content={"code_mode": projection})
+    return {"content": [text_block(content)], "isError": error,
+            "structuredContent": {"code_mode": projection}}
 
 
 def register(registry: ToolRegistry) -> None:

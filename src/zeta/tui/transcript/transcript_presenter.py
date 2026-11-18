@@ -473,7 +473,7 @@ class TranscriptPresenter:
                 unit.finish(
                     rendered,
                     event,
-                    compact=False,
+                    compact=event.tool_call.name == "code",
                     on_final_tail=lambda: self._tool_region.update(
                         self._tool_region_renderable()
                     ) if self._tool_region is not None else None,
