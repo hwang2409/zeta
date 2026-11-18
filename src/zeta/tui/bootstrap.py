@@ -705,6 +705,8 @@ def _create_app_with_root(
         observer_host=observer_host,
         telemetry=telemetry,
         otel_endpoint=config.otel_endpoint,
+        voice_engine=config.voice_engine,
+        voice_model=config.voice_model,
     )
     if composition.memory_reconciler is not None:
         composition.memory_reconciler.notice = app._print_system
