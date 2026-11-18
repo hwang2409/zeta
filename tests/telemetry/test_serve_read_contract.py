@@ -31,7 +31,7 @@ from zeta.telemetry.receiver.store import Writer, open_database
 HOUR = 3_600 * 10**9
 DAY = 24 * HOUR
 NOW = time.time_ns()
-RECENT = (NOW - 3 * HOUR) // HOUR * HOUR + 1_000  # raw spans, three hours ago
+RECENT = (NOW - 3 * HOUR) // HOUR * HOUR + 1_000  # three hours ago: read from raw spans
 OLD = NOW - 20 * DAY  # older than raw retention: read from the hourly rollups
 RANGE = {"start_ns": NOW - 21 * DAY, "end_ns": NOW + 1}
 ROOT, B_ROOT, C_ROOT = "a" * 32, "b" * 32, "c" * 32
@@ -175,6 +175,7 @@ def _contract_rows() -> list[dict]:
         _span("0e" * 16, 1, RECENT + 60, session=C_ROOT),  # ties B_ROOT on last_ns: session id breaks it
         _span("0f" * 16, 1, OLD, operation="chat", provider="p", request_model="m1", input_tokens=4, output_tokens=4, total_tokens=8),
         _span("0f" * 16, 2, OLD + 1, operation="execute_tool", tool_name="t1", tool_type="function"),
+        _span("10" * 16, 1, NOW - 13 * DAY, session=B_ROOT),  # the oldest raw span: the cutoff is long before RECENT
     ]
     rows += [
         _span(a, 100 + index, RECENT + 100 + index, operation="chat", provider="q", request_model="mq", duration=duration)
@@ -213,6 +214,10 @@ async def _call(client: ServeClient, method: Method, request_id: str = "read", *
     reply = json.loads(raw)
     assert "result" in reply, reply
     return reply["result"], len(raw.encode()) + 1  # serve counts a frame with its newline, as on the Unix socket
+
+
+def _frame_size(result: dict[str, Any]) -> int:
+    return protocol_module.FrameCodec().response_size("page", result)
 
 
 async def _walk(client: ServeClient, method: Method, cursor: str | None = None, **params: Any) -> list[dict[str, Any]]:
@@ -313,6 +318,8 @@ async def _lowered_budget(root: Path, method: Method, monkeypatch: pytest.Monkey
         _, larger = await _call(client, method, limit=k + 1, request_id="page")
         monkeypatch.setattr(protocol_module, "MAX_FRAME_BYTES", budget)
         cut, size = await _call(client, method, limit=k + 1, request_id="page")
+        monkeypatch.setattr(protocol_module, "MAX_FRAME_BYTES", larger)
+        frame_only, _ = await _call(client, method, limit=method.maximum, request_id="page")
         monkeypatch.undo()
         rest = await _walk(client, method, limit=method.maximum, cursor=cut["next_cursor"])
 
@@ -321,6 +328,8 @@ async def _lowered_budget(root: Path, method: Method, monkeypatch: pytest.Monkey
     assert cut[method.collection] == items[:k], "the cut page is not the largest fitting ordered prefix"
     assert cut["next_cursor"] == fitting["next_cursor"] is not None, "the frame cut did not continue after its last item"
     assert cut[method.collection] + _items(rest, method) == items, "the continuation after a frame cut lost items"
+    if _frame_size(whole) > larger:  # no row past the limit: the frame alone cuts the page, which still continues
+        assert frame_only[method.collection] == items[:k + 1] and frame_only["next_cursor"] is not None
 
 
 async def _shape(root: Path, method: Method, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,6 +363,8 @@ async def _values(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         agents, _ = await _call(client, METHODS["agent_agents"])
         traces, _ = await _call(client, METHODS["agent_traces"])
         span_ids, _ = await _call(client, METHODS["agent_span_ids"])
+        failed, _ = await _call(client, METHODS["sessions"], status="error")
+    assert [item["session_id"] for item in failed["items"]] == [ROOT]
     seed = _contract_rows()
     chat = [row for row in seed if row["operation"] == "chat"]
     by_model = {(item["provider"], item["model"]): item for item in models["items"]}
