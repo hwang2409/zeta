@@ -2,7 +2,12 @@
 
 from ...read_page import InvalidParams, TooLarge
 from ..protocol import ErrorDescriptor, MethodDescriptor, ProtocolError
-from ..read_home_state import accounts_page, retention_result, settings_page, storage_page
+from ..read_home_state import (
+    accounts_page,
+    retention_result,
+    settings_page,
+    storage_page,
+)
 from ..read_sessions import read_session_page
 
 
