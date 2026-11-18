@@ -105,7 +105,7 @@ def receiver(tmp_path):
 
 
 def _sessions(database: Path, **params) -> dict:
-    return reader.sessions(database.parents[1], {"start_ns": 0, **params})
+    return reader.sessions(database.parents[1], {"start_ns": 0, **params}, lambda result: True)
 
 
 def _trace(database: Path, trace_id: str) -> dict:
