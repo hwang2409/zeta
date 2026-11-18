@@ -7,7 +7,6 @@ import os
 import signal
 import subprocess
 import threading
-import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -28,11 +27,26 @@ from zeta.telemetry.receiver import autostart, process
 from zeta.telemetry.receiver.process import OTLP_URL, receiver_ready
 
 
-def _until(condition: Callable[[], bool], what: str, timeout: float = 30) -> None:
-    deadline = time.monotonic() + timeout
-    while not condition():
-        assert time.monotonic() < deadline, f"{what} within {timeout:g} s"
-        time.sleep(0.05)
+class Checks:
+    """Wake the test after each of the supervisors' health checks, which run on their own threads."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._changed = threading.Condition()
+        self._ready = autostart.receiver_ready
+        monkeypatch.setattr(autostart, "POLL_SECONDS", 0.1)
+        # test-contract: seam the health check is where the supervisor observes the receiver process
+        monkeypatch.setattr(autostart, "receiver_ready", self._check)
+
+    def _check(self, home: Path) -> bool:
+        try:
+            return self._ready(home)
+        finally:
+            with self._changed:
+                self._changed.notify_all()
+
+    def until(self, condition: Callable[[], bool], what: str) -> None:
+        with self._changed:
+            assert self._changed.wait_for(condition, timeout=30), what
 
 
 class Launches:
@@ -72,12 +86,13 @@ def test_concurrent_starters_produce_one_receiver(tmp_path: Path, builtin_port: 
     home = tmp_path / "home"
     launches = Launches(tmp_path, threading.Barrier(2))
     monkeypatch.setattr(autostart.subprocess, "Popen", launches)
+    checks = Checks(monkeypatch)
     starters = [autostart.ReceiverSupervisor(home), autostart.ReceiverSupervisor(home)]
     try:
         for starter in starters:
             starter.start()
-        _until(lambda: all(starter.snapshot() == ReceiverState("ready") for starter in starters), "both starters see the receiver")
-        _until(lambda: len(launches.alive()) == 1, "the losing launch exits")
+        checks.until(lambda: all(starter.snapshot() == ReceiverState("ready") for starter in starters), "both starters see the receiver")
+        checks.until(lambda: len(launches.alive()) == 1, "the losing launch exits")
 
         assert len(launches.children) == 2
         assert len(launches.alive()) == 1, "two receivers are running"
@@ -96,11 +111,11 @@ def test_stale_lock_after_a_crash_is_recovered(tmp_path: Path, builtin_port: Non
     home = tmp_path / "home"
     launches = Launches(tmp_path)
     monkeypatch.setattr(autostart.subprocess, "Popen", launches)
-    monkeypatch.setattr(autostart, "POLL_SECONDS", 0.1)
+    checks = Checks(monkeypatch)
     supervisor = autostart.ReceiverSupervisor(home)
     try:
         supervisor.start()
-        _until(lambda: supervisor.snapshot() == ReceiverState("ready"), "the first receiver starts")
+        checks.until(lambda: supervisor.snapshot() == ReceiverState("ready"), "the first receiver starts")
         (first,) = launches.alive()
         assert os.getsid(first.pid) == first.pid, "the receiver shares the starter's session and dies with its terminal"
 
@@ -108,7 +123,8 @@ def test_stale_lock_after_a_crash_is_recovered(tmp_path: Path, builtin_port: Non
         first.wait(timeout=10)
         assert (home / "telemetry" / "receiver.lock").exists()
 
-        _until(lambda: len(launches.alive()) == 1 and supervisor.snapshot() == ReceiverState("ready") and receiver_ready(home), "a new receiver takes the stale lock")
+        checks.until(lambda: len(launches.alive()) == 1 and supervisor.snapshot() == ReceiverState("ready"), "a new receiver takes the stale lock")
+        assert receiver_ready(home)
         assert len(launches.children) == 2
         assert launches.alive()[0].pid != first.pid
     finally:
@@ -125,6 +141,7 @@ def test_stale_lock_after_a_crash_is_recovered(tmp_path: Path, builtin_port: Non
 ])
 def test_an_external_endpoint_never_starts_a_receiver(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str) -> None:
     launched: list[Path] = []
+    # test-contract: seam a launch would start a real process; the test only needs to see that none starts
     monkeypatch.setattr(autostart, "_launch", launched.append)
     instance = Telemetry.configure(endpoint, tmp_path)
     try:
@@ -145,11 +162,14 @@ def test_status_reads_never_check_health_on_the_caller(tmp_path: Path, monkeypat
         callers.append(threading.get_ident())
         return home_id
 
+    # test-contract: seam the /health request is the I/O a status read must never do
     monkeypatch.setattr(process, "_running_home_id", health)
+    # test-contract: seam a ready receiver is never launched again
     monkeypatch.setattr(autostart, "_launch", lambda home: pytest.fail("a ready receiver was launched again"))
+    checks = Checks(monkeypatch)
     instance = Telemetry.configure(OTLP_URL, tmp_path)
     try:
-        _until(lambda: instance.receiver() == ReceiverState("ready"), "the supervisor sees the receiver")
+        checks.until(lambda: instance.receiver() == ReceiverState("ready"), "the supervisor sees the receiver")
         reads = [instance.receiver(), live_view(instance), instance.receiver()]
 
         assert threading.get_ident() not in callers, "a status read checked health on the caller's thread"
