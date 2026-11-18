@@ -133,6 +133,17 @@ collector, and zeta never starts anything for it.
   stops trying and shows `error`; run `zeta otel receiver` by hand to see why.
 - If the `otel` extra is not installed, startup stops with
   `OpenTelemetry support is not installed; install zeta[otel]`.
+- Each home has a random, non-secret id in `$ZETA_HOME/telemetry/home-id`,
+  which `/health` also reports. With the built-in endpoint, spans carry it as
+  the resource attribute `zeta.home.id`. The receiver stores only spans with
+  its own home id; it drops other spans (from another home, or from an older
+  zeta without the id), counts them in `/health` under
+  `dropped.foreign_home`, and reports them as OTLP `rejected_spans`. The id is
+  used only for this check and is not stored with the spans.
+- If the receiver on port 4323 belongs to another zeta home, zeta starts
+  nothing, sends no spans, and `/status` shows
+  `error (port 4323 held by another zeta home)`. It checks again every 10
+  seconds.
 
 `zeta otel receiver` still works by hand, for example with an external
 endpoint or to see its errors. It exits with `already running at

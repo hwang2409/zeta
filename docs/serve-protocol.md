@@ -671,7 +671,8 @@ integer Unix nanoseconds; ids are lowercase hex strings; absent values are
 - `receiver`: when this serve process uses the built-in endpoint, its
   supervisor's latest state: `starting` while it launches a receiver, `ready`
   when the receiver on `127.0.0.1:4323` reports this home's id, `stopped`
-  between failed launches, `error` after five failed launches in a row.
+  between failed launches, `error` after five failed launches in a row or
+  while another zeta home's receiver holds the port.
   Otherwise `ready` when that receiver reports this home's id, else `stopped`.
 - `endpoint`: `builtin` for exactly `http://127.0.0.1:4323/v1/traces`,
   `external` for another configured endpoint, or `null`.
