@@ -13,7 +13,7 @@ _CODEC = FrameCodec()
 
 async def telemetry_status(client, request_id, params):
     if params:
-        raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, "invalid params: telemetry_status takes no params")
+        raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, "invalid params")
     home = client.server.home
     return await _read(client, request_id, lambda reader, fits: reader.status(home, load_settings(home=home).settings.otel_endpoint))
 
@@ -36,14 +36,14 @@ async def _read(client, request_id, read: Callable[[Any, Callable[[object], bool
 
         try:
             result = read(reader, fits)
-        except reader.InvalidParams as exc:
-            raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, f"invalid params: {exc}") from None
+        except reader.InvalidParams:
+            raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, "invalid params") from None
         except reader.TraceNotFound as exc:
             raise ProtocolError(ErrorDescriptor.TRACE_NOT_FOUND, "resource not found", {"id": exc.trace_id}) from None
         except reader.Unavailable:
             raise ProtocolError(ErrorDescriptor.TELEMETRY_OFF, "state unavailable", {"retryable": True}) from None
         except reader.SchemaMismatch:
-            raise ProtocolError(ErrorDescriptor.TELEMETRY_SCHEMA_MISMATCH, "stored state is invalid") from None
+            raise ProtocolError(ErrorDescriptor.TELEMETRY_SCHEMA_MISMATCH, "telemetry schema is unsupported") from None
         except reader.TooLarge:
             raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit") from None
         if not fits(result):  # sessions and status pages are bounded far below the frame; this is the backstop

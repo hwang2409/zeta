@@ -58,7 +58,7 @@ class InvalidParams(ValueError):
 
 
 class Unavailable(Exception):
-    """No database to read: telemetry is off or the receiver has not created it."""
+    """No database file: telemetry is off or the receiver has not created it."""
 
 
 class TraceNotFound(LookupError):
@@ -222,9 +222,10 @@ def _snapshot[T](home: Path, read: Callable[[sqlite3.Connection], T]) -> T:
         connection.execute("BEGIN")
         try:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version == 0:  # an empty file the receiver has not migrated yet
-                raise Unavailable
-            stored = connection.execute("SELECT schema_version FROM viewer_meta").fetchone() if version == SCHEMA_VERSION else None
+            meta = version == SCHEMA_VERSION and connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'viewer_meta'"
+            ).fetchone()
+            stored = connection.execute("SELECT schema_version FROM viewer_meta").fetchone() if meta else None
             if stored is None or stored[0] != SCHEMA_VERSION:
                 raise SchemaMismatch(f"telemetry schema {version} is not {SCHEMA_VERSION}")
             return read(connection)
@@ -326,4 +327,3 @@ def _project(row: sqlite3.Row, columns: tuple[str, ...]) -> dict[str, Any]:
 def _session(row: sqlite3.Row) -> dict[str, Any]:
     projected = _project(row, _SESSION_COLUMNS)
     return {"session_id": projected.pop("root_session_id"), **projected}
-

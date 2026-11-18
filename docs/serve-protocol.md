@@ -723,12 +723,14 @@ filters, returns `-32602` with `data.code` `invalid_params`.
 
 Errors:
 
-- invalid params or cursor: `{"code":-32602,"message":"invalid params: ...","data":{"code":"invalid_params"}}`
+- invalid params or cursor: `{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}`
 - unknown trace: `{"code":-32602,"message":"resource not found","data":{"code":"trace_not_found","id":"<trace_id>"}}`
-- no database (or one the receiver has not migrated yet), data methods only:
+- no database file, data methods only:
   `{"code":-32005,"message":"state unavailable","data":{"code":"telemetry_off","retryable":true}}`
-- a schema version this zeta does not read, any method:
-  `{"code":-32000,"message":"stored state is invalid","data":{"code":"telemetry_schema_mismatch"}}`
+- a database file whose `user_version` or `viewer_meta.schema_version` is not
+  the one this zeta reads (including an unmigrated file or a missing
+  `viewer_meta` table), any method:
+  `{"code":-32000,"message":"telemetry schema is unsupported","data":{"code":"telemetry_schema_mismatch"}}`
 - one span alone larger than the frame: `{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}`
 
 ### `send`

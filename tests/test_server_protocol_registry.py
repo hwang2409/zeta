@@ -1135,9 +1135,9 @@ STRUCTURED_ERROR_FIXTURES = (
     ),
     (
         ErrorDescriptor.INVALID_TELEMETRY_PARAMS,
-        "invalid params: invalid cursor",
+        "invalid params",
         None,
-        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params: invalid cursor","data":{"code":"invalid_params"}}}\n',
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
     ),
     (
         ErrorDescriptor.TRACE_NOT_FOUND,
@@ -1153,9 +1153,9 @@ STRUCTURED_ERROR_FIXTURES = (
     ),
     (
         ErrorDescriptor.TELEMETRY_SCHEMA_MISMATCH,
-        "stored state is invalid",
+        "telemetry schema is unsupported",
         None,
-        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"stored state is invalid","data":{"code":"telemetry_schema_mismatch"}}}\n',
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"telemetry schema is unsupported","data":{"code":"telemetry_schema_mismatch"}}}\n',
     ),
     (
         ErrorDescriptor.RESULT_TOO_LARGE,

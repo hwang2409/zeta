@@ -144,7 +144,7 @@ async def test_session_pages_follow_the_cursor_and_reject_other_filters(tmp_path
         assert [item["session_id"] for item in by_model["items"]] == [roots[0]]
         assert by_model["items"][0]["input_tokens"] == 3
         assert mismatched.get("error") == {
-            "code": -32602, "message": "invalid params: invalid cursor", "data": {"code": "invalid_params"},
+            "code": -32602, "message": "invalid params", "data": {"code": "invalid_params"},
         }, "a cursor made for other filters was accepted"
         assert all(error["code"] == -32602 and error["data"] == {"code": "invalid_params"} for error in invalid)
     finally:
@@ -208,17 +208,30 @@ async def test_trace_pages_spans_in_order_with_their_events(tmp_path: Path) -> N
         await contract.close()
 
 
+OFF = {"code": -32005, "message": "state unavailable", "data": {"code": "telemetry_off", "retryable": True}}
+MISMATCH = {"code": -32000, "message": "telemetry schema is unsupported", "data": {"code": "telemetry_schema_mismatch"}}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["PRAGMA user_version = 2", "UPDATE viewer_meta SET schema_version = 2"])
-async def test_a_schema_mismatch_is_refused_before_any_query(tmp_path: Path, change: str) -> None:
+@pytest.mark.parametrize(("change", "status_error", "data_error"), [
+    (None, None, OFF),  # no database file
+    ("PRAGMA user_version = 0", MISMATCH, MISMATCH),
+    ("PRAGMA user_version = 2", MISMATCH, MISMATCH),
+    ("DROP TABLE viewer_meta", MISMATCH, MISMATCH),
+    ("UPDATE viewer_meta SET schema_version = 2", MISMATCH, MISMATCH),
+])
+async def test_only_a_missing_database_is_off_and_every_bad_schema_is_refused(
+    tmp_path: Path, change: str | None, status_error: dict | None, data_error: dict,
+) -> None:
     home = tmp_path / "home"
-    await _write(home, [_span(TRACE, 1, NOW - 100, session="e" * 32)])
-    connection = sqlite3.connect(home / "telemetry" / "telemetry.sqlite3")
-    try:
-        connection.execute(change)
-        connection.commit()
-    finally:
-        connection.close()
+    if change is not None:
+        await _write(home, [_span(TRACE, 1, NOW - 100, session="e" * 32)])
+        connection = sqlite3.connect(home / "telemetry" / "telemetry.sqlite3")
+        try:
+            connection.execute(change)
+            connection.commit()
+        finally:
+            connection.close()
     contract = await ServeContract.start(tmp_path, "websocket")
     try:
         client, _ = await _client(contract)
@@ -228,8 +241,7 @@ async def test_a_schema_mismatch_is_refused_before_any_query(tmp_path: Path, cha
             await client.request("trace", "telemetry_trace", {"trace_id": TRACE}),
         ]
 
-        mismatch = {"code": -32000, "message": "stored state is invalid", "data": {"code": "telemetry_schema_mismatch"}}
-        assert [reply.get("error") for reply in replies] == [mismatch] * 3, "a read ran against an unknown schema"
+        assert [reply.get("error") for reply in replies] == [status_error, data_error, data_error], change
     finally:
         await contract.close()
 
