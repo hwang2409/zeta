@@ -81,7 +81,7 @@ async def test_controller_update_checks_revision_and_lists_restarts(tmp_path: Pa
             }),
             await controller.request("unknown", "home_settings_update", {
                 "expected_revision": got["result"]["revision"],
-                "changes": [{"key": "telemetry.endpoint", "value": BUILTIN}],
+                "changes": [{"key": "yolo", "value": True}],
             }),
         ]
         stale = await controller.request(

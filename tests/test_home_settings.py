@@ -180,6 +180,8 @@ def test_custom_endpoint_is_read_only_and_byte_identical(tmp_path: Path) -> None
         (None, ON),
         ("REV", [{"key": "telemetry.endpoint", "value": BUILTIN}]),
         ("REV", [{"key": "otel.endpoint", "value": BUILTIN}]),
+        ("REV", [{"key": "yolo", "value": True}]),
+        ("REV", [{"key": "telemetry.custom", "value": False}]),
         ("REV", [{"key": "telemetry.enabled", "value": 1}]),
         ("REV", [{"key": "telemetry.enabled", "value": "true"}]),
         ("REV", [{"key": "telemetry.enabled", "value": True, "path": "/tmp"}]),
