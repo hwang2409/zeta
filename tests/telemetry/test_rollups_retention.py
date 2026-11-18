@@ -218,6 +218,7 @@ def test_storage_bounds_contract(case: Case, tmp_path: Path, monkeypatch) -> Non
     if case.schema < 3:
         _old_database(path, case.schema, case.seed)
     elif case.seed:
+        open_database(path)
         asyncio.run(write(path, list(case.seed), 0))
     result, startup_calls = asyncio.run(_drive(case, tmp_path, monkeypatch))
     if case.result:
