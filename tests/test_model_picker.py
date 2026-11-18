@@ -19,6 +19,7 @@ from rich.panel import Panel
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import owned_app
+from zeta.config.settings import Settings
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.models.catalog import PROVIDER_MODELS
@@ -77,6 +78,9 @@ def _app(
         on_model_change=_accept_model_change,
         console=Console(file=output, force_terminal=False, width=100),
         model_catalog_loader=loader or (lambda provider: None),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     if full_screen:
         app._active_session = app._make_session()

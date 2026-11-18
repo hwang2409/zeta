@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.support.fake_backend import FakeBackend
+from zeta.config.settings import Settings
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
@@ -139,7 +140,7 @@ async def test_broken_cursor_stops_reconciliation_and_renders_through_tui_and_se
         skill_catalog=SkillCatalog.empty(),
     )
     loop.memory_reconciler = replacement
-    app = TUIApp(loop, provider="codex", model="offline")
+    app = TUIApp(loop, provider="codex", model="offline", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     runtime = SimpleNamespace(
         loop=loop,
         state=SimpleNamespace(usage_tracker=app._usage_tracker),

@@ -22,6 +22,7 @@ from rich.console import Console
 from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
+from zeta.config.settings import Settings
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.commands.custom_commands import COMMAND_FILE_SIZE_LIMIT
 from zeta.core.commands.slash_registry import SlashLock
@@ -255,6 +256,9 @@ async def test_init_rejects_non_project_without_model_input(tmp_path: Path) -> N
         model="offline",
         zeta_home=tmp_path / "home",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("/init")
@@ -494,6 +498,9 @@ skill_catalog=SkillCatalog.empty(),
         model="offline",
         zeta_home=fake_home,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     assert all(command.name != "leak" for command in app._slash_commands.custom_commands)
@@ -530,6 +537,9 @@ skill_catalog=SkillCatalog.empty(),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     assert all(
@@ -554,6 +564,9 @@ skill_catalog=SkillCatalog.empty(),
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     assert [command.name for command in app._slash_commands.custom_commands] == [
@@ -643,6 +656,9 @@ async def test_custom_command_becomes_the_model_user_message(
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("/review changes")
@@ -673,6 +689,9 @@ async def test_init_becomes_the_model_user_message(tmp_path: Path) -> None:
         model="offline",
         zeta_home=tmp_path / "zeta-home",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("/init")
@@ -711,6 +730,9 @@ async def test_input_loop_control_commands_exclude_their_own_submission(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         app._input_loop_active = True
@@ -731,6 +753,9 @@ async def test_handler_failure_acknowledges_entry_and_advances_pipeline(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         original_dispatch = app._slash_commands.dispatch_async
@@ -770,6 +795,9 @@ async def test_provider_start_failure_rolls_back_and_advances_pipeline(
         model="offline",
         zeta_home=tmp_path / "home",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         original_start_turn = app._start_turn
@@ -818,6 +846,9 @@ async def test_same_tick_provider_failure_dispatches_the_next_submission(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         original_start_turn = app._start_turn
@@ -871,6 +902,9 @@ async def test_approval_shortcut_does_not_enter_history(tmp_path: Path) -> None:
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
 
@@ -905,6 +939,9 @@ async def test_failed_approval_action_acknowledges_waiter(
         zeta_home=tmp_path / "home",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
 
@@ -999,6 +1036,9 @@ async def test_tui_always_allow_remembers_only_the_current_action(
         zeta_home=tmp_path / "home",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value(f"/always {call.id}")
@@ -1036,6 +1076,9 @@ skill_catalog=SkillCatalog.empty(),
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("/inspect")
@@ -1075,6 +1118,9 @@ async def test_inline_shell_approval_covers_the_complete_batch(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=output, force_terminal=True, width=120),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
 
@@ -1123,6 +1169,9 @@ async def test_preprocessing_timing_cannot_reorder_provider_submissions(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     started = {name: asyncio.Event() for name in ("first", "second", "third")}
     release = {name: asyncio.Event() for name in ("first", "second", "third")}
@@ -1193,6 +1242,9 @@ async def test_inline_shell_approval_input_is_consumed_during_preprocessing(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         app._input_loop_active = True
@@ -1236,6 +1288,9 @@ async def test_unmapped_durable_approval_is_finalized(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         app._input_loop_active = True
@@ -1322,6 +1377,9 @@ skill_catalog=SkillCatalog.empty(),
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         await app._submissions.approval_action_wait(
@@ -1383,6 +1441,9 @@ skill_catalog=SkillCatalog.empty(),
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         owner.release_with(release.set)
@@ -1430,6 +1491,9 @@ async def test_close_resolves_pending_submission_ack_and_rejects_new_sends(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
 
@@ -1473,6 +1537,9 @@ async def test_inline_approval_queues_unrelated_submission(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         app._input_loop_active = True
@@ -1536,6 +1603,9 @@ async def test_undo_second_inline_submission_keeps_first_alive(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         app._input_loop_active = True
@@ -1601,6 +1671,9 @@ async def test_scoped_inline_abort_keeps_other_submission_alive(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         app._input_loop_active = True
@@ -1659,6 +1732,9 @@ skill_catalog=SkillCatalog.empty(),
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         app._input_loop_active = True
@@ -1768,6 +1844,9 @@ skill_catalog=SkillCatalog.empty(),
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("/inspect")
@@ -1820,6 +1899,9 @@ async def test_background_macro_exit_produces_exactly_one_notification_and_one_w
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     wakes = 0
@@ -1861,6 +1943,9 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
         model="offline",
         zeta_home=home,
         console=Console(file=output, force_terminal=True, color_system="truecolor"),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("/background")
@@ -1886,6 +1971,9 @@ async def test_background_exec_macro_notifies_on_next_turn_and_cancels_on_exit(
         model="offline",
         zeta_home=slow_home,
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     await slow_app._handle_prompt_value("/slow")
     await slow_app.close()
@@ -1963,6 +2051,9 @@ async def test_exec_macro_streams_receipt_writes_log_and_skips_provider(
         model="offline",
         zeta_home=home,
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("/rebuild first second")
@@ -1995,6 +2086,9 @@ async def test_exec_macro_approval_is_ephemeral_and_uses_substituted_script(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
 
@@ -2079,6 +2173,9 @@ async def test_exec_macro_approval_card_shows_argv_via_trusted_display(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=output, force_terminal=False, width=120),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
 
@@ -2119,6 +2216,9 @@ async def test_exec_macro_deny_renders_denied_receipt(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
 
@@ -2250,6 +2350,9 @@ async def test_exec_macro_abort_kills_process_and_renders_canceled_receipt(
         model="offline",
         zeta_home=home,
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
 
@@ -2321,6 +2424,9 @@ async def test_macro_input_loop_keeps_processing_approval_input(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         app._input_loop_active = True
@@ -2349,6 +2455,9 @@ async def test_macro_receipts_queue_until_the_next_provider_turn(tmp_path: Path)
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
 
@@ -2376,6 +2485,9 @@ async def test_macro_receipts_commit_in_submission_order_when_completion_reverse
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         app._input_loop_active = True
@@ -2424,6 +2536,9 @@ async def test_queued_prompt_consumes_macro_receipt_at_provider_start(
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         app._input_loop_active = True
@@ -2468,6 +2583,9 @@ async def test_two_macros_queued_prompt_and_abort_keep_receipt_order(
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         app._input_loop_active = True
@@ -2512,6 +2630,9 @@ async def test_macro_abort_does_not_cancel_background_agent(tmp_path: Path) -> N
         model="offline",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         canceled = asyncio.Event()
@@ -2564,6 +2685,9 @@ async def test_exec_macro_timeout_has_a_distinct_receipt_status(tmp_path: Path) 
         model="offline",
         zeta_home=home,
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("/short")

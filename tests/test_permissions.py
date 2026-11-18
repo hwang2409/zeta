@@ -9,7 +9,7 @@ from rich.console import Console
 
 from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend
-from zeta.config.settings import load_settings, resolve
+from zeta.config.settings import Settings, load_settings, resolve
 from zeta.core.approval import (
     ApprovalDecision,
     ApprovalPolicy,
@@ -86,6 +86,9 @@ async def test_permissions_shows_effective_policy_without_changing_it(
         zeta_home=home,
         approval_policy=composition.policy,
         console=Console(file=output, width=160, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     policy = composition.policy
     registry = app.loop.tool_registry
@@ -178,6 +181,9 @@ async def test_permissions_tracks_always_scope_and_session_lifetime(
         zeta_home=tmp_path / "home",
         approval_policy=policy,
         console=Console(file=StringIO(), width=160),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     registry = app.loop.tool_registry
     pending: asyncio.Task | None = None
@@ -356,6 +362,9 @@ async def test_permissions_revokes_only_session_grants_without_replaying_calls(
         zeta_home=home,
         approval_policy=policy,
         console=Console(file=StringIO(), width=160),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     try:
         calls = [

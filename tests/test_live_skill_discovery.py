@@ -19,7 +19,7 @@ from tests.test_server import (
     _request,
     _seed_slash_fixtures,
 )
-from zeta.config.settings import load_settings, resolve
+from zeta.config.settings import Settings, load_settings, resolve
 from zeta.core.project_context import load_project_context
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -396,6 +396,9 @@ async def test_tui_submit_discovers_new_skill_slash_before_parse(
         zeta_home=home,
         project_dir=project,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     _install_live_skill(home)
 

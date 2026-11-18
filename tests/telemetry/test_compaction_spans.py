@@ -17,6 +17,7 @@ from tests.telemetry.test_agent_spans import (
     _assert_no_content,
     _by_name,
 )
+from zeta.config.settings import Settings
 from zeta.core.commands.slash_registry import SlashSurface
 from zeta.core.context import ContextAssembler
 from zeta.core.slash import create_slash_registry
@@ -121,7 +122,7 @@ def test_forced_retry_compaction_is_one_emergency_span_in_the_same_turn(tmp_path
 
 
 def _tui_compact(loop: AgentLoop) -> str:
-    app = TUIApp(loop, provider="claude", model=MODEL)
+    app = TUIApp(loop, provider="claude", model=MODEL, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
 
     async def run() -> str:
         try:
@@ -133,7 +134,7 @@ def _tui_compact(loop: AgentLoop) -> str:
 
 
 def _serve_compact(loop: AgentLoop) -> str:
-    app = TUIApp(loop, provider="claude", model=MODEL)
+    app = TUIApp(loop, provider="claude", model=MODEL, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     runtime = SimpleNamespace(loop=loop, state=SimpleNamespace(usage_tracker=app._usage_tracker, model=MODEL))
 
     async def run() -> str:

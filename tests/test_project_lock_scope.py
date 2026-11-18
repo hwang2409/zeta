@@ -16,6 +16,7 @@ import pytest
 from rich.console import Console
 
 from zeta.attention_records import AttentionStore, observed_epoch_for_session
+from zeta.config.settings import Settings
 from zeta.core.session import SessionManager
 from zeta.core.session_links import (
     PENDING_CHILD_LINKS_DIRNAME,
@@ -405,6 +406,9 @@ async def test_p06_below_epoch_real_tui_serve_journey(
             provider="codex",
             model="offline",
             console=Console(file=StringIO(), force_terminal=True),
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
         session = app._make_session()
         app._active_session = session

@@ -14,6 +14,7 @@ from rich.text import Text
 from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
+from zeta.config.settings import Settings
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
 from zeta.project_errors import ProjectRegistryBusyError
@@ -237,7 +238,7 @@ async def test_pending_inbox_approval_names_beta_in_tui_card_and_serve_event(
         offload=offload,
         is_closing=lambda: False,
     )
-    app = TUIApp(loop, provider="codex", model="offline", approval_policy=policy)
+    app = TUIApp(loop, provider="codex", model="offline", approval_policy=policy, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     cards: list[str] = []
 
     async def show(event: StreamEvent) -> None:
@@ -301,7 +302,7 @@ async def test_registry_error_in_label_lookup_keeps_the_approval_usable(
         offload=offload,
         is_closing=lambda: False,
     )
-    app = TUIApp(loop, provider="codex", model="offline", approval_policy=policy)
+    app = TUIApp(loop, provider="codex", model="offline", approval_policy=policy, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     cards: list[str] = []
     outcomes: dict[str, object] = {}
     original_show = projects.show_project

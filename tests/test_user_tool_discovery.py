@@ -10,6 +10,7 @@ import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
+from zeta.config.settings import Settings
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -662,6 +663,9 @@ skill_catalog=SkillCatalog.empty(),
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
         external_tools=discovery,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
 

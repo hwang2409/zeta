@@ -26,6 +26,7 @@ from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
 from zeta.cli.main import build_parser, main
+from zeta.config.settings import Settings
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.commands.slash_registry import SlashLock
@@ -1904,6 +1905,9 @@ async def test_unknown_model_swap_warns_and_changes_the_model(tmp_path: Path) ->
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
         model_catalog_loader=lambda provider: frozenset({"claude-sonnet-4-6"}),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     output = await create_slash_registry(
@@ -1932,6 +1936,9 @@ async def test_unknown_model_with_provider_prefix_warns_before_state_change(
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
         model_catalog_loader=lambda provider: frozenset({"claude-sonnet-4-6"}),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     output = await create_slash_registry(
@@ -1959,6 +1966,9 @@ async def test_model_catalog_hit_has_no_warning(tmp_path: Path) -> None:
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
         model_catalog_loader=lambda provider: frozenset({"claude-opus-4-7"}),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     first = await create_slash_registry(
@@ -2007,6 +2017,9 @@ async def test_model_catalog_refreshes_after_a_previous_load(tmp_path: Path) -> 
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
         model_catalog_loader=load_catalog,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     first = await create_slash_registry(
@@ -2065,6 +2078,9 @@ async def test_model_catalog_load_does_not_block_input(tmp_path: Path) -> None:
         model="claude-sonnet-4-6",
         on_model_change=_accept_model_change,
         model_catalog_loader=load_catalog,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     first = await create_slash_registry(
@@ -2094,6 +2110,9 @@ async def test_unavailable_model_catalog_warns(tmp_path: Path) -> None:
         model="gpt-5.4",
         on_model_change=_accept_model_change,
         model_catalog_loader=lambda provider, **kwargs: None,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     output = await create_slash_registry(
@@ -2118,6 +2137,9 @@ async def test_wrong_provider_model_prefix_is_rejected(tmp_path: Path) -> None:
         provider="claude",
         model="claude-sonnet-4-6",
         model_catalog_loader=lambda provider: frozenset(),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     output = await create_slash_registry(
@@ -2140,6 +2162,9 @@ async def test_model_swap_is_rejected_during_active_turn(tmp_path: Path) -> None
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_task = asyncio.create_task(asyncio.sleep(1))
 
@@ -2179,6 +2204,9 @@ async def test_model_swap_is_rejected_with_pending_approval(tmp_path: Path) -> N
         provider="codex",
         model="offline",
         approval_policy=policy,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     output = await create_slash_registry(
@@ -2223,6 +2251,9 @@ async def test_compact_command_forces_the_existing_compaction_path(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     output = await create_slash_registry(
@@ -2847,6 +2878,9 @@ async def test_slash_approve_and_deny_answer_pending_by_key(
         provider="codex",
         model="offline",
         approval_policy=policy,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app.console = Console(file=StringIO(), force_terminal=False)
     child_a = ConversationStore(tmp_path / "children", session_id="a")
@@ -2920,6 +2954,9 @@ async def test_cancel_then_approve_does_not_resume_tool(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         approval_policy=policy,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     turn = asyncio.create_task(app._consume_turn("start"))
     app._active_task = turn
@@ -2969,6 +3006,9 @@ async def test_cancel_honors_approval_won_by_other_writer(
         provider="codex",
         model="offline",
         approval_policy=policy,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     finalized: list[str] = []
     finalize_canceled = app.loop.finalize_canceled
@@ -3085,6 +3125,9 @@ async def test_resumed_tool_abort_active_persists_canceled_result(
         provider="codex",
         model="offline",
         approval_policy=policy,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     approval_task = asyncio.create_task(app._handle_prompt_value(f"/approve {call.id}"))
     await asyncio.wait_for(started.wait(), timeout=1)

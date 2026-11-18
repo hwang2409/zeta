@@ -18,6 +18,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import owned_app
 from zeta.agent.presets import AgentPreset
 from zeta.agent.runner import run_finish_gate as real_run_finish_gate
+from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageOrigin, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
@@ -178,6 +179,9 @@ async def _unset_child_snapshot(
                 provider="codex",
                 model="offline",
                 console=Console(file=tui_output, force_terminal=False),
+
+                voice_engine=Settings().voice_engine,
+                voice_model=Settings().voice_model
             )
             async with owned_app(app):
                 await app._rebuild_transcript_async()

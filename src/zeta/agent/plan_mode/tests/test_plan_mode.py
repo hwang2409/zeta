@@ -14,6 +14,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.tui_render import render_full_screen
 from zeta.agent.plan_mode import PLAN_MODE_PREAMBLE, PLAN_MODE_TOOLS, plan_mode_messages
 from zeta.cli.main import build_parser
+from zeta.config.settings import Settings
 from zeta.config.tool_policy import ToolPolicy
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.slash import create_slash_registry
@@ -87,6 +88,9 @@ def build_app(tmp_path: Path, turns: list[ScriptedTurn]):
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
 

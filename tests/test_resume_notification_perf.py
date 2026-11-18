@@ -14,6 +14,7 @@ from rich.console import Console
 from tests.support.branch_reads import branch_entries
 from tests.support.fake_backend import FakeBackend
 from zeta.agent.background_lifecycle import recover_agent_children
+from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     ToolCall,
@@ -283,6 +284,9 @@ def _notification_replay_app(
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     return app, store, notification_ids
 

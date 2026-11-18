@@ -1,4 +1,5 @@
 from tests.support.branch_reads import branch_entries, branch_messages
+from zeta.config.settings import Settings
 from zeta.providers.completion import owned_completion
 from zeta.skills import SkillCatalog
 
@@ -376,6 +377,9 @@ async def test_inline_dollar_skill_request_is_sent_and_persisted(tmp_path: Path)
         model="offline",
         zeta_home=tmp_path / "home",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("please $review this branch")
@@ -468,6 +472,9 @@ skill_catalog=SkillCatalog.empty(),
         provider="provider-live",
         model="model-live",
         approval_policy=policy,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     output = await create_slash_registry(skill_catalog=SkillCatalog.empty()).dispatch(app, "/status")
 
@@ -531,7 +538,7 @@ async def test_status_counts_compaction_usage(tmp_path: Path) -> None:
         token_counter=_compaction_token_count,
     )
     loop = AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty())
-    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
 
     await app._consume_turn("first")
     await app._consume_turn("second")
@@ -591,7 +598,7 @@ async def test_manual_compact_avoids_summarization_cost(tmp_path: Path) -> None:
         token_counter=token_count,
     )
     loop = AgentLoop(backend, store, context_assembler=assembler, skill_catalog=SkillCatalog.empty())
-    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
 
     await app._consume_turn("first")
     baseline_input = assembler.uncached_input_tokens_this_session
@@ -631,7 +638,7 @@ async def test_errored_turn_usage_does_not_leak_to_next_model(tmp_path: Path) ->
     store = ConversationStore(tmp_path / "sessions")
     error_backend = _ErrorBackend([])
     loop = AgentLoop(error_backend, store, skill_catalog=SkillCatalog.empty())
-    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
 
     await app._consume_turn("first")
 
@@ -753,6 +760,9 @@ async def test_retention_pin_shared_dispatch_renders_real_tui_output(tmp_path: P
         model="offline",
         zeta_home=tmp_path,
         console=Console(file=rendered, force_terminal=False, width=200),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         for command, expected in (("/pin", "session pinned"), ("/unpin", "session unpinned")):
@@ -865,6 +875,9 @@ async def test_epoch_two_tui_repair_command_returns_upgrade_message(
         model="offline",
         zeta_home=tmp_path,
         console=Console(file=rendered, force_terminal=False, width=200),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     unchanged = {
         str(path.relative_to(tmp_path)): path.read_bytes()
@@ -1355,6 +1368,9 @@ def test_compaction_history_counts_folded_messages_only(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     history = app.slash_status().compaction_history
@@ -1383,6 +1399,9 @@ def test_status_uses_warm_index_without_transcript_payload_reads(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     payload_reads = 0
     original_read = TranscriptRows.read
@@ -1421,6 +1440,9 @@ def test_status_projection_tracks_foreign_compaction(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([]), resident, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     try:
@@ -1514,6 +1536,9 @@ def test_compaction_history_uses_the_active_fork_branch(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     assert app.slash_status().compaction_history == ()
@@ -1639,6 +1664,9 @@ async def test_tui_renders_status_without_calling_the_model(tmp_path: Path) -> N
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     with create_pipe_input() as pipe:
         prompt = PromptSession(

@@ -30,6 +30,7 @@ from tests.support.tui_child_view_home import (
     ChildViewHome,
     generate_child_view_home,
 )
+from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -297,6 +298,9 @@ async def test_real_tui_child_view_journey(
         model="offline",
         resumed=True,
         zeta_home=fixture.home,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     output_stream = StringIO()
     output = Vt100_Output(
@@ -856,6 +860,9 @@ async def test_child_keeps_every_top_row_across_park_and_reentry(
         model="offline",
         resumed=True,
         zeta_home=fixture.home,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     output = Vt100_Output(StringIO(), lambda: Size(rows=42, columns=120), enable_cpr=False)
     misses: list[str] = []

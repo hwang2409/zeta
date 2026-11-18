@@ -17,6 +17,7 @@ from tests.support.server_client import event as server_event
 from tests.support.server_client import request as server_request
 from tests.support.sockets import short_socket_path as _socket_path
 from zeta.codex import CodexCredentialDriver
+from zeta.config.settings import Settings
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.memory.auto import AutoMemoryConfig, AutoMemoryReconciler
@@ -85,7 +86,7 @@ async def test_blocked_scanner_status_renders_blocked_text_through_tui_and_serve
         skill_catalog=SkillCatalog.empty(),
     )
     loop.memory_reconciler = runner
-    app = TUIApp(loop, provider="codex", model="offline")
+    app = TUIApp(loop, provider="codex", model="offline", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     runtime = SimpleNamespace(
         loop=loop,
         state=SimpleNamespace(usage_tracker=app._usage_tracker),

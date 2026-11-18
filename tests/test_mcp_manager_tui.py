@@ -21,6 +21,7 @@ from rich.console import Console
 from tests.support.fake_backend import FakeBackend
 from tests.support.storage_homes import initialize_storage_home
 from tests.support.submissions import await_submission_pipeline
+from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.mcp import management as mcp_management
 from zeta.mcp.management import ManagedServer, MCPManagementService
@@ -54,6 +55,9 @@ async def test_slash_mcp_opens_primary_tui_manager(tmp_path):
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -248,6 +252,9 @@ async def test_add_wizard_opens_from_tui_key_path(tmp_path, monkeypatch):
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     assert "snapshot" not in vars(type(app._mcp_manager.service))
 
@@ -377,6 +384,9 @@ async def test_real_prompt_lock_contention_stays_responsive_and_renders_busy(
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=home,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     refreshed = asyncio.Event()
     original_refresh = app._refresh_mcp_manager
@@ -475,6 +485,9 @@ async def test_add_wizard_escape_does_not_leak_to_parent_manager(tmp_path, monke
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     terminal_entered = asyncio.Event()
@@ -558,7 +571,7 @@ async def test_wizard_cancelled_before_first_run_resets_state(tmp_path, monkeypa
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home")
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._mcp_manager_open = True
 
     async def wizard():
@@ -586,7 +599,7 @@ async def test_wizard_exception_resets_state(tmp_path, monkeypatch):
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home")
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._mcp_manager_open = True
 
     async def wizard():
@@ -611,7 +624,7 @@ async def test_second_add_key_ignored_while_wizard_active(tmp_path, monkeypatch)
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home")
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._mcp_manager_open = True
     gate = asyncio.Event()
     started = 0
@@ -641,7 +654,7 @@ async def test_app_close_cancels_running_wizard(tmp_path, monkeypatch):
         skill_catalog=SkillCatalog.empty(),
     )
     loop.set_mcp_scope(home=tmp_path / "home", project_dir=tmp_path / "repo")
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home")
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=tmp_path / "home", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._mcp_manager_open = True
     cancelled = asyncio.Event()
 
@@ -857,6 +870,9 @@ async def test_real_prompt_mcp_credential_evidence_recovery(
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=home,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     expected_text = (
         f"MCP credential file is {description} for 'live': {credential_file.absolute()}. "

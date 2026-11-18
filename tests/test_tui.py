@@ -89,6 +89,7 @@ from zeta.accounts import (
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
 from zeta.attention_decisions import DecisionItem
 from zeta.attention_records import AttentionRecord
+from zeta.config.settings import Settings
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.commands.custom_commands import CustomCommand
 from zeta.core.context import ContextAssembler
@@ -278,6 +279,9 @@ def test_account_startup_warning_uses_warning_render_path(tmp_path: Path) -> Non
         startup_warnings=(
             "could not clean up account directory /secret; check its mode or ownership, then delete it or fix it",
         ),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     app._present_startup_output()
@@ -304,6 +308,9 @@ def _agent_list_session(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -403,6 +410,9 @@ async def _background_event_transcript_count(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False, width=160),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     if app_sink is not None:
         app_sink(app)
@@ -596,6 +606,9 @@ async def _background_event_transcript_count(
                 provider="codex",
                 model="offline",
                 console=Console(file=resumed_output, force_terminal=False, width=160),
+
+                voice_engine=Settings().voice_engine,
+                voice_model=Settings().voice_model
             )
             await resumed_app._rebuild_transcript_async()
             resumed = (
@@ -656,6 +669,9 @@ async def test_request_exit_wakes_active_full_screen_prompt(tmp_path: Path) -> N
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     with create_pipe_input() as pipe:
@@ -724,6 +740,9 @@ async def test_live_notification_presentation_survives_tui_resume(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False, width=160),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     flow = await loop._ensure_step_delivery()
     prepared = await flow.prepare_request("terminal_fallback", [], None)
@@ -757,6 +776,9 @@ async def test_live_notification_presentation_survives_tui_resume(
         provider="codex",
         model="offline",
         console=Console(file=resumed_output, force_terminal=False, width=160),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     try:
         await resumed_app._rebuild_transcript_async()
@@ -790,6 +812,9 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False, width=160),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     flow = await loop._ensure_step_delivery()
     await flow.prepare_request("terminal_fallback", [], None)
@@ -843,6 +868,9 @@ async def test_canceled_live_notification_marks_presentation_before_resume(
             provider="codex",
             model="offline",
             console=Console(file=resumed_output, force_terminal=False, width=160),
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
         try:
             assert reopened.is_agent_notification_presented_to_tui(notification.id)
@@ -989,6 +1017,9 @@ async def test_status_renders_unavailable_accounts_through_tui(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     try:
         rendered = await app._slash_commands.dispatch_async(app, "/status")
@@ -1011,6 +1042,9 @@ def test_mcp_slash_error_uses_error_style(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     rendered: list[Text] = []
     app._presenter.print_unit = lambda value: rendered.append(value)
@@ -2981,6 +3015,9 @@ async def test_transcript_membership_indexes_match_replayed_app(tmp_path: Path) 
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     def assert_indexes_match() -> None:
         transcript = app._transcript
@@ -3688,6 +3725,9 @@ async def test_streamed_tool_output_is_not_repeated_at_end(tmp_path: Path) -> No
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     rendered: list[object] = []
@@ -3757,6 +3797,9 @@ async def test_tui_overflow_final_render_is_authoritative(tmp_path: Path) -> Non
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     rendered: list[object] = []
     app._print = rendered.append
@@ -3824,6 +3867,9 @@ async def test_tui_cancel_replaces_streamed_region_with_canceled_render(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     rendered: list[object] = []
     app._print = rendered.append
@@ -4596,6 +4642,9 @@ async def test_provider_failure_card_is_visible_in_both_modes(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session() if full_screen else None
     rendered: list[object] = []
@@ -4638,6 +4687,9 @@ async def test_oauth_refresh_rejection_renders_as_login_problem(tmp_path: Path) 
         provider="claude",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     rendered: list[object] = []
     app._print = rendered.append
@@ -4677,6 +4729,9 @@ async def test_transport_failure_shapes_render_error_cards(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     rendered: list[object] = []
     app._print = rendered.append
@@ -4722,6 +4777,9 @@ async def test_ollama_model_window_error_renders_in_tui(tmp_path: Path) -> None:
         provider="ollama",
         model="local-model",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("prompt")
@@ -4744,6 +4802,9 @@ async def test_retry_reuses_user_message_and_keeps_partial_output(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = None
     app._print_user("prompt")
@@ -4782,6 +4843,9 @@ async def test_retry_failure_renders_a_fresh_error_card(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = None
 
@@ -4842,6 +4906,9 @@ async def test_compaction_failure_renders_reason_and_retry_succeeds(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("new")
@@ -4917,6 +4984,9 @@ async def test_compaction_error_event_aborts_and_preserves_source(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("new")
@@ -4978,6 +5048,9 @@ async def test_resumed_failed_turn_renders_and_retries_without_duplication(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._rebuild_transcript_async()
@@ -5029,6 +5102,9 @@ def test_resumed_failure_followed_by_success_is_not_retryable(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     app._rebuild_transcript()
@@ -5064,6 +5140,9 @@ def test_resumed_failure_followed_by_new_user_is_not_retryable(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     app._rebuild_transcript()
@@ -5083,6 +5162,9 @@ async def test_draft_survives_provider_failure(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -5109,6 +5191,9 @@ async def test_submitted_revision_does_not_clear_a_rapid_new_draft(
         provider="codex",
         model="offline",
         draft_path=draft_path,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -5136,6 +5221,9 @@ async def test_rapid_buffer_sends_keep_the_newest_persisted_draft(
         provider="codex",
         model="offline",
         draft_path=tmp_path / "draft",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -5173,6 +5261,9 @@ async def test_rapid_buffer_sends_keep_each_staged_image_owned(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -5868,6 +5959,9 @@ def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> 
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -6414,6 +6508,9 @@ async def test_mcp_mount_notice_is_suppressed_after_terminal_restore(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     notices: list[object] = []
     app._handle_background_notice = notices.append
@@ -6450,6 +6547,9 @@ async def test_mcp_notices_suppressed_while_suspended_for_fork_and_rendered_afte
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     notices: list[object] = []
     app._handle_background_notice = notices.append
@@ -6846,6 +6946,9 @@ async def test_anthropic_redacted_thinking_reaches_tui_stream(tmp_path: Path) ->
         provider="anthropic",
         model="claude-sonnet-4-6",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("hello")
@@ -6905,6 +7008,9 @@ async def test_codex_thought_blocks_reach_tui_as_separate_units(
         provider="codex",
         model=DEFAULT_CODEX_MODEL,
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("hello")
@@ -6988,6 +7094,9 @@ async def test_anthropic_mixed_thinking_blocks_reach_tui_as_separate_lines(
         provider="anthropic",
         model="claude-sonnet-4-6",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("hello")
@@ -7091,6 +7200,9 @@ async def test_status_card_wraps_complete_project_context_health(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -7143,6 +7255,9 @@ async def test_status_card_wraps_long_path_at_separator(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     width = 40
@@ -7199,6 +7314,9 @@ async def test_status_card_renders_viewed_session_transcript_index_failure(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     viewed = app._agent_navigation.root_path / "child-session"
     app._agent_navigation.current_path = viewed
@@ -7434,6 +7552,9 @@ async def test_early_close_retry_drops_inline_partial_from_scrollback(
         provider="codex",
         model="offline",
         console=_test_console(output),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("hi")
@@ -7489,6 +7610,9 @@ async def test_truncated_response_notice_is_printed_once(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("hello")
@@ -7507,6 +7631,9 @@ def test_stream_kind_switch_keeps_partial_assistant_transient(tmp_path: Path) ->
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     rendered = []
     app._print = rendered.append
@@ -7544,6 +7671,9 @@ def test_thought_stream_is_visible_before_completion(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -7583,6 +7713,9 @@ def test_adjacent_signed_thought_blocks_keep_separate_units(tmp_path: Path) -> N
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -7609,6 +7742,9 @@ def test_thought_commit_keeps_logical_lines_for_resize(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -7640,6 +7776,9 @@ def test_thought_updates_keep_active_unit_after_interleaved_output(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -7709,6 +7848,9 @@ def test_thought_duration_uses_local_monotonic_lifecycle_clock(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._consume_text(
         StreamEvent(
@@ -7735,6 +7877,9 @@ def test_assistant_renderables_share_one_logical_unit(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     app._active_session = app._make_session()
@@ -7775,6 +7920,9 @@ async def test_error_flushes_assistant_before_error(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     rendered = []
@@ -7813,6 +7961,9 @@ async def test_verbose_error_flushes_before_raw_error(tmp_path: Path) -> None:
         model="offline",
         verbose=True,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     rendered = []
@@ -7887,6 +8038,9 @@ async def test_verbose_transition_flushes_before_raw_event(
         model="offline",
         verbose=True,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     rendered = []
@@ -7949,6 +8103,9 @@ async def test_queued_panel_follows_the_viewed_session(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     navigation = app._agent_navigation
 
@@ -7996,6 +8153,9 @@ async def test_queued_user_output_waits_for_assistant_flush(tmp_path: Path) -> N
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     with create_pipe_input() as pipe:
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
@@ -8309,6 +8469,9 @@ def test_completed_message_replaces_streaming_unit_once(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     source = "# completed\n\n- item"
@@ -8364,6 +8527,9 @@ async def test_assistant_preserves_blocks_nested_in_list_items(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -8404,6 +8570,9 @@ def test_mixed_assistant_tool_transcript_commits_each_text_once(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     calls: list[str] = []
@@ -8518,6 +8687,9 @@ def test_full_stream_preserves_inline_literals(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     source = "foo_bar_baz\n\\*literal\\*\n`a_b_c`\n**bold** mid _text_\n"
@@ -8548,6 +8720,9 @@ def test_markdown_stream_preserves_model_line_structure(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     source = [
@@ -8592,6 +8767,9 @@ def test_completed_message_renders_final_message_text(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -8628,6 +8806,9 @@ def test_completed_message_rerenders_text_split_by_thinking(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     events = [
@@ -8682,6 +8863,9 @@ def test_completed_message_rerenders_text_split_by_tool(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     events = [
@@ -8738,6 +8922,9 @@ async def test_full_screen_startup_replay_requests_redraw_without_input(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     invalidations: list[str] = []
 
@@ -8789,6 +8976,9 @@ async def test_startup_replay_rejects_actions_and_defers_runtime_events(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     replay_started = asyncio.Event()
     release_replay = asyncio.Event()
@@ -8846,6 +9036,9 @@ async def test_startup_submissions_keep_order_through_mcp_setup(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     replay_started = asyncio.Event()
     replay_release = asyncio.Event()
@@ -8903,6 +9096,9 @@ async def test_startup_failure_restores_accepted_input_to_draft(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -8957,6 +9153,9 @@ async def test_exit_during_activation_keeps_accepted_input_in_draft(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     activation_started = asyncio.Event()
 
@@ -9006,6 +9205,9 @@ async def test_prompt_crash_during_activation_keeps_accepted_input_in_draft(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     activation_started = asyncio.Event()
 
@@ -9056,6 +9258,9 @@ async def test_cancel_run_during_activation_stops_prompt_and_activation(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     activation_started = asyncio.Event()
     prompt_started = asyncio.Event()
@@ -9117,6 +9322,9 @@ async def test_ctrl_v_paste_waits_for_startup_replay(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     replay_started = asyncio.Event()
     release_replay = asyncio.Event()
@@ -9164,6 +9372,9 @@ def test_startup_replay_discards_child_streaming_events(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._begin_startup_replay()
 
@@ -9191,6 +9402,9 @@ def test_startup_replay_coalesces_tool_updates_without_reordering_boundaries(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     call = ToolCall("call-1", "bash", {"command": "echo hello"})
     app._begin_startup_replay()
@@ -9304,6 +9518,9 @@ async def test_exit_during_committed_recovery_persists_child_completion_once(
         provider="codex",
         model="offline",
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     monkeypatch.setattr(
         "zeta.tui.runtime.prompt.start_tui_stall_watchdog", lambda *args, **kwargs: None
@@ -9372,6 +9589,9 @@ async def test_empty_session_activation_does_not_construct_recovery_store(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     constructions = 0
     store_type = recovery_lease.ConversationStore
@@ -9413,6 +9633,9 @@ async def test_exit_aborts_startup_replay_before_mcp_and_freeze(
         provider="codex",
         model="offline",
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     mcp_calls: list[None] = []
     freeze_calls: list[None] = []
@@ -9473,6 +9696,9 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
         provider="codex",
         model="offline",
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     replay_started = asyncio.Event()
     release_replay = asyncio.Event()
@@ -9542,6 +9768,9 @@ async def test_async_rebuild_freezes_once_per_process_only_for_resume(
             provider="codex",
             model="offline",
             resumed=resumed,
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
 
     fresh = make_app("fresh", resumed=False)
@@ -9598,6 +9827,9 @@ async def test_rebuild_transcript_matches_character_stream(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     app._print_user("prompt")
@@ -9642,6 +9874,9 @@ async def test_run_replays_resumed_transcript_before_prompt(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=True, color_system="truecolor"),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     replay_done = asyncio.Event()
     rebuild_transcript = app._rebuild_transcript_async
@@ -9699,6 +9934,9 @@ async def test_run_keeps_mcp_startup_notice_after_transcript_rebuild(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     startup_ready = asyncio.Event()
@@ -9760,6 +9998,9 @@ async def test_history_page_renders_closed_turn_end_reasons(tmp_path: Path) -> N
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -9783,6 +10024,9 @@ def test_rebuild_renders_transcript_recovery_warning(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([]), recovered, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -9806,6 +10050,9 @@ def test_rebuild_renders_compaction_marker_as_chrome(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -9831,6 +10078,9 @@ async def test_run_keeps_empty_resumed_transcript_blank(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=True, color_system="truecolor"),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     with create_pipe_input() as pipe:
@@ -9976,6 +10226,9 @@ def _test_tui_app(store: ConversationStore, output: StringIO) -> TUIApp:
             force_terminal=True,
             color_system="truecolor",
         ),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
 
@@ -10059,6 +10312,9 @@ async def test_aborted_turn_does_not_reorder_the_next_reply(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     app._print_user("first prompt")
@@ -10096,6 +10352,9 @@ async def test_failed_turn_does_not_reorder_the_next_reply(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     app._print_user("first prompt")
@@ -10127,6 +10386,9 @@ def test_empty_final_message_removes_streamed_assistant_text(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     app._prepare_stream_event(StreamEvent(StreamEventType.MESSAGE_START))
@@ -10172,6 +10434,9 @@ def test_inline_message_commits_canonical_text_once(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._prepare_stream_event(StreamEvent(StreamEventType.MESSAGE_START))
     for block in message.content:
@@ -10213,6 +10478,9 @@ def test_rebuild_user_attachment_hides_file_content(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -10235,6 +10503,9 @@ def test_markdown_stream_keeps_model_blank_lines_without_inserting_more(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     source = ["intro", "", "1. first", "", "", "2. second", "after"]
@@ -10553,6 +10824,9 @@ async def test_composer_screen_fill_is_scoped_to_multiline_input(
             ),
             provider="codex",
             model="offline",
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
         session = app._make_session()
         app._active_session = session
@@ -10633,6 +10907,9 @@ def test_composer_meta_line_includes_model_approval_and_home_cwd(
         provider="codex",
         model="offline",
         approval_policy=ApprovalPolicy(default="ask"),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=160))
     monkeypatch.setattr("zeta.tui.app.get_app", lambda: SimpleNamespace(output=output))
@@ -10692,6 +10969,9 @@ def test_status_toolbar_preserves_live_state_at_production_widths(
         provider="claude",
         model="claude-opus-4-1",
         approval_policy=ApprovalPolicy(default="ask"),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     app._loop_state = "tool-running"
@@ -10723,6 +11003,9 @@ def test_full_screen_layout_pins_composer_and_footer(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._install_full_screen_layout(session)
@@ -10762,6 +11045,9 @@ def test_full_screen_layout_keeps_transcript_inset_through_agent_view(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._install_full_screen_layout(session)
@@ -10955,6 +11241,9 @@ async def test_pruned_agent_list_returns_focus_to_composer(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     with create_pipe_input() as pipe:
@@ -11008,6 +11297,9 @@ def test_full_screen_footer_fits_content_column(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     output = SimpleNamespace(
         get_size=lambda: Size(rows=24, columns=terminal_width),
@@ -11219,6 +11511,9 @@ def test_full_screen_transcript_preserves_markdown_list_line(
         provider="codex",
         model="offline",
         console=_test_console(),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=40))
@@ -11241,6 +11536,9 @@ def test_full_screen_transcript_reflows_logical_text_at_narrow_widths(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     columns = 40
@@ -11269,6 +11567,9 @@ def test_app_status_prefers_latest_provider_usage(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._update_usage(
         StreamEvent(
@@ -11296,6 +11597,9 @@ def test_status_toolbar_preserves_vim_state_style(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     output = SimpleNamespace(get_size=lambda: Size(rows=24, columns=80))
     monkeypatch.setattr(
@@ -11324,6 +11628,9 @@ def test_status_toolbar_does_not_advance_spinner_frame(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._spinner_frame = 0
     app._streaming = False
@@ -11345,6 +11652,9 @@ async def test_spinner_pulses_on_timer(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._streaming = True
     app._spinner_active = True
@@ -11382,6 +11692,9 @@ async def test_spinner_restarts_for_completion_after_tool(tmp_path: Path) -> Non
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     turn = asyncio.create_task(app._consume_turn("prompt"))
@@ -11414,6 +11727,9 @@ async def test_app_abort_enters_interrupted_state(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     states: list[str] = []
     app._invalidate_prompt = lambda: states.append(app._loop_state)
@@ -11451,6 +11767,9 @@ async def test_app_surfaces_compacting_state_before_provider_output(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     assembler = app.loop.context_assembler
     assemble = assembler.assemble
@@ -11495,6 +11814,9 @@ async def test_empty_max_tokens_completion_does_not_print_neutral_fallback(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("prompt")
@@ -11517,6 +11839,9 @@ async def test_empty_completion_prints_neutral_fallback(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._print_user("empty turn")
     await app._consume_turn("empty turn")
@@ -11541,6 +11866,9 @@ async def test_empty_completion_removes_preview_region_before_fallback(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     app._print_user("prompt")
@@ -11569,6 +11897,9 @@ async def test_full_screen_separates_user_and_assistant_units(tmp_path: Path) ->
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -11600,6 +11931,9 @@ async def test_full_session_preserves_assistant_tool_user_order(tmp_path: Path) 
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     app._print_user("first user")
@@ -11656,6 +11990,9 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False, width=72),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     app._print_user("inspect the session")
@@ -11723,6 +12060,9 @@ async def test_run_delivers_queued_follow_up_after_current_turn(tmp_path: Path) 
             provider="codex",
             model="offline",
             console=Console(file=StringIO(), force_terminal=False),
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
         pipe.send_text("first\r")
@@ -11771,6 +12111,9 @@ async def test_control_command_does_not_reject_rapid_follow_up(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     app._submit_input(command)
@@ -11798,6 +12141,9 @@ async def test_plain_approve_word_is_sent_to_model_from_composer(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     app._submit_input(text)
@@ -11830,6 +12176,9 @@ async def test_plain_approve_word_is_sent_to_model_from_prompt_session(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     with create_pipe_input() as pipe:
@@ -11872,6 +12221,9 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     app._present_pending_approvals()
@@ -11911,6 +12263,9 @@ async def test_submission_queue_preserves_rapid_enter_order(tmp_path: Path) -> N
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     app._submit_input("first")
@@ -11943,6 +12298,9 @@ async def test_submission_undo_cancels_only_the_exact_rapid_enter(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     app._submit_input("same")
@@ -11974,6 +12332,9 @@ async def test_undo_restores_double_slash_source_text(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -12021,6 +12382,9 @@ async def test_run_abort_persists_cancelled_tool_result(tmp_path: Path) -> None:
             provider="codex",
             model="offline",
             console=Console(file=StringIO(), force_terminal=False),
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
         pipe.send_text("run\r")
@@ -12060,6 +12424,9 @@ async def test_run_abort_during_streamed_tool_call_pairs_result(tmp_path: Path) 
             provider="codex",
             model="offline",
             console=Console(file=StringIO(), force_terminal=False),
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
         run_task = asyncio.create_task(app.run(app_session(app, pipe)))
         pipe.send_text("run\r")
@@ -12388,6 +12755,9 @@ async def test_vim_slash_command_toggles_both_directions(tmp_path: Path) -> None
         model="offline",
         session=session,
         vim_mode=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._invalidate_prompt = lambda: None
     session.editing_mode = EditingMode.VI
@@ -12419,6 +12789,9 @@ async def test_vi_composer_can_show_approval_prompt_while_in_normal_mode(
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     with create_pipe_input() as pipe:
         session = PromptSession(
@@ -12580,6 +12953,9 @@ async def test_tui_close_hands_off_blocked_todo_source(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     baseline = _fd_count()
     control = app._agent_navigation._todo_control
@@ -12640,6 +13016,9 @@ async def test_tui_close_closes_todo_when_transcript_close_fails(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     todo_closed = False
 
@@ -12711,6 +13090,9 @@ async def test_repeated_child_navigation_tui_close_restores_fd_count(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     baseline = _fd_count()
     navigation = app._agent_navigation
@@ -13222,6 +13604,9 @@ async def test_runtime_close_draft_writer_owns_its_directory_fd(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     started = threading.Event()
     release = threading.Event()
@@ -13328,6 +13713,9 @@ def test_exit_with_failed_draft_save_exits_cleanly_and_prints_draft(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     errors: list[BaseException] = []
 
@@ -13382,6 +13770,9 @@ def test_new_session_continues_after_failed_draft_save(
             ),
             provider="codex",
             model="offline",
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
         if name == "old":
             old_app = weakref.ref(app)
@@ -13462,6 +13853,9 @@ def test_failed_active_draft_is_printed_on_every_exit(
             ),
             provider="codex",
             model="offline",
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
 
     def fail_write(*_args: object, **_kwargs: object) -> None:
@@ -13554,6 +13948,9 @@ def test_failed_draft_is_printed_when_replacement_session_does_not_exit_normally
             ),
             provider="codex",
             model="offline",
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
 
     def fail_write(*_args: object, **_kwargs: object) -> None:
@@ -13622,6 +14019,9 @@ def test_new_session_with_successful_draft_prints_nothing(
             ),
             provider="codex",
             model="offline",
+
+            voice_engine=Settings().voice_engine,
+            voice_model=Settings().voice_model
         )
 
     async def run_tui(app: TUIApp, _args: object) -> tuple[bool, bool]:
@@ -13986,6 +14386,9 @@ async def test_mcp_prompt_result_does_not_activate_attachment_syntax(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._slash_commands.set_mcp_prompts([("fake:review", "fake", MCPPrompt("review"))])
 
@@ -14019,6 +14422,9 @@ async def test_mcp_prompt_error_restores_draft_and_attachments(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -14074,6 +14480,9 @@ async def test_undo_restores_submission_before_turn_creation(tmp_path: Path) -> 
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -14099,6 +14508,9 @@ async def test_pending_undo_keeps_a_new_buffer_draft(tmp_path: Path) -> None:
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -14125,6 +14537,9 @@ async def test_undo_restores_text_and_aborts_streaming_turn(tmp_path: Path) -> N
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -14154,6 +14569,9 @@ async def test_undo_keeps_a_draft_typed_during_streaming(tmp_path: Path) -> None
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -14186,6 +14604,9 @@ async def test_undo_restores_staged_image_for_resubmission(tmp_path: Path) -> No
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._pending_attachments.append(staged)
     app._pending_attachment_tokens["[Image #1]"] = staged
@@ -14227,6 +14648,9 @@ async def test_undo_restores_next_image_token_after_deleted_token(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._pending_attachments[:] = [first, second]
     app._pending_attachment_tokens.update({"[Image #1]": first, "[Image #2]": second})
@@ -14271,6 +14695,9 @@ async def test_unknown_slash_command_is_rendered_without_model_request(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     try:
         app._submissions.wake()
@@ -14311,6 +14738,9 @@ async def test_slash_like_model_text_reaches_model(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     try:
         app._submissions.wake()
@@ -14379,6 +14809,9 @@ async def test_background_wake_and_submission_share_one_provider_consumer(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     try:
@@ -14433,6 +14866,9 @@ async def test_nudge_shown_as_zeta_notice_in_tui(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     try:
@@ -14477,6 +14913,9 @@ async def test_notification_turn_empty_reply_is_silent(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("", notification=True)
@@ -14498,6 +14937,9 @@ async def test_user_turn_still_shows_no_response_after_failed_nudge(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
     await app._consume_turn("hi")
@@ -14580,6 +15022,9 @@ async def test_tui_ollama_model_switch_keeps_budget_equal_everywhere(
         model=start_model,
         on_model_change=persist_model_and_effective_budget,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     try:
         assert (await app.slash_model(model)).startswith(f"model: {model}")
@@ -14669,6 +15114,9 @@ async def test_tui_model_command_respects_unknown_fence_and_uses_transition(
         model="gpt-5.6-luna",
         on_model_change=switch_model,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     context._mark_unknown(lambda _metadata: FakeBackend([]))
 
@@ -14719,6 +15167,9 @@ async def test_tui_model_command_does_no_lock_work_on_loop(
         model="gpt-5.6-luna",
         on_model_change=switch_model,
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     owner_thread = threading.get_ident()
     lock_threads: list[int] = []
@@ -14762,7 +15213,7 @@ async def test_tui_accounts_slash_marks_missing_credentials_unavailable(
     )
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     try:
         assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         output = StringIO()
@@ -14804,7 +15255,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     loop.session_metadata = opened.metadata
     loop.account_context = resolver
     loop.tool_registry.account_context = resolver
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     list_display = AccountStore.list_display
     off_loop_calls: list[str] = []
 
@@ -14865,7 +15316,7 @@ async def test_accounts_picker_is_view_only_during_turn_then_switches(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     loop.tool_registry.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     busy = True
     monkeypatch.setattr(TUIApp, "active", property(lambda _app: busy))
 
@@ -14927,7 +15378,7 @@ async def test_accounts_switch_keeps_background_child_account_binding(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     loop.tool_registry.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._presenter.print_unit = lambda _renderable: None
     monkeypatch.setattr(
         type(loop), "background_children_running", property(lambda _loop: True)
@@ -15000,7 +15451,7 @@ async def test_account_picker_ignores_repeat_select_while_switching(
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = resolver
     loop.tool_registry.account_context = resolver
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._presenter.print_unit = lambda _renderable: None
     entered = asyncio.Event()
     release = asyncio.Event()
@@ -15053,7 +15504,7 @@ async def test_account_switch_serializes_real_prompt_submission(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     loop.tool_registry.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._active_session = app._make_session()
     app._presenter.print_unit = lambda _renderable: None
     entered = asyncio.Event()
@@ -15127,7 +15578,7 @@ async def test_tui_shutdown_with_switch_lock_held_exits_bounded(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     loop.tool_registry.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._accounts_picker = SimpleNamespace(highlighted=second)
     app._presenter.print_unit = lambda _renderable: None
     monkeypatch.setattr(
@@ -15315,7 +15766,7 @@ async def test_accounts_panel_does_not_block_on_held_lifecycle_lock(
     loop.manager = manager
     loop.session_metadata = opened.metadata
     loop.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._presenter.print_unit = Mock()
     locked = threading.Event()
     release = threading.Event()
@@ -15435,7 +15886,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
     loop.manager = manager
     loop.session_metadata = opened.metadata
     loop.account_context = context
-    app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="claude", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
 
     refreshed = False
 
@@ -15486,7 +15937,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     loop.manager = manager
     loop.session_metadata = opened.metadata
     loop.account_context = context
-    app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="claude", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     refresh_rendered = asyncio.Event()
     repaint = app._repaint_accounts_picker
 
@@ -15549,7 +16000,7 @@ async def test_accounts_refresh_does_not_block_event_loop(
     loop.manager = manager
     loop.session_metadata = opened.metadata
     loop.account_context = context
-    app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="claude", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     # test-contract: seam no public headless presenter injection exists
     app._presenter.print_unit = Mock()
     # test-contract: seam no public headless transcript injection exists
@@ -15602,7 +16053,7 @@ async def test_tui_accounts_named_login_uses_supplied_label(
     )
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._presenter.print_unit = lambda _renderable: None
     logins: list[tuple[str, str]] = []
 
@@ -15645,7 +16096,7 @@ async def test_tui_login_provider_failure_has_safe_cause_and_recovery(
     )
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._presenter.print_unit = lambda _renderable: None
     try:
         result = await app._slash_commands.dispatch_async(
@@ -15685,7 +16136,7 @@ async def test_tui_login_lock_failure_has_safe_cause_and_recovery(
     )
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = account_context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._presenter.print_unit = lambda _renderable: None
     try:
         result = await app._slash_commands.dispatch_async(
@@ -15718,7 +16169,7 @@ async def test_tui_login_callback_port_failure_has_safe_cause_and_recovery(
     )
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._presenter.print_unit = lambda _renderable: None
     try:
         with socket.socket() as listener:
@@ -15765,7 +16216,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
     )
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     logout = AccountStore.logout
     off_loop_calls = 0
 
@@ -15837,7 +16288,7 @@ def _limit_tui(
     loop.manager = manager
     loop.session_metadata = opened.metadata
     loop.account_context = context
-    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
+    app = TUIApp(loop, provider="codex", model="offline", zeta_home=home, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
     app._presenter.print_unit = Mock()
     return app, context, opened.store
 
@@ -15989,6 +16440,9 @@ async def test_low_capacity_notice_real_render_path(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False, width=500),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     assert loop.step_delivery is not None
     await loop.step_delivery.initialize()
@@ -16033,6 +16487,9 @@ async def test_history_finder_does_not_cross_session_boundaries(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     first._record_prompt("only from the first session")
     await first.close()
@@ -16045,6 +16502,9 @@ async def test_history_finder_does_not_cross_session_boundaries(
         ),
         provider="codex",
         model="offline",
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     request = second._history_finder.open_finder(Buffer())
     assert request is not None
@@ -16077,6 +16537,9 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
         provider="codex",
         model="offline",
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     buffer = Buffer(document=Document("prompt-0"))
@@ -16145,6 +16608,9 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
         provider="codex",
         model="offline",
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     started = asyncio.Event()
     release = asyncio.Event()
@@ -16324,6 +16790,9 @@ async def test_root_prompt_history_skips_non_user_pages_in_one_scan(
         provider="codex",
         model="offline",
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -16451,7 +16920,7 @@ async def test_broken_sent_ledger_notice_uses_real_tui_transcript_render(
         except Exception as exc:  # noqa: BLE001 - base behavior is asserted below
             activation_error = exc
         assert activation_error is None
-        app = TUIApp(loop, provider="codex", model="offline")
+        app = TUIApp(loop, provider="codex", model="offline", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
         async with owned_app(app):
             app._full_screen_active = lambda: True
             await app._rebuild_transcript_async()
@@ -16613,6 +17082,9 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         provider="codex",
         model="offline",
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -16883,6 +17355,9 @@ async def test_root_tui_paging_render_path_table(
         provider="codex",
         model="offline",
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -17779,6 +18254,9 @@ async def test_root_tui_page_uses_nearest_duplicate_tool_call_dependency(
         provider="codex",
         model="offline",
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -17816,6 +18294,9 @@ async def test_child_activation_discards_stale_slow_target_and_returns_to_root(
         provider="codex",
         model="offline",
         resumed=True,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     started = asyncio.Event()

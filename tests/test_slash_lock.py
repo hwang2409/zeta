@@ -17,6 +17,7 @@ import zeta.runtime.status as runtime_status
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail, owned_app
 from tests.support.storage_homes import initialize_storage_home
+from zeta.config.settings import Settings
 from zeta.core.checkpoints import active_branch
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
@@ -67,6 +68,9 @@ def _app(tmp_path: Path) -> TUIApp:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
 
 
@@ -300,6 +304,9 @@ async def test_tui_mcp_auth_cancel_is_immediate_and_frees_the_lock(
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
         zeta_home=home,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         printed = _Printed(app)

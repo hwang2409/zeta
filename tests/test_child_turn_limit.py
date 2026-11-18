@@ -27,6 +27,7 @@ from zeta.agent.turn_limit import (
     marker_for,
     parse_turn_limit_result,
 )
+from zeta.config.settings import Settings
 from zeta.core.checkpoints import load_session_json
 from zeta.core.store import ConversationEntry, ConversationStore
 from zeta.core.store._validation import validate_agent_notification_data
@@ -720,6 +721,9 @@ async def test_tui_replay_renders_child_turn_limit_notice_once(tmp_path: Path) -
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         await app._rebuild_transcript_async()

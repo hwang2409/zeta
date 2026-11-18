@@ -33,6 +33,7 @@ from zeta.accounts.availability import AccountDisplay
 from zeta.accounts.registry import AccountId
 from zeta.accounts.session import AccountListSnapshot
 from zeta.accounts.usage import UsageState
+from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     MESSAGE_ORIGIN_METADATA,
@@ -355,6 +356,9 @@ async def running_tui(
         model="offline",
         resumed=True,
         zeta_home=home.home,
+
+        voice_engine=Settings().voice_engine,
+        voice_model=Settings().voice_model
     )
     output = Vt100_Output(StringIO(), lambda: size, enable_cpr=False)
     with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
