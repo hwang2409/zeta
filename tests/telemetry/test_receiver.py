@@ -8,7 +8,6 @@ import json
 import os
 import select
 import signal
-import socket
 import sqlite3
 import stat
 import subprocess
@@ -333,19 +332,12 @@ def test_projection_is_identical_in_both_orders(tmp_path):
     assert session["model"] == "m-high"
 
 
-def _port_in_use() -> bool:
-    with socket.socket() as probe:
-        return probe.connect_ex(("127.0.0.1", 4323)) == 0
-
-
 def _receiver_command(home: Path) -> tuple[list[str], dict[str, str]]:
     command = [sys.executable, "-c", "import sys; from zeta.cli.main import main; sys.exit(main())", "otel", "receiver"]
     return command, {**os.environ, "ZETA_HOME": str(home)}
 
 
-def test_second_process_exits_and_bind_failure_releases_lock(tmp_path):
-    if _port_in_use():
-        pytest.skip("127.0.0.1:4323 is in use on this machine")
+def test_second_process_exits_and_bind_failure_releases_lock(tmp_path, builtin_port):
     owner_home, other_home = tmp_path / "owner", tmp_path / "other"
     command, environment = _receiver_command(owner_home)
     owner = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

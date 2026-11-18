@@ -408,7 +408,7 @@ class ZetaServer:
         if not self._borrowed and not self.telemetry.enabled():
             try:
                 self.telemetry = await asyncio.to_thread(
-                    lambda: Telemetry.configure(load_settings(home=self.home).settings)
+                    lambda: Telemetry.configure(load_settings(home=self.home).settings, self.home)
                 )
             except TelemetryError as exc:
                 raise SessionError(str(exc)) from None

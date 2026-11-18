@@ -17,7 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .process import HOST, OTLP_URL, PORT, _read_home_id, _running_home_id
+from .process import OTLP_URL, receiver_ready
 from .store import BUSY_TIMEOUT_MS, SCHEMA_VERSION
 
 RAW_DAYS = 14
@@ -79,8 +79,9 @@ def database_path(home: Path) -> Path:
     return home / "telemetry" / "telemetry.sqlite3"
 
 
-def status(home: Path, endpoint: str | None) -> dict[str, Any]:
-    """``TelemetryStatus``; ``endpoint`` is the configured ``[otel].endpoint``.
+def status(home: Path, endpoint: str | None, live: dict[str, Any]) -> dict[str, Any]:
+    """``TelemetryStatus``; ``endpoint`` is the configured ``[otel].endpoint``, ``live`` the serve process's
+    receiver and export snapshot. Without a supervised receiver, this checks the receiver's health itself.
 
     Never raises for a missing database: enabled means configured and a database exists.
     """
@@ -91,10 +92,10 @@ def status(home: Path, endpoint: str | None) -> dict[str, Any]:
         present, oldest = False, None
     return {
         "enabled": present and endpoint is not None,
-        "receiver": "ready" if _receiver_ready(home) else "stopped",
+        "receiver": live["receiver"] or ("ready" if receiver_ready(home) else "stopped"),
         "endpoint": None if endpoint is None else "builtin" if endpoint == OTLP_URL else "external",
-        "last_export": None,  # shortcut: serve does not see exporter results yet; the auto-start slice fills these
-        "last_export_ns": None,
+        "last_export": live["last_export"],
+        "last_export_ns": live["last_export_ns"],
         "raw_days": RAW_DAYS,
         "rollup_days": ROLLUP_DAYS,
         "max_bytes": MAX_BYTES,
@@ -233,14 +234,6 @@ def _snapshot[T](home: Path, read: Callable[[sqlite3.Connection], T]) -> T:
             connection.rollback()
     finally:
         connection.close()
-
-
-def _receiver_ready(home: Path) -> bool:
-    try:
-        home_id = _read_home_id(home / "telemetry" / "home-id")
-    except (OSError, RuntimeError):
-        return False
-    return _running_home_id(HOST, PORT) == home_id
 
 
 def _used_bytes(path: Path) -> int:

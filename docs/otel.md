@@ -104,6 +104,40 @@ tool name, request id, protocol version) to its `execute_tool` span; a prompt
 or resource call with no tool span gets its own `CLIENT` span. Server startup,
 refresh, and notifications carry no context.
 
+## built-in receiver
+
+Zeta has its own receiver, which stores traces for `zeta serve`'s
+`telemetry_*` reads. To use it, set the endpoint to exactly:
+
+```toml
+[otel]
+endpoint = "http://127.0.0.1:4323/v1/traces"
+```
+
+Every zeta process with this exact endpoint (the TUI, `zeta -p`, and
+`zeta serve`) starts the receiver when none is running for its home. Any
+other endpoint, even another loopback address or path, is an external
+collector, and zeta never starts anything for it.
+
+- The receiver runs as `zeta otel receiver` in its own process session. It
+  outlives the zeta process that started it, because the home's other zeta
+  processes export to it too. Stop it with `kill <pid>`; the next zeta
+  process starts it again.
+- When several processes start at the same time, the receiver's lock on
+  `$ZETA_HOME/telemetry/receiver.lock` keeps one; the others exit. The lock is
+  released when the process ends, also after a crash, so a new receiver can
+  start.
+- Each zeta process checks the receiver's `/health` every 10 seconds on a
+  background thread. If a launch does not answer within 15 seconds, it tries
+  again after 1, 2, 4, and 8 seconds. After five failed launches in a row it
+  stops trying and shows `error`; run `zeta otel receiver` by hand to see why.
+- If the `otel` extra is not installed, startup stops with
+  `OpenTelemetry support is not installed; install zeta[otel]`.
+
+`zeta otel receiver` still works by hand, for example with an external
+endpoint or to see its errors. It exits with `already running at
+http://127.0.0.1:4323` when the home's receiver already runs.
+
 ## status
 
 The TUI `/status` card has one line:
@@ -111,6 +145,16 @@ The TUI `/status` card has one line:
 - `otel: off`
 - `otel: healthy (127.0.0.1:4318)`
 - `otel: degraded (export unavailable)`
+
+With the built-in endpoint, a second line shows the receiver URL, its state
+(`starting`, `ready`, `stopped`, or `error`), and this process's latest export:
+
+- `otel receiver: http://127.0.0.1:4323/v1/traces ready, last export ok 3s ago`
+- `otel receiver: http://127.0.0.1:4323/v1/traces starting, no export yet`
+
+Serve `status` and `telemetry_status` show the same values (see
+[serve-protocol.md](serve-protocol.md)). Reading them never waits on the
+receiver.
 
 Export runs on a background thread, batched every 5 seconds. When a batch
 fails, the state becomes `degraded`; the next successful batch makes it

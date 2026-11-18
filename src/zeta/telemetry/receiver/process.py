@@ -93,6 +93,15 @@ def _running_home_id(host: str, port: int) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def receiver_ready(home: Path) -> bool:
+    """Whether the receiver on the fixed port answers with this home's id; blocks up to the health timeout."""
+    try:
+        home_id = _read_home_id(home / "telemetry" / "home-id")
+    except (OSError, RuntimeError):
+        return False
+    return _running_home_id(HOST, PORT) == home_id
+
+
 def _home_id(directory: Path) -> str:
     """A random, non-secret id for this zeta home, created once with mode 0600."""
     path = directory / "home-id"
