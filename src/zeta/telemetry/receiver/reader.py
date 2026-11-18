@@ -501,7 +501,7 @@ def _oldest(connection: sqlite3.Connection) -> tuple[int | None, int | None]:
 
 def _status(home: Path, endpoint: str | None, live: dict[str, Any], oldest: tuple[int | None, int | None] | None) -> dict[str, Any]:
     """``oldest`` is ``(oldest_raw_ns, oldest_rollup_ns)``, or None when there is no database."""
-    used = _used_bytes(database_path(home))
+    used = used_bytes(home)
     return {
         "enabled": oldest is not None and endpoint is not None,
         "receiver": live["receiver"] or ("ready" if receiver_ready(home) else "stopped"),
@@ -546,7 +546,8 @@ def _snapshot[T](home: Path, read: Callable[[sqlite3.Connection], T]) -> T:
         connection.close()
 
 
-def _used_bytes(path: Path) -> int:
+def used_bytes(home: Path) -> int:
+    path = database_path(home)
     total = 0
     for suffix in ("", "-wal", "-shm"):
         try:

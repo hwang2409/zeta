@@ -152,6 +152,7 @@ class Settings:
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
     otel_endpoint: str | None = None
+    redacted_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,7 +230,25 @@ def validate_home_settings(raw: bytes, home: str | Path) -> Settings:
 
     notices: list[str] = []
     path = Path(home).expanduser() / SETTINGS_FILENAME
-    return _load_layers(_parse_bytes(raw, path, notices), path, {}, None, notices).settings
+    data = _parse_bytes(raw, path, notices)
+    settings = _load_layers(data, path, {}, None, notices).settings
+    return replace(settings, redacted_keys=tuple(sorted(_secret_keys(data))))
+
+
+# Only disclose recognized field names, never arbitrary table names or values.
+_SECRET_KEYS = {"api_key", "access_token", "refresh_token", "token", "client_secret", "password", "secret"}
+
+
+def _secret_keys(data: Mapping[str, Any]) -> set[str]:
+    keys = set()
+    pending = [data]
+    while pending:
+        for key, value in pending.pop().items():
+            if key.casefold() in _SECRET_KEYS:
+                keys.add(key)
+            if isinstance(value, Mapping):
+                pending.append(value)
+    return keys
 
 
 def _load_layers(

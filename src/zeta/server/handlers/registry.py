@@ -29,6 +29,7 @@ from . import (
 from .run_work import cancel_background_task, list_run_work
 from .settings import home_settings_get, home_settings_update
 from .state import (
+    state_accounts,
     state_agents,
     state_attention,
     state_background_tasks,
@@ -38,8 +39,11 @@ from .state import (
     state_memory,
     state_memory_detail,
     state_projects,
+    state_retention,
     state_session,
     state_sessions,
+    state_settings,
+    state_storage,
 )
 from .telemetry import (
     telemetry_agent_tree,
@@ -508,6 +512,10 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.STATE_INBOX: state_inbox,
     MethodDescriptor.STATE_INBOX_DETAIL: state_inbox_detail,
     MethodDescriptor.STATE_ATTENTION: state_attention,
+    MethodDescriptor.STATE_SETTINGS: state_settings,
+    MethodDescriptor.STATE_ACCOUNTS: state_accounts,
+    MethodDescriptor.STATE_STORAGE: state_storage,
+    MethodDescriptor.STATE_RETENTION: state_retention,
     MethodDescriptor.TELEMETRY_STATUS: telemetry_status,
     MethodDescriptor.TELEMETRY_SESSIONS: telemetry_sessions,
     MethodDescriptor.TELEMETRY_TRACE: telemetry_trace,
@@ -522,6 +530,18 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
+
+
+# Keep the complete v1 contract explicit: missing descriptors or handlers must not negotiate.
+STATE_READ_V1 = frozenset({
+    "state_projects", "state_memory", "state_memory_detail", "state_inbox", "state_inbox_detail",
+    "state_sessions", "state_session", "state_agents", "state_background_tasks", "state_attention",
+    "state_catalog", "state_settings", "state_accounts", "state_storage", "state_retention",
+})
+
+
+def state_read_available() -> bool:
+    return STATE_READ_V1 == {method.wire for method in HANDLERS if method.feature == "state_read_v1"}
 
 
 def _require_attached_session(runtime: Any, params: dict[str, Any]) -> None:
