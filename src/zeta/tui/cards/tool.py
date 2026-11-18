@@ -11,7 +11,7 @@ from rich.console import ConsoleOptions, Group, RenderableType
 from rich.syntax import Syntax
 from rich.text import Text
 
-from ...core.code_audit import code_projection
+from ...core.context_parts.code_audit import code_projection
 from ...protocol.types import StreamEvent, ToolCall, flatten_tool_content
 from .. import theme
 from .base import (
@@ -434,6 +434,8 @@ def code_tool_card(event: StreamEvent, running: bool) -> RenderableType:
         omitted = projection.get("omitted_calls", 0)
         count = len(calls) + (omitted if type(omitted) is int else 0)
         label = f"{count} calls · emitted {len(result.content)} chars"
+    if result is not None and result.is_error:
+        label += " · error"
     header = header_with_status(Text("code", style=theme.COMMAND), Text(f"· {label}", style=theme.DIM))
     if running:
         return tool_panel(call, Text("running…", style=theme.DIM), header=header)

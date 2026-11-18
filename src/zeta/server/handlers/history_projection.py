@@ -10,7 +10,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ...agent.turn_limit import project_notification_data, project_tool_result_data
-from ...core.code_audit import nested_approval_anchors, nested_call_data
+from ...core.context_parts.code_audit import nested_approval_anchors, nested_call_data
 from ...core.store._client_delivery import CLIENT_DELIVERY_METADATA
 from ...protocol.types import (
     FAILED_TURN_ERROR,

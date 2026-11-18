@@ -550,6 +550,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 raise ValueError(f"{capability} must accept execution_context")
         frame = inspect.currentframe()
         caller = None if frame is None else frame.f_back
+        del frame  # Do not keep a self-referencing frame alive with GC disabled.
         if caller is not None and caller.f_code is ToolRegistry.register_session_tool.__code__:
             caller = caller.f_back
         origin = (

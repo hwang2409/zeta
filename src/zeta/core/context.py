@@ -28,7 +28,7 @@ from .context_parts.admission import (
     SessionRequestAdmission,
     ollama_model_window_guidance,
 )
-from .code_audit import code_projection, nested_approval_anchors
+from .context_parts.code_audit import code_projection, nested_approval_anchors
 from .store import ConversationEntry, ConversationStore
 from .store._client_delivery import without_client_delivery_marker
 from ..context_eviction import (

@@ -4,8 +4,8 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 
-from ..protocol.types import ASSISTANT_RESPONSE_SYNTHETIC
-from .store import ConversationEntry
+from ...protocol.types import ASSISTANT_RESPONSE_SYNTHETIC
+from ..store import ConversationEntry
 
 
 def nested_approval_anchors(entries: Sequence[ConversationEntry]) -> dict[str, str]:

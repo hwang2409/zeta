@@ -23,7 +23,7 @@ from ..core.checkpoints.workspace import (
     WorkspaceSnapshotStore,
     git_repo_root,
 )
-from ..core.code_audit import code_projection, nested_call_data
+from ..core.context_parts.code_audit import code_projection, nested_call_data
 from ..core.gc_policy import freeze_long_lived_heap
 from ..protocol.types import (
     FAILED_TURN_ERROR,

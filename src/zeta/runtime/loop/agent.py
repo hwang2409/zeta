@@ -43,8 +43,8 @@ from ...agent.tool_results import validated_tool_result as _validated_tool_resul
 from ...agent.turn_limit import ChildTurnControl
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
-from ...core.code_audit import nested_approval_anchors
 from ...core.context import BudgetExceeded, ContextAssembler
+from ...core.context_parts.code_audit import nested_approval_anchors
 from ...core.hooks import HookManager
 from ...core.session_links import ChildLineagePublisher
 from ...core.store import ConversationStore
