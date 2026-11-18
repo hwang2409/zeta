@@ -388,13 +388,15 @@ func drag(_ path: [CGPoint], killSource: Flag? = nil) throws {
     try checkKilled(killSource)
 }
 
+func makeScrollEvent(dx: Int, dy: Int) -> CGEvent? {
+    CGEvent(
+        scrollWheelEvent2Source: eventSource, units: .line, wheelCount: 2, wheel1: Int32(dy),
+        wheel2: Int32(dx), wheel3: 0)
+}
+
 func scroll(at point: CGPoint, dx: Int, dy: Int, flags: CGEventFlags = []) throws {
     try moveMouse(point)
-    guard
-        let event = CGEvent(
-            scrollWheelEvent2Source: eventSource, units: .line, wheelCount: 2, wheel1: Int32(dy),
-            wheel2: Int32(dx), wheel3: 0)
-    else { return }
+    guard let event = makeScrollEvent(dx: dx, dy: dy) else { return }
     event.flags = flags
     try eventGate.post(event, type: .scrollWheel, point: point, button: .left)
 }
@@ -750,6 +752,25 @@ func selfTestKill() {
     }
 }
 
+func selfTestScroll() {
+    func values(dx: Int, dy: Int) -> (axis1: Int64, axis2: Int64) {
+        guard let event = makeScrollEvent(dx: dx, dy: dy) else {
+            preconditionFailure("scroll event construction failed")
+        }
+        return (
+            event.getIntegerValueField(.scrollWheelEventDeltaAxis1),
+            event.getIntegerValueField(.scrollWheelEventDeltaAxis2))
+    }
+
+    let up = values(dx: 0, dy: 3)
+    precondition(up.axis1 == 3 && up.axis2 == 0, "up scroll axis mapping is wrong")
+    let down = values(dx: 0, dy: -2)
+    precondition(down.axis1 == -2 && down.axis2 == 0, "down scroll axis mapping is wrong")
+    let horizontal = values(dx: 4, dy: 0)
+    precondition(horizontal.axis1 == 0 && horizontal.axis2 == 4, "horizontal scroll axis mapping is wrong")
+    print("scroll self-test ok")
+}
+
 func selfTestLifecycle() {
     selfTestMode = true
     let captureDone = DispatchSemaphore(value: 0)
@@ -802,6 +823,10 @@ if CommandLine.arguments.contains("--selftest-kill") {
 }
 if CommandLine.arguments.contains("--selftest-lifecycle") {
     selfTestLifecycle()
+    exit(0)
+}
+if CommandLine.arguments.contains("--selftest-scroll") {
+    selfTestScroll()
     exit(0)
 }
 installKillSwitch()
