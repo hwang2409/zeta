@@ -168,7 +168,8 @@ def test_prepare_home_does_not_change_process_environment(tmp_path: Path, monkey
     monkeypatch.setenv("ZETA_ACCOUNT_HOME", "sentinel-account")
     before = {key: os.environ.get(key) for key in ("ZETA_HOME", "ZETA_ACCOUNT_HOME")}
     with run_module.prepare_home(tmp_path):
-        pass
+        assert os.environ["ZETA_HOME"] == str(tmp_path / "zeta-home")
+        assert os.environ["ZETA_ACCOUNT_HOME"] == str(Path.home() / ".zeta")
     after = {key: os.environ.get(key) for key in before}
     assert after == before
 
