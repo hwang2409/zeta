@@ -145,12 +145,12 @@ class ReadCatalog:
             return await self._run(page)
 
     async def project_state(
-        self, home: Path, method: str, params: dict[str, Any], fits: Callable[[dict[str, Any]], bool],
+        self, home: Path, collection: str, params: dict[str, Any], fits: Callable[[dict[str, Any]], bool],
     ) -> dict[str, Any]:
-        scope, start, limit = project_state.request(method, params)
-        rows = await self._share((home, *scope), lambda: project_state.snapshot(home, scope, _stable_snapshot))
+        scope, start, limit = project_state.request(collection, params)
+        rows = await self._share((home, "project_state", *scope), lambda: project_state.snapshot(home, scope, _stable_snapshot))
         async with self._slot:
-            return await self._run(lambda: project_state.page(method, rows, start, limit, fits))
+            return await self._run(lambda: project_state.page(collection, rows, start, limit, fits))
 
     async def _rows(self, home: Path, kind: str) -> list[dict[str, str]]:
         return await self._share((home, kind), lambda: _snapshot(home, kind))
