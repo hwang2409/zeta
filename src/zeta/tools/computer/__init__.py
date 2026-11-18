@@ -13,7 +13,7 @@ from ...media.image_normalization import normalize_image_bytes
 from ...protocol.types import StructuredToolResult
 from .._results import text_block
 from ..registry import ToolRegistry
-from .backend import Button, ComputerBackend, ComputerError, ScreenState
+from .backend import Button, ComputerBackend, ComputerError, Modifiers, ScreenState
 from .scaling import (
     OutOfBounds,
     ScreenGeometry,
@@ -22,7 +22,7 @@ from .scaling import (
     to_model_point,
 )
 
-_SCROLL_UNIT = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
+_SCROLL_UNIT = {"up": (0, 1), "down": (0, -1), "left": (1, 0), "right": (-1, 0)}
 _REFUSAL_REASON = {"locked": "the screen is locked", "secure_input": "a password field or secure input is active", "killed": "the kill switch is engaged; restart the helper to re-enable control"}
 
 
@@ -52,16 +52,27 @@ class _ActionSpec:
     followup_capture: bool = False
 
 
-def _point(geometry: ScreenGeometry | None, args: dict[str, Any], field: str = "coordinate") -> tuple[int, int]:
+def _point(geometry: ScreenGeometry | None, args: dict[str, Any], field: str = "coordinate") -> tuple[int, int] | None:
+    value = args.get(field)
+    if value is None:
+        return None
     if geometry is None:
         raise _BadAction("take a screenshot first")
-    value = args.get(field)
     if not isinstance(value, list) or len(value) != 2 or not all(type(v) is int for v in value):
         raise _BadAction(f"{field} must be an [x, y] integer pair")
     try:
         return to_backend_point(geometry, value[0], value[1])
     except OutOfBounds as exc:
         raise _BadAction(str(exc)) from exc
+
+
+def _modifiers(args: dict[str, Any]) -> Modifiers:
+    value = args.get("modifiers", ())
+    if value == ():
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise _BadAction("modifiers must be a list of key names")
+    return tuple(value)
 
 
 def app_access(registry: ToolRegistry, bundle_id: str | None) -> bool:
@@ -108,29 +119,56 @@ async def _screenshot(registry: ToolRegistry, backend: ComputerBackend, args: di
 
 def _click(button: Button, count: int) -> _ActionHandler:
     async def handle(registry: ToolRegistry, backend: ComputerBackend, args: dict[str, Any]) -> _Handled:
-        await backend.click(*_point(registry.computer_geometry, args), button, count)
+        point = _point(registry.computer_geometry, args)
+        if point is None:
+            point = await backend.cursor_position()
+        modifiers = _modifiers(args)
+        if modifiers:
+            await backend.click(*(point or (None, None)), button, count, modifiers)
+        else:
+            await backend.click(*(point or (None, None)), button, count)
         return _Handled()
 
     return handle
 
 
 async def _move(registry: ToolRegistry, backend: ComputerBackend, args: dict[str, Any]) -> _Handled:
-    await backend.move(*_point(registry.computer_geometry, args))
+    point = _point(registry.computer_geometry, args)
+    if point is None:
+        raise _BadAction("mouse_move requires coordinate")
+    await backend.move(*point)
     return _Handled()
 
 
 async def _drag(registry: ToolRegistry, backend: ComputerBackend, args: dict[str, Any]) -> _Handled:
-    await backend.drag([_point(registry.computer_geometry, args, "start_coordinate"), _point(registry.computer_geometry, args)])
+    raw_path = args.get("path")
+    if raw_path is not None:
+        if not isinstance(raw_path, list) or not raw_path:
+            raise _BadAction("path must be a nonempty list of coordinates")
+        path = [_point(registry.computer_geometry, {"coordinate": value}) for value in raw_path]
+    else:
+        start = _point(registry.computer_geometry, args, "start_coordinate")
+        end = _point(registry.computer_geometry, args)
+        if start is None or end is None:
+            raise _BadAction("drag requires start_coordinate and coordinate")
+        path = [start, end]
+    await backend.drag(path)
     return _Handled()
 
 
 async def _mouse_down(registry: ToolRegistry, backend: ComputerBackend, args: dict[str, Any]) -> _Handled:
-    await backend.mouse_down(*_point(registry.computer_geometry, args), "left")
+    point = _point(registry.computer_geometry, args)
+    if point is None:
+        raise _BadAction("mouse_down requires coordinate")
+    await backend.mouse_down(*point, "left")
     return _Handled()
 
 
 async def _mouse_up(registry: ToolRegistry, backend: ComputerBackend, args: dict[str, Any]) -> _Handled:
-    await backend.mouse_up(*_point(registry.computer_geometry, args), "left")
+    point = _point(registry.computer_geometry, args)
+    if point is None:
+        raise _BadAction("mouse_up requires coordinate")
+    await backend.mouse_up(*point, "left")
     return _Handled()
 
 
@@ -146,12 +184,22 @@ async def _key(registry: ToolRegistry, backend: ComputerBackend, args: dict[str,
     text = args.get("text")
     if type(text) is not str or not text:
         raise _BadAction("key requires a nonempty key combo in text")
-    await backend.key(text)
+    repeat = args.get("repeat", 1)
+    if type(repeat) is not int or not 1 <= repeat <= 100:
+        raise _BadAction("repeat must be an integer from 1 to 100")
+    hold = args.get("hold", False)
+    release = args.get("release", False)
+    if type(hold) is not bool or type(release) is not bool or hold and release:
+        raise _BadAction("hold and release must be exclusive boolean flags")
+    await backend.key(text, repeat, hold, release)
     return _Handled()
 
 
 async def _scroll(registry: ToolRegistry, backend: ComputerBackend, args: dict[str, Any]) -> _Handled:
-    x, y = _point(registry.computer_geometry, args)
+    point = _point(registry.computer_geometry, args)
+    if point is None:
+        point = await backend.cursor_position()
+    x, y = point
     direction = args.get("scroll_direction")
     amount = args.get("scroll_amount", 1)
     if direction not in _SCROLL_UNIT:
@@ -159,7 +207,11 @@ async def _scroll(registry: ToolRegistry, backend: ComputerBackend, args: dict[s
     if type(amount) is not int or amount < 1:
         raise _BadAction("scroll_amount must be a positive integer")
     dx, dy = _SCROLL_UNIT[direction]
-    await backend.scroll(x, y, dx * amount, dy * amount)
+    modifiers = _modifiers(args)
+    if modifiers:
+        await backend.scroll(x, y, dx * amount, dy * amount, modifiers)
+    else:
+        await backend.scroll(x, y, dx * amount, dy * amount)
     return _Handled()
 
 
@@ -172,7 +224,10 @@ async def _cursor_position(registry: ToolRegistry, backend: ComputerBackend, arg
 
 
 async def _wait(registry: ToolRegistry, backend: ComputerBackend, args: dict[str, Any]) -> _Handled:
-    await asyncio.sleep(1)
+    duration = args.get("duration", 1)
+    if type(duration) not in (int, float) or not 0 <= duration <= 10:
+        raise _BadAction("duration must be between 0 and 10 seconds")
+    await asyncio.sleep(duration)
     return _Handled()
 
 
@@ -288,4 +343,4 @@ async def _computer(registry: ToolRegistry, arguments: dict[str, Any]) -> Struct
 def register(registry: ToolRegistry) -> None:
     if not registry.computer_enabled:
         return
-    registry.register_session_tool("computer", _computer, binding="loop", approval_subject="action", description="Control the native desktop: capture a screenshot, move/click the mouse, type, press keys, drag, and scroll. Actions that change the screen return a fresh screenshot.", parameters={"type": "object", "properties": {"action": {"type": "string", "enum": list(_ACTION_HANDLERS)}, "coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "start_coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "text": {"type": "string"}, "scroll_direction": {"type": "string", "enum": list(_SCROLL_UNIT)}, "scroll_amount": {"type": "integer", "minimum": 1}, "display": {"type": "integer", "minimum": 0}}, "required": ["action"], "additionalProperties": False}, validation_error_result=_validation_error_result)
+    registry.register_session_tool("computer", _computer, binding="loop", approval_subject="action", description="Control the native desktop: capture a screenshot, move/click the mouse, type, press keys, drag, and scroll. Actions that change the screen return a fresh screenshot.", parameters={"type": "object", "properties": {"action": {"type": "string", "enum": list(_ACTION_HANDLERS)}, "coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "start_coordinate": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "path": {"type": "array", "items": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "minItems": 1}, "text": {"type": "string"}, "modifiers": {"type": "array", "items": {"type": "string"}}, "repeat": {"type": "integer", "minimum": 1, "maximum": 100}, "hold": {"type": "boolean"}, "release": {"type": "boolean"}, "duration": {"type": "number", "minimum": 0, "maximum": 10}, "scroll_direction": {"type": "string", "enum": list(_SCROLL_UNIT)}, "scroll_amount": {"type": "integer", "minimum": 1}, "display": {"type": "integer", "minimum": 0}}, "required": ["action"], "additionalProperties": False}, validation_error_result=_validation_error_result)

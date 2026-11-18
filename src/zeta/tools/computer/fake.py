@@ -60,8 +60,10 @@ class FakeBackend:
         self.actions.append(("move", x, y))
         self.cursor = (x, y)
 
-    async def click(self, x: int, y: int, button: Button, count: int) -> None:
-        self.actions.append(("click", x, y, button, count))
+    async def click(self, x: int | None, y: int | None, button: Button, count: int, modifiers: tuple[str, ...] = ()) -> None:
+        if x is None or y is None:
+            x, y = self.cursor
+        self.actions.append(("click", x, y, button, count) if not modifiers else ("click", x, y, button, count, modifiers))
         self.cursor = (x, y)
 
     async def mouse_down(self, x: int, y: int, button: Button) -> None:
@@ -80,11 +82,13 @@ class FakeBackend:
     async def type_text(self, text: str) -> None:
         self.actions.append(("type_text", text))
 
-    async def key(self, combo: str) -> None:
-        self.actions.append(("key", combo))
+    async def key(self, combo: str, repeat: int = 1, hold: bool = False, release: bool = False) -> None:
+        self.actions.append(("key", combo) if (repeat, hold, release) == (1, False, False) else ("key", combo, repeat, hold, release))
 
-    async def scroll(self, x: int, y: int, dx: int, dy: int) -> None:
-        self.actions.append(("scroll", x, y, dx, dy))
+    async def scroll(self, x: int | None, y: int | None, dx: int, dy: int, modifiers: tuple[str, ...] = ()) -> None:
+        if x is None or y is None:
+            x, y = self.cursor
+        self.actions.append(("scroll", x, y, dx, dy) if not modifiers else ("scroll", x, y, dx, dy, modifiers))
         self.cursor = (x, y)
 
     async def cursor_position(self) -> tuple[int, int]:

@@ -173,6 +173,15 @@ struct Capture {
     let originY: Int
 }
 
+func captureWithSafety<T>(
+    _ safety: @escaping () throws -> Void, _ capture: () async throws -> T
+) async throws -> T {
+    try safety()
+    let value = try await capture()
+    try safety()
+    return value
+}
+
 func captureDisplay(_ index: Int) throws -> Capture {
     let sem = DispatchSemaphore(value: 0)
     var result: Capture?
@@ -198,12 +207,17 @@ func captureDisplay(_ index: Int) throws -> Capture {
             config.width = pxWidth
             config.height = pxHeight
             config.showsCursor = true
-            let cgImage = try await SCScreenshotManager.captureImage(
-                contentFilter: filter, configuration: config)
+            // The desktop can become protected while ScreenCaptureKit awaits content or pixels.
+            let cgImage = try await captureWithSafety(guardSafety) {
+                try await SCScreenshotManager.captureImage(
+                    contentFilter: filter, configuration: config)
+            }
             let rep = NSBitmapImageRep(cgImage: cgImage)
             guard let png = rep.representation(using: .png, properties: [:]) else {
                 throw HelperError.internalError("png encode failed")
             }
+            // Refuse bytes if protection began during encoding as well.
+            try guardSafety()
             result = Capture(
                 pngBase64: png.base64EncodedString(),
                 width: cgImage.width, height: cgImage.height, scale: scale,
@@ -264,6 +278,14 @@ final class EventGate {
         }
     }
 
+    func postKey(_ event: CGEvent, keycode: CGKeyCode, flags: CGEventFlags, down: Bool) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !killed.isSet else { throw HelperError.killed }
+        poster(event)
+        if down { heldKeys[keycode] = flags } else { heldKeys.removeValue(forKey: keycode) }
+    }
+
     func postKeyPair(_ down: CGEvent, _ up: CGEvent, keycode: CGKeyCode, flags: CGEventFlags) throws {
         lock.lock()
         defer { lock.unlock() }
@@ -302,10 +324,27 @@ var activeKill = killed
 killed.observe { DispatchQueue.global().async { eventGate.kill() } }
 func currentKill() -> Flag { activeKill }
 
-func postMouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, clickState: Int = 1) throws {
+func modifierFlags(_ raw: Any?) -> CGEventFlags {
+    guard let names = raw as? [String] else { return [] }
+    var flags: CGEventFlags = []
+    for name in names {
+        switch name.lowercased() {
+        case "cmd", "command", "meta", "super": flags.insert(.maskCommand)
+        case "shift": flags.insert(.maskShift)
+        case "ctrl", "control": flags.insert(.maskControl)
+        case "opt", "option", "alt": flags.insert(.maskAlternate)
+        case "fn", "function": flags.insert(.maskSecondaryFn)
+        default: break
+        }
+    }
+    return flags
+}
+
+func postMouse(_ type: CGEventType, _ point: CGPoint, _ button: CGMouseButton, clickState: Int = 1, flags: CGEventFlags = []) throws {
     guard let event = CGEvent(mouseEventSource: eventSource, mouseType: type,
                               mouseCursorPosition: point, mouseButton: button) else { return }
     if clickState > 1 { event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState)) }
+    event.flags = flags
     try eventGate.post(event, type: type, point: point, button: button)
 }
 
@@ -326,12 +365,12 @@ func runInterruptibleSteps<Step>(
     }
 }
 
-func click(_ point: CGPoint, button name: String, count: Int) throws {
+func click(_ point: CGPoint, button name: String, count: Int, flags: CGEventFlags = []) throws {
     let b = try mouseButton(name)
     let n = max(1, min(count, 3))
     try runInterruptibleSteps(1...n, killSource: currentKill()) { i in
-        try postMouse(b.down, point, b.button, clickState: i)
-        try postMouse(b.up, point, b.button, clickState: i)
+        try postMouse(b.down, point, b.button, clickState: i, flags: flags)
+        try postMouse(b.up, point, b.button, clickState: i, flags: flags)
     }
 }
 
@@ -349,13 +388,14 @@ func drag(_ path: [CGPoint], killSource: Flag? = nil) throws {
     try checkKilled(killSource)
 }
 
-func scroll(at point: CGPoint, dx: Int, dy: Int) throws {
+func scroll(at point: CGPoint, dx: Int, dy: Int, flags: CGEventFlags = []) throws {
     try moveMouse(point)
     guard
         let event = CGEvent(
-            scrollWheelEvent2Source: eventSource, units: .pixel, wheelCount: 2, wheel1: Int32(dy),
+            scrollWheelEvent2Source: eventSource, units: .line, wheelCount: 2, wheel1: Int32(dy),
             wheel2: Int32(dx), wheel3: 0)
     else { return }
+    event.flags = flags
     try eventGate.post(event, type: .scrollWheel, point: point, button: .left)
 }
 
@@ -388,7 +428,7 @@ let keyCodes: [String: CGKeyCode] = [
     "f9": 101, "f10": 109, "f11": 103, "f12": 111,
 ]
 
-func keyCombo(_ combo: String) throws {
+func keyCombo(_ combo: String, repeatCount: Int = 1, hold: Bool = false, release: Bool = false) throws {
     try checkKilled(currentKill())
     let parts = combo.lowercased().split(separator: "+").map(String.init)
     guard !parts.isEmpty else { throw HelperError.badRequest("empty key combo") }
@@ -415,7 +455,12 @@ func keyCombo(_ combo: String) throws {
     else { throw HelperError.internalError("could not create key event") }
     down.flags = flags
     up.flags = flags
-    try eventGate.postKeyPair(down, up, keycode: code, flags: flags)
+    let count = max(1, min(repeatCount, 100))
+    if hold || release {
+        try eventGate.postKey(hold ? down : up, keycode: code, flags: flags, down: hold)
+    } else {
+        for _ in 0..<count { try eventGate.postKeyPair(down, up, keycode: code, flags: flags) }
+    }
 }
 
 // MARK: - request handling
@@ -427,15 +472,22 @@ func intArg(_ req: [String: Any], _ key: String) throws -> Int {
 }
 
 func pointArg(_ req: [String: Any]) throws -> CGPoint {
+    if req["x"] == nil && req["y"] == nil {
+        return CGEvent(source: nil)?.location ?? .zero
+    }
     return CGPoint(x: Double(try intArg(req, "x")), y: Double(try intArg(req, "y")))
 }
 
 var selfTestMode = false
 
-func guardInput() throws {
-    if selfTestMode { return }
+func guardSafety() throws {
     if screenIsLocked() { throw HelperError.locked }
     if secureInputEnabled() || securityPromptFrontmost() { throw HelperError.secureInput }
+}
+
+func guardInput() throws {
+    if selfTestMode { return }
+    try guardSafety()
     if !AXIsProcessTrusted() { throw HelperError.notPermitted("Accessibility permission is required") }
 }
 
@@ -450,7 +502,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
     case "state":
         return [
             "locked": screenIsLocked(),
-            "secure_input": secureInputEnabled(),
+            "secure_input": secureInputEnabled() || securityPromptFrontmost(),
             "frontmost_bundle_id": frontmostBundleID(),
         ]
     case "cursor_position":
@@ -458,7 +510,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         // Use the same nearest-integer rule as all integer input coordinates.
         return ["x": Int(loc.x.rounded()), "y": Int(loc.y.rounded())]
     case "screenshot":
-        if screenIsLocked() { throw HelperError.locked }
+        try guardSafety()
         if !CGPreflightScreenCaptureAccess() {
             throw HelperError.notPermitted(
                 "Screen Recording permission is required; turn it on in System Settings > " +
@@ -478,7 +530,7 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         try guardInput()
         let button = (req["button"] as? String) ?? "left"
         let count = (req["count"] as? Int) ?? 1
-        try click(try pointArg(req), button: button, count: count)
+        try click(try pointArg(req), button: button, count: count, flags: modifierFlags(req["modifiers"]))
         return [:]
     case "mouse_down":
         try guardInput()
@@ -518,11 +570,15 @@ func handle(_ op: String, _ req: [String: Any]) throws -> [String: Any] {
         guard let combo = req["combo"] as? String else {
             throw HelperError.badRequest("key needs combo")
         }
-        try keyCombo(combo)
+        let repeatCount = (req["repeat"] as? Int) ?? 1
+        let hold = (req["hold"] as? Bool) ?? false
+        let release = (req["release"] as? Bool) ?? false
+        if hold && release { throw HelperError.badRequest("hold and release are exclusive") }
+        try keyCombo(combo, repeatCount: repeatCount, hold: hold, release: release)
         return [:]
     case "scroll":
         try guardInput()
-        try scroll(at: try pointArg(req), dx: try intArg(req, "dx"), dy: try intArg(req, "dy"))
+        try scroll(at: try pointArg(req), dx: try intArg(req, "dx"), dy: try intArg(req, "dy"), flags: modifierFlags(req["modifiers"]))
         return [:]
     default:
         throw HelperError.badRequest("unknown op: \(op)")
@@ -583,6 +639,13 @@ final class Indicator {
 let stdout = FileHandle.standardOutput
 let responseLock = NSLock()
 let actionQueue = DispatchQueue(label: "zeta-computer-helper.actions")
+
+func shutdown(eventGate: EventGate, kill: Flag, queue: DispatchQueue) {
+    // Stop new posts, drain accepted work, then release again. EventGate.kill is idempotent.
+    kill.set()
+    queue.sync {}
+    eventGate.kill()
+}
 
 func writeResponse(_ dict: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: dict) else { return }
@@ -687,12 +750,58 @@ func selfTestKill() {
     }
 }
 
+func selfTestLifecycle() {
+    selfTestMode = true
+    let captureDone = DispatchSemaphore(value: 0)
+    var captureResult = ""
+    var safetyCalls = 0
+    Task {
+        do {
+            _ = try await captureWithSafety({
+                safetyCalls += 1
+                if safetyCalls == 2 { throw HelperError.secureInput }
+            }) { "png-bytes" }
+            captureResult = "returned"
+        } catch {
+            captureResult = "refused"
+        }
+        captureDone.signal()
+    }
+    captureDone.wait()
+
+    let flag = Flag()
+    let queue = DispatchQueue(label: "zeta-computer-helper.selftest-shutdown")
+    var events: [String] = []
+    let gate = EventGate(killed: flag) { event in
+        if event.type == .leftMouseDown { events.append("mouse_down") }
+        if event.type == .leftMouseUp { events.append("mouse_up") }
+        if event.type == .keyDown { events.append("key_down") }
+        if event.type == .keyUp { events.append("key_up") }
+    }
+    let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                       mouseCursorPosition: .zero, mouseButton: .left)!
+    let key = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)!
+    try? gate.post(down, type: .leftMouseDown, point: .zero, button: .left)
+    try? gate.postKey(key, keycode: 0, flags: [], down: true)
+    queue.async {
+        try? gate.post(down, type: .leftMouseDown, point: .zero, button: .left)
+    }
+    shutdown(eventGate: gate, kill: flag, queue: queue)
+    print((try? JSONSerialization.data(withJSONObject: [
+        "capture": captureResult, "safety_calls": safetyCalls, "events": events,
+    ])).flatMap { String(data: $0, encoding: .utf8) } ?? "{}")
+}
+
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let indicator = Indicator()
 killed.observe { DispatchQueue.main.async { indicator.hide() } }
 if CommandLine.arguments.contains("--selftest-kill") {
     selfTestKill()
+    exit(0)
+}
+if CommandLine.arguments.contains("--selftest-lifecycle") {
+    selfTestLifecycle()
     exit(0)
 }
 installKillSwitch()
@@ -718,7 +827,7 @@ Thread {
             runRequest(id: id, op: op, request: req, indicator: indicator, sink: writeResponse)
         }
     }
-    actionQueue.sync {}
+    shutdown(eventGate: eventGate, kill: activeKill, queue: actionQueue)
     DispatchQueue.main.sync {
         indicator.hide()
         app.terminate(nil)

@@ -142,6 +142,21 @@ class HelperClient:
             raise HelperError(error["code"], error["message"])
         return {k: v for k, v in response.items() if k not in ("id", "ok")}
 
+    def cancel(self) -> None:
+        """Close stdin so the helper releases held input before a forced fallback kill."""
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            self._kill()
+
     def _kill(self) -> None:
         proc = self._proc
         if proc is not None and proc.poll() is None:
