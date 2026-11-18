@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import io
 import json
 
@@ -13,9 +15,13 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
+    MessageRole,
+
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolUseContent,
+
 )
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
@@ -35,7 +41,7 @@ pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
 async def run_script(tmp_path, script, *, policy=None, delegated=False, configure=None, on_event=None):
     skills = SkillCatalog.empty()
-    store = ConversationStore(tmp_path / "session")
+    store = ConversationStore(tmp_path / "session", session_id="test")
     if delegated:
         policy = ChildApprovalPolicy(policy, store, "proof", "code-child", child_cwd=tmp_path)
     registry = ToolRegistry(tmp_path, session_store=store, skill_catalog=skills,
@@ -53,7 +59,9 @@ async def run_script(tmp_path, script, *, policy=None, delegated=False, configur
         async for event in loop.run_turn("run the script", origin=MessageOrigin.USER):
             events.append(event)
             if on_event is not None:
-                on_event(event)
+                reply = on_event(event)
+                if inspect.isawaitable(reply):
+                    await await_or_fail(reply, what="test event handler")
 
     try:
         await await_or_fail(collect(), what="code mode turn settles")
@@ -198,3 +206,59 @@ async def test_unexposed_controls(tmp_path):
         """.replace("NAMES", json.dumps(names)), configure=configure)
     assert json.loads(result.content) == [f"tool {name!r} is not exposed to code mode" for name in names]
     assert not [event for event in events if event.data.get("code_parent_id") == "outer"]
+
+
+async def test_restart_does_not_resume_inner_call(tmp_path):
+    root = tmp_path / "session"
+    store = ConversationStore(root, session_id="interrupted")
+    outer = ToolCall("outer", "code", {"script": "output(null)"})
+    inner = ToolCall("outer:code:1", "write", {"path": "never", "content": "changed"})
+    try:
+        store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(outer)]))
+        store.append_approval_request(inner.id, inner)
+    finally:
+        store.close()
+    store = ConversationStore(root, session_id="interrupted")
+    skills = SkillCatalog.empty()
+    registry = ToolRegistry(tmp_path, session_store=store, skill_catalog=skills,
+                            approval_policy=ApprovalPolicy(), code_mode_enabled=True)
+    loop = AgentLoop(FakeBackend([]), store, registry=registry, skill_catalog=skills, skip_mcp_mount=True)
+    try:
+        await await_or_fail(loop.activate(), what="recover interrupted code invocation")
+        assert store.approval_state_now(inner.id)[1] == "abort"
+        assert store.tool_result(inner.id).is_canceled
+        assert (await await_or_fail(loop.resume_pending_tool(inner.id), what="refuse standalone nested resume")).is_canceled
+        assert not (tmp_path / "never").exists()
+        messages = await await_or_fail(loop.context_assembler.assemble(), what="assemble recovered conversation")
+        assert inner.id not in json.dumps([message.to_dict() for message in messages])
+    finally:
+        await await_or_fail(loop.close(), what="close recovered owner")
+        store.close()
+
+
+@pytest.mark.parametrize("delegated", [False, True], ids=["direct", "delegated"])
+async def test_cancel_pending_inner_approval(tmp_path, delegated):
+    policy = ApprovalPolicy()
+    awaiting_approval = asyncio.Event()
+    never = asyncio.Event()
+
+    async def hold(event):
+        if event.type is StreamEventType.TOOL_APPROVAL_START:
+            awaiting_approval.set()
+            await await_or_fail(never.wait(), what="hold unsettled approval until cancellation")
+
+    task = asyncio.create_task(run_script(tmp_path, "await tools.write({path: 'never', content: 'never'});",
+                                         policy=policy, delegated=delegated, on_event=hold))
+    try:
+        await await_or_fail(awaiting_approval.wait(), what="inner approval is durable")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(task, what="cancel code invocation and join guest")
+    store = ConversationStore(tmp_path / "session", session_id="test")
+    try:
+        assert store.approval_state_now("outer:code:1")[1] == "abort"
+        assert store.tool_result("outer:code:1").is_canceled
+        assert not (tmp_path / "never").exists()
+    finally:
+        store.close()
