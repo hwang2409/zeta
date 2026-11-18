@@ -25,7 +25,7 @@ START = "2026-11-08T00:00:00+00:00"
 
 
 async def seed(home, cwd):
-    manager = SessionManager(home)
+    manager = await asyncio.to_thread(SessionManager, home)
     with ExitStack() as cleanup:
         opened = await asyncio.to_thread(manager.create, provider="codex", model="offline", cwd=cwd, auto_project=False,
                                 name="synthetic", system_prompt=MARKER)
