@@ -36,7 +36,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application.current import set_app
+from prompt_toolkit.application.current import create_app_session, set_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
@@ -6477,6 +6477,48 @@ async def test_mcp_notices_suppressed_while_suspended_for_fork_and_rendered_afte
         assert notices == ["after resume"]
         pipe.send_text("\\x04")
         await asyncio.wait_for(resumed_task, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_code_cell_shortcut_reveals_source_after_inner_reads(tmp_path: Path) -> None:
+    app = _test_tui_app(ConversationStore(tmp_path / "sessions"), StringIO())
+    script = 'const pointer = await tools.read({path: "pointer"});'
+    outer = ToolCall("cell", "code", {"script": script})
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
+        session = app._make_session()
+        running = asyncio.create_task(app.run(session))
+        try:
+            await wait_until(lambda: app._input_loop_active)
+            app._handle_tool_event(
+                StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=outer)
+            )
+            reads = (("pointer", "target"), ("target", "selected-value"))
+            for index, (path, content) in enumerate(reads, start=1):
+                inner = ToolCall(f"cell:code:{index}", "read", {"path": path})
+                data = {"code_parent_id": outer.id, "code_call_index": index}
+                app._handle_tool_event(StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_START, tool_call=inner, data=data,
+                ))
+                app._handle_tool_event(StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END, tool_call=inner, data=data,
+                    tool_result=ToolResult(inner.id, content),
+                ))
+            app._handle_tool_event(StreamEvent(
+                StreamEventType.TOOL_EXECUTION_END, tool_call=outer,
+                tool_result=ToolResult(outer.id, "done"),
+            ))
+            before = Text.from_ansi(app._transcript.render(120)).plain
+            assert "selected-value" in before
+            assert script not in before
+            # The following character confirms the key processor consumed the chord.
+            pipe.send_text("\x18\x0fx")
+            await wait_until(lambda: session.default_buffer.text == "x")
+            after = Text.from_ansi(app._transcript.render(120)).plain
+            assert script in after, "Ctrl-X Ctrl-O did not reveal the code cell source"
+            assert "selected-value" in after
+        finally:
+            app.request_exit()
+            await asyncio.wait_for(running, timeout=10)
 
 
 def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
