@@ -161,6 +161,12 @@ class ErrorDescriptor(Enum):
         "the telemetry database schema is not the one this zeta reads",
     )
     RESULT_TOO_LARGE = (-32007, "result_too_large", "not even one item fits one frame")
+    INVALID_HOME_SETTINGS_PARAMS = (-32602, "invalid_params", "home settings parameters or changes are invalid")
+    CUSTOM_HOME_SETTING = (-32602, "custom_home_setting", "the setting has a custom value that serve does not change")
+    STALE_REVISION = (-32009, "stale_revision", "settings.toml changed since the given revision")
+    SETTINGS_BUSY = (-32009, "settings_busy", "another zeta process is writing settings.toml")
+    SETTINGS_MALFORMED = (-32000, "settings_malformed", "settings.toml does not parse or validate")
+    SETTINGS_UNSAFE = (-32000, "settings_unsafe", "settings.toml is a link or not a regular, unshared file")
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
         self.code = code
@@ -300,6 +306,7 @@ FEATURES = (
     "session_park",
     "tool_approval_origin",
     "telemetry_read_v1",
+    "home_settings_v1",
 )
 
 
@@ -403,6 +410,8 @@ class MethodDescriptor(Enum):
     TELEMETRY_STATUS = ("telemetry_status", None, "telemetry_read_v1", Access.READ)
     TELEMETRY_SESSIONS = ("telemetry_sessions", None, "telemetry_read_v1", Access.READ)
     TELEMETRY_TRACE = ("telemetry_trace", None, "telemetry_read_v1", Access.READ)
+    HOME_SETTINGS_GET = ("home_settings_get", None, "home_settings_v1", Access.READ)
+    HOME_SETTINGS_UPDATE = ("home_settings_update", None, "home_settings_v1", Access.CONTROLLER_WRITE)
 
     def __init__(
         self, wire: str, since: str | None, feature: str | None, access: Access

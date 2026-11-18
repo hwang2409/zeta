@@ -25,6 +25,14 @@ or tool text is put in spans.
 3. Restart zeta. Telemetry is read once at startup; the serve
    `set_settings` request does not change it.
 
+   A serve client with the `home_settings_v1` feature can turn the built-in
+   endpoint on or off instead. That update changes only the endpoint line
+   (under an existing `[otel]` header, else a top-level `otel.endpoint` line;
+   it never adds or removes the header), so on then off restores the file's
+   exact bytes. It publishes `settings.toml` with mode `0600` (an existing
+   `0644` file becomes `0600` on its first write); a no-op update does not
+   rewrite it.
+
 Rules for `[otel]`:
 
 - `endpoint` is the only key. Without it, telemetry is off: no OpenTelemetry

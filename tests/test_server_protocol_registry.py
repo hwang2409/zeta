@@ -1162,6 +1162,41 @@ STRUCTURED_ERROR_FIXTURES = (
         "result exceeds frame limit",
         None,
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}}\n',
+    ),    (
+        ErrorDescriptor.INVALID_HOME_SETTINGS_PARAMS,
+        "invalid params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
+    ),
+    (
+        ErrorDescriptor.CUSTOM_HOME_SETTING,
+        "the setting has a custom value that serve does not change",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}}\n',
+    ),
+    (
+        ErrorDescriptor.STALE_REVISION,
+        "settings.toml changed since the given revision",
+        {"current_revision": "sha256:" + "0" * 64},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}}}\n',
+    ),
+    (
+        ErrorDescriptor.SETTINGS_BUSY,
+        "another zeta process is writing settings.toml",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"another zeta process is writing settings.toml","data":{"code":"settings_busy","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.SETTINGS_MALFORMED,
+        "settings.toml does not parse or validate",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"settings.toml does not parse or validate","data":{"code":"settings_malformed"}}}\n',
+    ),
+    (
+        ErrorDescriptor.SETTINGS_UNSAFE,
+        "settings.toml is a link or not a regular, unshared file",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"settings.toml is a link or not a regular, unshared file","data":{"code":"settings_unsafe"}}}\n',
     ),
 )
 
