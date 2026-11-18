@@ -1,13 +1,11 @@
-"""The viewer's one HTTP app: OTLP ingest, read-only JSON, health, and the packaged page."""
+"""The receiver's one HTTP app: OTLP ingest and health. Reads go through ``zeta serve``."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import queue
-import re
 from collections.abc import AsyncIterator
-from importlib import resources
 from pathlib import Path
 from typing import Any
 
@@ -19,20 +17,12 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from .process import AUTHORITY, OTLP_URL, URL
-from .receiver import MAX_BODY_BYTES, Reject, project_request
-from .store import SCHEMA_VERSION, Reader, Writer, open_database, parse_page
+from .projector import MAX_BODY_BYTES, Reject, project_request
+from .store import SCHEMA_VERSION, Writer, open_database
 
-_TRACE_ID = re.compile(r"[0-9a-f]{32}\Z")
-_ASSETS = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/viewer.css": ("viewer.css", "text/css; charset=utf-8"),
-    "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-    "/format.js": ("format.js", "text/javascript; charset=utf-8"),
-}
 _SECURITY_HEADERS = [
     (b"content-security-policy", (
-        b"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; "
-        b"base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+        b"default-src 'none'; frame-ancestors 'none'"
     )),
     (b"x-content-type-options", b"nosniff"),
     (b"x-frame-options", b"DENY"),
@@ -49,7 +39,7 @@ def _error(status: int, message: str) -> JSONResponse:
 class _Guard:
     """Refuses any request not addressed to the exact loopback authority, and adds security headers.
 
-    The exact ``Host`` check stops DNS-rebinding pages; a present ``Origin`` must be the viewer's own.
+    The exact ``Host`` check stops DNS-rebinding pages; a present ``Origin`` must be the receiver's own.
     """
 
     def __init__(self, app: Any) -> None:
@@ -80,10 +70,7 @@ def create_app(directory: Path, home_id: str) -> Starlette:
     database = directory / "telemetry.sqlite3"
     open_database(database)
     writer = Writer(database)
-    reader = Reader(database)
     accepting = True
-    static = resources.files(__package__) / "static"
-    assets = {path: ((static / name).read_bytes(), media_type) for path, (name, media_type) in _ASSETS.items()}
 
     async def ingest(request: Request) -> Response:
         media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
@@ -119,31 +106,14 @@ def create_app(directory: Path, home_id: str) -> Starlette:
 
         return Response(ExportTraceServiceResponse().SerializeToString(), media_type="application/x-protobuf")
 
-    async def sessions(request: Request) -> Response:
-        try:
-            limit, after = parse_page(request.query_params.get("limit"), request.query_params.get("cursor"))
-        except ValueError:
-            return _error(400, "invalid pagination")
-        return JSONResponse(await asyncio.to_thread(reader.sessions, limit, after))
-
-    async def trace(request: Request) -> Response:
-        trace_id = request.path_params["trace_id"]
-        result = await asyncio.to_thread(reader.trace, trace_id) if _TRACE_ID.match(trace_id) else None
-        return JSONResponse(result) if result is not None else _error(404, "trace not found")
-
     async def health(request: Request) -> Response:
         return JSONResponse({
             "home_id": home_id,
             "schema_version": SCHEMA_VERSION,
             "protocol": "http/protobuf",
-            "url": URL,
             "otlp_url": OTLP_URL,
             "ready": True,
         })
-
-    async def asset(request: Request) -> Response:
-        content, media_type = assets[request.url.path]
-        return Response(content, media_type=media_type)
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -154,14 +124,10 @@ def create_app(directory: Path, home_id: str) -> Starlette:
         finally:
             accepting = False
             await asyncio.to_thread(writer.close)
-            await asyncio.to_thread(reader.close)
 
     routes = [
         Route("/v1/traces", ingest, methods=["POST"]),
-        Route("/api/sessions", sessions, methods=["GET"]),
-        Route("/api/traces/{trace_id}", trace, methods=["GET"]),
         Route("/health", health, methods=["GET"]),
-        *(Route(path, asset, methods=["GET"]) for path in _ASSETS),
     ]
     app = Starlette(routes=routes, middleware=[Middleware(_Guard)], lifespan=lifespan)
     app.state.writer = writer

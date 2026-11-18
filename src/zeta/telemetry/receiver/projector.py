@@ -214,8 +214,13 @@ def _project_span(span: Any, service_version: str, scope_version: str) -> dict[s
         service_version=service_version,
         scope_version=scope_version,
     )
+    row["events"] = _project_events(span.events, trace_id, span_id)
+    return row
+
+
+def _project_events(span_events: Any, trace_id: bytes, span_id: bytes) -> list[dict[str, Any]]:
     events = []
-    for index, event in enumerate(span.events):
+    for index, event in enumerate(span_events):
         event_attributes = _attributes(event.attributes)
         time_ns = _timestamp(event.time_unix_nano)
         if event.name not in _EVENT_ATTRIBUTE_KEYS:
@@ -225,8 +230,7 @@ def _project_span(span: Any, service_version: str, scope_version: str) -> dict[s
             projected[_EVENT_COLUMNS[key]] = int(value) if isinstance(value, bool) else value
         projected.update(trace_id=trace_id, span_id=span_id, event_index=index, name=event.name, time_ns=time_ns)
         events.append(projected)
-    row["events"] = events
-    return row
+    return events
 
 
 def root_session_id(session_id: str | None) -> str | None:

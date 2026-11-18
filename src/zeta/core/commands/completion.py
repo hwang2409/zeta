@@ -125,7 +125,7 @@ _zeta() {
                     _arguments '--project=[project name or ID]:project:'
                     ;;
                 otel)
-                    _arguments '1:action:(view)' '--no-open[do not open a browser]'
+                    _arguments '1:action:(receiver)'
                     ;;
                 mcp)
                     case ${original_words[command_index+1]} in
@@ -257,7 +257,7 @@ def bash_script() -> str:
             COMPREPLY=( $(compgen -W "--project" -- "$cur") )
             ;;
         otel)
-            COMPREPLY=( $(compgen -W "view --no-open" -- "$cur") )
+            COMPREPLY=( $(compgen -W "receiver" -- "$cur") )
             ;;
         mcp)
             if (( COMP_CWORD <= command_index + 1 )); then

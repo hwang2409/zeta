@@ -31,8 +31,9 @@ with warnings.catch_warnings():  # starlette warns that its test client prefers 
     warnings.simplefilter("ignore")
     from starlette.testclient import TestClient
 
-from zeta.telemetry.viewer import store as store_module
-from zeta.telemetry.viewer.app import create_app
+from zeta.telemetry.receiver import reader
+from zeta.telemetry.receiver import store as store_module
+from zeta.telemetry.receiver.app import create_app
 
 VERSION = importlib.metadata.version("zeta")
 ROOT = "0123456789abcdef0123456789abcdef"
@@ -90,10 +91,20 @@ def _body(*spans: Span, resource: dict[str, object] | None = None, scope_name: s
 
 
 @pytest.fixture
-def viewer(tmp_path):
-    app = create_app(tmp_path, "f" * 32)
+def receiver(tmp_path):
+    directory = tmp_path / "telemetry"
+    directory.mkdir()
+    app = create_app(directory, "f" * 32)
     with TestClient(app, base_url="http://127.0.0.1:4323") as client:
-        yield client, app, tmp_path / "telemetry.sqlite3"
+        yield client, app, directory / "telemetry.sqlite3"
+
+
+def _sessions(database: Path, **params) -> dict:
+    return reader.sessions(database.parents[1], None, {"start_ns": 0, **params})
+
+
+def _trace(database: Path, trace_id: str) -> dict:
+    return reader.trace(database.parents[1], None, {"trace_id": trace_id})
 
 
 def _rows(database: Path, table: str) -> list[tuple]:
@@ -107,13 +118,13 @@ def _rows(database: Path, table: str) -> list[tuple]:
 def _committed_sequence(database: Path) -> int:
     connection = sqlite3.connect(database)
     try:
-        return connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
+        return connection.execute("SELECT committed_sequence FROM receiver_meta").fetchone()[0]
     finally:
         connection.close()
 
 
-def test_receiver_retains_only_allowlisted_metadata(viewer):
-    client, _, database = viewer
+def test_receiver_retains_only_allowlisted_metadata(receiver):
+    client, _, database = receiver
     secret = "SECRET-CONTENT-MARKER"
     span = _span(
         1,
@@ -142,7 +153,7 @@ def test_receiver_retains_only_allowlisted_metadata(viewer):
 
     assert client.post("/v1/traces", content=body, headers=PROTOBUF).status_code == 200
 
-    stored = client.get(f"/api/traces/{TRACE.hex()}").json()["spans"][0]
+    stored = _trace(database, TRACE.hex())["spans"][0]
     assert stored["operation"] == "chat"
     assert stored["response_model"] == "_invalid"
     assert stored["request_model"] == "qwen3:4b"
@@ -166,8 +177,8 @@ def test_receiver_retains_only_allowlisted_metadata(viewer):
         pytest.param(_body(_span(1), scope_name="other"), id="foreign scope"),
     ],
 )
-def test_invalid_batch_is_rejected_whole(viewer, body):
-    client, app, database = viewer
+def test_invalid_batch_is_rejected_whole(receiver, body):
+    client, app, database = receiver
 
     response = client.post("/v1/traces", content=body, headers=PROTOBUF)
 
@@ -177,8 +188,8 @@ def test_invalid_batch_is_rejected_whole(viewer, body):
     assert app.state.writer.committed_sequence == 0
 
 
-def test_oversize_body_is_refused_while_streaming(viewer):
-    client, _, database = viewer
+def test_oversize_body_is_refused_while_streaming(receiver):
+    client, _, database = receiver
 
     def chunks():
         for _ in range(9):
@@ -193,19 +204,19 @@ def test_oversize_body_is_refused_while_streaming(viewer):
 
 
 @pytest.mark.parametrize("host", ["localhost:4323", "127.0.0.1:4324", "127.0.0.1", "[::1]:4323", "attacker.example"])
-def test_foreign_host_is_refused(viewer, host):
-    client, _, database = viewer
+def test_foreign_host_is_refused(receiver, host):
+    client, _, database = receiver
 
     ingest = client.post("/v1/traces", content=_body(_span(1)), headers={**PROTOBUF, "host": host})
-    page = client.get("/api/sessions", headers={"host": host})
+    health = client.get("/health", headers={"host": host})
 
     assert ingest.status_code == 400
-    assert page.status_code == 400
+    assert health.status_code == 400
     assert _rows(database, "spans") == []
 
 
-def test_request_shape_rules(viewer):
-    client, _, database = viewer
+def test_request_shape_rules(receiver):
+    client, _, database = receiver
     body = _body(_span(1))
 
     assert client.post("/v1/traces", content=body, headers={"content-type": "application/json"}).status_code == 415
@@ -214,14 +225,16 @@ def test_request_shape_rules(viewer):
     assert client.get("/v1/traces").status_code == 405
     assert client.post("/v1/traces", content=body, headers={**PROTOBUF, "origin": "http://evil.example"}).status_code == 403
     assert _rows(database, "spans") == []
-    page = client.get("/")
-    assert page.status_code == 200
-    assert "script-src 'self'" in page.headers["content-security-policy"]
-    assert page.headers["x-content-type-options"] == "nosniff"
+    for path in ("/", "/api/sessions", f"/api/traces/{TRACE.hex()}", "/app.js"):
+        assert client.get(path).status_code == 404  # the receiver serves no page and no read routes
+    health = client.get("/health")
+    assert health.status_code == 200
+    assert health.headers["content-security-policy"] == "default-src 'none'; frame-ancestors 'none'"
+    assert health.headers["x-content-type-options"] == "nosniff"
 
 
-def test_duplicate_batch_and_span_count_once(viewer):
-    client, app, database = viewer
+def test_duplicate_batch_and_span_count_once(receiver):
+    client, app, database = receiver
     event = Span.Event(name="zeta.approval.requested", time_unix_nano=150, attributes=_attributes({"decision": "ask", "scope": "once"}))
     body = _body(_span(1, events=(event,)), _span(1, events=(event,)))
 
@@ -230,10 +243,10 @@ def test_duplicate_batch_and_span_count_once(viewer):
     second = client.post("/v1/traces", content=body, headers=PROTOBUF)
 
     assert first.status_code == second.status_code == 200
-    session = client.get("/api/sessions").json()["sessions"][0]
+    session = _sessions(database)["items"][0]
     assert session["span_count"] == 1
     assert session["turn_count"] == 1
-    assert client.get(f"/api/traces/{TRACE.hex()}").json()["trace"]["span_count"] == 1
+    assert _trace(database, TRACE.hex())["trace"]["span_count"] == 1
     assert len(_rows(database, "span_events")) == 1
     assert sequence == 1
     assert app.state.writer.committed_sequence == _committed_sequence(database) == 1
@@ -249,8 +262,10 @@ def test_commit_failure_acknowledges_and_publishes_nothing(tmp_path, monkeypatch
             super().commit()
 
     monkeypatch.setattr(store_module.sqlite3, "connect", functools.partial(sqlite3.connect, factory=CrashingConnection))
-    app = create_app(tmp_path, "f" * 32)
-    database = tmp_path / "telemetry.sqlite3"
+    directory = tmp_path / "telemetry"
+    directory.mkdir()
+    app = create_app(directory, "f" * 32)
+    database = directory / "telemetry.sqlite3"
     with TestClient(app, base_url="http://127.0.0.1:4323") as client:
         body = _body(_span(1), _span(2, parent=1, name="execute_tool read", attributes={"zeta.tool.name": "read"}))
         crash["armed"] = True
@@ -268,7 +283,7 @@ def test_commit_failure_acknowledges_and_publishes_nothing(tmp_path, monkeypatch
 
         assert retried.status_code == 200
         assert app.state.writer.committed_sequence == 1
-        assert client.get("/api/sessions").json()["sessions"][0]["span_count"] == 2
+        assert _sessions(database)["items"][0]["span_count"] == 2
 
 
 def test_projection_is_identical_in_both_orders(tmp_path):
@@ -318,33 +333,13 @@ def test_projection_is_identical_in_both_orders(tmp_path):
     assert session["model"] == "m-high"
 
 
-def test_session_pages_use_keyset_cursor(viewer):
-    client, _, _ = viewer
-    roots = [f"{index:032x}" for index in range(3)]
-    for index, root in enumerate(roots):
-        span = _span(index + 1, trace=bytes([index + 1]) * 16, start=10, end=500 if index else 400,
-                     attributes={"gen_ai.conversation.id": root})
-        assert client.post("/v1/traces", content=_body(span), headers=PROTOBUF).status_code == 200
-
-    first = client.get("/api/sessions", params={"limit": 2}).json()
-    second = client.get("/api/sessions", params={"limit": 2, "cursor": first["next_cursor"]}).json()
-
-    assert [row["root_session_id"] for row in first["sessions"]] == [roots[1], roots[2]]
-    assert [row["root_session_id"] for row in second["sessions"]] == [roots[0]]
-    assert second["next_cursor"] is None
-    for params in ({"limit": 0}, {"limit": 101}, {"limit": "x"}, {"cursor": "not-a-cursor"}, {"cursor": first["next_cursor"] + "="}):
-        response = client.get("/api/sessions", params=params)
-        assert (response.status_code, response.json()) == (400, {"error": "invalid pagination"})
-    assert client.get("/api/traces/" + "0" * 32).status_code == 404
-
-
 def _port_in_use() -> bool:
     with socket.socket() as probe:
         return probe.connect_ex(("127.0.0.1", 4323)) == 0
 
 
-def _viewer_command(home: Path) -> tuple[list[str], dict[str, str]]:
-    command = [sys.executable, "-c", "import sys; from zeta.cli.main import main; sys.exit(main())", "otel", "view", "--no-open"]
+def _receiver_command(home: Path) -> tuple[list[str], dict[str, str]]:
+    command = [sys.executable, "-c", "import sys; from zeta.cli.main import main; sys.exit(main())", "otel", "receiver"]
     return command, {**os.environ, "ZETA_HOME": str(home)}
 
 
@@ -352,12 +347,12 @@ def test_second_process_exits_and_bind_failure_releases_lock(tmp_path):
     if _port_in_use():
         pytest.skip("127.0.0.1:4323 is in use on this machine")
     owner_home, other_home = tmp_path / "owner", tmp_path / "other"
-    command, environment = _viewer_command(owner_home)
+    command, environment = _receiver_command(owner_home)
     owner = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         ready, _, _ = select.select([owner.stdout], [], [], 20)
-        assert ready, "viewer did not report ready"
-        assert owner.stdout.readline().startswith(b"zeta otel view: http://127.0.0.1:4323/")
+        assert ready, "receiver did not report ready"
+        assert owner.stdout.readline().startswith(b"zeta otel receiver: http://127.0.0.1:4323/v1/traces")
         home_id = (owner_home / "telemetry" / "home-id").read_text().strip()
         # the ready line follows listen(), so this request waits in the backlog until uvicorn serves it
         connection = http.client.HTTPConnection("127.0.0.1", 4323, timeout=10)
@@ -372,7 +367,7 @@ def test_second_process_exits_and_bind_failure_releases_lock(tmp_path):
         assert stat.S_IMODE((owner_home / "telemetry" / "telemetry.sqlite3").stat().st_mode) == 0o600
 
         same_home = subprocess.run(command, env=environment, capture_output=True, timeout=30, check=False)
-        command_b, environment_b = _viewer_command(other_home)
+        command_b, environment_b = _receiver_command(other_home)
         other = subprocess.run(command_b, env=environment_b, capture_output=True, timeout=30, check=False)
 
         assert same_home.returncode == 1
@@ -380,7 +375,7 @@ def test_second_process_exits_and_bind_failure_releases_lock(tmp_path):
         assert other.returncode == 1
         assert b"cannot listen on 127.0.0.1:4323" in other.stderr
         assert not (other_home / "telemetry" / "telemetry.sqlite3").exists()
-        descriptor = os.open(other_home / "telemetry" / "viewer.lock", os.O_RDWR)
+        descriptor = os.open(other_home / "telemetry" / "receiver.lock", os.O_RDWR)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises if bind failure kept the lock
         finally:

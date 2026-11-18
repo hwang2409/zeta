@@ -1,4 +1,4 @@
-"""``zeta otel view``: own the home's viewer lock, bind the fixed port, and serve."""
+"""``zeta otel receiver``: own the home's receiver lock, bind the fixed port, and serve."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ import socket
 import sqlite3
 import stat
 import sys
-import webbrowser
 from pathlib import Path
 
 HOST = "127.0.0.1"
@@ -24,23 +23,23 @@ HEALTH_TIMEOUT_SECONDS = 1.0
 _HOME_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 
-def run_viewer(home: Path, *, open_browser: bool) -> int:
+def run_receiver(home: Path) -> int:
     """Startup order: home id, lock, bind, migrate, serve. Returns the process exit code."""
     try:
         import uvicorn  # noqa: F401 - fail before taking the lock when the extra is missing
 
         from . import app  # noqa: F401
     except ModuleNotFoundError:
-        print("zeta otel view: OpenTelemetry support is not installed; install zeta[otel]", file=sys.stderr)
+        print("zeta otel receiver: OpenTelemetry support is not installed; install zeta[otel]", file=sys.stderr)
         return 1
     directory = home / "telemetry"
     try:
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
         home_id = _home_id(directory)
-        lock = os.open(directory / "viewer.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        lock = os.open(directory / "receiver.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     except (OSError, RuntimeError) as exc:
-        print(f"zeta otel view: {exc}", file=sys.stderr)
+        print(f"zeta otel receiver: {exc}", file=sys.stderr)
         return 1
     try:
         try:
@@ -49,20 +48,20 @@ def run_viewer(home: Path, *, open_browser: bool) -> int:
             if _running_home_id(HOST, PORT) == home_id:
                 print(f"already running at http://{AUTHORITY}")
             else:
-                print(f"zeta otel view: another viewer holds {directory / 'viewer.lock'} but is not answering", file=sys.stderr)
+                print(f"zeta otel receiver: another receiver holds {directory / 'receiver.lock'} but is not answering", file=sys.stderr)
             return 1
         try:
             listener = socket.create_server((HOST, PORT))
         except OSError as exc:
-            print(f"zeta otel view: cannot listen on {AUTHORITY}: {exc.strerror or exc}", file=sys.stderr)
+            print(f"zeta otel receiver: cannot listen on {AUTHORITY}: {exc.strerror or exc}", file=sys.stderr)
             return 1
         with listener:
-            return _serve(listener, directory, home_id, open_browser)
+            return _serve(listener, directory, home_id)
     finally:
         os.close(lock)  # closing the descriptor releases the lock
 
 
-def _serve(listener: socket.socket, directory: Path, home_id: str, open_browser: bool) -> int:
+def _serve(listener: socket.socket, directory: Path, home_id: str) -> int:
     import uvicorn
 
     from .app import create_app
@@ -70,18 +69,16 @@ def _serve(listener: socket.socket, directory: Path, home_id: str, open_browser:
     try:
         app = create_app(directory, home_id)
     except (OSError, RuntimeError, sqlite3.Error) as exc:
-        print(f"zeta otel view: cannot open the telemetry database: {exc}", file=sys.stderr)
+        print(f"zeta otel receiver: cannot open the telemetry database: {exc}", file=sys.stderr)
         return 1
-    print(f"zeta otel view: {URL}  (OTLP endpoint {OTLP_URL})", flush=True)
-    if open_browser:
-        webbrowser.open(URL)  # the listener is already accepting into its backlog
+    print(f"zeta otel receiver: {OTLP_URL}", flush=True)  # the listener already accepts into its backlog
     server = uvicorn.Server(uvicorn.Config(app, log_level="warning", access_log=False, lifespan="on"))
     server.run(sockets=[listener])
     return 0
 
 
 def _running_home_id(host: str, port: int) -> str | None:
-    """The home id a live viewer reports, or ``None`` when health is unavailable."""
+    """The home id a live receiver reports, or ``None`` when health is unavailable."""
     connection = http.client.HTTPConnection(host, port, timeout=HEALTH_TIMEOUT_SECONDS)
     try:
         connection.request("GET", "/health")
@@ -123,5 +120,5 @@ def _read_home_id(path: Path) -> str:
             raise RuntimeError(f"{path} is not a regular file")
         value = file.read(64).strip()
     if not _HOME_ID.fullmatch(value):
-        raise RuntimeError(f"{path} does not hold a viewer home id")
+        raise RuntimeError(f"{path} does not hold a receiver home id")
     return value

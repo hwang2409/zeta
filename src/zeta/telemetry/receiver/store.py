@@ -1,15 +1,12 @@
-"""The viewer database: exact slice-1 schema, one writer thread, and read-only queries.
+"""The telemetry database: exact slice-1 schema and its one writer thread.
 
-Only the writer thread writes. Reads use a separate read-only connection; both run off the
-event loop. An OTLP batch is acknowledged only after its transaction commits.
+Only the receiver's writer thread writes. ``zeta serve`` reads through ``reader.py`` with a
+read-only connection. An OTLP batch is acknowledged only after its transaction commits.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
-import json
 import os
 import queue
 import sqlite3
@@ -18,17 +15,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .receiver import EVENT_COLUMNS, SPAN_COLUMNS, root_session_id
+from .projector import EVENT_COLUMNS, SPAN_COLUMNS, root_session_id
 
 SCHEMA_VERSION = 1
 INGEST_QUEUE_CAPACITY = 64
 GRACEFUL_COMMIT_TIMEOUT_SECONDS = 5.0
 BUSY_TIMEOUT_MS = 5_000
-DEFAULT_PAGE_SIZE = 50
-MAX_PAGE_SIZE = 100
 
 SCHEMA = """
-CREATE TABLE viewer_meta (
+CREATE TABLE receiver_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
     committed_sequence INTEGER NOT NULL DEFAULT 0 CHECK (committed_sequence >= 0)
@@ -139,7 +134,7 @@ CREATE TABLE sessions (
     CHECK ((model IS NULL) = (model_span_id IS NULL))
 ) STRICT;
 
-CREATE INDEX spans_trace_start ON spans(trace_id, start_ns);
+CREATE INDEX spans_trace_start ON spans(trace_id, start_ns, span_id);
 CREATE INDEX spans_parent ON spans(trace_id, parent_span_id);
 CREATE INDEX spans_session_start ON spans(root_session_id, start_ns);
 CREATE INDEX spans_provider_model_start ON spans(provider, request_model, start_ns);
@@ -147,12 +142,13 @@ CREATE INDEX spans_tool_start ON spans(tool_name, start_ns);
 CREATE INDEX spans_error_start ON spans(start_ns) WHERE status = 'error';
 CREATE INDEX span_events_span_time ON span_events(trace_id, span_id, time_ns);
 CREATE INDEX span_events_name_time ON span_events(name, time_ns);
+CREATE INDEX traces_first ON traces(first_ns);
 CREATE INDEX traces_last ON traces(last_ns DESC);
 CREATE INDEX traces_session_last ON traces(root_session_id, last_ns DESC);
 CREATE INDEX traces_status_last ON traces(status, last_ns DESC);
-CREATE INDEX sessions_last ON sessions(last_ns DESC);
-CREATE INDEX sessions_profile_last ON sessions(profile, last_ns DESC);
-CREATE INDEX sessions_model_last ON sessions(model, last_ns DESC);
+CREATE INDEX sessions_last ON sessions(last_ns DESC, root_session_id DESC);
+CREATE INDEX sessions_profile_last ON sessions(profile, last_ns DESC, root_session_id DESC);
+CREATE INDEX sessions_model_last ON sessions(model, last_ns DESC, root_session_id DESC);
 """
 
 _TRACE_UPSERT = """
@@ -277,29 +273,16 @@ _SPAN_INSERT = (
     "ON CONFLICT(trace_id, span_id) DO NOTHING"
 )
 _EVENT_INSERT = f"INSERT INTO span_events ({', '.join(EVENT_COLUMNS)}) VALUES ({', '.join(':' + name for name in EVENT_COLUMNS)})"
-_SESSION_KEYS = (
-    "root_session_id", "first_ns", "last_ns", "last_trace_id", "span_count", "turn_count", "model_count",
-    "tool_count", "error_count", "input_tokens", "output_tokens", "total_tokens", "profile", "model",
-)
-_TRACE_KEYS = ("trace_id", "first_ns", "last_ns", "root_span_id", "root_session_id", "status", "span_count", "error_count")
-_TRACE_SPAN_KEYS = (
-    "span_id", "parent_span_id", "operation", "kind", "start_ns", "end_ns", "duration_ns", "status", "error_type",
-    "session_id", "agent_name", "provider", "request_model", "response_model", "tool_name", "tool_type",
-    "input_tokens", "output_tokens", "total_tokens",
-)
-_EVENT_KEYS = (
-    "event_index", "name", "time_ns", "retry_attempt", "retry_reason", "retry_delay", "retry_after", "decision",
-    "scope", "duration_ns",
-)
-_HEX_KEYS = frozenset({"trace_id", "span_id", "parent_span_id", "root_span_id", "last_trace_id"})
-
-
 def project_span(span: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """The trace candidate and optional session candidate of one newly inserted span."""
     root = root_session_id(span["session_id"])
-    operation = span["operation"]
     error_count = 1 if span["status"] == "error" else 0
-    trace = {
+    trace = _trace_candidate(span, root, error_count)
+    return trace, None if root is None else _session_candidate(span, root, error_count)
+
+
+def _trace_candidate(span: dict[str, Any], root: str | None, error_count: int) -> dict[str, Any]:
+    return {
         "trace_id": span["trace_id"],
         "first_ns": span["start_ns"],
         "last_ns": span["end_ns"],
@@ -309,8 +292,10 @@ def project_span(span: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] |
         "span_count": 1,
         "error_count": error_count,
     }
-    if root is None:
-        return trace, None
+
+
+def _session_candidate(span: dict[str, Any], root: str, error_count: int) -> dict[str, Any]:
+    operation = span["operation"]
     is_chat = operation == "chat"
     profile = span["agent_name"] if operation == "invoke_agent" else None
     model = None
@@ -338,7 +323,7 @@ def project_span(span: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] |
         session[f"{name}_last_ns"] = span["end_ns"] if latest else None
         session[f"{name}_trace_id"] = span["trace_id"] if latest else None
         session[f"{name}_span_id"] = span["span_id"] if latest else None
-    return trace, session
+    return session
 
 
 def _connect(path: Path, **options: Any) -> sqlite3.Connection:
@@ -350,7 +335,7 @@ def _connect(path: Path, **options: Any) -> sqlite3.Connection:
 
 
 def open_database(path: Path) -> None:
-    """Create or migrate the database; the caller holds the viewer lock. Fails closed."""
+    """Create or migrate the database; the caller holds the receiver lock. Fails closed."""
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     os.close(descriptor)
     os.chmod(path, 0o600)
@@ -367,7 +352,7 @@ def open_database(path: Path) -> None:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     connection.execute(statement)
-            connection.execute("INSERT INTO viewer_meta (singleton, schema_version) VALUES (1, ?)", (SCHEMA_VERSION,))
+            connection.execute("INSERT INTO receiver_meta (singleton, schema_version) VALUES (1, ?)", (SCHEMA_VERSION,))
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         except BaseException:
@@ -385,9 +370,9 @@ class Writer:
         self._queue: queue.Queue[tuple[list[dict[str, Any]], Callable[[object], None]] | None] = queue.Queue(
             INGEST_QUEUE_CAPACITY
         )
-        self._thread = threading.Thread(target=self._run, name="zeta-otel-viewer-writer", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="zeta-otel-receiver-writer", daemon=True)
         # the last committed sequence; set only after its transaction commits
-        self.committed_sequence = self._connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
+        self.committed_sequence = self._connection.execute("SELECT committed_sequence FROM receiver_meta").fetchone()[0]
 
     def start(self) -> None:
         self._thread.start()
@@ -444,99 +429,11 @@ class Writer:
                 if session is not None:
                     connection.execute(_SESSION_UPSERT, session)
             if inserted:
-                connection.execute("UPDATE viewer_meta SET committed_sequence = committed_sequence + 1 WHERE singleton = 1")
-            sequence = connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
+                connection.execute("UPDATE receiver_meta SET committed_sequence = committed_sequence + 1 WHERE singleton = 1")
+            sequence = connection.execute("SELECT committed_sequence FROM receiver_meta").fetchone()[0]
             connection.commit()
         except BaseException:
             connection.rollback()
             raise
         self.committed_sequence = sequence
         return sequence
-
-
-def parse_page(limit: str | None, cursor: str | None) -> tuple[int, tuple[int, str] | None]:
-    """Validate ``/api/sessions`` paging; raises ``ValueError`` for anything malformed."""
-    size = DEFAULT_PAGE_SIZE
-    if limit is not None:
-        if not limit.isascii() or not limit.isdigit() or not 1 <= int(limit) <= MAX_PAGE_SIZE:
-            raise ValueError("invalid limit")
-        size = int(limit)
-    if cursor is None:
-        return size, None
-    if not cursor or "=" in cursor:
-        raise ValueError("invalid cursor")
-    try:
-        value = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode())
-    except (binascii.Error, UnicodeDecodeError, ValueError):
-        raise ValueError("invalid cursor") from None
-    if (
-        not isinstance(value, list)
-        or len(value) != 2
-        or type(value[0]) is not int
-        or value[0] < 0
-        or not isinstance(value[1], str)
-    ):
-        raise ValueError("invalid cursor")
-    return size, (value[0], value[1])
-
-
-def _encode_cursor(last_ns: int, root: str) -> str:
-    text = json.dumps([last_ns, root], separators=(",", ":"))
-    return base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
-
-
-def _json_row(row: sqlite3.Row, keys: tuple[str, ...]) -> dict[str, Any]:
-    return {key: row[key].hex() if key in _HEX_KEYS and row[key] is not None else row[key] for key in keys}
-
-
-class Reader:
-    """A read-only connection; callers run it off the event loop."""
-
-    def __init__(self, path: Path) -> None:
-        self._connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        self._lock = threading.Lock()
-
-    def close(self) -> None:
-        with self._lock:
-            self._connection.close()
-
-    def sessions(self, limit: int, after: tuple[int, str] | None) -> dict[str, Any]:
-        query = f"SELECT {', '.join(_SESSION_KEYS)} FROM sessions"
-        parameters: tuple[object, ...] = ()
-        if after is not None:
-            query += " WHERE last_ns < ? OR (last_ns = ? AND root_session_id > ?)"
-            parameters = (after[0], after[0], after[1])
-        query += " ORDER BY last_ns DESC, root_session_id ASC LIMIT ?"
-        with self._lock:
-            rows = self._connection.execute(query, (*parameters, limit + 1)).fetchall()
-        page = [_json_row(row, _SESSION_KEYS) for row in rows[:limit]]
-        next_cursor = _encode_cursor(page[-1]["last_ns"], page[-1]["root_session_id"]) if len(rows) > limit else None
-        return {"sessions": page, "next_cursor": next_cursor}
-
-    def trace(self, trace_id: str) -> dict[str, Any] | None:
-        key = bytes.fromhex(trace_id)
-        with self._lock:
-            connection = self._connection
-            connection.execute("BEGIN")
-            try:
-                trace = connection.execute(f"SELECT {', '.join(_TRACE_KEYS)} FROM traces WHERE trace_id = ?", (key,)).fetchone()
-                spans = connection.execute(
-                    f"SELECT {', '.join(_TRACE_SPAN_KEYS)} FROM spans WHERE trace_id = ? ORDER BY start_ns, span_id", (key,)
-                ).fetchall()
-                events = connection.execute(
-                    f"SELECT span_id, {', '.join(_EVENT_KEYS)} FROM span_events WHERE trace_id = ? "
-                    "ORDER BY time_ns, event_index",
-                    (key,),
-                ).fetchall()
-            finally:
-                connection.rollback()
-        if trace is None:
-            return None
-        by_span: dict[bytes, list[dict[str, Any]]] = {}
-        for event in events:
-            by_span.setdefault(event["span_id"], []).append(_json_row(event, _EVENT_KEYS))
-        return {
-            "trace": _json_row(trace, _TRACE_KEYS),
-            "spans": [{**_json_row(span, _TRACE_SPAN_KEYS), "events": by_span.get(span["span_id"], [])} for span in spans],
-        }

@@ -338,8 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     otel = commands.add_parser("otel", help="OpenTelemetry tools")
     otel_commands = otel.add_subparsers(dest="otel_action", required=True)
-    otel_view = otel_commands.add_parser("view", help="receive and view local telemetry at http://127.0.0.1:4323/")
-    otel_view.add_argument("--no-open", action="store_true", help="do not open a browser")
+    otel_commands.add_parser("receiver", help="run the built-in OTLP receiver at http://127.0.0.1:4323/v1/traces")
 
     mcp = commands.add_parser("mcp", help="manage MCP servers")
     mcp_commands = mcp.add_subparsers(dest="mcp_action", required=True)
@@ -1186,9 +1185,9 @@ def _main(argv: list[str] | None = None) -> int:
         except (MCPManagementError, OSError, ValueError, KeyError) as exc:
             print(f"mcp error: {exc}", file=sys.stderr)
             return 2
-    if args.command == "otel" and args.otel_action == "view":
-        from ..telemetry.viewer import run_viewer
-        return run_viewer(env_home(), open_browser=not args.no_open)
+    if args.command == "otel" and args.otel_action == "receiver":
+        from ..telemetry.receiver import run_receiver
+        return run_receiver(env_home())
     if args.command == "session":
         from .session import run as _run_session
 
