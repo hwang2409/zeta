@@ -180,11 +180,10 @@ def test_prepare_home_restores_set_and_unset_environment(tmp_path: Path, monkeyp
 
     monkeypatch.setenv("ZETA_ACCOUNT_HOME", str(tmp_path / "outer-account"))
     before = dict(os.environ)
-    with pytest.raises(OSError, match="artifact write failed"):
-        with prepare_home(tmp_path):
-            assert os.environ["ZETA_HOME"] == str(tmp_path / "zeta-home")
-            assert os.environ["ZETA_ACCOUNT_HOME"] == str(Path.home() / ".zeta")
-            raise OSError("artifact write failed")
+    with pytest.raises(OSError, match="artifact write failed"), prepare_home(tmp_path):
+        assert os.environ["ZETA_HOME"] == str(tmp_path / "zeta-home")
+        assert os.environ["ZETA_ACCOUNT_HOME"] == str(Path.home() / ".zeta")
+        raise OSError("artifact write failed")
     assert dict(os.environ) == before
 
 
