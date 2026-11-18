@@ -99,6 +99,34 @@ def _provider_prompt_tokens(detail: Mapping[str, Any]) -> int | None:
     return int(match.group(1).replace(",", "")) if match is not None else None
 
 
+def _codex_stream_failure(
+    detail: Mapping[str, Any],
+    *,
+    pre_output: bool,
+    diagnostic_context: dict[str, object],
+) -> CodexStreamError:
+    # The provider's free-text message is never logged (it may carry request content);
+    # only the structured code and status survive, as the stream-error tests require.
+    error = decode_stream_error(detail)
+    retryable = error.retry_reason is not None
+    retry_reason = error.retry_reason
+    if error.code == "invalid_request_error" and pre_output:
+        # A provider-side "stream error" before any output is safe to retry once:
+        # no text, reasoning, or tool call was exposed, so a replay cannot duplicate it.
+        retryable = True
+        retry_reason = "invalid_request_error"
+    failure = CodexStreamError(
+        error.message,
+        code=error.code,
+        status_code=error.status_code,
+        retryable=retryable,
+        retry_reason=retry_reason,
+    )
+    failure.provider_prompt_tokens = _provider_prompt_tokens(detail)
+    failure.diagnostic_context = diagnostic_context
+    return failure
+
+
 @dataclass(slots=True)
 class _BlockState:
     kind: str
@@ -314,7 +342,8 @@ class CodexBackend(CompletionBackend):
             if (
                 primary_exception is not None
                 and self.diagnostics_path is not None
-                and getattr(primary_exception, "code", None) == "server_error"
+                and getattr(primary_exception, "code", None)
+                in {"server_error", "invalid_request_error"}
             ):
                 primary_exception.stream_diagnostic = (
                     self.diagnostics_path,
@@ -498,24 +527,18 @@ def _translate_event(
         detail = payload.get("error")
         if not isinstance(detail, Mapping):
             detail = {key: value for key, value in payload.items() if key != "type"}
-        error = decode_stream_error(detail)
-        failure = CodexStreamError(
-            error.message,
-            code=error.code,
-            status_code=error.status_code,
-            retryable=error.retry_reason is not None,
-            retry_reason=error.retry_reason,
+        raise _codex_stream_failure(
+            detail,
+            pre_output=not items,
+            diagnostic_context={
+                "response_id": response_data.get("id"),
+                "terminal_event_type": None,
+                "last_event_type": event_type,
+                "event_count": 1,
+                "stream_age_seconds": _stream_age(response_data),
+                "max_progress_gap_s": response_data.get("max_progress_gap_s", 0.0),
+            },
         )
-        failure.provider_prompt_tokens = _provider_prompt_tokens(detail)
-        failure.diagnostic_context = {
-            "response_id": response_data.get("id"),
-            "terminal_event_type": None,
-            "last_event_type": event_type,
-            "event_count": 1,
-            "stream_age_seconds": _stream_age(response_data),
-            "max_progress_gap_s": response_data.get("max_progress_gap_s", 0.0),
-        }
-        raise failure
     if event_type == "response.created":
         if response_state != "not-started":
             raise CodexStreamError("Codex response.created is duplicated")
@@ -957,24 +980,18 @@ def _decode_terminal_response(
         detail = response.get("error") if isinstance(response, Mapping) else None
         if not isinstance(detail, Mapping):
             detail = {}
-        error = decode_stream_error(detail)
-        failure = CodexStreamError(
-            error.message,
-            code=error.code,
-            status_code=error.status_code,
-            retryable=error.retry_reason is not None,
-            retry_reason=error.retry_reason,
+        raise _codex_stream_failure(
+            detail,
+            pre_output=not items,
+            diagnostic_context={
+                "response_id": response_data.get("id"),
+                "terminal_event_type": event_type,
+                "last_event_type": event_type,
+                "event_count": response_data.get("event_count", 1),
+                "stream_age_seconds": _stream_age(response_data),
+                "max_progress_gap_s": response_data.get("max_progress_gap_s", 0.0),
+            },
         )
-        failure.provider_prompt_tokens = _provider_prompt_tokens(detail)
-        failure.diagnostic_context = {
-            "response_id": response_data.get("id"),
-            "terminal_event_type": event_type,
-            "last_event_type": event_type,
-            "event_count": response_data.get("event_count", 1),
-            "stream_age_seconds": _stream_age(response_data),
-            "max_progress_gap_s": response_data.get("max_progress_gap_s", 0.0),
-        }
-        raise failure
     if response is not None and not isinstance(response, Mapping):
         raise CodexStreamError("Codex response completion is invalid")
     if any(item.state != "stopped" for item in items.values()):
