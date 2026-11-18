@@ -44,18 +44,20 @@ class SafariObservedState:
 @dataclasses.dataclass(frozen=True)
 class SafariAction:
     kind: str
-    identifier: str
+    window_id: str | None = None
+    tab_id: str | None = None
+    bundle: str | None = None
 
 
 def plan_cleanup(observed_state: SafariObservedState, token: SafariOwnership) -> list[SafariAction]:
     actions: list[SafariAction] = []
     if observed_state.owned_window_id == token.window_id:
         if observed_state.tab_ids == (token.tab_id,):
-            actions.append(SafariAction("close_window", token.window_id))
+            actions.append(SafariAction("close_window", window_id=token.window_id))
         elif token.tab_id in observed_state.tab_ids:
-            actions.append(SafariAction("close_tab", token.tab_id))
+            actions.append(SafariAction("close_tab", window_id=token.window_id, tab_id=token.tab_id))
     if observed_state.frontmost_bundle == "com.apple.Safari" and observed_state.front_window_id == token.window_id:
-        actions.append(SafariAction("restore_focus", token.prior_frontmost_bundle))
+        actions.append(SafariAction("restore_focus", bundle=token.prior_frontmost_bundle))
     return actions
 
 
@@ -246,11 +248,11 @@ class MacSafari:
 
     async def _execute_action(self, action: SafariAction) -> None:
         if action.kind == "close_window":
-            source = f'tell application "Safari" to close window id {action.identifier}'
+            source = f'tell application "Safari" to close window id {action.window_id}'
         elif action.kind == "close_tab":
-            source = f'tell application "Safari" to close tab id {action.identifier} of window id {self._active_window_id}'
+            source = f'tell application "Safari" to close tab id {action.tab_id} of window id {action.window_id}'
         elif action.kind == "restore_focus":
-            bundle = action.identifier.replace('"', '\\"')
+            bundle = (action.bundle or "").replace('"', '\\"')
             source = f'tell application "System Events" to set frontmost of first application process whose bundle identifier is "{bundle}" to true'
         else:
             raise ValueError(f"unknown Safari cleanup action: {action.kind}")
@@ -262,7 +264,6 @@ class MacSafari:
         removed = False
         restored = False
         error: str | None = None
-        self._active_window_id = ownership.window_id
         for action in actions:
             try:
                 await self._execute_action(action)

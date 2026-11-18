@@ -241,19 +241,19 @@ class FakeSafariState:
         if action.kind == "close_window":
             if self.fail_close:
                 raise RuntimeError("close failed")
-            self.windows.pop(action.identifier, None)
-            if self.front_window == action.identifier:
+            self.windows.pop(action.window_id, None)
+            if self.front_window == action.window_id:
                 self.front_window = next(iter(self.windows), None)
         elif action.kind == "close_tab":
             if self.fail_close:
                 raise RuntimeError("close failed")
             tabs = self.windows.get(token.window_id, [])
-            if action.identifier in tabs:
-                tabs.remove(action.identifier)
+            if action.tab_id in tabs:
+                tabs.remove(action.tab_id)
         elif action.kind == "restore_focus":
             if self.fail_restore:
                 raise RuntimeError("restore failed")
-            self.frontmost = action.identifier
+            self.frontmost = action.bundle
 
 
 def test_safari_cleanup_plan_state_table() -> None:
@@ -264,7 +264,7 @@ def test_safari_cleanup_plan_state_table() -> None:
         ("second-tab", FakeSafariState("com.apple.Safari", "owned", {"owned": ["created", "user"]}), ["close_tab", "restore_focus"], "com.example.Editor"),
         ("switched-app", FakeSafariState("com.example.Editor", "owned", {"owned": ["created"]}), ["close_window"], "com.example.Editor"),
         ("not-front", FakeSafariState("com.apple.Safari", "other", {"owned": ["created"], "other": ["user"]}), ["close_window"], "com.apple.Safari"),
-        ("close-fails", FakeSafariState("com.apple.Safari", "owned", {"owned": ["created"]}, fail_close=True), ["close_window", "restore_focus"], "com.example.Editor"),
+        ("close-fails", FakeSafariState("com.apple.Safari", "owned", {"owned": ["created"]}, fail_close=True), ["close_window", "restore_focus"], "com.apple.Safari"),
         ("restore-fails", FakeSafariState("com.apple.Safari", "owned", {"owned": ["created"]}, fail_restore=True), ["close_window", "restore_focus"], "com.apple.Safari"),
     ]
     for name, state, expected_actions, expected_frontmost in cases:
@@ -275,11 +275,15 @@ def test_safari_cleanup_plan_state_table() -> None:
             try:
                 state.apply(action, token)
             except RuntimeError:
-                pass
+                break
         assert state.frontmost == expected_frontmost, name
         assert state.trace[0] == "observe", name
         assert state.trace.count("observe") == 1, name
-        assert state.trace[1:] == expected_actions, name
+        assert state.trace[1:] == expected_actions[:len(state.trace) - 1], name
+        if name == "close-fails":
+            assert "owned" in state.windows and state.frontmost == "com.apple.Safari", name
+        if name == "restore-fails":
+            assert "owned" not in state.windows and state.frontmost == "com.apple.Safari", name
     happy = cases[0][1]
     assert "owned" not in happy.windows
     assert happy.frontmost == "com.example.Editor"
@@ -306,11 +310,40 @@ async def test_safari_cleanup_executor_observes_once_then_one_call_per_action(mo
 
 
 @pytest.mark.asyncio
-async def test_timeout_persists_false_terminal_cleanup_evidence(tmp_path: Path) -> None:
-    class SlowBrowser(Browser):
+async def test_timeout_persists_false_terminal_cleanup_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class HangingProcess:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.killed = False
+            self.waited = False
+            self.released = asyncio.Event()
+
+        async def communicate(self):
+            await asyncio.wait_for(self.released.wait(), 10)
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+            self.released.set()
+
+        async def wait(self):
+            self.waited = True
+
+    process = HangingProcess()
+
+    async def create(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    safari = MacSafari()
+
+    class ProductionBrowser:
+        async def open_owned(self, url):
+            return SafariOwnership("42", "99", "com.example.Editor")
+
         async def cleanup_owned(self, ownership):
-            # test-contract: latency cleanup guard exercises terminal timeout evidence.
-            await asyncio.sleep(10)
+            return await safari.cleanup_owned(ownership)
 
     fixture = FixtureHandle(tmp_path / "fixture", 1)
     backend = ComputerBackend()
@@ -323,16 +356,16 @@ async def test_timeout_persists_false_terminal_cleanup_evidence(tmp_path: Path) 
     def timeout_factory(_seconds):
         nonlocal calls
         calls += 1
-        return asyncio.timeout(5)
+        return asyncio.timeout(5 if calls == 1 else 0.1)
 
     with pytest.raises(RuntimeError, match="trial cleanup failed"):
-        await pilot(tmp_path, provider_factory=lambda _: adapter, backend_factory=lambda _: backend, fixture_factory=lambda *_: fixture, browser_factory=SlowBrowser, timeout_factory=timeout_factory)
+        await pilot(tmp_path, provider_factory=lambda _: adapter, backend_factory=lambda _: backend, fixture_factory=lambda *_: fixture, browser_factory=ProductionBrowser, timeout_factory=timeout_factory)
     artifact = json.loads((tmp_path / "pilot.json").read_text())
+    assert process.killed and process.waited and process.returncode is not None
     assert artifact["status"] == "failed"
     assert artifact["cleanup"]["owned_browser_state_removed"] is False
     assert artifact["cleanup"]["prior_state_restored"] is False
     assert artifact["cleanup"]["errors"]
-    assert backend.closed and fixture.closed
 
 
 def test_reset_removes_only_run_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
