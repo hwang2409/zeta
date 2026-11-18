@@ -6,7 +6,7 @@ from ..protocol import ErrorDescriptor, ProtocolError
 
 async def state_catalog(client, request_id, params):
     try:
-        return await client.connections.read_catalog.catalog(
+        return await client.connections.state_reader.catalog(
             client.server.home, params, lambda result: client.codec.response_fits(request_id, result),
         )
     except InvalidParams:

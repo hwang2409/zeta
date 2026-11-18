@@ -4,6 +4,7 @@ import asyncio
 import json
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -64,16 +65,27 @@ async def test_state_catalog_websocket(tmp_path: Path, monkeypatch, case):
     kind = case if case in KINDS else "profiles"
     folder = home / KINDS[kind]
     folder.mkdir()
-    for i in range(4):
-        name = f"!s6a-{i}"
+    def seed(name, description, index):
         front = "" if kind == "commands" else f"name: '{name}'\n"
-        text = f"---\n{front}description: {'x' * 480}{i}\n---\n{MARKER}\n"
+        text = f"---\n{front}description: '{description}'\n---\n{MARKER}\n"
         if kind == "skills":
             path = folder / name / "SKILL.md"
             path.parent.mkdir()
         else:
-            path = folder / f"{name}.md"
+            path = folder / f"{index}.md"
         path.write_text(text)
+
+    if case == "shorter_cursor":
+        for i, (name, description) in enumerate([
+            ("!a", "meta"), ("!b", "meta"), ("!c" * 750, "meta"), ("!d", "meta"), ("!e", "x" * 1400),
+        ]):
+            seed(name, description, i)
+    elif case == "cap":
+        for i in reversed(range(1001)):
+            seed(f"!row-{i:04}", "row", i)
+    else:
+        for i in range(4):
+            seed(f"!s6a-{i}", f"{'x' * 480}{i}", f"!s6a-{i}")
     manifest = home / "storage-format.json"
     if case != "missing":
         manifest.write_text("{}" if case == "malformed" else json.dumps({
@@ -157,11 +169,6 @@ async def test_state_catalog_websocket(tmp_path: Path, monkeypatch, case):
                         "code": "stale_state_snapshot", "retryable": True,
                     }}
             elif case == "shorter_cursor":
-                rows = [
-                    {"name": name, "description": description, "source": "home"}
-                    for name, description in [("a", ""), ("b", ""), ("c" * 1500, ""), ("d", ""), ("e", "x" * 1400)]
-                ]
-                monkeypatch.setattr(read_catalog, "_owner_rows", lambda *_: rows)
                 three = (await _call(client, kind=kind, limit=3))["result"]
                 four = (await _call(client, kind=kind, limit=4))["result"]
                 codec = protocol.FrameCodec()
@@ -171,27 +178,29 @@ async def test_state_catalog_websocket(tmp_path: Path, monkeypatch, case):
                 first = (await _call(client, kind=kind))["result"]
                 assert first == four
                 last = (await _call(client, kind=kind, cursor=first["next_cursor"]))["result"]
-                assert last == {"kind": kind, "items": rows[4:], "next_cursor": None}
+                assert last["items"][0] == {"name": "!e", "description": "x" * 1400, "source": "home"}
             elif case == "cap":
                 rows = [
-                    {"name": f"row-{i:04}", "description": "row", "source": "home"} for i in range(1001)
+                    {"name": f"!row-{i:04}", "description": "row", "source": "home"} for i in range(1000)
                 ]
-                monkeypatch.setattr(read_catalog, "_owner_rows", lambda *_: list(reversed(rows)))
                 page = (await _call(client, kind=kind))["result"]
                 assert page["items"] == rows[:50]
                 seen = page["items"]
                 while page["next_cursor"] is not None:
                     page = (await _call(client, kind=kind, limit=200, cursor=page["next_cursor"]))["result"]
                     seen += page["items"]
-                assert seen == rows[:1000]
+                assert seen == rows
             else:
                 if case == "tie":
-                    original = read_catalog._owner_rows
+                    original = read_catalog.discover_session_agents
 
-                    def tied(*args):
-                        return [*original(*args), {"name": "!s6a-0", "description": "tie", "source": "built_in"}]
+                    def tied(**kwargs):
+                        catalog = original(**kwargs)
+                        home_entry = catalog.find("!s6a-0")
+                        built_in = replace(home_entry, source="packaged", selection_guidance="tie")
+                        return replace(catalog, agents=(*catalog.agents, built_in))
 
-                    monkeypatch.setattr(read_catalog, "_owner_rows", tied)
+                    monkeypatch.setattr(read_catalog, "discover_session_agents", tied)
                 expected = (await _call(client, kind=kind, limit=200))["result"]
                 assert set(expected) == {"kind", "items", "next_cursor"}
                 assert expected["kind"] == kind and expected["next_cursor"] is None

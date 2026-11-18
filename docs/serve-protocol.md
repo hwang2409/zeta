@@ -2612,6 +2612,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `tool_approval_origin` | adds `approval_origin: "automatic" | "user"` to live `tool_start` calls and replayed history `tool_use` calls |
 | `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, `telemetry_trace`, `telemetry_overview`, `telemetry_models`, `telemetry_tools`, `telemetry_errors`, `telemetry_series`, and `telemetry_agent_tree` methods |
+| `state_read_v1` | enables `state_catalog` for metadata-only profile, skill, and command lists (see "state catalog") |
 | `home_settings_v1` | enables `home_settings_get` and controller-only `home_settings_update` for the home `settings.toml` (`telemetry.enabled` only) |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
