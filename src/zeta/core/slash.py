@@ -552,6 +552,7 @@ class SlashStatus:
     max_agent_depth: int = 3
     unavailable_accounts: tuple[str, ...] = ()
     otel_status: str = "off"
+    otel_receiver: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -735,6 +736,7 @@ def _format_status(status: SlashStatus) -> str:
         f"provider: {status.provider}",
         f"model: {status.model}",
         f"otel: {status.otel_status}",
+        *(() if status.otel_receiver is None else (f"otel receiver: {status.otel_receiver}",)),
         "completion_client_setups: "
         + (
             ", ".join(

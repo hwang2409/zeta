@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections import deque
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -132,12 +133,13 @@ class StatusCell:
     """A one-slot handoff from the exporter thread to the event-loop owner."""
 
     def __init__(self) -> None:
-        self._values: deque[str] = deque(maxlen=1)
+        self._values: deque[tuple[str, int]] = deque(maxlen=1)
 
     def publish(self, state: str) -> None:
-        self._values.append(state)
+        self._values.append((state, time.time_ns()))
 
-    def read(self) -> str | None:
+    def read(self) -> tuple[str, int] | None:
+        """The latest export state and when it was published, or None when nothing is new."""
         return self._values.pop() if self._values else None
 
 
@@ -236,14 +238,18 @@ class _SpanHandle(SpanHandle):
 
 
 class _Exporter:
-    def __init__(self, delegate: object, cell: StatusCell, session: object) -> None:
+    def __init__(self, delegate: object, cell: StatusCell, session: object, receiver: object | None) -> None:
         self._delegate = delegate
         self._cell = cell
         self._session = session
+        self._receiver = receiver
 
     def export(self, spans: object) -> object:
         from opentelemetry.sdk.trace.export import SpanExportResult
 
+        if self._receiver is not None and not self._receiver.may_export(len(spans)):
+            self._cell.publish("export_unavailable")  # this home's receiver is not confirmed: send nothing
+            return SpanExportResult.FAILURE
         try:
             result = self._delegate.export(spans)
         except Exception:  # noqa: BLE001 - exporter failures must never escape the SDK worker
@@ -272,9 +278,11 @@ class _Runtime:
         self._lock = threading.Lock()
 
     def status(self) -> TelemetryStatus:
-        state = self._cell.read()
-        if state is not None:
-            self._status = TelemetryStatus(True, "degraded" if state == "export_unavailable" else "healthy", "export_unavailable" if state == "export_unavailable" else None)
+        published = self._cell.read()
+        if published is not None:
+            state, at_ns = published
+            failed = state == "export_unavailable"
+            self._status = TelemetryStatus(True, "degraded" if failed else "healthy", "export_unavailable" if failed else None, at_ns)
         return self._status
 
     def shutdown(self) -> None:
@@ -345,7 +353,9 @@ class _Runtime:
             context.detach(token)
 
 
-def configure(endpoint: str) -> _Runtime:
+def configure(endpoint: str, receiver: object | None = None) -> _Runtime:
+    """``receiver`` is the built-in receiver's supervisor: spans carry its ``home_id``, and
+    export sends only while its ``may_export()`` is true."""
     endpoint = validate_loopback_endpoint(endpoint)
     for name, value in os.environ.items():
         if name.startswith(("OTEL_EXPORTER_OTLP", "OTEL_PYTHON_EXPORTER_OTLP")) and value:
@@ -371,7 +381,7 @@ def configure(endpoint: str) -> _Runtime:
     session.trust_env = False
     cell = StatusCell()
     delegate = OTLPSpanExporter(endpoint=endpoint, headers={}, timeout=5, session=session)
-    exporter = _Exporter(delegate, cell, session)
+    exporter = _Exporter(delegate, cell, session, receiver)
     limits = SpanLimits(
         max_attributes=128,
         max_events=128,
@@ -385,7 +395,10 @@ def configure(endpoint: str) -> _Runtime:
     from importlib.metadata import version
 
     provider = TracerProvider(
-        resource=Resource({"service.name": "zeta", "service.version": version("zeta")}),
+        resource=Resource({
+            "service.name": "zeta", "service.version": version("zeta"),
+            **({} if receiver is None else {"zeta.home.id": receiver.home_id}),
+        }),
         sampler=ParentBased(ALWAYS_ON),
         span_limits=limits,
     )

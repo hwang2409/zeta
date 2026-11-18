@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Self
 
 from .attributes import GEN_AI_PROVIDER_NAMES
@@ -15,6 +16,21 @@ class TelemetryStatus:
     enabled: bool
     state: str
     reason: str | None = None
+    last_export_ns: int | None = None  # when the latest export batch finished; None before the first
+
+    @property
+    def last_export(self) -> str | None:
+        if self.last_export_ns is None:
+            return None
+        return "error" if self.state == "degraded" else "ok"
+
+
+@dataclass(frozen=True)
+class ReceiverState:
+    """One snapshot of the built-in receiver, as seen by this process's supervisor."""
+
+    state: str  # starting | ready | stopped | error
+    error: str | None = None
 
 
 class TelemetryError(RuntimeError):
@@ -113,21 +129,31 @@ _NOOP = SpanHandle()
 class Telemetry:
     """A process-owned, optional telemetry provider."""
 
-    def __init__(self, implementation: object | None = None) -> None:
+    def __init__(self, implementation: object | None = None, receiver: object | None = None) -> None:
         self._implementation = implementation
+        self._receiver = receiver
 
     @classmethod
     def disabled(cls) -> Telemetry:
         return cls()
 
     @classmethod
-    def configure(cls, settings: object) -> Telemetry:
+    def configure(cls, settings: object, home: Path | None = None) -> Telemetry:
+        """With ``home``, the exact built-in endpoint also keeps that home's receiver running."""
         endpoint = getattr(settings, "otel_endpoint", settings if isinstance(settings, str) else None)
         if not endpoint:
             return cls.disabled()
         from .runtime import configure
 
-        return cls(configure(endpoint))
+        receiver = None
+        if home is not None:
+            from .receiver.autostart import supervisor_for
+
+            receiver = supervisor_for(home, endpoint)
+        implementation = configure(endpoint, receiver)
+        if receiver is not None:
+            receiver.start()
+        return cls(implementation, receiver)
 
     def enabled(self) -> bool:
         return self._implementation is not None
@@ -137,7 +163,13 @@ class Telemetry:
             return TelemetryStatus(False, "off")
         return self._implementation.status()
 
+    def receiver(self) -> ReceiverState | None:
+        """The latest built-in receiver state, or None when this process does not supervise it; never does I/O."""
+        return None if self._receiver is None else self._receiver.snapshot()
+
     def shutdown(self) -> None:
+        if self._receiver is not None:
+            self._receiver.stop()  # the receiver itself keeps running for the home's other processes
         if self._implementation is not None:
             self._implementation.shutdown()
 
@@ -235,4 +267,4 @@ class Telemetry:
         return self._implementation._span(name, kind=kind, operation=operation, attributes=attributes)
 
 
-__all__ = ["SpanHandle", "Telemetry", "TelemetryError", "TelemetryStatus"]
+__all__ = ["ReceiverState", "SpanHandle", "Telemetry", "TelemetryError", "TelemetryStatus"]

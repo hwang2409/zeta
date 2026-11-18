@@ -6,16 +6,33 @@ from collections.abc import Callable
 from typing import Any
 
 from ...config.settings import load_settings
+from ...telemetry import Telemetry
 from ..protocol import ErrorDescriptor, FrameCodec, ProtocolError
 
 _CODEC = FrameCodec()
+
+
+def live_view(telemetry: Telemetry) -> dict[str, Any]:
+    """This process's receiver and export state; serve ``status`` and ``telemetry_status`` share it.
+
+    Reads in-memory snapshots only, on the event loop (the export status cell's one reader).
+    ``receiver`` is None when this process does not supervise the built-in receiver.
+    """
+    receiver = telemetry.receiver()
+    exported = telemetry.status()
+    return {
+        "receiver": None if receiver is None else receiver.state,
+        "last_export": exported.last_export,
+        "last_export_ns": exported.last_export_ns,
+    }
 
 
 async def telemetry_status(client, request_id, params):
     if params:
         raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, "invalid params")
     home = client.server.home
-    return await _read(client, request_id, lambda reader, fits: reader.status(home, load_settings(home=home).settings.otel_endpoint))
+    live = live_view(client.server.telemetry)
+    return await _read(client, request_id, lambda reader, fits: reader.status(home, load_settings(home=home).settings.otel_endpoint, live))
 
 
 async def telemetry_sessions(client, request_id, params):

@@ -2,6 +2,9 @@
 
 Nothing outside the rows this module returns is retained. Adding a retained key means
 changing ``_SPAN_COLUMNS`` or ``_EVENT_COLUMNS`` here and its privacy test.
+
+The resource attribute ``zeta.home.id`` is read only to keep this home's spans: a resource from
+another home (or with no home id) is dropped and counted, never stored.
 """
 
 from __future__ import annotations
@@ -102,8 +105,14 @@ class Reject(ValueError):
     """The whole OTLP request is refused; nothing from it is written."""
 
 
-def project_request(body: bytes) -> list[dict[str, Any]]:
-    """Decode one ExportTraceServiceRequest into projected span rows, or raise ``Reject``."""
+HOME_ID_ATTRIBUTE = "zeta.home.id"
+
+
+def project_request(body: bytes, home_id: str) -> tuple[list[dict[str, Any]], int]:
+    """Decode one ExportTraceServiceRequest into this home's projected span rows, or raise ``Reject``.
+
+    Returns the rows and the number of spans dropped because their resource is not ``home_id``'s.
+    """
     from google.protobuf.message import DecodeError
     from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
         ExportTraceServiceRequest,
@@ -118,18 +127,29 @@ def project_request(body: bytes) -> list[dict[str, Any]]:
         raise Reject("too many spans")
     zeta_version = importlib.metadata.version("zeta")
     rows: list[dict[str, Any]] = []
+    foreign = 0
     for resource_spans in request.resource_spans:
-        resource = _attributes(resource_spans.resource.attributes)
-        service_version = _version(resource.get("service.version"), zeta_version)
-        for scope_spans in resource_spans.scope_spans:
-            scope = scope_spans.scope
-            _attributes(scope.attributes)  # enforces the per-object cap; scope attributes are dropped
-            if scope.name != "zeta":
-                raise Reject("unknown instrumentation scope")
-            scope_version = _version(scope.version, zeta_version)
-            for span in scope_spans.spans:
-                rows.append(_project_span(span, service_version, scope_version))
-    return rows
+        resource_rows, resource_foreign = _project_resource(resource_spans, home_id, zeta_version)
+        rows.extend(resource_rows)
+        foreign += resource_foreign
+    return rows, foreign
+
+
+def _project_resource(resource_spans: Any, home_id: str, zeta_version: str) -> tuple[list[dict[str, Any]], int]:
+    """One resource's projected rows, or none and its span count when the resource is not ``home_id``'s."""
+    resource = _attributes(resource_spans.resource.attributes)
+    if resource.get(HOME_ID_ATTRIBUTE) != home_id:
+        return [], sum(len(scope.spans) for scope in resource_spans.scope_spans)
+    service_version = _version(resource.get("service.version"), zeta_version)
+    rows: list[dict[str, Any]] = []
+    for scope_spans in resource_spans.scope_spans:
+        scope = scope_spans.scope
+        _attributes(scope.attributes)  # enforces the per-object cap; scope attributes are dropped
+        if scope.name != "zeta":
+            raise Reject("unknown instrumentation scope")
+        scope_version = _version(scope.version, zeta_version)
+        rows.extend(_project_span(span, service_version, scope_version) for span in scope_spans.spans)
+    return rows, 0
 
 
 def _version(value: object, zeta_version: str) -> str:

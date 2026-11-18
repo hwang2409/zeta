@@ -354,7 +354,7 @@ def _create_app_with_root(
     except SettingsError as exc:
         raise SessionError(str(exc)) from exc
     try:
-        telemetry = Telemetry.configure(config)
+        telemetry = Telemetry.configure(config, home)
     except TelemetryError as exc:
         raise SessionError(str(exc)) from None
     # the app owns it after a successful start; until then this startup cleanup does

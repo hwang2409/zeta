@@ -176,7 +176,8 @@ def test_shutdown_is_synchronous_and_export_failure_is_not_logged(monkeypatch: p
         instance.shutdown()
         instance.shutdown()
         assert stopped.is_set()
-        assert instance.status() == telemetry.TelemetryStatus(True, "degraded", "export_unavailable")
+        status = instance.status()
+        assert (status.enabled, status.state, status.reason, status.last_export) == (True, "degraded", "export_unavailable", "error")
         assert not records
     finally:
         app_logger.removeHandler(handler)
@@ -211,7 +212,7 @@ def test_loopback_and_one_slot() -> None:
     cell = StatusCell()
     for value in ("healthy", "export_unavailable", "healthy"):
         cell.publish(value)
-    assert cell.read() == "healthy"
+    assert cell.read()[0] == "healthy"
     assert cell.read() is None
 
 
@@ -271,7 +272,7 @@ def test_status_cell_is_bounded_with_concurrent_publishers() -> None:
         thread.join(timeout=5)
     assert all(not thread.is_alive() for thread in threads)
     cell.publish("healthy")
-    assert cell.read() == "healthy"
+    assert cell.read()[0] == "healthy"
     assert cell.read() is None
 
 

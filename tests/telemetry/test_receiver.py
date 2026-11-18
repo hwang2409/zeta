@@ -8,7 +8,6 @@ import json
 import os
 import select
 import signal
-import socket
 import sqlite3
 import stat
 import subprocess
@@ -39,6 +38,7 @@ VERSION = importlib.metadata.version("zeta")
 ROOT = "0123456789abcdef0123456789abcdef"
 TRACE = bytes.fromhex("00112233445566778899aabbccddeeff")
 PROTOBUF = {"content-type": "application/x-protobuf"}
+HOME_ID = "f" * 32
 
 
 def _value(value: object) -> AnyValue:
@@ -82,7 +82,7 @@ def _span(
 def _body(*spans: Span, resource: dict[str, object] | None = None, scope_name: str = "zeta") -> bytes:
     request = ExportTraceServiceRequest()
     resource_spans = request.resource_spans.add()
-    resource_spans.resource.attributes.extend(_attributes(resource or {"service.name": "zeta", "service.version": VERSION}))
+    resource_spans.resource.attributes.extend(_attributes(resource or {"service.name": "zeta", "service.version": VERSION, "zeta.home.id": HOME_ID}))
     scope_spans = resource_spans.scope_spans.add()
     scope_spans.scope.name = scope_name
     scope_spans.scope.version = VERSION
@@ -94,7 +94,7 @@ def _body(*spans: Span, resource: dict[str, object] | None = None, scope_name: s
 def receiver(tmp_path):
     directory = tmp_path / "telemetry"
     directory.mkdir()
-    app = create_app(directory, "f" * 32)
+    app = create_app(directory, HOME_ID)
     with TestClient(app, base_url="http://127.0.0.1:4323") as client:
         yield client, app, directory / "telemetry.sqlite3"
 
@@ -149,7 +149,7 @@ def test_receiver_retains_only_allowlisted_metadata(receiver):
     span.status.message = secret
     span.trace_state = secret
     span.links.add(trace_id=TRACE, span_id=(9).to_bytes(8, "big"), attributes=_attributes({"link": secret}))
-    body = _body(span, resource={"service.name": "zeta", "service.version": VERSION, "host.name": secret})
+    body = _body(span, resource={"service.name": "zeta", "service.version": VERSION, "zeta.home.id": HOME_ID, "host.name": secret})
 
     assert client.post("/v1/traces", content=body, headers=PROTOBUF).status_code == 200
 
@@ -318,6 +318,27 @@ def test_request_shape_rules(receiver):
     assert health.headers["x-content-type-options"] == "nosniff"
 
 
+def test_spans_from_another_home_are_dropped_and_counted(receiver):
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+        ExportTraceServiceResponse,
+    )
+
+    client, _app, database = receiver
+    other = {"service.name": "zeta", "service.version": VERSION, "zeta.home.id": "e" * 32}
+    unmarked = {"service.name": "zeta", "service.version": VERSION}
+
+    own = client.post("/v1/traces", content=_body(_span(1)), headers=PROTOBUF)
+    foreign = client.post("/v1/traces", content=_body(_span(2), _span(3), resource=other), headers=PROTOBUF)
+    legacy = client.post("/v1/traces", content=_body(_span(4), resource=unmarked), headers=PROTOBUF)
+    health = client.get("/health").json()
+
+    assert [response.status_code for response in (own, foreign, legacy)] == [200, 200, 200]
+    assert [span["span_id"] for span in _trace(database, TRACE.hex())["spans"]] == [(1).to_bytes(8, "big").hex()], "another home's spans were stored"
+    rejected = ExportTraceServiceResponse.FromString(foreign.content).partial_success
+    assert (rejected.rejected_spans, rejected.error_message) == (2, "foreign_home")
+    assert health["dropped"] == {"foreign_home": 3}
+
+
 def test_duplicate_batch_and_span_count_once(receiver):
     client, app, database = receiver
     event = Span.Event(name="zeta.approval.requested", time_unix_nano=150, attributes=_attributes({"decision": "ask", "scope": "once"}))
@@ -349,7 +370,7 @@ def test_commit_failure_acknowledges_and_publishes_nothing(tmp_path, monkeypatch
     monkeypatch.setattr(store_module.sqlite3, "connect", functools.partial(sqlite3.connect, factory=CrashingConnection))
     directory = tmp_path / "telemetry"
     directory.mkdir()
-    app = create_app(directory, "f" * 32)
+    app = create_app(directory, HOME_ID)
     database = directory / "telemetry.sqlite3"
     with TestClient(app, base_url="http://127.0.0.1:4323") as client:
         body = _body(_span(1), _span(2, parent=1, name="execute_tool read", attributes={"zeta.tool.name": "read"}))
@@ -390,7 +411,7 @@ def test_projection_is_identical_in_both_orders(tmp_path):
 
     def ingest(order: list[Span], home: Path) -> tuple[list[tuple], list[tuple]]:
         home.mkdir()
-        with TestClient(create_app(home, "f" * 32), base_url="http://127.0.0.1:4323") as client:
+        with TestClient(create_app(home, HOME_ID), base_url="http://127.0.0.1:4323") as client:
             for span in order:
                 assert client.post("/v1/traces", content=_body(span), headers=PROTOBUF).status_code == 200
         database = home / "telemetry.sqlite3"
@@ -418,19 +439,12 @@ def test_projection_is_identical_in_both_orders(tmp_path):
     assert session["model"] == "m-high"
 
 
-def _port_in_use() -> bool:
-    with socket.socket() as probe:
-        return probe.connect_ex(("127.0.0.1", 4323)) == 0
-
-
 def _receiver_command(home: Path) -> tuple[list[str], dict[str, str]]:
     command = [sys.executable, "-c", "import sys; from zeta.cli.main import main; sys.exit(main())", "otel", "receiver"]
     return command, {**os.environ, "ZETA_HOME": str(home)}
 
 
-def test_second_process_exits_and_bind_failure_releases_lock(tmp_path):
-    if _port_in_use():
-        pytest.skip("127.0.0.1:4323 is in use on this machine")
+def test_second_process_exits_and_bind_failure_releases_lock(tmp_path, builtin_port):
     owner_home, other_home = tmp_path / "owner", tmp_path / "other"
     command, environment = _receiver_command(owner_home)
     owner = subprocess.Popen(command, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -475,3 +489,83 @@ def test_second_process_exits_and_bind_failure_releases_lock(tmp_path):
         owner.stdout.close()
         owner.stderr.close()
     assert owner.returncode == -signal.SIGTERM  # uvicorn shuts down gracefully, then re-raises the signal
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_idle_receiver_exits_after_the_timeout(tmp_path):
+    import asyncio
+    import socket
+
+    import uvicorn
+
+    from zeta.telemetry.receiver.app import IdleExitServer, IdleTimer
+    from zeta.telemetry.receiver.process import IDLE_EXIT_SECONDS
+
+    clock = _Clock()
+    idle = IdleTimer(IDLE_EXIT_SECONDS, clock)
+    clock.now = IDLE_EXIT_SECONDS - 1
+    assert not idle.expired()
+    clock.now = IDLE_EXIT_SECONDS
+    assert idle.expired()
+
+    directory = tmp_path / "telemetry"
+    directory.mkdir()
+    app = create_app(directory, HOME_ID, idle)
+    server = IdleExitServer(uvicorn.Config(app, log_level="warning", lifespan="on"), idle)
+    listener = socket.create_server(("127.0.0.1", 0))
+    try:
+        asyncio.run(asyncio.wait_for(server.serve(sockets=[listener]), 10))  # returns only when the idle tick stops it
+    finally:
+        listener.close()
+    assert server.started
+    assert not app.state.writer._thread.is_alive()  # the lifespan closed the writer: a clean shutdown
+
+
+@pytest.mark.parametrize("request_kind", ["health", "ingest"])
+def test_health_or_ingest_resets_the_idle_timer(tmp_path, request_kind):
+    from zeta.telemetry.receiver.app import IdleTimer
+    from zeta.telemetry.receiver.process import IDLE_EXIT_SECONDS
+
+    clock = _Clock()
+    idle = IdleTimer(IDLE_EXIT_SECONDS, clock)
+    directory = tmp_path / "telemetry"
+    directory.mkdir()
+    with TestClient(create_app(directory, HOME_ID, idle), base_url="http://127.0.0.1:4323") as client:
+        clock.now = IDLE_EXIT_SECONDS - 1
+        if request_kind == "health":
+            assert client.get("/health").status_code == 200
+        else:
+            assert client.post("/v1/traces", content=_body(_span(1)), headers=PROTOBUF).status_code == 200
+        clock.now = 2 * IDLE_EXIT_SECONDS - 2
+        assert not idle.expired(), f"{request_kind} did not reset the idle timer"
+        clock.now = 2 * IDLE_EXIT_SECONDS - 1
+        assert idle.expired()
+
+
+@pytest.mark.parametrize(("arguments", "exits_when_idle"), [([], False), (["--idle-exit"], True)], ids=["manual", "auto-started"])
+def test_only_the_auto_started_receiver_idle_exits(tmp_path, monkeypatch, arguments, exits_when_idle):
+    import socket
+
+    from zeta.cli.main import main
+    from zeta.telemetry.receiver import process
+    from zeta.telemetry.receiver.app import IdleTimer
+
+    served: list[float] = []
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    create_server = socket.create_server
+    monkeypatch.setattr(process.socket, "create_server", lambda address: create_server(("127.0.0.1", 0)))  # not the fixed port
+    # test-contract: seam _serve takes the idle timeout the CLI chose; a manual receiver can only be shown not to expire
+    monkeypatch.setattr(process, "_serve", lambda listener, directory, home_id, idle_seconds: served.append(idle_seconds) or 0)
+
+    assert main(["otel", "receiver", *arguments]) == 0
+    clock = _Clock()
+    idle = IdleTimer(served[0], clock)
+    clock.now = 10.0**12
+    assert idle.expired() is exits_when_idle

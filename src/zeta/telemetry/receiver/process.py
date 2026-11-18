@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import http.client
 import json
+import math
 import os
 import re
 import secrets
@@ -20,11 +21,16 @@ AUTHORITY = f"{HOST}:{PORT}"
 URL = f"http://{AUTHORITY}/"
 OTLP_URL = f"{URL}v1/traces"
 HEALTH_TIMEOUT_SECONDS = 1.0
+IDLE_EXIT_SECONDS = 15 * 60  # an auto-started receiver with no ingest and no /health for this long exits
 _HOME_ID = re.compile(r"[0-9a-f]{32}\Z")
 
 
-def run_receiver(home: Path) -> int:
-    """Startup order: home id, lock, bind, migrate, serve. Returns the process exit code."""
+def run_receiver(home: Path, idle_exit: bool = False) -> int:
+    """Startup order: home id, lock, bind, migrate, serve. Returns the process exit code.
+
+    With ``idle_exit`` (auto-started receivers), it exits cleanly after ``IDLE_EXIT_SECONDS``
+    without an ingest or ``/health`` request; every supervisor checks health every 10 seconds.
+    """
     try:
         import uvicorn  # noqa: F401 - fail before taking the lock when the extra is missing
 
@@ -56,23 +62,24 @@ def run_receiver(home: Path) -> int:
             print(f"zeta otel receiver: cannot listen on {AUTHORITY}: {exc.strerror or exc}", file=sys.stderr)
             return 1
         with listener:
-            return _serve(listener, directory, home_id)
+            return _serve(listener, directory, home_id, IDLE_EXIT_SECONDS if idle_exit else math.inf)
     finally:
         os.close(lock)  # closing the descriptor releases the lock
 
 
-def _serve(listener: socket.socket, directory: Path, home_id: str) -> int:
+def _serve(listener: socket.socket, directory: Path, home_id: str, idle_seconds: float) -> int:
     import uvicorn
 
-    from .app import create_app
+    from .app import IdleExitServer, IdleTimer, create_app
 
+    idle = IdleTimer(idle_seconds)
     try:
-        app = create_app(directory, home_id)
+        app = create_app(directory, home_id, idle)
     except (OSError, RuntimeError, sqlite3.Error) as exc:
         print(f"zeta otel receiver: cannot open the telemetry database: {exc}", file=sys.stderr)
         return 1
     print(f"zeta otel receiver: {OTLP_URL}", flush=True)  # the listener already accepts into its backlog
-    server = uvicorn.Server(uvicorn.Config(app, log_level="warning", access_log=False, lifespan="on"))
+    server = IdleExitServer(uvicorn.Config(app, log_level="warning", access_log=False, lifespan="on"), idle)
     server.run(sockets=[listener])
     return 0
 
@@ -91,6 +98,15 @@ def _running_home_id(host: str, port: int) -> str | None:
     finally:
         connection.close()
     return value if isinstance(value, str) else None
+
+
+def receiver_ready(home: Path) -> bool:
+    """Whether the receiver on the fixed port answers with this home's id; blocks up to the health timeout."""
+    try:
+        home_id = _read_home_id(home / "telemetry" / "home-id")
+    except (OSError, RuntimeError):
+        return False
+    return _running_home_id(HOST, PORT) == home_id
 
 
 def _home_id(directory: Path) -> str:

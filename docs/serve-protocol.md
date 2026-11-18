@@ -669,11 +669,16 @@ integer Unix nanoseconds; ids are lowercase hex strings; absent values are
 ```
 
 - `enabled`: `[otel].endpoint` is configured and the database exists.
-- `receiver`: `ready` when the receiver on `127.0.0.1:4323` reports this
-  home's id, else `stopped`. `starting` and `error` are reserved.
+- `receiver`: when this serve process uses the built-in endpoint, its
+  supervisor's latest state: `starting` while it launches a receiver, `ready`
+  when the receiver on `127.0.0.1:4323` reports this home's id, `stopped`
+  between failed launches, `error` after five failed launches in a row or
+  while another zeta home's receiver holds the port.
+  Otherwise `ready` when that receiver reports this home's id, else `stopped`.
 - `endpoint`: `builtin` for exactly `http://127.0.0.1:4323/v1/traces`,
   `external` for another configured endpoint, or `null`.
-- `last_export` and `last_export_ns` are `null` in this version.
+- `last_export`: `ok` or `error` for this serve process's latest export
+  batch, and `last_export_ns` when it finished; both `null` before the first.
 - `used_bytes`: the database file plus its `-wal` and `-shm` files.
 - `oldest_raw_ns`: the earliest stored span start, or `null`.
 - `oldest_rollup_ns` is `null` in this version.
@@ -1182,6 +1187,15 @@ With `session_park`, the result also has `parked_sessions`: one
 first. `state` uses the same values as the top-level `state`, and
 `pending_approvals` is the number of its pending approvals. A closing session
 is not listed. Without the feature, the key is omitted.
+
+With `telemetry_read_v1`, the result also has `telemetry`:
+`{"receiver": "ready" | "starting" | "stopped" | "error" | null, "last_export": "ok" | "error" | null, "last_export_ns": integer | null}`.
+`receiver` is this serve process's latest view of the built-in receiver, or
+`null` when its `[otel].endpoint` is not the built-in one. `last_export` is the
+result of this process's latest export batch and `last_export_ns` when it
+finished; both are `null` before the first batch. `telemetry_status` returns
+the same values. Reading them does no I/O. Without the feature, the key is
+omitted.
 
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the live
 projection merged with the durable store projection by `request_id` (a live row

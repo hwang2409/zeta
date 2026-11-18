@@ -125,7 +125,10 @@ _zeta() {
                     _arguments '--project=[project name or ID]:project:'
                     ;;
                 otel)
-                    _arguments '1:action:(receiver)'
+                    case ${original_words[command_index+1]} in
+                        receiver) _arguments '--idle-exit[exit after 15 idle minutes]' ;;
+                        *) _arguments '1:action:(receiver)' ;;
+                    esac
                     ;;
                 mcp)
                     case ${original_words[command_index+1]} in
@@ -257,7 +260,11 @@ def bash_script() -> str:
             COMPREPLY=( $(compgen -W "--project" -- "$cur") )
             ;;
         otel)
-            COMPREPLY=( $(compgen -W "receiver" -- "$cur") )
+            if (( COMP_CWORD <= command_index + 1 )); then
+                COMPREPLY=( $(compgen -W "receiver" -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -W "--idle-exit" -- "$cur") )
+            fi
             ;;
         mcp)
             if (( COMP_CWORD <= command_index + 1 )); then
