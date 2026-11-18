@@ -1708,6 +1708,7 @@ def _tool_contract_events(name: str) -> tuple[StreamEvent, StreamEvent, StreamEv
         {
             "path": "sample.txt",
             "command": "printf sample",
+            "script": "output(\"sample\")",
             "content": "sample",
             "items": [],
             "name": "sample",
@@ -1736,7 +1737,7 @@ def _assert_tool_contract(name: str) -> None:
     assert all(item is not None for item in rendered), name
     plain = [terminal_plain(item).lower() for item in rendered]
     assert name.lower() in plain[0], name
-    assert "sample" in plain[0], name
+    assert ("1 lines" if name == "code" else "sample") in plain[0], name
     assert "contract result" in plain[1] or name.lower() in plain[1], name
     assert "contract error" in plain[2], name
     assert any(marker in plain[2] for marker in ("error", "failed", "denied")), name
@@ -1767,6 +1768,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
     top_level = ToolRegistry(
         tmp_path,
         session_store=stores[0],
+        code_mode_enabled=True,
         skill_catalog=SkillCatalog.empty(),
         project_id="project-1",
         project_registry=SimpleNamespace(),
@@ -1859,7 +1861,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
 async def test_tool_card_registry_only_names_real_or_supported_alias_tools(
     tmp_path: Path,
 ) -> None:
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty(), code_mode_enabled=True)
     try:
         assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {
             "exec",

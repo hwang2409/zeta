@@ -10,6 +10,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ...agent.turn_limit import project_notification_data, project_tool_result_data
+from ...core.context_parts.code_audit import nested_approval_anchors, nested_call_data
 from ...core.store._client_delivery import CLIENT_DELIVERY_METADATA
 from ...protocol.types import (
     FAILED_TURN_ERROR,
@@ -68,6 +69,7 @@ class HistoryProjection:
     frontier: int = 0
     frontier_row_id: str | None = None
     approval_origins: Mapping[str, object] = MappingProxyType({})
+    nested_anchors: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -403,6 +405,7 @@ def history_projection(
         frontier=branch[-1].seq if branch else 0,
         frontier_row_id=branch[-1].id if branch else None,
         approval_origins=MappingProxyType(approval_origins),
+        nested_anchors=frozenset(nested_approval_anchors(branch)),
     )
     if stable_generation is None or skip_cache:
         return built
@@ -689,6 +692,15 @@ def forward_next_offset(projection: HistoryProjection, cursor: int) -> int | Non
     return None
 
 
+def _annotate_nested_history(row: dict[str, object], projection: HistoryProjection) -> dict[str, object]:
+    result = row.get("tool_result")
+    call_id = result.get("tool_call_id") if isinstance(result, dict) else row.get("request_id")
+    if isinstance(call_id, str) and call_id in projection.nested_anchors:
+        parent, _, _ = call_id.rpartition(":code:")
+        return {**row, **nested_call_data(call_id, parent)}
+    return row
+
+
 def _history_group(
     projection: HistoryProjection,
     index: int,
@@ -702,7 +714,7 @@ def _history_group(
     validator: dict[str, object] | None,
 ) -> tuple[tuple[dict[str, object], ...], int, tuple[dict[str, object], ...], int]:
     raw = [
-        row
+        _annotate_nested_history(row, projection)
         for entry in projection.entry_groups[index]
         for row in _history_entry_rows(
             entry,
@@ -757,7 +769,7 @@ def _history_group_fits(
         return False, group, size
     # Alone on its page, the group must still fit this page's real envelope.
     raw = [
-        row
+        _annotate_nested_history(row, projection)
         for entry in raw_group
         for row in _history_entry_rows(
             entry,
