@@ -20,7 +20,7 @@ from typing import Any
 
 from .projector import EVENT_COLUMNS, SPAN_COLUMNS, root_session_id
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 RAW_DAYS = 14
 ROLLUP_DAYS = 90
 MAX_BYTES = 1 << 30
@@ -30,7 +30,7 @@ INGEST_QUEUE_CAPACITY = 64
 GRACEFUL_COMMIT_TIMEOUT_SECONDS = 5.0
 BUSY_TIMEOUT_MS = 5_000
 
-# the schema-1 tables; a new database also runs every entry of MIGRATIONS, so both paths reach one shape
+# the schema-1 tables; a new database also runs all migrations
 SCHEMA = """
 CREATE TABLE viewer_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -169,7 +169,6 @@ CREATE TABLE hourly_distinct(hour_ns INTEGER NOT NULL, group_by TEXT NOT NULL CH
 CREATE TABLE hourly_models(hour_ns INTEGER NOT NULL, model_key TEXT NOT NULL, provider TEXT, model TEXT NOT NULL, calls INTEGER NOT NULL CHECK(calls>=0), errors INTEGER NOT NULL CHECK(errors>=0), duration_ns INTEGER NOT NULL CHECK(duration_ns>=0), input_tokens INTEGER NOT NULL CHECK(input_tokens>=0), output_tokens INTEGER NOT NULL CHECK(output_tokens>=0), total_tokens INTEGER NOT NULL CHECK(total_tokens>=0), last_ns INTEGER NOT NULL CHECK(last_ns>=0), PRIMARY KEY(hour_ns,model_key)) STRICT;
 CREATE TABLE hourly_tools(hour_ns INTEGER NOT NULL, tool_key TEXT NOT NULL, tool_name TEXT NOT NULL, tool_type TEXT, calls INTEGER NOT NULL CHECK(calls>=0), errors INTEGER NOT NULL CHECK(errors>=0), duration_ns INTEGER NOT NULL CHECK(duration_ns>=0), argument_bytes INTEGER NOT NULL CHECK(argument_bytes>=0), result_bytes INTEGER NOT NULL CHECK(result_bytes>=0), last_ns INTEGER NOT NULL CHECK(last_ns>=0), PRIMARY KEY(hour_ns,tool_key)) STRICT;
 CREATE TABLE hourly_latency(hour_ns INTEGER NOT NULL, family TEXT NOT NULL CHECK(family IN('model','tool')), family_key TEXT NOT NULL, bucket INTEGER NOT NULL CHECK(bucket BETWEEN 0 AND 63), calls INTEGER NOT NULL CHECK(calls>=0), PRIMARY KEY(hour_ns,family,family_key,bucket)) STRICT;
-CREATE INDEX spans_start ON spans(start_ns);
 CREATE INDEX hourly_distinct_range ON hourly_distinct(group_by,group_key,hour_ns,identity_kind);
 CREATE INDEX hourly_models_range ON hourly_models(hour_ns,provider,model);
 CREATE INDEX hourly_tools_range ON hourly_tools(hour_ns,tool_name,tool_type);
@@ -450,7 +449,12 @@ def open_database(path: Path) -> None:
             if version == 1:
                 for statement in MIGRATIONS_2:
                     connection.execute(statement)
-            _migrate_v3(connection)
+            if version < 3:
+                _migrate_v3(connection)
+            # Slice-4 preview databases can already have this index at v3.
+            connection.execute("CREATE INDEX IF NOT EXISTS spans_start ON spans(start_ns)")
+            connection.execute("UPDATE viewer_meta SET schema_version=4 WHERE singleton=1")
+            connection.execute("PRAGMA user_version=4")
             connection.commit()
         except BaseException:
             connection.rollback(); raise
@@ -470,15 +474,13 @@ def _enable_incremental_vacuum(connection: sqlite3.Connection, path: Path) -> No
 
 
 def _migrate_v3(connection: sqlite3.Connection) -> None:
-    """Create the v3 tables, backfill fingerprints and rollups from every raw span, and publish v3."""
+    """Create the v3 tables and backfill fingerprints and rollups from every raw span."""
     _set_v3_tables(connection)
     connection.row_factory = sqlite3.Row
     for raw in connection.execute("SELECT * FROM spans"):
         row = _row_dict(raw)
         connection.execute("INSERT OR IGNORE INTO span_fingerprints VALUES(?,?,?)", (row["trace_id"],row["span_id"],row["start_ns"]))
         _project_rollup(connection, row)
-    connection.execute("UPDATE viewer_meta SET schema_version=3 WHERE singleton=1")
-    connection.execute("PRAGMA user_version=3")
 
 
 def _histogram_bucket(duration_ns: int) -> int:
