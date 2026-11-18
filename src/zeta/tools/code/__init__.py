@@ -70,6 +70,7 @@ async def _code(arguments, abort_signal, *, execution_context: ToolExecutionCont
     except (GuestError, TimeoutError, UnicodeError) as exc:
         error = True
         content = str(exc) or "code mode wall deadline exceeded"
+    summaries.sort(key=lambda summary: summary["index"])
     projection = {
         "version": 1, "state": "error" if error else "completed",
         "source_sha256": hashlib.sha256(source.encode(errors="surrogatepass")).hexdigest(),

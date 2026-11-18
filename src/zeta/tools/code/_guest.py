@@ -27,6 +27,7 @@ OUTPUT_INPUT_LIMIT = 1024 * 1024
 MEMORY = 32 * 1024**2
 FUEL = 60 * 10**9
 MAX_CALLS = 50
+GuestCall = tuple[str, dict[str, Any], int]
 Dispatch = Callable[[str, dict[str, Any], int], Awaitable[dict[str, object]]]
 
 
@@ -83,11 +84,11 @@ def _json_loads(data: str | bytes) -> Any:
 
 
 def _json_bytes(value: object) -> bytes:
-    return json.dumps(value, separators=(",", ":"), allow_nan=False).encode()
+    return json.dumps(value, separators=(",", ":"), allow_nan=False, ensure_ascii=False).encode(errors="backslashreplace")
 
 
 class _Bridge:
-    def __init__(self, request: Callable[[str, dict[str, Any], int], bytes]) -> None:
+    def __init__(self, request: Callable[[list[GuestCall]], bytes]) -> None:
         self.request = request
         self.calls = 0
         self.incoming = memoryview(b'{"event-loop":true,"simd-json-builtins":false}')
@@ -112,17 +113,19 @@ class _Bridge:
             return
         calls = message.get("calls")
         if (message.get("op") != "call" or set(message) != {"op", "calls"}
-                or not isinstance(calls, list) or len(calls) != 1 or self.incoming):
-            raise GuestError("invalid sequential call frame")
-        call = calls[0]
-        if (not isinstance(call, dict) or set(call) != {"tool", "args"}
-                or not isinstance(call["tool"], str) or len(call["tool"]) > 128
-                or not isinstance(call["args"], dict)):
-            raise GuestError("invalid nested call")
-        if self.calls >= MAX_CALLS:
+                or not isinstance(calls, list) or not calls or self.incoming):
+            raise GuestError("invalid call frame")
+        if self.calls + len(calls) > MAX_CALLS:
             raise GuestError("code mode allows at most 50 tool calls")
-        self.calls += 1
-        data = self.request(call["tool"], call["args"], self.calls)
+        batch: list[GuestCall] = []
+        for index, call in enumerate(calls, self.calls + 1):
+            if (not isinstance(call, dict) or set(call) != {"tool", "args"}
+                    or not isinstance(call["tool"], str) or len(call["tool"]) > 128
+                    or not isinstance(call["args"], dict)):
+                raise GuestError("invalid nested call")
+            batch.append((call["tool"], call["args"], index))
+        self.calls += len(batch)
+        data = self.request(batch)
         self.incoming = memoryview(struct.pack("<I", len(data)) + data)
 
     def io(self, caller: Any, fd: int, table: int, num: int, out: int, *, reading: bool) -> int:
@@ -213,7 +216,7 @@ def _invoke(wasm: Any, engine: Any, module: Any, source: bytes, bridge: _Bridge,
 async def run_guest(
     script: str, names: Sequence[str], dispatch: Dispatch, *, wall: float = 600, active: float = 60,
 ) -> bytes:
-    """Own the invocation, including worker join and draining any admitted call."""
+    """Own the invocation, including worker join and draining the current call batch."""
     source = script.encode()
     if len(source) > FRAME:
         raise GuestError("script exceeds 64 KiB")
@@ -228,6 +231,8 @@ async def run_guest(
     started = loop.time()
 
     def interrupt(message: str) -> None:
+        if stop.is_set():
+            return
         stop.set()
         with engine_lock:
             if engine is not None:
@@ -246,19 +251,34 @@ async def run_guest(
         started = loop.time()
         timer = loop.call_later(active, interrupt, "code mode active guest deadline exceeded")
 
-    async def run_call(name: str, args: dict[str, Any], index: int) -> bytes:
-        result = await dispatch(name, args, index)
+    async def run_batch(batch: list[GuestCall]) -> bytes:
+        tasks = [loop.create_task(dispatch(*call)) for call in batch]
+        replies = asyncio.gather(*tasks)
         try:
-            data = _json_bytes([result])
-            if len(data) <= FRAME:
-                return data
-        except (ValueError, TypeError, RecursionError):
-            pass
-        return _json_bytes([{"ok": False, "error": {"name": "ToolError", "tool": name,
-                            "callId": index, "content": "inner result exceeds bridge limits",
-                            "structuredContent": None, "canceled": False}}])
+            results = await asyncio.shield(replies)
+        except BaseException:
+            for child in tasks:
+                child.cancel()
+            await asyncio.gather(replies, *tasks, return_exceptions=True)
+            raise
 
-    def start_call(name: str, args: dict[str, Any], index: int, reply: Future[bytes]) -> None:
+        encoded = []
+        for (name, _, index), result in zip(batch, results, strict=True):
+            fallback = _json_bytes({"ok": False, "error": {"name": "ToolError", "tool": name,
+                                   "callId": index, "content": "inner result exceeds bridge limits",
+                                   "structuredContent": None, "canceled": False}})
+            try:
+                data = _json_bytes(result)
+            except (ValueError, TypeError, RecursionError):
+                data = fallback
+            encoded.append((data, fallback))
+        # Keep small siblings when replies would exceed the shared frame budget.
+        limit = FRAME
+        if 1 + sum(len(data) + 1 for data, _ in encoded) > FRAME:
+            limit = (FRAME - 1) // len(batch) - 1
+        return b"[" + b",".join(data if len(data) <= limit else fallback for data, fallback in encoded) + b"]"
+
+    def start_batch(batch: list[GuestCall], reply: Future[bytes]) -> None:
         nonlocal task, pending, active
         if stop.is_set():
             reply.cancel()
@@ -270,7 +290,7 @@ async def run_guest(
         if active <= 0:
             interrupt("code mode active guest deadline exceeded")
             return
-        task = loop.create_task(run_call(name, args, index))
+        task = loop.create_task(run_batch(batch))
 
         def transfer(completed: asyncio.Task[bytes]) -> None:
             if completed.cancelled():
@@ -286,11 +306,11 @@ async def run_guest(
 
         task.add_done_callback(transfer)
 
-    def request(name: str, args: dict[str, Any], index: int) -> bytes:
+    def request(batch: list[GuestCall]) -> bytes:
         if stop.is_set():
             raise GuestError("code mode stopped")
         reply: Future[bytes] = Future()
-        loop.call_soon_threadsafe(start_call, name, args, index, reply)
+        loop.call_soon_threadsafe(start_batch, batch, reply)
         return reply.result()
 
     def worker() -> None:

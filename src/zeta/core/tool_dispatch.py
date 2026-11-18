@@ -19,6 +19,7 @@ from ..protocol.types import (
 from ..telemetry import SpanHandle, Telemetry
 from .abort import AbortSignal
 from .agent_progress import read_agent_lifecycle
+from .tool_dispatch_coordinator import ToolDispatchCoordinator
 
 TaskResult = TypeVar("TaskResult")
 
@@ -193,6 +194,23 @@ async def dispatch_tool_calls(
                 )
             )
 
+    def execution_options(call: ToolCall) -> dict[str, Any]:
+        return {
+            "abort_signal": abort_signal,
+            "_scope_signal": abort_signal,
+            "_host_environment": host_environment,
+            "_pending_execution_owner": execution_owner,
+            "_stream_sink": enqueue_tool_update,
+            "_lifecycle_sink": lambda kind, data=None, tool_result=None: enqueue_tool_lifecycle(
+                kind, call, data, tool_result
+            ),
+            "_lifecycle_payload_sink": lambda kind, data: enqueue_tool_lifecycle(kind, call, data),
+            "_retain_approval_origin": True,
+        }
+
+    coordinator = ToolDispatchCoordinator(max_parallel=max(1, len(calls)))
+
+    update_task: asyncio.Task[StreamEvent] | None = None
     active_task: asyncio.Task[ToolResult] | None = None
     parallel_tasks: dict[asyncio.Task[StructuredToolResult], tuple[int, ToolCall]] = {}
     parallel_results: list[ToolResult | None] = [None] * len(calls)
@@ -220,7 +238,7 @@ async def dispatch_tool_calls(
                 definition = loop.tool_registry.definitions_by_name.get(
                     calls[call_index].name
                 )
-                if definition is not None and definition.parallel_safe:
+                if definition is not None and definition.parallel_safe and tool_call.name != "code":
                     parallel_calls.append(calls[call_index])
                     while call_index + len(parallel_calls) < len(calls):
                         next_call = calls[call_index + len(parallel_calls)]
@@ -229,32 +247,19 @@ async def dispatch_tool_calls(
                         next_definition = loop.tool_registry.definitions_by_name.get(
                             next_call.name
                         )
-                        if next_definition is None or not next_definition.parallel_safe:
+                        if next_definition is None or not next_definition.parallel_safe or next_call.name == "code":
                             break
                         parallel_calls.append(next_call)
             if len(parallel_calls) > 1:
+                async def run_parallel(tool_call: ToolCall) -> StructuredToolResult:
+                    async with coordinator.slot(parallel_safe=True):
+                        return await _traced_execute(
+                            loop, tool_call, **execution_options(tool_call),
+                        )
+
                 parallel_tasks = {
                     loop._create_task(
-                        _traced_execute(
-                            loop,
-                            tool_call,
-                            abort_signal=abort_signal,
-                            _scope_signal=abort_signal,
-                            _host_environment=host_environment,
-                            _pending_execution_owner=execution_owner,
-                            _stream_sink=enqueue_tool_update,
-                            _lifecycle_sink=(
-                                lambda kind, call=tool_call, data=None, tool_result=None: enqueue_tool_lifecycle(
-                                    kind, call, data, tool_result
-                                )
-                            ),
-                            _lifecycle_payload_sink=(
-                                lambda kind, data, call=tool_call: enqueue_tool_lifecycle(
-                                    kind, call, data
-                                )
-                            ),
-                            _retain_approval_origin=True,
-                        )
+                        run_parallel(tool_call),
                     ): (call_index + offset, tool_call)
                     for offset, tool_call in enumerate(parallel_calls)
                 }
@@ -311,32 +316,22 @@ async def dispatch_tool_calls(
                 continue
 
             tool_call = calls[call_index]
-            nested_factory = getattr(loop, "_nested_executor_for", None)
-            nested = (
-                nested_factory(tool_call, abort_signal, enqueue_tool_update, host_environment)
-                if nested_factory is not None and tool_call.name == "code"
-                else None
-            )
-            active_task = loop._create_task(
-                execute_owned_tool(
-                    loop, tool_call, validate_result,
-                    abort_signal=abort_signal,
-                    _scope_signal=abort_signal,
-                    _host_environment=host_environment,
-                    _pending_execution_owner=execution_owner,
-                    _stream_sink=enqueue_tool_update,
-                    _lifecycle_sink=(
-                        lambda kind, call=tool_call, data=None, tool_result=None: enqueue_tool_lifecycle(
-                            kind, call, data, tool_result
-                        )
-                    ),
-                    _lifecycle_payload_sink=(
-                        lambda kind, data, call=tool_call: enqueue_tool_lifecycle(kind, call, data)
-                    ),
-                    _retain_approval_origin=True,
-                    **({"_nested_tool_executor": nested} if nested is not None else {}),
-                )
-            )
+            async def run_single(tool_call: ToolCall) -> ToolResult:
+                async with coordinator.slot(parallel_safe=False):
+                    nested_factory = getattr(loop, "_nested_executor_for", None)
+                    nested = (
+                        # The outer slot stays held until its own inner scope has drained.
+                        nested_factory(tool_call, abort_signal, enqueue_tool_update, host_environment,
+                                       ToolDispatchCoordinator(max_parallel=8))
+                        if nested_factory is not None and tool_call.name == "code"
+                        else None
+                    )
+                    return await execute_owned_tool(
+                        loop, tool_call, validate_result, **execution_options(tool_call),
+                        **({"_nested_tool_executor": nested} if nested is not None else {}),
+                    )
+
+            active_task = loop._create_task(run_single(tool_call))
             try:
                 while True:
                     update_task = loop._create_task(stream_updates.get())
@@ -370,6 +365,8 @@ async def dispatch_tool_calls(
             call_index += 1
     except (asyncio.CancelledError, GeneratorExit):
         pending_tasks: list[asyncio.Task[StructuredToolResult]] = []
+        if update_task is not None and not update_task.done():
+            update_task.cancel()
         await asyncio.sleep(0)
         if active_task is not None and not active_task.done():
             active_task.cancel()
@@ -387,7 +384,7 @@ async def dispatch_tool_calls(
             else:
                 task.cancel()
                 pending_tasks.append(task)
-        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        await asyncio.gather(*pending_tasks, *([update_task] if update_task else []), return_exceptions=True)
         pending_indexes = [
             index for index in range(len(calls)) if index not in completed_tool_indexes
         ]

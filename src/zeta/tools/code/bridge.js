@@ -45,12 +45,13 @@
     const batch = queue;
     queue = [];
     try {
-      if (batch.length !== 1) throw new Err('code mode only accepts sequential tool calls');
-      const item = batch[0];
-      send({op: 'call', calls: [item.request]});
-      const [reply] = receive();
-      if (reply.ok) item.resolve(reply.value);
-      else item.reject(assign(new Err(reply.error.content), reply.error));
+      send({op: 'call', calls: batch.map(item => item.request)});
+      const replies = receive();
+      for (let i = 0; i < batch.length; i++) {
+        const item = batch[i], reply = replies[i];
+        if (reply.ok) item.resolve(reply.value);
+        else item.reject(assign(new Err(reply.error.content), reply.error));
+      }
     } catch (error) {
       for (const item of batch) item.reject(error);
     }

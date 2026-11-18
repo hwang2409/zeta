@@ -28,24 +28,32 @@ async def test_guest_runs_dependent_calls_without_ambient_io():
 
 
 async def test_cancel_drains_host_and_guest():
-    entered = asyncio.Event()
-    drained = asyncio.Event()
+    both_entered = asyncio.Event()
+    blocked = asyncio.Event()
+    entered = []
+    canceled = []
 
-    async def dispatch(*_):
-        entered.set()
+    async def dispatch(name, args, index):
+        entered.append(index)
+        if len(entered) == 2:
+            both_entered.set()
         try:
-            await await_or_fail(asyncio.Event().wait(), what="pending nested tool must be canceled")
-        finally:
-            drained.set()
+            await await_or_fail(blocked.wait(), what="pending nested tool must be canceled")
+        except asyncio.CancelledError:
+            canceled.append(index)
+            raise
 
-    task = asyncio.create_task(run_guest('await tools.read({});', ["read"], dispatch))
+    task = asyncio.create_task(run_guest('await Promise.all([tools.read({}), tools.read({})]);', ["read"], dispatch))
     try:
-        await await_or_fail(entered.wait(), what="guest dispatches call")
+        await await_or_fail(both_entered.wait(), what="guest dispatches both calls")
     finally:
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await await_or_fail(task, what="canceled guest is joined")
-    assert drained.is_set()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(task, timeout=20, what="canceled guest is joined")
+        finally:
+            blocked.set()
+    assert sorted(canceled) == [1, 2]
     assert not any(t.name == "zeta-code-guest" for t in threading.enumerate())
 
 
