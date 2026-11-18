@@ -787,13 +787,17 @@ A file that does not parse or that zeta would refuse at startup projects as
 
 `home_settings_update` params are exactly `expected_revision` and `changes`,
 a list with one `{"key":"telemetry.enabled","value":true|false}`. The update
-changes only the `endpoint` line: `true` inserts it under an existing `[otel]`
-header or appends `[otel]` and the line at the end; `false` removes the line,
-and removes a bare `[otel]` header only when nothing follows it before the
-next table. Every other byte is kept, with the file's line endings (LF or
-CRLF) and its trailing-newline state, so on then off returns a file that had
-no `[otel]` to its exact bytes. An `otel` inline table or dotted
-`otel.endpoint` key is refused as `custom_home_setting`. Under the sibling lock
+changes only the built-in endpoint line and never adds or removes an `[otel]`
+header. If the file has an `[otel]` table, `true` inserts
+`endpoint = "http://127.0.0.1:4323/v1/traces"` under its header and `false`
+removes that line. If it has none, `true` inserts the top-level line
+`otel.endpoint = "http://127.0.0.1:4323/v1/traces"` before the first table (or
+at the end) and `false` removes it. Every other byte is kept, with the file's
+line endings (LF or CRLF) and its trailing-newline state, so on then off
+returns the exact original bytes. An update that must edit a layout neither
+form can express (an `otel` inline table, a line inside a multiline string)
+is refused as `custom_home_setting`; an update that changes nothing succeeds
+without a write. Under the sibling lock
 `settings.toml.lock` the server rereads the file, compares its revision,
 validates the changed file as zeta's startup does, and only then replaces the
 file atomically (mode `0600`, file and directory fsync). The lock serializes

@@ -26,9 +26,12 @@ or tool text is put in spans.
    `set_settings` request does not change it.
 
    A serve client with the `home_settings_v1` feature can turn the built-in
-   endpoint on or off instead. That update changes only the `endpoint` line
-   and publishes `settings.toml` with mode `0600` (an existing `0644` file
-   becomes `0600` on its first write); a no-op update does not rewrite it.
+   endpoint on or off instead. That update changes only the endpoint line
+   (under an existing `[otel]` header, else a top-level `otel.endpoint` line;
+   it never adds or removes the header), so on then off restores the file's
+   exact bytes. It publishes `settings.toml` with mode `0600` (an existing
+   `0644` file becomes `0600` on its first write); a no-op update does not
+   rewrite it.
 
 Rules for `[otel]`:
 

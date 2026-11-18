@@ -4,9 +4,9 @@ A client sees an allowlisted projection plus ``revision``, the SHA-256 of the ex
 (an absent file hashes as empty bytes). An update names that revision; it takes the sibling
 ``settings.toml.lock``, rereads the bytes under the lock, and refuses a stale revision, so an edit
 finished before the reread is never lost. The lock serializes zeta writers only; an editor that
-writes after the reread is not stopped. The edit touches only the ``[otel]`` ``endpoint`` line
-(and a header it added), checked against a ``tomlkit`` parse, and a candidate is published only
-after ``load_settings``'s own validation accepts it.
+writes after the reread is not stopped. The edit touches only the built-in endpoint line (under
+``[otel]``, or a top-level ``otel.endpoint``), checked against a ``tomlkit`` parse, and a
+candidate is published only after ``load_settings``'s own validation accepts it.
 
 Every function blocks (file locks, fsync, a directory scan); call it off the event loop.
 """
@@ -43,7 +43,9 @@ RESTART_SCAN_SECONDS = 1.0
 _REVISION = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _HEADER = re.compile(rb"[ \t]*\[")  # a table or array-of-tables header line
 _OTEL_HEADER = re.compile(rb"""[ \t]*\[[ \t]*(?:otel|"otel"|'otel')[ \t]*\][ \t]*(?:#[^\r\n]*)?\r?\n?\Z""")
-_ENDPOINT = re.compile(rb"""[ \t]*(?:endpoint|"endpoint"|'endpoint')[ \t]*=""")
+_KEY = rb"""[ \t]*(?:endpoint|"endpoint"|'endpoint')[ \t]*="""
+_ENDPOINT = re.compile(_KEY)
+_DOTTED = re.compile(rb"""[ \t]*(?:otel|"otel"|'otel')[ \t]*\.""" + _KEY)
 
 
 class HomeSettingsError(Exception):
@@ -169,39 +171,51 @@ def _project(raw: bytes, home: Path) -> dict[str, Any]:
 
 
 def _with_telemetry(raw: bytes, enabled: bool) -> bytes:
-    """Add or remove only the ``[otel]`` ``endpoint`` line; every other byte stays as it was.
+    """Add or remove only the built-in endpoint line; every other byte stays as it was.
 
-    Turning on inserts the line under an existing ``[otel]`` header or appends a new
-    ``[otel]`` table. Turning off removes the line, and a bare ``[otel]`` header only when
-    nothing follows it before the next table, so on-then-off restores a file that had no
-    ``[otel]`` exactly. Line endings and the trailing-newline state are kept. A layout this edit cannot express (an
-    inline ``otel`` table, a dotted ``otel.endpoint`` key) fails the tomlkit comparison below and
-    is refused as a hand-configured setting.
+    With an ``[otel]`` table, on inserts ``endpoint`` under its header and off removes that line;
+    the header is never added or removed. Without one, on inserts a top-level
+    ``otel.endpoint`` line before the first table (or at the end) and off removes it, so
+    on-then-off restores the exact bytes. Line endings and the trailing-newline state are kept.
+    Each edit must parse to the same document as the requested change, else the layout (an
+    inline table, a line inside a multiline string) is refused as a hand-configured setting.
     """
     newline = b"\r\n" if b"\r\n" in raw else b"\n"
     unterminated = bool(raw) and not raw.endswith(b"\n")
     lines = (raw + newline if unterminated else raw).splitlines(keepends=True)
-    header = next((i for i, line in enumerate(lines) if _OTEL_HEADER.match(line)), None)
-    if enabled:
-        entry = b'endpoint = "' + OTLP_URL.encode() + b'"' + newline
-        if header is None:
-            lines += [b"[otel]" + newline, entry]
-        else:
-            lines.insert(header + 1, entry)
-    elif header is not None:
-        end = next((i for i in range(header + 1, len(lines)) if _HEADER.match(lines[i])), len(lines))
-        endpoint = next((i for i in range(header + 1, end) if _ENDPOINT.match(lines[i])), None)
-        if endpoint is not None:
-            del lines[endpoint]
-            emptied = header + 1 == len(lines) or _HEADER.match(lines[header + 1])
-            if emptied and lines[header].rstrip(b"\r\n") == b"[otel]":  # only a header the toggle adds
-                del lines[header]
-    candidate = b"".join(lines)
-    if unterminated and candidate.endswith(newline):
-        candidate = candidate[: -len(newline)]
-    if _document(candidate) != _document(raw, enabled):
-        raise HomeSettingsError("custom_home_setting")
-    return candidate
+    expected = _document(raw, enabled)
+    for edited in _on_edits(lines, newline) if enabled else _off_edits(lines):
+        candidate = b"".join(edited)
+        if unterminated and candidate.endswith(newline):
+            candidate = candidate[: -len(newline)]
+        try:
+            if _document(candidate) == expected:
+                return candidate
+        except HomeSettingsError:
+            pass  # the edit does not parse here; try the next one
+    raise HomeSettingsError("custom_home_setting")
+
+
+def _on_edits(lines: list[bytes], newline: bytes) -> list[list[bytes]]:
+    """Insert the endpoint under an ``[otel]`` header, or as a dotted line before the first table."""
+    value = b' = "' + OTLP_URL.encode() + b'"' + newline
+    headers = [i for i, line in enumerate(lines) if _OTEL_HEADER.match(line)]
+    if headers:
+        return [lines[: i + 1] + [b"endpoint" + value] + lines[i + 1 :] for i in headers]
+    first = _first_table(lines, 0)
+    return [lines[:first] + [b"otel.endpoint" + value] + lines[first:]]
+
+
+def _off_edits(lines: list[bytes]) -> list[list[bytes]]:
+    """Remove one endpoint line: a top-level dotted one, or one inside an ``[otel]`` table."""
+    found = [i for i in range(_first_table(lines, 0)) if _DOTTED.match(lines[i])]
+    for header in (i for i, line in enumerate(lines) if _OTEL_HEADER.match(line)):
+        found += [i for i in range(header + 1, _first_table(lines, header + 1)) if _ENDPOINT.match(lines[i])]
+    return [lines[:i] + lines[i + 1 :] for i in found]
+
+
+def _first_table(lines: list[bytes], start: int) -> int:
+    return next((i for i in range(start, len(lines)) if _HEADER.match(lines[i])), len(lines))
 
 
 def _document(raw: bytes, enabled: bool | None = None) -> dict[str, Any]:

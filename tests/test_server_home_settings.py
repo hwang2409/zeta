@@ -104,7 +104,7 @@ async def test_controller_update_checks_revision_and_lists_restarts(tmp_path: Pa
     }
     assert unchanged is False
     written = settings.read_bytes()
-    assert written == f'[otel]\nendpoint = "{BUILTIN}"\n'.encode()
+    assert written == f'otel.endpoint = "{BUILTIN}"\n'.encode()
     assert updated["result"] == {
         "revision": _revision(written),
         "settings": {"telemetry": {"enabled": True, "source": "builtin", "editable": True}},

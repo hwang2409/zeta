@@ -83,7 +83,7 @@ def test_missing_file_projects_defaults_and_update_creates_it(tmp_path: Path) ->
         "settings_malformed": False,
     }
     written = (home / "settings.toml").read_bytes()
-    assert written == f'[otel]\nendpoint = "{BUILTIN}"\n'.encode()
+    assert written == f'otel.endpoint = "{BUILTIN}"\n'.encode()
     assert updated["revision"] == _revision(written)
     assert updated["settings"] == {"telemetry": {"enabled": True, "source": "builtin", "editable": True}}
 
@@ -146,66 +146,117 @@ def test_a_held_lock_is_busy_after_its_deadline_and_writes_nothing(tmp_path: Pat
 
 _GENERAL = (
     b'# lead\nmodel = "gpt-5.6-luna"  # keep\nunknown = [1, 2, 3]\ninline = { a = 1, b = "two" }\n'
-    b'text = """line one\nline two"""\n\n[future]\nz = true # tail'
+    b'text = """line one\nline two"""\n\n'
 )
+_TABLE = b"[future]\nz = true # tail"
 _ENTRY = f'endpoint = "{BUILTIN}"'.encode()
+_DOTTED = b"otel." + _ENTRY
 
 
 def _crlf(raw: bytes) -> bytes:
     return raw.replace(b"\n", b"\r\n")
 
 
-@pytest.mark.parametrize(
-    ("original", "toggled", "restored"),
-    [
-        pytest.param(_GENERAL + b"\n", _GENERAL + b"\n[otel]\n" + _ENTRY + b"\n", _GENERAL + b"\n", id="lf"),
-        pytest.param(_GENERAL, _GENERAL + b"\n[otel]\n" + _ENTRY, _GENERAL, id="lf-no-trailing-newline"),
-        pytest.param(
-            _crlf(_GENERAL + b"\n"), _crlf(_GENERAL + b"\n[otel]\n" + _ENTRY + b"\n"), _crlf(_GENERAL + b"\n"),
-            id="crlf",
-        ),
-        pytest.param(
-            _crlf(_GENERAL), _crlf(_GENERAL + b"\n[otel]\n" + _ENTRY), _crlf(_GENERAL), id="crlf-no-trailing-newline"
-        ),
-        pytest.param(b"", b"[otel]\n" + _ENTRY + b"\n", b"", id="empty"),
-        pytest.param(
-            b"# lead\n[otel]\n# collector\n" + _ENTRY + b" # note\n\n[future]\nz = 1\n",
-            b"# lead\n[otel]\n# collector\n\n[future]\nz = 1\n",
-            b"# lead\n[otel]\n" + _ENTRY + b"\n# collector\n\n[future]\nz = 1\n",
-            id="otel-comments-stay",
-        ),
-        pytest.param(
-            _crlf(b"[otel]\n" + _ENTRY + b"\n[future]\nz = 1\n"),
-            _crlf(b"[future]\nz = 1\n"),
-            _crlf(b"[future]\nz = 1\n[otel]\n" + _ENTRY + b"\n"),
-            id="bare-otel-before-a-table",
-        ),
-    ],
-)
-def test_toggles_change_only_the_endpoint_line(tmp_path: Path, original: bytes, toggled: bytes, restored: bytes) -> None:
+def _off(original: bytes, on: bytes) -> tuple[bytes, bytes, bytes]:
+    """A file that starts off: on writes ``on``; off restores ``original`` exactly."""
+    return (original, original, on)
+
+
+def _bytes(home: Path) -> bytes | None:
+    path = home / "settings.toml"
+    return path.read_bytes() if path.exists() else None
+
+
+# (original, off bytes, on bytes); a file that starts off has off == original.
+_LAYOUTS = {
+    "missing-file": (None, b"", _DOTTED + b"\n"),
+    "empty": _off(b"", _DOTTED + b"\n"),
+    "no-tables": _off(b'model = "a"\n', b'model = "a"\n' + _DOTTED + b"\n"),
+    "no-tables-no-trailing-newline": _off(b'model = "a"', b'model = "a"\n' + _DOTTED),
+    "lf": _off(_GENERAL + _TABLE + b"\n", _GENERAL + _DOTTED + b"\n" + _TABLE + b"\n"),
+    "lf-no-trailing-newline": _off(_GENERAL + _TABLE, _GENERAL + _DOTTED + b"\n" + _TABLE),
+    "crlf": _off(_crlf(_GENERAL + _TABLE + b"\n"), _crlf(_GENERAL + _DOTTED + b"\n" + _TABLE + b"\n")),
+    "crlf-no-trailing-newline": _off(_crlf(_GENERAL + _TABLE), _crlf(_GENERAL + _DOTTED + b"\n" + _TABLE)),
+    "mixed-eol": _off(b'model = "a"\r\n[future]\nz = 1\n', b'model = "a"\r\n' + _DOTTED + b"\r\n[future]\nz = 1\n"),
+    "multiline-string-decoy": _off(
+        b'text = """\n' + _DOTTED + b'\n"""\n', b'text = """\n' + _DOTTED + b'\n"""\n' + _DOTTED + b"\n"
+    ),
+    "bare-otel-at-eof": _off(b'model = "gpt-5.6-luna"\n[otel]\n', b'model = "gpt-5.6-luna"\n[otel]\n' + _ENTRY + b"\n"),
+    "bare-otel-no-trailing-newline": _off(b'model = "a"\n[otel]', b'model = "a"\n[otel]\n' + _ENTRY),
+    "otel-with-comments": _off(
+        b"# lead\n[otel]\n# collector\n\n[future]\nz = 1\n",
+        b"# lead\n[otel]\n" + _ENTRY + b"\n# collector\n\n[future]\nz = 1\n",
+    ),
+    "otel-header-comment": _off(b"[otel] # c\n", b"[otel] # c\n" + _ENTRY + b"\n"),
+    "spaced-otel-header": _off(b"[ otel ]\n[future]\n", b"[ otel ]\n" + _ENTRY + b"\n[future]\n"),
+    "quoted-otel-header": _off(b'["otel"]\n', b'["otel"]\n' + _ENTRY + b"\n"),
+    "crlf-otel": _off(_crlf(b"[future]\nz = 1\n[otel]\n"), _crlf(b"[future]\nz = 1\n[otel]\n" + _ENTRY + b"\n")),
+    "on-otel-with-comments": (
+        b"# lead\n[otel]\n# collector\n" + _ENTRY + b" # note\n\n[future]\nz = 1\n",
+        b"# lead\n[otel]\n# collector\n\n[future]\nz = 1\n",
+        b"# lead\n[otel]\n" + _ENTRY + b"\n# collector\n\n[future]\nz = 1\n",
+    ),
+    "on-otel-keeps-its-header": (
+        _crlf(b"[otel]\n" + _ENTRY + b"\n[future]\nz = 1\n"),
+        _crlf(b"[otel]\n[future]\nz = 1\n"),
+        _crlf(b"[otel]\n" + _ENTRY + b"\n[future]\nz = 1\n"),
+    ),
+    "on-endpoint-single-quotes": (
+        f"[otel]\nendpoint   =   '{BUILTIN}'\n".encode(), b"[otel]\n", b"[otel]\n" + _ENTRY + b"\n"
+    ),
+    "on-dotted": (
+        _DOTTED + b'\nmodel = "a"\n[future]\n',
+        b'model = "a"\n[future]\n',
+        b'model = "a"\n' + _DOTTED + b"\n[future]\n",
+    ),
+    "on-quoted-dotted": (
+        f"\"otel\" . 'endpoint' = '{BUILTIN}'  # mine\n".encode(), b"", _DOTTED + b"\n"
+    ),
+}
+
+# (original, the update that would edit it, the refusal); the file stays byte-identical.
+_REFUSED = {
+    "inline-table": (f'otel = {{ endpoint = "{BUILTIN}" }}\n'.encode(), OFF, "custom_home_setting"),
+    "empty-inline-table": (b"otel = {}\n", ON, "custom_home_setting"),
+    "custom-dotted": (b'otel.endpoint = "http://127.0.0.1:9999/v1/traces"\n', OFF, "custom_home_setting"),
+    "multiline-basic-header-decoy": (b'text = """\n[otel]\n"""\n', ON, "custom_home_setting"),
+    "multiline-literal-header-decoy": (b"text = '''\n[otel]\n'''\n", ON, "custom_home_setting"),
+    "sub-table-before": (b"[otel.sub]\n[otel]\n", ON, "settings_malformed"),
+    "sub-table-after": (b"[otel]\n[otel.sub]\n", ON, "settings_malformed"),
+    "bom": (b'\xef\xbb\xbfmodel = "a"\n', ON, "settings_malformed"),
+}
+
+
+def _set(home: Path, changes: list) -> bytes | None:
+    home_settings.update(home, home_settings.get(home)["revision"], changes)
+    return _bytes(home)
+
+
+@pytest.mark.parametrize(("original", "off", "on"), list(_LAYOUTS.values()), ids=list(_LAYOUTS))
+def test_toggles_change_only_the_endpoint_line(tmp_path: Path, original: bytes | None, off: bytes, on: bytes) -> None:
     home = _home(tmp_path, original)
-    state = home_settings.get(home)
-    enabled = state["settings"]["telemetry"]["enabled"]
 
-    first = home_settings.update(home, state["revision"], OFF if enabled else ON)
-    after_first = (home / "settings.toml").read_bytes()
-    home_settings.update(home, first["revision"], ON if enabled else OFF)
-
-    assert after_first == toggled
-    assert (home / "settings.toml").read_bytes() == restored
+    assert _set(home, OFF) == (None if original is None else off)  # off on a missing file writes nothing
+    assert _set(home, ON) == on
+    assert _set(home, ON) == on
+    assert _set(home, OFF) == off
+    assert home_settings.get(home)["settings"]["telemetry"] == {"enabled": False, "source": "off", "editable": True}
 
 
-@pytest.mark.parametrize(
-    "original",
-    [f'otel = {{ endpoint = "{BUILTIN}" }}\n'.encode(), f'otel.endpoint = "{BUILTIN}"\n'.encode()],
-    ids=["inline-table", "dotted-key"],
-)
-def test_an_otel_layout_the_line_edit_cannot_change_is_refused(tmp_path: Path, original: bytes) -> None:
+@pytest.mark.parametrize(("original", "changes", "code"), list(_REFUSED.values()), ids=list(_REFUSED))
+def test_an_otel_layout_the_line_edit_cannot_change_is_refused(
+    tmp_path: Path, original: bytes, changes: list, code: str
+) -> None:
     home = _home(tmp_path, original)
 
-    _refused("custom_home_setting", lambda: home_settings.update(home, _revision(original), OFF))
+    _refused(code, lambda: home_settings.update(home, _revision(original), changes))
+    for other in (ON, OFF):
+        try:
+            home_settings.update(home, _revision(original), other)
+        except HomeSettingsError:
+            pass
 
-    assert (home / "settings.toml").read_bytes() == original
+    assert _bytes(home) == original
 
 
 def test_custom_endpoint_is_read_only_and_byte_identical(tmp_path: Path) -> None:
@@ -322,7 +373,7 @@ def test_simultaneous_updates_from_one_revision_apply_once(tmp_path: Path, monke
     assert isinstance(results["second"], HomeSettingsError)
     assert results["second"].code == "stale_revision"
     assert results["second"].data == {"current_revision": _revision(written)}
-    assert written == f'[otel]\nendpoint = "{BUILTIN}"\n'.encode()
+    assert written == f'otel.endpoint = "{BUILTIN}"\n'.encode()
 
 
 def test_hand_edit_before_the_locked_reread_is_kept(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
