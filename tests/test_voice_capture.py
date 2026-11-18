@@ -8,10 +8,10 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
-import time
 import wave
 from pathlib import Path
 
@@ -78,15 +78,18 @@ async def test_record_exists_before_ffmpeg_runs(tmp_path: Path, monkeypatch: pyt
     bin_dir, directory, probe = tmp_path / "bin", tmp_path / "run", tmp_path / "probe"
     bin_dir.mkdir()
     directory.mkdir(mode=0o700)
+    started = socket.create_server(("127.0.0.1", 0))  # fake ffmpeg connects once it has checked
+    started.settimeout(10)
     fake = bin_dir / "ffmpeg"
     fake.write_text(
         f"#!{sys.executable}\n"
-        "import json, os, sys\n"
+        "import json, os, socket, sys\n"
         "try:\n"
         f"    ok = json.load(open({str(directory / audio.PID_NAME)!r}))['pid'] == os.getpid()\n"
         "except OSError:\n"
         "    ok = False\n"
         f"open({str(probe)!r}, 'w').write('recorded' if ok else 'missing')\n"
+        f"socket.create_connection(('127.0.0.1', {started.getsockname()[1]})).close()\n"
         "sys.stdout.buffer.write(bytes(3200))\n"
     )
     fake.chmod(0o755)
@@ -95,9 +98,7 @@ async def test_record_exists_before_ffmpeg_runs(tmp_path: Path, monkeypatch: pyt
 
     def after_ffmpeg_started(pid: int) -> str | None:
         # forced order: any parent-side record step runs only after ffmpeg started
-        deadline = time.monotonic() + 10
-        while not probe.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
+        started.accept()[0].close()
         return identity(pid)
 
     monkeypatch.setattr(audio, "process_identity", after_ffmpeg_started)
@@ -106,6 +107,7 @@ async def test_record_exists_before_ffmpeg_runs(tmp_path: Path, monkeypatch: pyt
         await await_or_fail(source.start(directory / audio.CAPTURE_NAME), what="fake ffmpeg capture")
     finally:
         await await_or_fail(source.close(), what="close fake capture")
+        started.close()
     assert probe.read_text() == "recorded", "ffmpeg ran before its pid record existed"
 
 
