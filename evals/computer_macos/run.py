@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import platform
@@ -41,7 +42,9 @@ class TrialFixture(Protocol):
     async def close_and_verify(self) -> bool: ...
 
 
-def prepare_home(run_dir: Path) -> Path:
+@contextlib.contextmanager
+def prepare_home(run_dir: Path):
+    old = {key: os.environ.get(key) for key in ("ZETA_HOME", "ZETA_ACCOUNT_HOME")}
     run_dir = run_dir.resolve()
     home = (run_dir / "zeta-home").resolve()
     real = Path.home() / ".zeta"
@@ -53,7 +56,14 @@ def prepare_home(run_dir: Path) -> Path:
         settings.write_text('[computer]\nenabled = true\ndefault_app_access = "allow"\n')
     os.environ["ZETA_HOME"] = str(home)
     os.environ["ZETA_ACCOUNT_HOME"] = str(real)
-    return home
+    try:
+        yield home
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -80,7 +90,11 @@ def _event_metrics(events: list[Any]) -> dict[str, Any]:
 
 
 async def phase0(run_dir: Path, backend: Any | None = None) -> dict[str, Any]:
-    prepare_home(run_dir)
+    with prepare_home(run_dir):
+        return await _phase0(run_dir, backend)
+
+
+async def _phase0(run_dir: Path, backend: Any | None = None) -> dict[str, Any]:
     if backend is None:
         if platform.system() != "Darwin":
             raise RuntimeError("phase 0 requires macOS")
@@ -307,8 +321,20 @@ async def pilot(
 ) -> dict[str, Any]:
     if trials != 3:
         raise ValueError("the pilot is exactly three trials")
-    old = {key: os.environ.get(key) for key in ("ZETA_HOME", "ZETA_ACCOUNT_HOME")}
-    prepare_home(run_dir)
+    with prepare_home(run_dir):
+        return await _pilot(run_dir, trials, provider_factory=provider_factory, backend_factory=backend_factory, fixture_factory=fixture_factory, browser_factory=browser_factory, timeout_factory=timeout_factory)
+
+
+async def _pilot(
+    run_dir: Path,
+    trials: int,
+    *,
+    provider_factory: Callable[[int], ProviderAdapter] | None,
+    backend_factory: Callable[[int], Any] | None,
+    fixture_factory: Callable[[Path, int], Any] | None,
+    browser_factory: Callable[[], BrowserAdapter] | None,
+    timeout_factory: Callable[[float], Any],
+) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     status = "failed"
     error: str | None = None
@@ -344,11 +370,6 @@ async def pilot(
         payload = {"status": status, "error": error, "provider": EXPECTED_PROVIDER, "model": EXPECTED_MODEL, "trials": results if status == "complete" else [], "cleanup": cleanup}
         _atomic_json(run_dir / "cleanup.json", cleanup)
         _atomic_json(run_dir / "pilot.json", payload)
-        for key, value in old.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
     return payload
 
 

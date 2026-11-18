@@ -6,23 +6,26 @@ import json
 import shutil
 from pathlib import Path
 
+from .run import prepare_home
+
 
 def reset(run_dir: Path, verify: bool) -> dict:
-    fixture = run_dir / "fixture"
-    removed = []
-    if fixture.exists():
-        for path in fixture.glob("trial-*.json"):
-            path.unlink()
-            removed.append(str(path))
-    home = run_dir / "zeta-home"
-    if home.exists():
-        shutil.rmtree(home)
-        removed.append(str(home))
-    result = {"pass": not home.exists(), "removed": removed, "apps_quit": [], "files_deleted": []}
-    if verify and not result["pass"]:
-        raise SystemExit("reset verification failed")
-    (run_dir / "cleanup.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-    return result
+    with prepare_home(run_dir):
+        fixture = run_dir / "fixture"
+        removed = []
+        if fixture.exists():
+            for path in fixture.glob("trial-*.json"):
+                path.unlink()
+                removed.append(str(path))
+        home = run_dir / "zeta-home"
+        if home.exists():
+            shutil.rmtree(home)
+            removed.append(str(home))
+        result = {"pass": not home.exists(), "removed": removed, "apps_quit": [], "files_deleted": []}
+        if verify and not result["pass"]:
+            raise SystemExit("reset verification failed")
+        (run_dir / "cleanup.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        return result
 
 
 def main() -> None:
