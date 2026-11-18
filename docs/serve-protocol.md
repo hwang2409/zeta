@@ -651,7 +651,8 @@ the database read-only (SQLite `mode=ro`), never creates or migrates it, and
 runs each read in its bounded read executor, off the event loop. Each read is
 one SQLite read transaction that first checks `PRAGMA user_version` and
 `viewer_meta.schema_version`. The receiver
-(`zeta otel receiver`) is the only writer. Serve sends no telemetry
+(`zeta otel receiver`) is the only writer, and it migrates an older database
+forward when it starts. Serve sends no telemetry
 notifications; a client polls (for example every 5 seconds while a view is
 visible).
 
@@ -705,13 +706,31 @@ continues after its last span, so a page can be shorter than `limit` while
 `next_cursor` is not `null`:
 
 ```json
-{"trace":{"trace_id":"00112233445566778899aabbccddeeff","first_ns":0,"last_ns":0,"root_span_id":null,"root_session_id":null,"status":"ok","span_count":0,"error_count":0},"spans":[{"span_id":"0011223344556677","parent_span_id":null,"operation":"turn","start_ns":0,"end_ns":0,"duration_ns":0,"status":"ok","error_type":null,"session_id":null,"agent_name":null,"agent_depth":null,"background":null,"turn_number":null,"notification":null,"provider":null,"request_model":null,"response_model":null,"stream":null,"input_tokens":null,"output_tokens":null,"total_tokens":null,"finish_reason":null,"tool_name":null,"tool_type":null,"tool_call_id":null,"tool_argument_bytes":null,"tool_result_bytes":null,"tool_count":null,"emergency":null,"tokens_before":null,"tokens_after":null,"rpc_method":null,"mcp_method":null,"mcp_server":null,"mcp_tool":null,"mcp_prompt":null,"mcp_protocol":null,"request_id":null,"events":[{"name":"gen_ai.client.retry","time_ns":0,"retry_attempt":null,"retry_reason":null,"retry_delay":null,"retry_after":null,"decision":null,"scope":null,"duration_ns":null}]}],"next_cursor":null}
+{"trace":{"trace_id":"00112233445566778899aabbccddeeff","first_ns":0,"last_ns":0,"root_span_id":null,"root_session_id":null,"status":"ok","span_count":0,"error_count":0},"spans":[{"span_id":"0011223344556677","parent_span_id":null,"operation":"turn","start_ns":0,"end_ns":0,"duration_ns":0,"status":"ok","error_type":null,"error_code":null,"session_id":null,"agent_name":null,"agent_depth":null,"background":null,"run_id":null,"parent_run_id":null,"turn_number":null,"notification":null,"outcome":null,"provider":null,"request_model":null,"response_model":null,"stream":null,"input_tokens":null,"output_tokens":null,"total_tokens":null,"cache_read_tokens":null,"cache_write_tokens":null,"finish_reason":null,"ttft_ns":null,"retry_count":null,"tool_name":null,"tool_type":null,"tool_call_id":null,"tool_argument_bytes":null,"tool_result_bytes":null,"tool_count":null,"emergency":null,"tokens_before":null,"tokens_after":null,"rpc_method":null,"mcp_method":null,"mcp_server":null,"mcp_tool":null,"mcp_prompt":null,"mcp_protocol":null,"request_id":null,"events":[{"name":"gen_ai.client.retry","time_ns":0,"retry_attempt":null,"retry_reason":null,"retry_delay":null,"retry_after":null,"decision":null,"scope":null,"duration_ns":null}]}],"next_cursor":null}
 ```
 
 `operation` is one of `invoke_agent`, `turn`, `chat`, `execute_tool`,
 `context_compact`, `serve`, or `mcp`; `status` is `unset`, `ok`, or `error`.
 `background`, `notification`, `stream`, `emergency`, and `retry_after` are
-booleans. Events are ordered by `time_ns`. The trace, spans, and events of one
+booleans. Events are ordered by `time_ns`.
+
+- `error_code` (failed spans): `invalid_request`, `rate_limit`, `overloaded`,
+  `timeout`, `auth`, `context_length`, `server_error`, `network`,
+  `stream_error`, `model_not_found`, `max_tokens`, `refusal`, `turn_limit`,
+  `cancelled`, `tool_error`, or `unknown`. It comes from zeta's error classes
+  and the provider's machine error code, never from an error message.
+  `error_type` stays the exception class name.
+- `run_id` and `parent_run_id` (`invoke_agent`): a child agent's public run
+  id (`child_instance_id`) and its parent run's id; `null` for the top-level
+  agent and for a direct child's parent. They join spans to the agent tree.
+- `outcome` (`invoke_agent` and `turn`): `finished`, `failed`, `cancelled`,
+  `interrupted`, `turn_limit`, or, for a turn the loop restarted,
+  `redispatched`.
+- `chat` only: `cache_read_tokens` and `cache_write_tokens` are counted inside
+  `input_tokens` and are `null` when the provider did not report them;
+  `ttft_ns` is the time from the span start to the first decoded model output
+  (`null` when none arrived); `retry_count` is the number of provider retries
+  inside the call. The trace, spans, and events of one
 page come from one database snapshot; later pages may see spans that arrived
 since.
 
@@ -728,8 +747,8 @@ Errors:
 - no database file, data methods only:
   `{"code":-32005,"message":"state unavailable","data":{"code":"telemetry_off","retryable":true}}`
 - a database file whose `user_version` or `viewer_meta.schema_version` is not
-  the one this zeta reads (including an unmigrated file or a missing
-  `viewer_meta` table), any method:
+  2, the one this zeta reads (including a schema-1 file the receiver has not
+  migrated yet, or a missing `viewer_meta` table), any method:
   `{"code":-32000,"message":"telemetry schema is unsupported","data":{"code":"telemetry_schema_mismatch"}}`
 - one span alone larger than the frame: `{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}`
 
