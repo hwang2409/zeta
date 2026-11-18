@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 from typing import Protocol
 
+from ..config.settings import DEFAULT_VOICE_MODEL
 from .process import OwnedProcess, run_stoppable
 
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.en.bin"
@@ -22,7 +23,7 @@ class Transcriber(Protocol):
 
 
 class WhisperCpp:
-    def __init__(self, *, zeta_home: Path, model: str = "small.en") -> None:
+    def __init__(self, *, zeta_home: Path, model: str = DEFAULT_VOICE_MODEL) -> None:
         self._model_path = zeta_home / "cache" / "voice" / "whisper.cpp" / f"ggml-{model}.bin"
 
     async def prepare(self) -> None:

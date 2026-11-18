@@ -24,6 +24,8 @@ from rich.padding import Padding
 from rich.text import Text
 
 from ..config.settings import (
+    DEFAULT_VOICE_ENGINE,
+    DEFAULT_VOICE_MODEL,
     load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
 )
 from ..core.approval import ApprovalPolicy
@@ -218,8 +220,8 @@ class TUIApp(
         observer_host: Any | None = None,
         telemetry: Telemetry | None = None,
         otel_endpoint: str | None = None,
-        voice_engine: str = "whisper.cpp",
-        voice_model: str = "small.en",
+        voice_engine: str = DEFAULT_VOICE_ENGINE,
+        voice_model: str = DEFAULT_VOICE_MODEL,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
