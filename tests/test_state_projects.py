@@ -31,6 +31,7 @@ def seed(home):
     registry = project_registry.ProjectRegistry(home / "projects")
     manager = SessionManager(home)
     try:
+        # test-contract: seam freeze the writer clock to exercise the public id tie-breaker
         with patch.object(project_registry, "_now", return_value=WHEN):
             projects = [registry.create_project(f"synthetic-{i}", "synthetic scope", str(home / f"repo-{i}")) for i in range(3)]
         project_id = projects[0].project_id
@@ -43,11 +44,13 @@ def seed(home):
         session.store.close()
         inbox = project_inbox.ProjectInbox(registry, sessions_root=home / "sessions")
         message_ids = [f"{i:032x}" for i in range(1, 4)]
+        # test-contract: seam freeze the writer clock to exercise the public id tie-breaker
         with patch.object(project_inbox, "_now", return_value=WHEN):
             for ident in message_ids:
                 inbox.send(from_project=project_id, from_session=session_id, to_project=project_id,
                            kind="question", title="safe title", body=BODY, message_id=ident)
         store = attention_records.AttentionStore(home / "sessions" / session_id, writer_epoch=WRITER_EPOCH)
+        # test-contract: seam freeze the writer clock to exercise the public id tie-breaker
         with patch.object(attention_records, "_now", return_value=WHEN):
             attention_ids = [store.request(session_id=session_id, project_id=project_id, entry_id=None,
                                            entry_seq=None, title="safe title", why=MARKER).id for _ in range(3)]
