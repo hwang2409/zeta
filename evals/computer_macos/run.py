@@ -365,8 +365,14 @@ async def pilot(
                 provider = provider_factory(trial) if provider_factory else _production_provider(run_dir)
                 backend = backend_factory(trial) if backend_factory else _production_backend()
                 browser = browser_factory() if browser_factory else (MacSafari() if platform.system() == "Darwin" else None)
-                async with timeout_factory(TRIAL_DEADLINE):
-                    record = await run_trial(run_dir, trial, provider, backend, fixture_factory=fixture_factory, browser=browser)
+                try:
+                    async with timeout_factory(TRIAL_DEADLINE):
+                        record = await run_trial(run_dir, trial, provider, backend, fixture_factory=fixture_factory, browser=browser)
+                except BaseException:
+                    artifact = run_dir / f"trial-{trial}.json"
+                    if artifact.exists():
+                        results.append(json.loads(artifact.read_text()))
+                    raise
                 results.append(record)
                 if record["status"] != "complete":
                     raise RuntimeError(record.get("error") or "trial failed")
