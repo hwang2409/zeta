@@ -16,7 +16,6 @@ from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.tui_render import render_full_screen
-from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -41,9 +40,6 @@ def _app(
             force_terminal=True,
             color_system="truecolor",
         ),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session

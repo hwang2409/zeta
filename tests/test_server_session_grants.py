@@ -39,7 +39,6 @@ from tests.test_server_websocket import (
     _read_json,
     _send_json,
 )
-from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import MessageRole, StreamEventType, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
@@ -346,9 +345,6 @@ async def test_session_grant_list_revoke_and_next_call_asks_over_stream_transpor
                 zeta_home=tmp_path,
                 approval_policy=server.runtime.policy,
                 console=Console(file=output, width=160, force_terminal=False),
-
-                voice_engine=Settings().voice_engine,
-                voice_model=Settings().voice_model
             )
             await app._handle_prompt_value("/permissions")
             assert "Rule precedence: deny > ask > allow > default" in output.getvalue()

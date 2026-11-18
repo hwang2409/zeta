@@ -15,7 +15,6 @@ from rich.text import Text
 
 from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.config.settings import Settings
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -621,9 +620,6 @@ async def test_config_changed_background_event_renders_immediately(
             provider="codex",
             model="offline",
             console=Console(file=output, force_terminal=False),
-
-            voice_engine=Settings().voice_engine,
-            voice_model=Settings().voice_model
         )
         stack.push_async_callback(app.close)
 

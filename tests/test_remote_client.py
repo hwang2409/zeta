@@ -16,7 +16,6 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import owned_app
-from zeta.config.settings import Settings
 from zeta.core.checkpoints import ConversationEntry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -311,9 +310,6 @@ async def test_failed_remote_command_output_is_repainted_without_a_keypress(tmp_
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex", model="offline", zeta_home=tmp_path, console=Console(file=StringIO()),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         app._remote_session_client = RemoteSessionClient(tmp_path, ssh=_fake_ssh(tmp_path))

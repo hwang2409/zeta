@@ -17,7 +17,6 @@ from prompt_toolkit.output import DummyOutput
 from tests.support.branch_reads import branch_entries, branch_messages
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, owned_app
-from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     ImageContent,
@@ -366,9 +365,6 @@ async def test_ctrl_v_queues_one_image_and_preserves_composer_text(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     notices: list[str] = []
     app._print_system = notices.append
@@ -391,9 +387,6 @@ async def test_cancelled_image_paste_cleans_up_staged_file(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     entered = threading.Event()
     release = threading.Event()
@@ -428,9 +421,6 @@ async def test_concurrent_pastes_insert_in_invocation_order(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -472,9 +462,6 @@ async def test_cancelling_queued_paste_preserves_surviving_fifo_order(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     async with owned_app(app) as owner:
         session = app._make_session()
@@ -576,9 +563,6 @@ async def test_paste_completion_file_io_stays_off_loop(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     paths = iter(
         [
@@ -637,9 +621,6 @@ async def test_session_switch_drops_staged_paste(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     old_session = app._make_session()
     old_session.default_buffer.text = "old"
@@ -689,9 +670,6 @@ async def test_close_cancels_and_awaits_staging_paste(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -744,9 +722,6 @@ async def test_ctrl_v_numbers_multiple_images_without_renumbering(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     submitted = await run_ctrl_v(app, "a\x16b\x16c")
@@ -781,9 +756,6 @@ async def test_slash_paste_inserts_the_same_token_without_notice(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     async with owned_app(app):
         notices: list[str] = []
@@ -823,9 +795,6 @@ async def test_image_tokens_resolve_in_text_order_and_deleted_tokens_cancel(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app._pending_attachments[:] = [first, second]
     app._pending_attachment_tokens.update(
@@ -858,9 +827,6 @@ async def test_unknown_image_token_is_plain_text(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     message = await app._prepare_user_message("look at [Image #7]")
@@ -878,9 +844,6 @@ async def test_image_token_numbering_resets_after_send(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app._pending_attachments.append(image)
     app._pending_attachment_tokens["[Image #1]"] = image
@@ -905,9 +868,6 @@ async def test_cancelled_image_token_removes_staged_file_on_send(
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     staged = store.session_dir / "clipboard-cancelled.png"
     staged.write_bytes(PNG)
@@ -932,9 +892,6 @@ async def test_cancelled_image_token_keeps_delivered_staged_file(
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     cancelled = store.session_dir / "clipboard-cancelled.png"
     delivered = store.session_dir / "clipboard-delivered.png"
@@ -965,9 +922,6 @@ async def test_partial_image_token_cancellation_removes_staged_file(
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     staged = store.session_dir / "clipboard-partial.png"
     staged.write_bytes(PNG)
@@ -988,9 +942,6 @@ async def test_paste_has_no_notice_or_pending_footer(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     with create_pipe_input() as pipe:
         session = PromptSession(input=pipe, output=DummyOutput(), multiline=True)
@@ -1025,9 +976,6 @@ async def test_ctrl_v_empty_clipboard_preserves_input_without_queueing(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     notices: list[str] = []
     app._print_system = notices.append
@@ -1051,9 +999,6 @@ async def test_ctrl_v_non_macos_uses_paste_notice(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     notices: list[str] = []
     app._print_system = notices.append
@@ -1078,9 +1023,6 @@ async def test_clipboard_image_is_normalized_before_provider_request(
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="anthropic",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     def paste_image(*args: object, **kwargs: object) -> Path:
@@ -1119,9 +1061,6 @@ async def test_file_image_is_normalized_before_provider_request(tmp_path: Path) 
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="anthropic",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("inspect @./wide.png")
@@ -1152,9 +1091,6 @@ async def test_corrupt_image_reference_reports_one_visible_notice(tmp_path: Path
         AgentLoop(backend, store, skill_catalog=SkillCatalog.empty()),
         provider="anthropic",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     notices: list[str] = []
     app._print_system = notices.append
@@ -1183,9 +1119,6 @@ async def test_mixed_tui_submission_prepares_each_source_once_off_loop(
         ),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     staged = store.session_dir / "clipboard-mixed.png"
     encoded: list[bytes] = []
@@ -1277,9 +1210,6 @@ async def test_app_submits_attachment_on_the_same_user_message(tmp_path: Path) -
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     await app._handle_prompt_value("use @./prompt.txt")
@@ -1300,9 +1230,6 @@ async def test_missing_path_like_reference_sends_without_notice(tmp_path: Path) 
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     notices: list[str] = []
     app._print_system = notices.append
@@ -1325,9 +1252,6 @@ async def test_unusable_reference_sends_with_notice(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     notices: list[str] = []
     app._print_system = notices.append
@@ -1350,9 +1274,6 @@ async def test_missing_path_sends_pending_paste(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     notices: list[str] = []
     app._print_system = notices.append
@@ -1384,9 +1305,6 @@ async def test_deleted_pending_paste_is_dropped_once(tmp_path: Path) -> None:
         AgentLoop(FakeBackend([ScriptedTurn([TextContent("done")])]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     notices: list[str] = []
     app._print_system = notices.append

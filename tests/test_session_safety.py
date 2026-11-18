@@ -13,7 +13,6 @@ from threading import Event
 import pytest
 
 from zeta.cli.main import main
-from zeta.config.settings import Settings
 from zeta.core import session as session_module
 from zeta.core.session import SessionError, SessionInUseError, SessionManager
 from zeta.core.store import ConversationStore, TranscriptLoadError
@@ -793,9 +792,6 @@ def test_composer_persistence_survives_directory_swap(tmp_path, monkeypatch):
                 AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
                 provider="codex",
                 model="offline",
-
-                voice_engine=Settings().voice_engine,
-                voice_model=Settings().voice_model
             )
             app._delete_staged_attachment(path)
             await app._paste_runtime.reset()

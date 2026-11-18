@@ -14,7 +14,6 @@ from rich.text import Text
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.submissions import await_submission_pipeline
-from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -454,9 +453,6 @@ def _app(tmp_path: Path) -> TUIApp:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
 

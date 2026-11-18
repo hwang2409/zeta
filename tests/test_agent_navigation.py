@@ -23,7 +23,6 @@ from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.agent.pending_delivery import StepDeliveryFlow
-from zeta.config.settings import Settings
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -1087,9 +1086,6 @@ async def _child_send_app(tmp_path: Path) -> tuple[TUIApp, ConversationStore, Co
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app.loop.store.register_agent_child(
         call,
@@ -1396,9 +1392,6 @@ async def test_enter_in_eligible_child_view_queues_for_child_not_main(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app.loop.store.register_agent_child(
         call,
@@ -1483,9 +1476,6 @@ async def test_enter_in_ineligible_child_view_keeps_text_and_does_not_submit(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app.loop.store.register_agent_child(
         call,
@@ -2539,9 +2529,6 @@ def test_nested_tool_events_stay_out_of_the_parent_transcript(tmp_path: Path) ->
         AgentLoop(FakeBackend([]), store, skip_mcp_mount=True, skill_catalog=SkillCatalog.empty()),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     calls: list[object] = []
     app._presenter.handle_tool_event = lambda *args, **kwargs: calls.append(args)  # type: ignore[method-assign]
@@ -2588,9 +2575,6 @@ async def test_child_approval_surfaces_when_view_is_closed_or_open(
         model="offline",
         approval_policy=policy,
         console=Console(file=output, force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     if open_child:
         app._agent_navigation.selected_index = 1
@@ -2641,9 +2625,6 @@ async def test_child_approval_exits_navigation_in_full_screen(
         model="offline",
         approval_policy=policy,
         console=Console(force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     assert isinstance(session, FullScreenPromptSession)

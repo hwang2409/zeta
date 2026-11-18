@@ -14,7 +14,6 @@ import pytest
 
 from tests.support.storage_homes import initialize_storage_home
 from zeta.cli.main import _print_exit_hint, build_parser, main
-from zeta.config.settings import Settings
 from zeta.core.session import (
     SESSION_NAME_MAX_LENGTH,
     SessionError,
@@ -153,9 +152,6 @@ def test_slash_new_rejected_during_active_turn(tmp_path: Path) -> None:
             ),
             provider="codex",
             model="offline",
-
-            voice_engine=Settings().voice_engine,
-            voice_model=Settings().voice_model
         )
         app._active_task = asyncio.create_task(asyncio.sleep(1))
         try:

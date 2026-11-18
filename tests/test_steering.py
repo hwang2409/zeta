@@ -23,7 +23,6 @@ import zeta.providers.completion as completion_module
 from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
-from zeta.config.settings import Settings
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.context import BudgetExceeded, ContextAssembler
 from zeta.core.store import ConversationStore
@@ -455,9 +454,6 @@ def _notification_app(tmp_path: Path, backend: CompletionBackend) -> TUIApp:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
 
@@ -960,9 +956,6 @@ async def test_pipeline_routes_default_submission_as_steer(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     release_app_resources(app, backend.release_turn1)
@@ -1020,9 +1013,6 @@ async def test_backslash_prefix_defers_to_after_turn_end(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     release_app_resources(app, backend.release_turn1)
@@ -1079,9 +1069,6 @@ async def test_abort_drops_pending_steering(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     release_app_resources(app, backend.release_turn1)
@@ -1151,9 +1138,6 @@ async def test_toolless_turn_delivers_late_steer_as_next_turn(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     release_app_resources(app, backend.release_turn1, backend.release_turn2)
@@ -1195,9 +1179,6 @@ async def test_queued_message_dispatches_after_stale_notification_wake(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     release_app_resources(app, backend.release_turn1, backend.release_turn2)
@@ -1240,9 +1221,6 @@ async def test_steer_submitted_as_provider_finishes_is_delivered_once(
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     release_app_resources(app, backend.release_turn1, backend.release_turn2)
@@ -1282,9 +1260,6 @@ async def test_toolless_turn_delivers_two_late_steers_in_order(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     release_app_resources(app, backend.release_turn1, backend.release_turn2)
@@ -1330,9 +1305,6 @@ async def test_undo_during_late_steer_auto_turn_restores_steer(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     release_app_resources(app, backend.release_turn1, backend.release_turn2)
     session = app._make_session()
@@ -1503,9 +1475,6 @@ async def test_passthrough_runs_shell_without_provider_call(tmp_path: Path) -> N
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     # test-contract: seam composer submission has no public acknowledgement method
@@ -1526,9 +1495,6 @@ async def test_passthrough_ctrl_c_aborts_process_group(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     started = asyncio.Event()
     original_handle = app._handle_tool_event
@@ -1560,9 +1526,6 @@ async def test_passthrough_end_repaints_terminal_card(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     with create_pipe_input() as pipe:
         app._active_session = FullScreenPromptSession(
@@ -1599,9 +1562,6 @@ async def test_passthrough_repeat_uses_last_command(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     # test-contract: seam composer submission has no public acknowledgement method
@@ -1625,9 +1585,6 @@ async def test_passthrough_repeat_without_history_notes_error(tmp_path: Path) ->
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     # test-contract: seam composer submission has no public acknowledgement method
@@ -1654,9 +1611,6 @@ async def test_passthrough_respects_approval_policy(tmp_path: Path) -> None:
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     # test-contract: seam composer submission has no public acknowledgement method
@@ -1694,9 +1648,6 @@ async def test_8k_steering_alone_over_budget_keeps_main_requeue(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False, width=300),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     release_app_resources(app, backend.release_turn1)
     oversized = "oversized-steering-" * 10_000

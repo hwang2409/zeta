@@ -17,7 +17,6 @@ from rich.console import Console
 from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from zeta.cli import main as cli
-from zeta.config.settings import Settings
 from zeta.core.session import SessionManager
 from zeta.protocol.types import (
     Message,
@@ -62,9 +61,6 @@ def test_render_failure_exits_without_input_and_restores_session(
         model="gpt-5.6-luna",
         console=Console(file=StringIO(), force_terminal=False),
         ephemeral_root=root if ephemeral else None,
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     output = StringIO()
     broken = phase == "startup"

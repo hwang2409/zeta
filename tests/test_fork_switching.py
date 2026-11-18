@@ -10,7 +10,6 @@ from prompt_toolkit.document import Document
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from zeta.config.settings import Settings
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy, ApprovalRequest
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import TextContent, ToolCall
@@ -75,9 +74,6 @@ async def test_fork_switch_cancels_finder_and_restores_composer(
         ),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     draft = Document("draft before switch", cursor_position=6)
@@ -444,9 +440,6 @@ async def test_live_approval_handle_survives_refresh_and_submission(
         model="offline",
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     controller = ForkStackController(app, pytest.fail)
     app._active_session = app._make_session()

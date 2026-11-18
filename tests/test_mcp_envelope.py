@@ -18,7 +18,7 @@ from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from tests.support.serve_contract import ServeClient
 from tests.support.tui_render import render_full_screen
-from zeta.config.settings import Settings, load_settings
+from zeta.config.settings import load_settings
 from zeta.core.abort import AbortSignal
 from zeta.core.store import ConversationStore
 from zeta.mcp.client import MCPTool, make_error_result
@@ -1026,7 +1026,7 @@ async def test_mcp_status_shows_effective_limits_in_real_tui_render(tmp_path) ->
     )
     mount = _status_mount(tmp_path / "tools")
     loop.attach_mcp_mount(mount)
-    app = TUIApp(loop, provider="codex", model="offline", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
+    app = TUIApp(loop, provider="codex", model="offline")
     session = app._make_session()
     app._active_session = session
     app._install_full_screen_layout(session)

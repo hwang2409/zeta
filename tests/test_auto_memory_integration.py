@@ -14,7 +14,7 @@ from rich.text import Text
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from zeta.codex import CodexLoginRequiredError
-from zeta.config.settings import Settings, load_settings, resolve
+from zeta.config.settings import load_settings, resolve
 from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.project_context import ProjectContext
 from zeta.core.session import OpenedSession, SessionManager
@@ -332,9 +332,6 @@ async def test_login_required_notice_renders_in_tui(tmp_path: Path) -> None:
         provider="codex",
         model="unused-main",
         console=Console(file=output, force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     reconciler = composition.memory_reconciler
     assert reconciler is not None

@@ -24,7 +24,6 @@ from tests.support.retention_owner import _age_tree, _create_closed
 from tests.support.serve_close import close_serve
 from tests.test_server import _connect, _event, _request
 from zeta.cli.main import _attach_retention_owner
-from zeta.config.settings import Settings
 from zeta.core.session import SessionManager
 from zeta.locking import RETENTION_HOME_ID, domain_lock_name
 from zeta.runtime.loop import AgentLoop
@@ -312,9 +311,6 @@ def _tui_app(home: Path) -> tuple[TUIApp, StringIO]:
     app = TUIApp(
         loop, provider="codex", model="offline", zeta_home=home,
         console=Console(file=rendered, force_terminal=False, width=200),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     return app, rendered
 

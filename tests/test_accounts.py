@@ -51,7 +51,6 @@ from zeta.accounts import (
 )
 from zeta.accounts.login import login_named_account
 from zeta.agent.runner import resolve_child_backend
-from zeta.config.settings import Settings
 from zeta.core.login_flow import LoginPublicationError
 from zeta.core.session import SessionManager, account_home
 from zeta.core.store import ConversationStore
@@ -828,9 +827,6 @@ async def test_registry_lock_timeout_reaches_tui_turn_error_card(
         provider="codex",
         model="gpt-5.4",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     rendered: list[object] = []
     app._print = rendered.append
@@ -2566,7 +2562,7 @@ def test_api_key_mode_skips_named_accounts(
 
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
-    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
+    app = TUIApp(loop, provider="claude", model="claude-sonnet-4-6")
     rendered: list[object] = []
     app._presenter.print_unit = rendered.append
     app._handle_slash_output(asyncio.run(app._slash_commands.dispatch_async(app, "/accounts")))
@@ -2781,9 +2777,6 @@ async def test_tui_accounts_login_renders_the_registry_refusal(
         model="offline",
         zeta_home=home,
         console=Console(file=output, force_terminal=False, width=240),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     try:

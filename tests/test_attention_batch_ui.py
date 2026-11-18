@@ -21,7 +21,6 @@ from tests.support.owned import await_or_fail, close_owned_app, owned_app
 from zeta.attention_decisions import open_decisions
 from zeta.attention_records import AttentionStore
 from zeta.attention_replies import AttentionReplies
-from zeta.config.settings import Settings
 from zeta.core.session import SessionManager
 from zeta.project_inbox import ProjectInbox
 from zeta.runtime.loop import AgentLoop
@@ -108,9 +107,6 @@ async def _make_app(
         provider="codex",
         model="fake",
         console=Console(file=StringIO(), force_terminal=True),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session

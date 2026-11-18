@@ -12,7 +12,6 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import close_owned_app
-from zeta.config.settings import Settings
 from zeta.core.checkpoints import workspace as workspace_module
 from zeta.core.checkpoints.workspace import (
     DEFAULT_SNAPSHOT_CAP,
@@ -77,9 +76,6 @@ def _make_tui(store: ConversationStore) -> TUIApp:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
 

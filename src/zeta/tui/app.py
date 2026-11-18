@@ -218,8 +218,8 @@ class TUIApp(
         observer_host: Any | None = None,
         telemetry: Telemetry | None = None,
         otel_endpoint: str | None = None,
-        voice_engine: str,
-        voice_model: str,
+        voice_engine: str = "whisper.cpp",
+        voice_model: str = "small.en",
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop

@@ -13,7 +13,6 @@ from rich.console import Console
 
 from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
-from zeta.config.settings import Settings
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.core.todo import TODO_STATUSES, todo_items_for_display
@@ -491,9 +490,6 @@ async def test_todo_widget_keeps_overflow_summary_in_an_80_by_24_terminal(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="standard"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._install_full_screen_layout(session)
@@ -539,9 +535,6 @@ def test_status_includes_todo_counts_only_when_nonempty(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     registry = create_slash_registry(skill_catalog=SkillCatalog.empty())
 
@@ -565,9 +558,6 @@ def test_full_screen_layout_places_todo_between_transcript_and_composer(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._install_full_screen_layout(session)

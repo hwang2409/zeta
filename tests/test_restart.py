@@ -13,7 +13,6 @@ from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail, owned_app
 from zeta.cli import main as cli_main
 from zeta.cli.main import _exec_restart, _restart_argv
-from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -70,9 +69,6 @@ async def test_status_footer_composes_update_and_restart_notices(
         ),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     monitor = SimpleNamespace(current=None)
     monkeypatch.setattr(layout, "process_update_monitor", lambda _package: monitor)
@@ -132,9 +128,6 @@ def test_restart_slash_closes_once_restores_terminal_then_execs(
         provider="codex",
         model="offline",
         zeta_home=home,
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = FullScreenPromptSession(input=DummyInput(), output=DummyOutput())
     app._session = session
@@ -236,9 +229,6 @@ async def test_restart_controller_covers_fork_and_argument_cases(
         ),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     fork = TUIApp(
         AgentLoop(
@@ -248,9 +238,6 @@ async def test_restart_controller_covers_fork_and_argument_cases(
         ),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     controller = ForkStackController(
         main, lambda _target: asyncio.sleep(0, result=fork), schedule
@@ -320,9 +307,6 @@ async def test_fork_resume_binds_one_restart_idle_composer_callback(
         ),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = FullScreenPromptSession(input=DummyInput(), output=DummyOutput())
     try:
@@ -351,9 +335,6 @@ async def test_restart_when_idle_polls_background_task_end(tmp_path: Path) -> No
         ),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     controller = ForkStackController(app, lambda _target: asyncio.sleep(0), schedule)
     task_id, _pid = await app.loop.tool_registry.background_tasks.start(
@@ -397,9 +378,6 @@ async def test_restart_when_idle_cancel_cancels_poll_timer(
         ),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     controller = ForkStackController(app, lambda _target: asyncio.sleep(0), schedule)
     monkeypatch.setattr(TUIApp, "restart_has_running_work", property(lambda _app: True))

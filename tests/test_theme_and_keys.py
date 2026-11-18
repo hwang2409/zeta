@@ -13,7 +13,6 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.tui_backend import FakeInteractiveBackend
-from zeta.config.settings import Settings
 from zeta.core.session import SessionError
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
@@ -369,9 +368,6 @@ skill_catalog=SkillCatalog.empty(),
         provider="codex",
         model="offline",
         zeta_home=tmp_path / "zeta-home",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     rebuilt = [0]
 
@@ -402,9 +398,6 @@ skill_catalog=SkillCatalog.empty(),
         provider="codex",
         model="offline",
         zeta_home=home,
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     assert "theme: dark" in app.slash_theme("")
     assert "dark" in app.slash_theme("list")
@@ -425,9 +418,6 @@ skill_catalog=SkillCatalog.empty(),
         provider="codex",
         model="offline",
         zeta_home=home,
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     original = theme_module.active_palette().name
     result = app.slash_theme("nope")

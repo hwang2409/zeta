@@ -22,7 +22,6 @@ from tests.support.owned import await_or_fail
 from tests.support.submissions import await_submission_pipeline
 from zeta.attention_decisions import DecisionItem
 from zeta.attention_records import AttentionStore
-from zeta.config.settings import Settings
 from zeta.core.commands.slash_registry import SlashCommand
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
@@ -68,9 +67,6 @@ async def test_status_card_open_close_preserves_composer_and_transcript(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -118,9 +114,6 @@ async def test_bare_overlay_commands_dispatch_and_render_through_registry(
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
         zeta_home=tmp_path / "home",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -260,9 +253,6 @@ async def test_status_card_renders_compaction_with_or_without_fact_floor(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     try:
         session = app._make_session()
@@ -323,9 +313,6 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
         model="offline",
         zeta_home=tmp_path,
         console=Console(file=StringIO(), force_terminal=True),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -424,9 +411,6 @@ async def test_empty_decisions_popup_renders_and_closes(tmp_path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     try:
         session = app._make_session()
@@ -475,9 +459,6 @@ async def test_status_card_render_is_centered_and_bounded(tmp_path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -499,9 +480,6 @@ async def test_status_card_small_terminal_scrolls_and_clamps(tmp_path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session
@@ -570,9 +548,6 @@ async def test_status_card_renders_otel_state(
         console=Console(file=StringIO(), force_terminal=True),
         telemetry=None if status is None else Telemetry(_StatusOnlyTelemetry(status)),
         otel_endpoint=None if status is None else "http://127.0.0.1:4318/v1/traces",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     try:
         session = app._make_session()

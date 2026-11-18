@@ -17,7 +17,6 @@ from rich.text import Text
 
 from tests.support.branch_reads import branch_entries, resident_entries
 from tests.support.fake_backend import FakeBackend
-from zeta.config.settings import Settings
 from zeta.context_eviction import recall_history
 from zeta.core.context import ContextAssembler
 from zeta.core.store import ConversationStore
@@ -312,9 +311,6 @@ def test_tui_replays_start_row_through_real_renderer(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     try:
         app._rebuild_transcript()

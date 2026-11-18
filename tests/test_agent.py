@@ -60,7 +60,7 @@ from zeta.agent.presets import (
 )
 from zeta.agent.runner import _child_base_system_prompt
 from zeta.agent.terminal_fence import TerminalTransitionFence
-from zeta.config.settings import Settings, SettingsError, load_settings
+from zeta.config.settings import SettingsError, load_settings
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
 from zeta.core.checkpoints import ConversationEntry
@@ -2636,9 +2636,6 @@ async def test_user_submission_waits_behind_notification_wake(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     app._submissions.wake()

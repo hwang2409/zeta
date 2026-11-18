@@ -17,7 +17,6 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
-from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -108,7 +107,7 @@ def _voice_files(home: Path) -> list[str]:
 @pytest.mark.asyncio
 async def test_runtime_transcribes_and_cleans_private_audio(tmp_path: Path) -> None:
     source = FakeSource()
-    runtime = VoiceRuntime(zeta_home=tmp_path, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model, source=source, transcriber=FakeTranscriber(tmp_path))
+    runtime = VoiceRuntime(zeta_home=tmp_path, source=source, transcriber=FakeTranscriber(tmp_path))
     try:
         await runtime.start_recording()
         assert runtime.state is VoiceState.RECORDING
@@ -125,7 +124,7 @@ async def test_runtime_transcribes_and_cleans_private_audio(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_runtime_rejects_invalid_transitions(tmp_path: Path) -> None:
-    runtime = VoiceRuntime(zeta_home=tmp_path, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model, source=FakeSource(), transcriber=FakeTranscriber(tmp_path))
+    runtime = VoiceRuntime(zeta_home=tmp_path, source=FakeSource(), transcriber=FakeTranscriber(tmp_path))
     with pytest.raises(VoiceStateError):
         await runtime.stop_and_transcribe()
     await runtime.close()
@@ -168,7 +167,7 @@ async def test_cancellation_at_every_phase_cleans_up_before_it_propagates(
             fire()
         states.append(state)
 
-    runtime = VoiceRuntime(zeta_home=tmp_path, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model, progress=progress, source=source, transcriber=transcriber)
+    runtime = VoiceRuntime(zeta_home=tmp_path, progress=progress, source=source, transcriber=transcriber)
     try:
         if phase == "capture_start":
             caller = asyncio.create_task(runtime.start_recording())
@@ -213,9 +212,6 @@ def _voice_app(tmp_path: Path, transcriber: FakeTranscriber, changed: asyncio.Ev
         model="offline",
         zeta_home=tmp_path / "home",
         console=Console(file=open(os.devnull, "w"), force_terminal=False, width=120),  # noqa: SIM115
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
     def progress(state: VoiceState) -> None:
@@ -223,7 +219,7 @@ def _voice_app(tmp_path: Path, transcriber: FakeTranscriber, changed: asyncio.Ev
         if changed is not None:
             changed.set()
 
-    app._voice = VoiceRuntime(zeta_home=tmp_path / "home", voice_engine=Settings().voice_engine, voice_model=Settings().voice_model, progress=progress, source=FakeSource(), transcriber=transcriber)
+    app._voice = VoiceRuntime(zeta_home=tmp_path / "home", progress=progress, source=FakeSource(), transcriber=transcriber)
     return app
 
 

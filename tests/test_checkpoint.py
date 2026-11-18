@@ -11,7 +11,6 @@ from rich.text import Text
 from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, close_owned_app
-from zeta.config.settings import Settings
 from zeta.core.checkpoints import CheckpointForkMixin
 from zeta.core.context import ContextAssembler
 from zeta.core.session import SessionManager
@@ -220,9 +219,6 @@ def test_tui_replay_hides_passive_harness_message(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -399,9 +395,6 @@ def test_naive_checkpoint_timestamp_is_normalized_at_jsonl_boundary(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     picker = app.slash_fork("")
     assert "prior user messages" in picker
@@ -429,9 +422,6 @@ async def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -472,7 +462,7 @@ async def test_parallel_group_replays_in_the_order_it_rendered_live(
         console = Console(
             file=output, force_terminal=True, color_system="truecolor", width=100
         )
-        return TUIApp(loop, provider="codex", model="offline", console=console, voice_engine=Settings().voice_engine, voice_model=Settings().voice_model)
+        return TUIApp(loop, provider="codex", model="offline", console=console)
 
     live_output = StringIO()
     live = app_for(
@@ -629,9 +619,6 @@ def test_live_and_replay_agent_notification_bytes_match(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -660,9 +647,6 @@ def test_display_only_agent_notification_remains_visible_in_tui_replay(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
 
@@ -703,9 +687,6 @@ def test_padded_agent_notification_keeps_live_and_replay_bytes_equal(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     live_app._active_session = live_app._make_session()
     live_app._print_unit(render_markdown("pr link"))
@@ -717,9 +698,6 @@ def test_padded_agent_notification_keeps_live_and_replay_bytes_equal(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     replay_app._active_session = replay_app._make_session()
     replay_app._rebuild_transcript()
@@ -742,9 +720,6 @@ async def test_fork_rejects_running_background_agents_then_allows_completion(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app.loop._background_child_cancellers["agent-1"] = lambda: None
 
@@ -802,9 +777,6 @@ def test_transcript_rebuild_reads_session_metadata_once(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     app._active_session = app._make_session()
     reads = _count_meta_reads(monkeypatch)

@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from zeta.config.settings import Settings
 from zeta.remote.descriptor import (
     Descriptor,
     DescriptorError,
@@ -386,9 +385,6 @@ async def test_tui_runs_with_notice_when_observer_host_start_fails(
         console=Console(file=StringIO(), force_terminal=True, width=200),
         foreground_event_publisher=publisher,
         observer_host=host,
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     prompt_ready = asyncio.Event()
     run_full_screen = app._run_full_screen

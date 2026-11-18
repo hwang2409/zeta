@@ -20,7 +20,6 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend
-from zeta.config.settings import Settings
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -60,9 +59,6 @@ def _app(tmp_path: Path) -> tuple[TUIApp, FullScreenPromptSession]:
         console=Console(
             file=StringIO(), force_terminal=True, color_system="truecolor"
         ),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     session = app._make_session()
     app._active_session = session

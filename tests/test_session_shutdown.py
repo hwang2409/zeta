@@ -18,7 +18,6 @@ from prompt_toolkit.output import DummyOutput
 
 from tests.support.fake_backend import FakeBackend
 from zeta.cli.main import build_parser, main
-from zeta.config.settings import Settings
 from zeta.core.checkpoints.workspace import (
     WorkspaceSnapshotError,
     WorkspaceSnapshotStore,
@@ -191,9 +190,6 @@ async def test_closing_app_cancels_pending_model_catalog_refresh(
         model="claude-sonnet-4-6",
         on_model_change=lambda model: None,
         model_catalog_loader=load_catalog,
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     refreshes = 0
 

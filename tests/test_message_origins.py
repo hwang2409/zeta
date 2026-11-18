@@ -25,7 +25,6 @@ from tests.test_agent import (
 )
 from tests.test_server import _connect, _frames_until_event, _request
 from tests.test_steering import SteerToolBackend
-from zeta.config.settings import Settings
 from zeta.core.commands.slash_registry import SlashLock
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
@@ -401,9 +400,6 @@ async def _audit_tui_row(path: str, tmp_path: Path) -> dict[str, object]:
         model="offline",
         zeta_home=tmp_path / "home",
         console=Console(file=StringIO(), force_terminal=False),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     if path == "/implement":
         loop.set_plan_mode(True)
@@ -694,9 +690,6 @@ def test_headless_entry_persists_user_origin(
         ),
         provider="codex",
         model="offline",
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     monkeypatch.setattr("zeta.tui.app.create_app", lambda _args: app)
     monkeypatch.setattr(sys, "stdout", StringIO())

@@ -28,7 +28,6 @@ from zeta.attention_decisions import DecisionItem, open_decisions
 from zeta.attention_forks import create_discussion_fork, release_discussion_fork
 from zeta.attention_records import AttentionStore
 from zeta.attention_replies import AttentionReplies
-from zeta.config.settings import Settings
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.project_inbox import ProjectInbox
@@ -110,9 +109,6 @@ def _decisions_app(home: Path, opened) -> TUIApp:
         model="fake",
         zeta_home=home,
         console=Console(file=StringIO(), force_terminal=True),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
 
 
@@ -1042,9 +1038,6 @@ async def test_decisions_overflow_indicator_uses_real_float_render(
         provider="codex",
         model="offline",
         console=Console(file=StringIO(), force_terminal=True),
-
-        voice_engine=Settings().voice_engine,
-        voice_model=Settings().voice_model
     )
     try:
         session = app._make_session()
