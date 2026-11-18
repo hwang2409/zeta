@@ -143,8 +143,9 @@ async def test_session_pages_follow_the_cursor_and_reject_other_filters(tmp_path
         assert list(first["items"][0]) == SESSION_KEYS
         assert [item["session_id"] for item in by_model["items"]] == [roots[0]]
         assert by_model["items"][0]["input_tokens"] == 3
-        assert mismatched["error"]["code"] == -32602, "a cursor made for other filters was accepted"
-        assert mismatched["error"]["data"] == {"code": "invalid_params"}
+        assert mismatched.get("error") == {
+            "code": -32602, "message": "invalid params: invalid cursor", "data": {"code": "invalid_params"},
+        }, "a cursor made for other filters was accepted"
         assert all(error["code"] == -32602 and error["data"] == {"code": "invalid_params"} for error in invalid)
     finally:
         await contract.close()
@@ -176,7 +177,9 @@ async def test_trace_pages_spans_in_order_with_their_events(tmp_path: Path) -> N
         large, cursor = [], None
         while True:
             params = {"trace_id": "ee" * 16, **({"cursor": cursor} if cursor else {})}
-            page = (await client.request(f"l{len(large)}", "telemetry_trace", params))["result"]
+            reply = await client.request(f"l{len(large)}", "telemetry_trace", params)
+            assert "result" in reply, f"an oversized page was not cut to the frame budget: {reply.get('error')}"
+            page = reply["result"]
             large.append(page)
             cursor = page["next_cursor"]
             if cursor is None:
@@ -270,10 +273,12 @@ async def test_reads_stay_consistent_while_the_writer_commits(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_a_slow_read_does_not_block_the_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     release = threading.Event()
+    released: list[bool] = []
     real_sessions = reader.sessions
 
     def slow_sessions(*arguments):
-        release.wait(5)  # bounded so a read on the loop delays, rather than hangs, the test
+        # bounded so a read on the loop delays, rather than hangs, the test; it times out only then
+        released.append(release.wait(5))
         return real_sessions(*arguments)
 
     monkeypatch.setattr(reader, "sessions", slow_sessions)
@@ -290,12 +295,11 @@ async def test_a_slow_read_does_not_block_the_event_loop(tmp_path: Path, monkeyp
         await send(observer_stream, observer, "ping", "ping")  # a connection reads its own requests in order
 
         pong = await read(observer_stream)
-        answered_while_slow = not release.is_set()
         release.set()
         slow = await read(reader_stream)
 
         assert pong["result"] == {"pong": True}
-        assert answered_while_slow, "ping waited for the telemetry read: the read ran on the event loop"
+        assert released == [True], "ping waited for the telemetry read: the read ran on the event loop"
         assert slow["id"] == "slow"
     finally:
         release.set()
