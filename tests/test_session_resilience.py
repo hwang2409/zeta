@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.branch_reads import branch_messages
+from zeta.core import session
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.store import (
     ConversationIntegrityError,
@@ -444,7 +445,7 @@ def test_listing_boundaries_propagate_programming_faults(
     def fail(*args, **kwargs):
         raise fault("programming fault")
 
-    monkeypatch.setattr(manager, "read_metadata", fail)
+    monkeypatch.setattr(session, "read_session_metadata", fail)
     with pytest.raises(fault, match="programming fault"):
         manager.list_sessions_read_only()
 
