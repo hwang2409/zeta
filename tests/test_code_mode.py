@@ -20,7 +20,7 @@ from zeta.core.approval import (
     ApprovalRule,
 )
 from zeta.core.store import ConversationStore
-from zeta.core.tool_dispatch_coordinator import ToolDispatchCoordinator
+from zeta.core.tool_dispatch import ToolDispatchCoordinator
 from zeta.protocol.types import (
     Message,
     MessageOrigin,

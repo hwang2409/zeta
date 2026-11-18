@@ -10,8 +10,7 @@ from typing import TYPE_CHECKING, Final
 
 from ...agent.tool_results import validated_tool_result
 from ...core.abort import AbortSignal
-from ...core.tool_dispatch import execute_owned_tool
-from ...core.tool_dispatch_coordinator import ToolDispatchCoordinator
+from ...core.tool_dispatch import ToolDispatchCoordinator, execute_owned_tool
 from ...protocol.types import (
     StreamEvent,
     StreamEventType,
