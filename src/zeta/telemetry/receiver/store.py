@@ -536,6 +536,8 @@ class Writer:
             if age_rows: age_family = family; break
         c.execute("BEGIN IMMEDIATE"); c.execute("DELETE FROM traces WHERE NOT EXISTS(SELECT 1 FROM spans WHERE spans.trace_id=traces.trace_id)"); c.execute("DELETE FROM sessions WHERE NOT EXISTS(SELECT 1 FROM spans WHERE spans.session_id=sessions.root_session_id OR spans.session_id LIKE sessions.root_session_id || ':%')"); c.commit()
         self._reclaim(); after = _database_bytes(self._path); over = after > MAX_BYTES
+        if over and MAX_BYTES < 45 * c.execute("PRAGMA page_size").fetchone()[0]:
+            return {"age_family": age_family, "age_rows": age_rows, "size_family": None, "size_rows": 0, "bytes_before": before, "bytes_after": after, "caught_up": False, "over_cap": True, "stalled": True}
         if over:
             for table, order, family in (("spans","start_ns,trace_id,span_id","raw"),("span_fingerprints","seen_ns,trace_id,span_id","fingerprints"),("hourly_series","hour_ns,group_by,group_key","rollups"),("hourly_distinct","hour_ns,group_by,group_key,identity_kind,identity_key","rollups"),("hourly_models","hour_ns,model_key","rollups"),("hourly_tools","hour_ns,tool_key","rollups"),("hourly_latency","hour_ns,family,family_key,bucket","rollups")):
                 n = delete(table, "1", (), order)
