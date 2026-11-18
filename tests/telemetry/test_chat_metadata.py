@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from types import SimpleNamespace
 
 import pytest
@@ -46,6 +47,32 @@ SECRET = "SECRET-PROMPT-TEXT"
 def test_error_code_is_read_from_machine_fields_only(error: object, code: str) -> None:
     assert error_code(error) == code
     assert code in ERROR_CODES
+
+
+# message words that a message-reading mapper would act on: known codes, secrets, free text.
+# "prompt is too long" is left out: the anthropic provider maps it to a different machine code.
+_WORDS = [*ERROR_CODES, "invalid_request_error", "rate_limit_error", "overloaded_error", "429", "timeout",
+          SECRET, "sk-ant-api03-AAAA", "Bearer eyJhbGciOi", "password=hunter2", "", " ", "\n", "é", "😀"]
+
+
+@pytest.mark.parametrize("make", [
+    pytest.param(lambda m: CodexStreamError(m, code="invalid_request_error"), id="codex code"),
+    pytest.param(lambda m: CodexStreamError(m, code="not_a_known_code", retry_reason="nor_this"), id="unknown classifier code"),
+    pytest.param(lambda m: AnthropicStreamError(m, code="overloaded_error", retry_reason="overloaded_error"), id="anthropic code"),
+    pytest.param(lambda m: AnthropicHTTPError(m, status_code=418), id="unmapped status"),
+    pytest.param(lambda m: OllamaError(m, status_code=404), id="ollama status"),
+    pytest.param(lambda m: ErrorInfo("backend_error", m), id="ErrorInfo unknown code"),
+    pytest.param(lambda m: RuntimeError(m), id="no machine fields"),
+])
+def test_error_code_ignores_message_text(make) -> None:
+    rng = random.Random(1445)
+    base = make("")
+    fields = lambda e: (getattr(e, "code", None), getattr(e, "retry_reason", None), getattr(e, "status_code", None))
+    for _ in range(200):
+        error = make(" ".join(rng.choice(_WORDS) for _ in range(rng.randint(1, 8))))
+        assert fields(error) == fields(base)
+        assert error_code(error) == error_code(base), f"message changed the code: {error!s}"
+        assert error_code(error) in ERROR_CODES
 
 
 class _Recorder(SpanHandle):

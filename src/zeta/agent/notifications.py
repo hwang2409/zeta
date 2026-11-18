@@ -249,6 +249,12 @@ class AgentNotificationMixin:
         turn_span: SpanHandle | None = None
         run_id = self.agent_instance_id
         outcome = "finished"
+
+        def close_turn(turn_outcome: str, exc: BaseException | None = None) -> None:
+            if turn_span is not None:
+                turn_span.set_outcome(turn_outcome)
+                turn_span.__exit__(None if exc is None else type(exc), exc, None)
+
         with telemetry.agent_span(
             self.agent_profile,
             agent_name=self.agent_profile,
@@ -265,9 +271,7 @@ class AgentNotificationMixin:
                         # turn spans follow the loop's own turn events, so the
                         # inference span the loop opens next is their child
                         if event.type is StreamEventType.TURN_START:
-                            if turn_span is not None:  # a redispatch starts a turn without TURN_END
-                                turn_span.set_outcome("redispatched")
-                                turn_span.__exit__(None, None, None)
+                            close_turn("redispatched")  # a redispatch starts a turn without TURN_END
                             turn_span = telemetry.turn_span(
                                 conversation_id=self.conversation_id,
                                 turn_number=event.data.get("turn", 0),
@@ -276,8 +280,7 @@ class AgentNotificationMixin:
                             turn_span.__enter__()
                         elif event.type is StreamEventType.TURN_END and turn_span is not None:
                             turn_span.set_tool_count(tool_count=event.data.get("tool_calls", 0))
-                            turn_span.set_outcome("finished")
-                            turn_span.__exit__(None, None, None)
+                            close_turn("finished")
                             turn_span = None
                         elif event.type is StreamEventType.ERROR:
                             outcome = "turn_limit" if getattr(event.error, "code", None) == "max_turns" else "failed"
@@ -301,18 +304,14 @@ class AgentNotificationMixin:
             except BaseException as exc:
                 outcome = "cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt)) else "failed"
                 agent_span.set_outcome(outcome)
-                if turn_span is not None:
-                    turn_span.set_outcome(outcome)
-                    turn_span.__exit__(type(exc), exc, None)
+                close_turn(outcome, exc)
                 raise
             if self._abort_admitted:
                 outcome = "interrupted"
             elif self.child_turn_control is not None and self.child_turn_control.exhausted:
                 outcome = "turn_limit"
             agent_span.set_outcome(outcome)
-            if turn_span is not None:
-                turn_span.set_outcome(outcome)
-                turn_span.__exit__(None, None, None)
+            close_turn(outcome)
 
     def set_background_wake_callback(self, callback: Callable[[], None] | None) -> None:
         if callback is None:

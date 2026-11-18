@@ -2,6 +2,12 @@
 
 The code is read only from machine fields (``code``, ``retry_reason``, ``status_code``) and
 the exception class, never from a message: provider messages can carry request content.
+
+Boundary: a provider classifier may inspect its own message inside the provider, but only to
+pick a closed code (for example ``anthropic_errors`` turns "prompt is too long" into
+``context_length_exceeded``). Telemetry receives only that closed result, never calls
+``str(exc)`` or reads ``args``/message attributes, and maps any code it does not know to
+``unknown``, so every result is a member of ``ERROR_CODES``.
 """
 
 from __future__ import annotations
