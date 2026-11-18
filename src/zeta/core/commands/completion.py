@@ -14,7 +14,7 @@ _zeta() {
     local context state line command_index command_name token
     local -a commands session_verbs project_verbs project_index_verbs mcp_verbs original_words
     typeset -A opt_args
-    commands=(login accounts serve session project inbox mcp stalls storage-format remote completion)
+    commands=(login accounts serve session project inbox mcp otel stalls storage-format remote completion)
     session_verbs=(list rename delete export push pull)
     project_verbs=(create init discover list show memory index)
     project_index_verbs=(status rebuild search)
@@ -124,6 +124,9 @@ _zeta() {
                 inbox)
                     _arguments '--project=[project name or ID]:project:'
                     ;;
+                otel)
+                    _arguments '1:action:(view)' '--no-open[do not open a browser]'
+                    ;;
                 mcp)
                     case ${original_words[command_index+1]} in
                         add) _arguments '--scope=[configuration scope]:scope:(user project)' '--url=[HTTP server URL]:URL:' '--oauth[use OAuth]' '*--env=[environment reference]:KEY=VALUE:' '*--header=[HTTP header reference]:HEADER=VALUE:' '1:name:' '*:server command:' ;;
@@ -193,7 +196,7 @@ def bash_script() -> str:
         verb="${COMP_WORDS[command_index+1]}"
     fi
     local top_flags="-h --help --provider --model --continue -c --resume --no-session --force-provider --verbose --yolo --no-yolo --auto-memory --no-auto-memory --token-budget --tools --disallowed-tools --require-tools --allow-hooks --max-turns --print -p --format --system-prompt --append-system-prompt"
-    local commands="login accounts serve session project inbox mcp stalls storage-format remote completion"
+    local commands="login accounts serve session project inbox mcp otel stalls storage-format remote completion"
 
     if (( command_index == 0 )); then
         if [[ "$cur" == -* ]]; then
@@ -252,6 +255,9 @@ def bash_script() -> str:
             ;;
         inbox)
             COMPREPLY=( $(compgen -W "--project" -- "$cur") )
+            ;;
+        otel)
+            COMPREPLY=( $(compgen -W "view --no-open" -- "$cur") )
             ;;
         mcp)
             if (( COMP_CWORD <= command_index + 1 )); then
