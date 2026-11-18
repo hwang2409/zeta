@@ -47,6 +47,8 @@ def _home_settings(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
             case _:
                 descriptor = ErrorDescriptor.SETTINGS_UNSAFE
         raise ProtocolError(descriptor, descriptor.meaning, exc.data or None) from None
+    except Exception:  # noqa: BLE001 - an OSError names the home path; no detail leaves this process
+        raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, ErrorDescriptor.INTERNAL_ERROR.meaning) from None
 
 
 def telemetry(client) -> dict | None:

@@ -144,16 +144,68 @@ def test_a_held_lock_is_busy_after_its_deadline_and_writes_nothing(tmp_path: Pat
     assert not (home / "settings.toml").exists()
 
 
-def test_comments_and_unknown_keys_survive_both_directions(tmp_path: Path) -> None:
-    original = b'# my settings\nmodel = "gpt-5.6-luna"  # pinned\nfuture_key = 1\n\n[future]\nx = "y"  # keep\n'
+_GENERAL = (
+    b'# lead\nmodel = "gpt-5.6-luna"  # keep\nunknown = [1, 2, 3]\ninline = { a = 1, b = "two" }\n'
+    b'text = """line one\nline two"""\n\n[future]\nz = true # tail'
+)
+_ENTRY = f'endpoint = "{BUILTIN}"'.encode()
+
+
+def _crlf(raw: bytes) -> bytes:
+    return raw.replace(b"\n", b"\r\n")
+
+
+@pytest.mark.parametrize(
+    ("original", "toggled", "restored"),
+    [
+        pytest.param(_GENERAL + b"\n", _GENERAL + b"\n[otel]\n" + _ENTRY + b"\n", _GENERAL + b"\n", id="lf"),
+        pytest.param(_GENERAL, _GENERAL + b"\n[otel]\n" + _ENTRY, _GENERAL, id="lf-no-trailing-newline"),
+        pytest.param(
+            _crlf(_GENERAL + b"\n"), _crlf(_GENERAL + b"\n[otel]\n" + _ENTRY + b"\n"), _crlf(_GENERAL + b"\n"),
+            id="crlf",
+        ),
+        pytest.param(
+            _crlf(_GENERAL), _crlf(_GENERAL + b"\n[otel]\n" + _ENTRY), _crlf(_GENERAL), id="crlf-no-trailing-newline"
+        ),
+        pytest.param(b"", b"[otel]\n" + _ENTRY + b"\n", b"", id="empty"),
+        pytest.param(
+            b"# lead\n[otel]\n# collector\n" + _ENTRY + b" # note\n\n[future]\nz = 1\n",
+            b"# lead\n[otel]\n# collector\n\n[future]\nz = 1\n",
+            b"# lead\n[otel]\n" + _ENTRY + b"\n# collector\n\n[future]\nz = 1\n",
+            id="otel-comments-stay",
+        ),
+        pytest.param(
+            _crlf(b"[otel]\n" + _ENTRY + b"\n[future]\nz = 1\n"),
+            _crlf(b"[future]\nz = 1\n"),
+            _crlf(b"[future]\nz = 1\n[otel]\n" + _ENTRY + b"\n"),
+            id="bare-otel-before-a-table",
+        ),
+    ],
+)
+def test_toggles_change_only_the_endpoint_line(tmp_path: Path, original: bytes, toggled: bytes, restored: bytes) -> None:
+    home = _home(tmp_path, original)
+    state = home_settings.get(home)
+    enabled = state["settings"]["telemetry"]["enabled"]
+
+    first = home_settings.update(home, state["revision"], OFF if enabled else ON)
+    after_first = (home / "settings.toml").read_bytes()
+    home_settings.update(home, first["revision"], ON if enabled else OFF)
+
+    assert after_first == toggled
+    assert (home / "settings.toml").read_bytes() == restored
+
+
+@pytest.mark.parametrize(
+    "original",
+    [f'otel = {{ endpoint = "{BUILTIN}" }}\n'.encode(), f'otel.endpoint = "{BUILTIN}"\n'.encode()],
+    ids=["inline-table", "dotted-key"],
+)
+def test_an_otel_layout_the_line_edit_cannot_change_is_refused(tmp_path: Path, original: bytes) -> None:
     home = _home(tmp_path, original)
 
-    on = home_settings.update(home, _revision(original), ON)
-    enabled = (home / "settings.toml").read_bytes()
-    home_settings.update(home, on["revision"], OFF)
+    _refused("custom_home_setting", lambda: home_settings.update(home, _revision(original), OFF))
 
-    assert enabled == original + f'\n[otel]\nendpoint = "{BUILTIN}"\n'.encode()
-    assert (home / "settings.toml").read_bytes().rstrip(b"\n") == original.rstrip(b"\n")
+    assert (home / "settings.toml").read_bytes() == original
 
 
 def test_custom_endpoint_is_read_only_and_byte_identical(tmp_path: Path) -> None:

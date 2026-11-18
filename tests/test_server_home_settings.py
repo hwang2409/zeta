@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -129,3 +130,28 @@ async def test_update_handler_writes_only_through_home_settings(tmp_path: Path, 
     assert result == {"written": "by home_settings"}
     assert calls == [(tmp_path, _revision(b""), ON)]
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_a_filesystem_failure_names_no_path(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    contract = await ServeContract.start(tmp_path, "websocket")
+    try:
+        controller, _ = await _client(contract)
+        got = await controller.request("get", "home_settings_get")
+        home.rename(tmp_path / "moved")
+        try:
+            replies = [
+                await controller.request("get", "home_settings_get"),
+                await controller.request(
+                    "update", "home_settings_update", {"expected_revision": got["result"]["revision"], "changes": ON}
+                ),
+            ]
+        finally:
+            (tmp_path / "moved").rename(home)
+    finally:
+        await contract.close()
+
+    for reply in replies:
+        assert tmp_path.name not in json.dumps(reply)
+        assert reply["error"] == {"code": -32000, "message": "unexpected server or storage failure"}

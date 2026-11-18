@@ -4,8 +4,9 @@ A client sees an allowlisted projection plus ``revision``, the SHA-256 of the ex
 (an absent file hashes as empty bytes). An update names that revision; it takes the sibling
 ``settings.toml.lock``, rereads the bytes under the lock, and refuses a stale revision, so an edit
 finished before the reread is never lost. The lock serializes zeta writers only; an editor that
-writes after the reread is not stopped. ``tomlkit`` keeps comments and unknown keys, and a
-candidate is published only after ``load_settings``'s own validation accepts it.
+writes after the reread is not stopped. The edit touches only the ``[otel]`` ``endpoint`` line
+(and a header it added), checked against a ``tomlkit`` parse, and a candidate is published only
+after ``load_settings``'s own validation accepts it.
 
 Every function blocks (file locks, fsync, a directory scan); call it off the event loop.
 """
@@ -40,6 +41,9 @@ LOCK_SECONDS = 0.25
 LOCK_POLL_SECONDS = 0.01
 RESTART_SCAN_SECONDS = 1.0
 _REVISION = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_HEADER = re.compile(rb"[ \t]*\[")  # a table or array-of-tables header line
+_OTEL_HEADER = re.compile(rb"""[ \t]*\[[ \t]*(?:otel|"otel"|'otel')[ \t]*\][ \t]*(?:#[^\r\n]*)?\r?\n?\Z""")
+_ENDPOINT = re.compile(rb"""[ \t]*(?:endpoint|"endpoint"|'endpoint')[ \t]*=""")
 
 
 class HomeSettingsError(Exception):
@@ -81,7 +85,7 @@ def update(home: Path, expected_revision: object, changes: object) -> dict[str, 
             current = _project(raw, home)["telemetry"]
             if current["source"] == "custom":
                 raise HomeSettingsError("custom_home_setting")
-            candidate = _with_telemetry(raw, enabled)
+            candidate = raw if current["enabled"] == enabled else _with_telemetry(raw, enabled)
             _project(candidate, home)  # the same validation load_settings runs, before publication
             if candidate != raw:
                 write_session_file(home_fd, SETTINGS_FILENAME, candidate)
@@ -165,21 +169,56 @@ def _project(raw: bytes, home: Path) -> dict[str, Any]:
 
 
 def _with_telemetry(raw: bytes, enabled: bool) -> bytes:
-    """Round-trip ``raw`` through tomlkit so comments and unknown keys survive the one change."""
+    """Add or remove only the ``[otel]`` ``endpoint`` line; every other byte stays as it was.
+
+    Turning on inserts the line under an existing ``[otel]`` header or appends a new
+    ``[otel]`` table. Turning off removes the line, and a bare ``[otel]`` header only when
+    nothing follows it before the next table, so on-then-off restores a file that had no
+    ``[otel]`` exactly. Line endings and the trailing-newline state are kept. A layout this edit cannot express (an
+    inline ``otel`` table, a dotted ``otel.endpoint`` key) fails the tomlkit comparison below and
+    is refused as a hand-configured setting.
+    """
+    newline = b"\r\n" if b"\r\n" in raw else b"\n"
+    unterminated = bool(raw) and not raw.endswith(b"\n")
+    lines = (raw + newline if unterminated else raw).splitlines(keepends=True)
+    header = next((i for i, line in enumerate(lines) if _OTEL_HEADER.match(line)), None)
+    if enabled:
+        entry = b'endpoint = "' + OTLP_URL.encode() + b'"' + newline
+        if header is None:
+            lines += [b"[otel]" + newline, entry]
+        else:
+            lines.insert(header + 1, entry)
+    elif header is not None:
+        end = next((i for i in range(header + 1, len(lines)) if _HEADER.match(lines[i])), len(lines))
+        endpoint = next((i for i in range(header + 1, end) if _ENDPOINT.match(lines[i])), None)
+        if endpoint is not None:
+            del lines[endpoint]
+            emptied = header + 1 == len(lines) or _HEADER.match(lines[header + 1])
+            if emptied and lines[header].rstrip(b"\r\n") == b"[otel]":  # only a header the toggle adds
+                del lines[header]
+    candidate = b"".join(lines)
+    if unterminated and candidate.endswith(newline):
+        candidate = candidate[: -len(newline)]
+    if _document(candidate) != _document(raw, enabled):
+        raise HomeSettingsError("custom_home_setting")
+    return candidate
+
+
+def _document(raw: bytes, enabled: bool | None = None) -> dict[str, Any]:
+    """``raw`` as plain data, with the endpoint set (``enabled``) or removed, and no empty ``otel``."""
     try:
-        document = tomlkit.parse(raw.decode("utf-8"))
+        document = tomlkit.parse(raw.decode("utf-8")).unwrap()
     except (TOMLKitError, UnicodeDecodeError):
         raise HomeSettingsError("settings_malformed") from None
-    if enabled:
-        if "otel" not in document:
-            document["otel"] = tomlkit.table()
-        document["otel"]["endpoint"] = OTLP_URL  # type: ignore[index]
-    elif "otel" in document:
-        otel = document["otel"]
-        otel.pop("endpoint", None)  # type: ignore[union-attr]
-        if not otel:
-            del document["otel"]
-    return tomlkit.dumps(document).encode("utf-8")
+    if enabled is not None and isinstance(document.get("otel", {}), dict):
+        otel = document.setdefault("otel", {})
+        if enabled:
+            otel["endpoint"] = OTLP_URL
+        else:
+            otel.pop("endpoint", None)
+    if document.get("otel") == {}:
+        del document["otel"]
+    return document
 
 
 def _restart(home_fd: int) -> dict[str, Any]:

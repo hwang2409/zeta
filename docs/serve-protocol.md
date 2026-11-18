@@ -786,9 +786,14 @@ A file that does not parse or that zeta would refuse at startup projects as
 `settings_malformed: true`.
 
 `home_settings_update` params are exactly `expected_revision` and `changes`,
-a list with one `{"key":"telemetry.enabled","value":true|false}`. `true`
-writes the built-in endpoint; `false` removes `[otel].endpoint` and an empty
-`[otel]` table. Comments and unknown keys are kept. Under the sibling lock
+a list with one `{"key":"telemetry.enabled","value":true|false}`. The update
+changes only the `endpoint` line: `true` inserts it under an existing `[otel]`
+header or appends `[otel]` and the line at the end; `false` removes the line,
+and removes a bare `[otel]` header only when nothing follows it before the
+next table. Every other byte is kept, with the file's line endings (LF or
+CRLF) and its trailing-newline state, so on then off returns a file that had
+no `[otel]` to its exact bytes. An `otel` inline table or dotted
+`otel.endpoint` key is refused as `custom_home_setting`. Under the sibling lock
 `settings.toml.lock` the server rereads the file, compares its revision,
 validates the changed file as zeta's startup does, and only then replaces the
 file atomically (mode `0600`, file and directory fsync). The lock serializes
@@ -813,7 +818,8 @@ Errors:
 
 - unknown, duplicate, or extra keys, a non-boolean value, or a malformed
   revision: `{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}`
-- a custom endpoint is set; the file is not changed:
+- a custom endpoint, or an `otel` inline table or dotted key, is set; the
+  file is not changed:
   `{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}`
 - the file changed since `expected_revision`:
   `{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:<64 hex>"}}`
@@ -824,6 +830,9 @@ Errors:
 - `settings.toml` is a symbolic link or not a regular, unshared file (get and
   update; it is never followed or replaced):
   `{"code":-32000,"message":"settings.toml is a link or not a regular, unshared file","data":{"code":"settings_unsafe"}}`
+- any other failure, such as a missing or moved home directory (get and
+  update): `{"code":-32000,"message":"unexpected server or storage failure"}`;
+  the reply never carries a path or the underlying error text
 
 ### `send`
 
