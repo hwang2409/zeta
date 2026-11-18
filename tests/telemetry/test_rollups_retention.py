@@ -105,7 +105,7 @@ class Case:
     expect: dict[str, int]  # a table's row count, or a ``PRAGMA``/``SELECT`` scalar
     result: dict[str, Any] = field(default_factory=dict)  # a subset of the last step's result
     seed: tuple[dict, ...] = ()  # spans written before startup, at clock 0
-    schema: int = 3  # below 3: an auto_vacuum=0 file of that schema holds the seed spans
+    schema: int | None = None  # when set, seed an existing database at this version
     start_at_now: bool = False  # startup catch-up runs at NOW instead of clock 0
     chunk: int = store.PRUNE_CHUNK
     orphans: int = 0  # traces and sessions without spans, inserted after startup
@@ -143,11 +143,14 @@ CASES = (
          seed=(span(1, NOW - 15 * DAY, session=A), span(3, NOW - DAY, session=B)), chunk=1, steps=1,
          expect={"spans": 1, "traces": 1, "sessions": 1}),
     Case("schema 1 migrates to incremental vacuum", schema=1, seed=(span(1, NOW - DAY),),
-         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 3, "spans": 1, "hourly_series": 3}),
+         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 4, "spans": 1, "hourly_series": 3}),
     Case("schema 2 migrates to incremental vacuum", schema=2, seed=(span(1, NOW - DAY),),
-         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 3, "spans": 1, "hourly_series": 3}),
+         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 4, "spans": 1, "hourly_series": 3}),
     Case("a file over the vacuum bound migrates without vacuum", schema=2, seed=(span(1, NOW - DAY),), vacuum_max=0,
-         expect={"PRAGMA auto_vacuum": 0, "PRAGMA user_version": 3, "spans": 1, "hourly_series": 3}),
+         expect={"PRAGMA auto_vacuum": 0, "PRAGMA user_version": 4, "spans": 1, "hourly_series": 3}),
+    Case("schema 3 migrates to an indexed span range", schema=3, seed=(span(1, NOW - DAY),),
+         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 4, "SELECT schema_version FROM viewer_meta": 4,
+                 "SELECT start_ns FROM spans": NOW - DAY, "SELECT sum(spans) FROM hourly_series": 3}),
     Case("late duplicate after a migrated prune is not recounted", schema=2, seed=(span(1, NOW - 30 * DAY),), start_at_now=True,
          late=(span(1, NOW - 30 * DAY),),
          expect={"spans": 0, "span_fingerprints": 1, "SELECT sum(spans) FROM hourly_series WHERE group_by='operation'": 1}),
@@ -157,20 +160,28 @@ CASES = (
 
 
 def _old_database(path: Path, schema: int, rows: tuple[dict, ...]) -> None:
-    """A schema-1 or schema-2 file as older receivers wrote it: no incremental auto-vacuum."""
+    """Create a database from the DDL of an older receiver."""
     db = sqlite3.connect(path)
     try:
+        if schema == 3:
+            db.execute("PRAGMA auto_vacuum = INCREMENTAL")
         db.executescript(store.SCHEMA)
-        if schema == 2:
+        if schema >= 2:
             for statement in store.MIGRATIONS_2:
                 db.execute(statement)
+        if schema == 3:
+            for statement in store.V3_SCHEMA:
+                if statement.strip():
+                    db.execute(statement)
+            for row in rows:
+                store._project_rollup(db, row)
         columns = [column[1] for column in db.execute("PRAGMA table_info(spans)")]
         db.executemany(f"INSERT INTO spans ({','.join(columns)}) VALUES ({','.join('?' * len(columns))})",
                        [[row.get(column) for column in columns] for row in rows])
         db.execute("INSERT INTO viewer_meta (singleton, schema_version) VALUES (1, ?)", (schema,))
         db.execute(f"PRAGMA user_version = {schema}")
         db.commit()
-        assert db.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+        assert db.execute("PRAGMA auto_vacuum").fetchone()[0] == (2 if schema == 3 else 0)
     finally:
         db.close()
 
@@ -227,7 +238,7 @@ def test_storage_bounds_contract(case: Case, tmp_path: Path, monkeypatch) -> Non
     monkeypatch.setattr(store, "PRUNE_CHUNK", case.chunk)
     if case.vacuum_max is not None:
         monkeypatch.setattr(store, "VACUUM_MAX_BYTES", case.vacuum_max)
-    if case.schema < 3:
+    if case.schema is not None:
         _old_database(path, case.schema, case.seed)
     elif case.seed:
         open_database(path)
@@ -239,6 +250,13 @@ def test_storage_bounds_contract(case: Case, tmp_path: Path, monkeypatch) -> Non
     if case.result:
         assert result is not None and {key: result[key] for key in case.result} == case.result
     with contextlib.closing(sqlite3.connect(path)) as db:
+        if case.schema == 3:
+            plan = [row[3] for row in db.execute(
+                "EXPLAIN QUERY PLAN SELECT count(*) FROM spans WHERE start_ns >= ? AND start_ns < ?", (NOW - DAY, NOW),
+            )]
+            assert any("SEARCH spans" in step and "INDEX spans_start " in step for step in plan), plan
+            assert not any("SCAN spans" in step for step in plan), plan
+            assert db.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='spans_start'").fetchone()
         actual = {key: db.execute(key if key.startswith(("PRAGMA", "SELECT")) else f"SELECT count(*) FROM {key}").fetchone()[0]
                   for key in case.expect}
     assert actual == case.expect

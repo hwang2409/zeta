@@ -20,7 +20,7 @@ from typing import Any
 
 from .projector import EVENT_COLUMNS, SPAN_COLUMNS, root_session_id
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 RAW_DAYS = 14
 ROLLUP_DAYS = 90
 MAX_BYTES = 1 << 30
@@ -30,7 +30,7 @@ INGEST_QUEUE_CAPACITY = 64
 GRACEFUL_COMMIT_TIMEOUT_SECONDS = 5.0
 BUSY_TIMEOUT_MS = 5_000
 
-# the schema-1 tables; a new database also runs every entry of MIGRATIONS, so both paths reach one shape
+# the schema-1 tables; a new database also runs all migrations
 SCHEMA = """
 CREATE TABLE viewer_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -404,7 +404,7 @@ def _upsert_series(connection: sqlite3.Connection, row: dict[str, Any], hour: in
 
 
 def _insert_distinct(connection: sqlite3.Connection, row: dict[str, Any], hour: int, group: str, key: str) -> None:
-    for kind, identity in (("trace", row["trace_id"]), ("session", row.get("root_session_id") or row.get("session_id"))):
+    for kind, identity in (("trace", row["trace_id"]), ("session", root_session_id(row.get("session_id")))):
         if identity is not None:
             connection.execute("INSERT OR IGNORE INTO hourly_distinct VALUES(?,?,?,?,?)", (hour, group, key, kind, identity.encode() if isinstance(identity, str) else identity))
 
@@ -449,7 +449,12 @@ def open_database(path: Path) -> None:
             if version == 1:
                 for statement in MIGRATIONS_2:
                     connection.execute(statement)
-            _migrate_v3(connection)
+            if version < 3:
+                _migrate_v3(connection)
+            # Slice-4 preview databases can already have this index at v3.
+            connection.execute("CREATE INDEX IF NOT EXISTS spans_start ON spans(start_ns)")
+            connection.execute("UPDATE viewer_meta SET schema_version=4 WHERE singleton=1")
+            connection.execute("PRAGMA user_version=4")
             connection.commit()
         except BaseException:
             connection.rollback(); raise
@@ -469,15 +474,13 @@ def _enable_incremental_vacuum(connection: sqlite3.Connection, path: Path) -> No
 
 
 def _migrate_v3(connection: sqlite3.Connection) -> None:
-    """Create the v3 tables, backfill fingerprints and rollups from every raw span, and publish v3."""
+    """Create the v3 tables and backfill fingerprints and rollups from every raw span."""
     _set_v3_tables(connection)
     connection.row_factory = sqlite3.Row
     for raw in connection.execute("SELECT * FROM spans"):
         row = _row_dict(raw)
         connection.execute("INSERT OR IGNORE INTO span_fingerprints VALUES(?,?,?)", (row["trace_id"],row["span_id"],row["start_ns"]))
         _project_rollup(connection, row)
-    connection.execute("UPDATE viewer_meta SET schema_version=3 WHERE singleton=1")
-    connection.execute("PRAGMA user_version=3")
 
 
 def _histogram_bucket(duration_ns: int) -> int:

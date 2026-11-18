@@ -410,6 +410,12 @@ class MethodDescriptor(Enum):
     TELEMETRY_STATUS = ("telemetry_status", None, "telemetry_read_v1", Access.READ)
     TELEMETRY_SESSIONS = ("telemetry_sessions", None, "telemetry_read_v1", Access.READ)
     TELEMETRY_TRACE = ("telemetry_trace", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_OVERVIEW = ("telemetry_overview", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_MODELS = ("telemetry_models", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_TOOLS = ("telemetry_tools", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_ERRORS = ("telemetry_errors", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_SERIES = ("telemetry_series", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_AGENT_TREE = ("telemetry_agent_tree", None, "telemetry_read_v1", Access.READ)
     HOME_SETTINGS_GET = ("home_settings_get", None, "home_settings_v1", Access.READ)
     HOME_SETTINGS_UPDATE = ("home_settings_update", None, "home_settings_v1", Access.CONTROLLER_WRITE)
 

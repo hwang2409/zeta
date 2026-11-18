@@ -202,6 +202,12 @@ feature. Observer connections receive only methods with `read` access.
 | `telemetry_status` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_sessions` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_trace` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_overview` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_models` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_tools` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_errors` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_series` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_agent_tree` | `1.0` | `telemetry_read_v1` | `read` |
 | `home_settings_get` | `1.0` | `home_settings_v1` | `read` |
 | `home_settings_update` | `1.0` | `home_settings_v1` | `controller_write` |
 
@@ -667,7 +673,7 @@ integer Unix nanoseconds; ids are lowercase hex strings; absent values are
 `telemetry_status` takes `{}` and returns:
 
 ```json
-{"enabled":true,"receiver":"ready","endpoint":"builtin","last_export":null,"last_export_ns":null,"raw_days":14,"rollup_days":90,"max_bytes":1073741824,"used_bytes":0,"oldest_raw_ns":null,"oldest_rollup_ns":null}
+{"enabled":true,"receiver":"ready","endpoint":"builtin","last_export":null,"last_export_ns":null,"raw_days":14,"rollup_days":90,"max_bytes":1073741824,"used_bytes":0,"oldest_raw_ns":null,"oldest_rollup_ns":null,"over_cap":false}
 ```
 
 - `enabled`: `[otel].endpoint` is configured and the database exists.
@@ -683,7 +689,9 @@ integer Unix nanoseconds; ids are lowercase hex strings; absent values are
   batch, and `last_export_ns` when it finished; both `null` before the first.
 - `used_bytes`: the database file plus its `-wal` and `-shm` files.
 - `oldest_raw_ns`: the earliest stored span start, or `null`.
-- `oldest_rollup_ns` is `null` in this version.
+- `oldest_rollup_ns`: the start of the earliest stored rollup hour, or `null`.
+- `over_cap`: `used_bytes` is above `max_bytes`. The receiver still accepts
+  spans; its retention deletes the oldest raw spans first, then rollups.
 
 A missing database is not an error here: a home without telemetry returns
 `enabled:false`, `receiver:"stopped"`, and `used_bytes:0`.
@@ -741,11 +749,7 @@ booleans. Events are ordered by `time_ns`.
 page come from one database snapshot; later pages may see spans that arrived
 since.
 
-Cursors are opaque strings. A cursor belongs to the method and filters that
-made it (`telemetry_sessions`: `status`, `profile`, `model`, and the given
-`start_ns`/`end_ns`; `telemetry_trace`: `trace_id`) and keeps the first
-page's resolved time range. A malformed cursor, or one used with other
-filters, returns `-32602` with `data.code` `invalid_params`.
+Cursors follow the page rules below.
 
 Errors:
 
@@ -754,10 +758,147 @@ Errors:
 - no database file, data methods only:
   `{"code":-32005,"message":"state unavailable","data":{"code":"telemetry_off","retryable":true}}`
 - a database file whose `user_version` or `viewer_meta.schema_version` is not
-  2, the one this zeta reads (including a schema-1 file the receiver has not
-  migrated yet, or a missing `viewer_meta` table), any method:
+  4, the one this zeta reads (including a schema-1, schema-2, or schema-3 file
+  the receiver has not migrated yet, or a missing `viewer_meta` table), any method:
   `{"code":-32000,"message":"telemetry schema is unsupported","data":{"code":"telemetry_schema_mismatch"}}`
 - one span alone larger than the frame: `{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}`
+
+#### pages, ranges, and retention
+
+Every list below is a keyset page. `limit` is the most items a page holds.
+A page is the largest ordered prefix of up to `limit` items whose whole
+response fits the 1 MiB frame. When more items exist, or the frame cut the
+page short, `next_cursor` continues right after the page's last item;
+otherwise it is `null`. Walking every cursor returns each item once, in the
+stated order (the last key in each order is a unique tie-breaker). A cursor
+belongs to the method and to every filter, selector, and sort param that made
+it, and pins the first page's resolved time range; a malformed cursor, one
+used with other params, or a `limit` outside its range returns `-32602`.
+`-32007` means one item alone does not fit. Each page is one database
+snapshot; later pages may see newer spans. Every method returns the errors listed
+above.
+
+`start_ns` and `end_ns` select spans with `start_ns <= span start < end_ns`.
+They are optional unless stated, `end_ns` defaults to now and `start_ns` to
+24 hours before `end_ns`, and `start_ns` must be less than `end_ns`. Raw spans
+are kept 14 days and hourly rollups 90 days. Aggregate reads (`overview`,
+`models`, `tools`, `series`) split a range at the raw cutoff: the first hour
+boundary after both now minus 14 days and the oldest stored span. Hours that
+start before the cutoff come whole from the rollups, so a range start inside
+such an hour includes that whole hour. Spans that start at or after the cutoff
+come from raw spans. The cutoff is an hour boundary, so each span counts once
+when a range crosses it. `telemetry_errors` reads raw spans only and returns
+nothing older than 14 days.
+
+Model and tool keys: a model is `[provider, model]` with the response model,
+else the request model, of a `chat` span; a tool is `[tool_name, tool_type]`
+of an `execute_tool` span. Their canonical key is that array as compact JSON
+(for example `["openai","gpt-5"]`). Other spans never make model or tool rows.
+`sessions` counts distinct root sessions; `traces` counts distinct traces;
+both are exact over the bucket or range, never sums of hourly counts. Token
+totals sum model (`chat`) spans only. There is no cost field.
+
+A `SeriesPoint` is:
+
+```json
+{"start_ns":0,"end_ns":0,"sessions":0,"traces":0,"spans":0,"errors":0,"model_calls":0,"tool_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"duration_ns":0}
+```
+
+Bucketed points cover `[start_ns, end_ns)` of one UTC hour or day; only
+buckets with spans appear.
+
+#### `telemetry_overview`
+
+Params: `{"start_ns":null,"end_ns":null,"bucket":"hour","limit":200,"cursor":null}`.
+`bucket` is `hour` or `day`; `limit` is 1 to 200. Result:
+
+```json
+{"status":{"enabled":true,"receiver":"ready","endpoint":"builtin","last_export":null,"last_export_ns":null,"raw_days":14,"rollup_days":90,"max_bytes":1073741824,"used_bytes":0,"oldest_raw_ns":null,"oldest_rollup_ns":null,"over_cap":false},"totals":{"start_ns":0,"end_ns":0,"sessions":0,"traces":0,"spans":0,"errors":0,"model_calls":0,"tool_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"duration_ns":0},"series":[{"start_ns":0,"end_ns":0,"sessions":0,"traces":0,"spans":0,"errors":0,"model_calls":0,"tool_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"duration_ns":0}],"active_models":0,"active_tools":0,"next_cursor":null}
+```
+
+`status` is `telemetry_status`. `totals` is one point for the whole range
+(`start_ns`/`end_ns` are the resolved range). `series` pages the range's
+buckets ordered by `start_ns`; every page repeats `status`, `totals`, and the
+counts. At most 2,208 points come back over all pages. `active_models` and
+`active_tools` count distinct model and tool keys with calls in the range.
+
+#### `telemetry_models` and `telemetry_tools`
+
+Params: `{"start_ns":null,"end_ns":null,"limit":50,"cursor":null}`; `limit`
+is 1 to 200. Each returns a page ordered by `calls` descending, then the
+canonical key ascending:
+
+```json
+{"items":[{"provider":"openai","model":"gpt-5","calls":0,"errors":0,"duration_ns":0,"p50_ns":0,"p95_ns":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"last_ns":0}],"next_cursor":null,"as_of_ns":0}
+{"items":[{"tool_name":"bash","tool_type":"function","calls":0,"errors":0,"duration_ns":0,"p50_ns":0,"p95_ns":0,"argument_bytes":0,"result_bytes":0,"last_ns":0}],"next_cursor":null,"as_of_ns":0}
+```
+
+`provider` and `tool_type` may be `null`. `duration_ns` is the sum over calls;
+`last_ns` is the latest call end. `argument_bytes` and `result_bytes` are byte
+counts only. `p50_ns` and `p95_ns` come from hourly latency histograms over
+every hour the range touches: bucket 0 holds exactly 0 ns, and bucket `b`
+holds `2^(b-1)` to `2^b - 1` ns. The nearest-rank quantile returns its
+bucket's upper edge, so a positive value is never below the true quantile and
+is less than twice it.
+
+#### `telemetry_errors`
+
+Params: `{"start_ns":null,"end_ns":null,"operation":null,"limit":50,"cursor":null}`.
+`operation` is `null` or one span operation; `limit` is 1 to 200. Returns
+failed spans newest first (`time_ns` descending, then `trace_id` and
+`span_id` descending):
+
+```json
+{"items":[{"trace_id":"00112233445566778899aabbccddeeff","span_id":"0011223344556677","session_id":null,"time_ns":0,"operation":"mcp","error_type":null,"duration_ns":0,"model":null,"tool_name":null,"agent_name":null,"mcp_server":null,"mcp_method":null,"mcp_tool":null}],"next_cursor":null,"as_of_ns":0}
+```
+
+`time_ns` is the span start; `model` is the response, else request, model;
+`agent_name`, `mcp_server`, `mcp_method`, and `mcp_tool` name the failing
+operation's target. No error message is ever returned.
+
+#### `telemetry_series`
+
+Params: `{"metric":"spans","start_ns":0,"end_ns":0,"bucket":"hour","group_by":"none","limit":200,"cursor":null}`.
+`metric`, `start_ns`, `end_ns`, `bucket`, and `group_by` are required.
+`metric` is a `SeriesPoint` measure (`sessions`, `traces`, `spans`, `errors`,
+`model_calls`, `tool_calls`, `input_tokens`, `output_tokens`, `total_tokens`,
+`duration_ns`); `bucket` is `hour` or `day`; `group_by` is `none`, `model`,
+`tool`, or `operation`; `limit` is 1 to 200. Result:
+
+```json
+{"points":[{"key":null,"point":{"start_ns":0,"end_ns":0,"sessions":0,"traces":0,"spans":0,"errors":0,"model_calls":0,"tool_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"duration_ns":0}}],"next_cursor":null}
+```
+
+`key` is `null` for `none`, the operation name, or the canonical model or
+tool key. Only the 20 keys with the largest sum of `metric` over the range's
+buckets appear (ties by key). Points are ordered by `key` (`null` first),
+then `start_ns`; at most 2,208 points come back over all pages.
+
+#### `telemetry_agent_tree`
+
+Params: `{"session_id":"<32 hex>","collection":"traces","trace_id":null,"agent_session_id":null,"limit":200,"cursor":null}`.
+`session_id` is a root session id; `limit` is 1 to 200. Each collection takes
+exactly its selectors:
+
+- `traces` (no selector): the session's trace ids, ordered by first span
+  start, then trace id.
+- `agents` (`trace_id`): one agent row per conversation id in that trace,
+  ordered by `first_ns`, then `session_id`; at most 1,000 rows over all pages.
+- `span_ids` (`trace_id` and `agent_session_id`, a conversation id under
+  `session_id`): that agent's span ids in the trace, ordered by `start_ns`,
+  then span id. Read the spans with `telemetry_trace`.
+
+```json
+{"session_id":"0123456789abcdef0123456789abcdef","trace_id":null,"agent_session_id":null,"items":["00112233445566778899aabbccddeeff"],"next_cursor":null}
+{"session_id":"0123456789abcdef0123456789abcdef","trace_id":"00112233445566778899aabbccddeeff","agent_session_id":null,"items":[{"session_id":"0123456789abcdef0123456789abcdef:1","parent_session_id":"0123456789abcdef0123456789abcdef","agent_name":"worker","depth":1,"background":false,"first_ns":0,"last_ns":0,"status":"ok"}],"next_cursor":null}
+{"session_id":"0123456789abcdef0123456789abcdef","trace_id":"00112233445566778899aabbccddeeff","agent_session_id":"0123456789abcdef0123456789abcdef:1","items":["0011223344556677"],"next_cursor":null}
+```
+
+An agent's `parent_session_id` is its conversation id without the last
+`:<n>` segment (`null` for the root). `agent_name` is its `invoke_agent`
+span's name; `depth` is that span's depth, else the number of `:` segments;
+`status` is `error` when any of its spans failed, else `ok` when any span is
+`ok`, else `unset`.
 
 ### home settings (`home_settings_v1` feature)
 
@@ -2433,7 +2574,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_mcp_bindings` | allows controllers to bind transient headers for trusted global MCP servers on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `tool_approval_origin` | adds `approval_origin: "automatic" | "user"` to live `tool_start` calls and replayed history `tool_use` calls |
-| `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, and `telemetry_trace` methods |
+| `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, `telemetry_trace`, `telemetry_overview`, `telemetry_models`, `telemetry_tools`, `telemetry_errors`, `telemetry_series`, and `telemetry_agent_tree` methods |
 | `home_settings_v1` | enables `home_settings_get` and controller-only `home_settings_update` for the home `settings.toml` (`telemetry.enabled` only) |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
