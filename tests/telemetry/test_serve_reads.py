@@ -88,7 +88,7 @@ async def test_slice4_telemetry_methods_use_real_websocket_and_exact_shapes(tmp_
         overview = overview_reply["result"]
         models = (await client.request("m", "telemetry_models", {**common, "limit": 1}))['result']
         tools = (await client.request("t", "telemetry_tools", {**common, "limit": 1}))['result']
-        errors = (await client.request("e", "telemetry_errors", {**common, "limit": 1}))['result']
+        errors = (await client.request("e", "telemetry_errors", {**common, "operation": "mcp", "limit": 1}))['result']
         series = (await client.request("s", "telemetry_series", {**common, "metric": "spans", "bucket": "hour", "group_by": "none", "limit": 1}))['result']
         tree_reply = await client.request("a", "telemetry_agent_tree", {"session_id": "0" * 32, "collection": "traces", "limit": 1})
         assert "result" in tree_reply, tree_reply
