@@ -10,7 +10,14 @@ import pytest
 
 from evals.computer_macos.fixture import FixtureServer, trial_state
 from evals.computer_macos.reset import reset
-from evals.computer_macos.run import EXPECTED_MODEL, EXPECTED_PROVIDER, MacSafari, SafariOwnership, phase0, pilot
+from evals.computer_macos.run import (
+    EXPECTED_MODEL,
+    EXPECTED_PROVIDER,
+    MacSafari,
+    SafariOwnership,
+    phase0,
+    pilot,
+)
 from tests.support.fake_backend import FakeBackend as ProviderBackend
 from tests.support.fake_backend import ScriptedTurn
 from zeta.protocol.types import TextContent, ToolCall

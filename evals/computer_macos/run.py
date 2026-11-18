@@ -9,7 +9,6 @@ import json
 import os
 import platform
 import shutil
-import subprocess
 import sys
 import time
 import urllib.request
@@ -252,7 +251,7 @@ async def _bounded(awaitable: Any, timeout: float) -> Any:
             task.cancel()
         try:
             await task
-        except BaseException:
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001, S110 - drain before propagating
             pass
         raise
 
