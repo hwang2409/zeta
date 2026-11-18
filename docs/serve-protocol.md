@@ -202,6 +202,8 @@ feature. Observer connections receive only methods with `read` access.
 | `telemetry_status` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_sessions` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_trace` | `1.0` | `telemetry_read_v1` | `read` |
+| `home_settings_get` | `1.0` | `home_settings_v1` | `read` |
+| `home_settings_update` | `1.0` | `home_settings_v1` | `controller_write` |
 
 ## common JSON-RPC shapes
 
@@ -756,6 +758,72 @@ Errors:
   migrated yet, or a missing `viewer_meta` table), any method:
   `{"code":-32000,"message":"telemetry schema is unsupported","data":{"code":"telemetry_schema_mismatch"}}`
 - one span alone larger than the frame: `{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}`
+
+### home settings (`home_settings_v1` feature)
+
+`home_settings_get` and `home_settings_update` read and change the home
+`$ZETA_HOME/settings.toml`. Only an allowlisted projection crosses the wire;
+endpoints, paths, environment values, and other keys are never returned or
+accepted. The only key in v1 is `telemetry.enabled`. Controllers and observers
+may call `home_settings_get`; `home_settings_update` is controller-only, and an
+observer receives `-32008` `observer_read_only`. Both run off the event loop.
+Serve sends no event and the TUI shows nothing for these methods; a client
+reads the result.
+
+`revision` is `sha256:` plus the SHA-256 of the exact file bytes; a missing
+file hashes as empty bytes and projects defaults. `telemetry.source` is
+`builtin` (endpoint `http://127.0.0.1:4323/v1/traces`, `enabled: true`),
+`off` (no `[otel].endpoint`, `enabled: false`), or `custom` (any other valid
+endpoint, `enabled: true`, `editable: false`).
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"home_settings_get","params":{}}
+{"jsonrpc":"2.0","id":1,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"settings_malformed":false}}
+```
+
+A file that does not parse or that zeta would refuse at startup projects as
+`{"telemetry":{"source":"unknown","editable":false}}` with
+`settings_malformed: true`.
+
+`home_settings_update` params are exactly `expected_revision` and `changes`,
+a list with one `{"key":"telemetry.enabled","value":true|false}`. `true`
+writes the built-in endpoint; `false` removes `[otel].endpoint` and an empty
+`[otel]` table. Comments and unknown keys are kept. Under the sibling lock
+`settings.toml.lock` the server rereads the file, compares its revision,
+validates the changed file as zeta's startup does, and only then replaces the
+file atomically (mode `0600`, file and directory fsync). The lock serializes
+zeta writers only; an editor that writes after that reread is not detected.
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"home_settings_update","params":{"expected_revision":"sha256:<64 hex>","changes":[{"key":"telemetry.enabled","value":true}]}}
+{"jsonrpc":"2.0","id":2,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"restart":{"serve":true,"sessions":["<session id>"],"complete":true}}}
+```
+
+The result has the settings read back from the file after the write. A
+process reads `[otel]` once at startup, so `restart` lists what must restart
+to use the change: `serve` is always `true` (this process), and `sessions` are
+the sorted ids of every top-level session a live process owns, found through
+the kernel lock on each session's `runtime.lease` (never a stored pid).
+Child agents restart with their top-level session. The scan has no row cap
+and a 1 second deadline; `complete` is `false` when the deadline or an
+unreadable directory stopped it, and `sessions` then has the owners found so
+far.
+
+Errors:
+
+- unknown, duplicate, or extra keys, a non-boolean value, or a malformed
+  revision: `{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}`
+- a custom endpoint is set; the file is not changed:
+  `{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}`
+- the file changed since `expected_revision`:
+  `{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:<64 hex>"}}`
+- another zeta writer held the lock for 250 ms:
+  `{"code":-32009,"message":"another zeta process is writing settings.toml","data":{"code":"settings_busy","retryable":true}}`
+- the file does not parse or validate (update only; nothing is written):
+  `{"code":-32000,"message":"settings.toml does not parse or validate","data":{"code":"settings_malformed"}}`
+- `settings.toml` is a symbolic link or not a regular, unshared file (get and
+  update; it is never followed or replaced):
+  `{"code":-32000,"message":"settings.toml is a link or not a regular, unshared file","data":{"code":"settings_unsafe"}}`
 
 ### `send`
 
@@ -1576,6 +1644,12 @@ Error descriptors are:
 | `telemetry_off` | `-32005` | `telemetry_off` | no telemetry database exists |
 | `telemetry_schema_mismatch` | `-32000` | `telemetry_schema_mismatch` | the telemetry database schema is not the one this zeta reads |
 | `result_too_large` | `-32007` | `result_too_large` | not even one item fits one frame |
+| `invalid_home_settings_params` | `-32602` | `invalid_params` | home settings parameters or changes are invalid |
+| `custom_home_setting` | `-32602` | `custom_home_setting` | the setting has a custom value that serve does not change |
+| `stale_revision` | `-32009` | `stale_revision` | settings.toml changed since the given revision |
+| `settings_busy` | `-32009` | `settings_busy` | another zeta process is writing settings.toml |
+| `settings_malformed` | `-32000` | `settings_malformed` | settings.toml does not parse or validate |
+| `settings_unsafe` | `-32000` | `settings_unsafe` | settings.toml is a link or not a regular, unshared file |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. With `session_park`, a swap over the park limit returns
@@ -2345,6 +2419,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `tool_approval_origin` | adds `approval_origin: "automatic" | "user"` to live `tool_start` calls and replayed history `tool_use` calls |
 | `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, and `telemetry_trace` methods |
+| `home_settings_v1` | enables `home_settings_get` and controller-only `home_settings_update` for the home `settings.toml` (`telemetry.enabled` only) |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
 | `child_run_events` | enables the atomic newest-page and live child lifecycle join; the server advertises the feature and request only when the client also requests `session_replay_seq`, `child_run_history`, and `child_runs` |

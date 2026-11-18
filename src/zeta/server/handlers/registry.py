@@ -27,6 +27,7 @@ from . import (
     validation,
 )
 from .run_work import cancel_background_task, list_run_work
+from .settings import home_settings_get, home_settings_update
 from .telemetry import telemetry_sessions, telemetry_status, telemetry_trace
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
@@ -476,6 +477,8 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.TELEMETRY_STATUS: telemetry_status,
     MethodDescriptor.TELEMETRY_SESSIONS: telemetry_sessions,
     MethodDescriptor.TELEMETRY_TRACE: telemetry_trace,
+    MethodDescriptor.HOME_SETTINGS_GET: home_settings_get,
+    MethodDescriptor.HOME_SETTINGS_UPDATE: home_settings_update,
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
