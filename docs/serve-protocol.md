@@ -199,6 +199,10 @@ feature. Observer connections receive only methods with `read` access.
 | `child_run_list` | `1.0` | `child_runs` | `read` |
 | `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 | `mcp_refresh_tools` | `1.0` | `mcp_refresh_tools` | `session_mutation` |
+| `state_sessions` | `1.0` | `state_read_v1` | `read` |
+| `state_session` | `1.0` | `state_read_v1` | `read` |
+| `state_agents` | `1.0` | `state_read_v1` | `read` |
+| `state_background_tasks` | `1.0` | `state_read_v1` | `read` |
 | `state_catalog` | `1.0` | `state_read_v1` | `read` |
 | `state_projects` | `1.0` | `state_read_v1` | `read` |
 | `state_memory` | `1.0` | `state_read_v1` | `read` |
@@ -910,8 +914,8 @@ span's name; `depth` is that span's depth, else the number of `:` segments;
 ### state catalog (`state_read_v1` feature)
 
 Request `state_read_v1` in a protocol 1.2 `hello` and check that the server
-returns it in `capabilities.features`. On `feature/otel-viewer`, this includes
-`state_catalog` and the project state methods below. The feature will only be
+returns it in `capabilities.features`. `capabilities.requests` lists the
+implemented subset on `feature/otel-viewer`. The feature will only be
 advertised on `main` when the full v1 state read interface is available.
 
 Authenticated controllers and observers can call `state_catalog` without an
@@ -986,6 +990,45 @@ bytes. Detail bodies are capped at 64 KiB on a UTF-8 character boundary;
 `truncated` reports whether any bytes were omitted. Detail bodies are not
 cached. These methods share the state catalog's errors and single snapshot
 retry; invalid ids or a missing detail item return `-32602` `invalid_params`.
+
+### session state (`state_read_v1` feature)
+
+Controllers and observers can read this metadata without attaching a session
+or running a telemetry receiver. No transcript, child output, tool arguments,
+or task command is returned.
+
+| request | params | order (descending) |
+|---|---|---|
+| `state_sessions` | optional `project_id`, `status` | `updated_ns`, `session_id` |
+| `state_session` | required `session_id`, `collection` (`agents`, `background_tasks`, or `attention`) | `attention`: `updated_ns`, `attention_id`; otherwise same as the selected list |
+| `state_agents` | optional `session_id`, `status` | `started_ns` (null last), `run_id` |
+| `state_background_tasks` | optional `session_id`, `status` | `started_ns` (null last), `task_id` |
+
+Each request also accepts `limit` (1–200, default 50, or 200 for
+`state_session`) and a nullable `cursor`. Keep the filters and collection
+unchanged when passing `next_cursor`. Each response returns the largest
+prefix that fits the 1 MiB frame. Lists return `items`, `next_cursor`, and
+`as_of_ns`; `state_session` returns `session`, `collection`, `items`, and
+`next_cursor`, with at most 1,000 items per collection. Timestamps are Unix
+nanoseconds; missing times are null.
+
+- Session rows contain `session_id`, `project_id`, `title`, `profile`, `model`,
+  `created_ns`, `updated_ns`, `status` (`idle`, `running`, `approval`, `failed`,
+  or `unknown`), `child_count` (direct child slots), `background_count` (session
+  tasks), `attention_count` (stored attention records), and `bytes` (top-level transcript size, read from file metadata).
+- Agent rows contain `run_id`, `session_id`, `parent_run_id`, `profile`, `status`
+  (`running`, `idle`, `waiting`, `finished`, `failed`, `cancelled`, or `unknown`),
+  `background`, `started_ns`, and `ended_ns`. The owning `session_id` joins to
+  trace `zeta.session.id`. `run_id` is the existing `child_instance_id` and joins
+  to span `zeta.agent.run_id`; direct children have null `parent_run_id`.
+- Task rows contain `task_id`, `session_id`, `kind`, `status` (`running`,
+  `finished`, `failed`, `cancelled`, or `unknown`), `started_ns`, `ended_ns`,
+  and `summary`. Durable task clocks are monotonic, so Unix times are null.
+- Attention rows use the `Attention` shape in project state above, scoped
+  to the selected session.
+
+Session state uses the same state read errors as the catalog. A missing
+`state_session` target returns `-32602` with `data.code` `session_not_found`.
 
 ### home settings (`home_settings_v1` feature)
 
@@ -2666,7 +2709,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `tool_approval_origin` | adds `approval_origin: "automatic" | "user"` to live `tool_start` calls and replayed history `tool_use` calls |
 | `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, `telemetry_trace`, `telemetry_overview`, `telemetry_models`, `telemetry_tools`, `telemetry_errors`, `telemetry_series`, and `telemetry_agent_tree` methods |
-| `state_read_v1` | enables `state_catalog`, `state_projects`, `state_memory`, `state_memory_detail`, `state_inbox`, `state_inbox_detail`, and `state_attention` |
+| `state_read_v1` | enables `state_catalog`, `state_projects`, `state_memory`, `state_memory_detail`, `state_inbox`, `state_inbox_detail`, `state_attention`, `state_sessions`, `state_session`, `state_agents`, and `state_background_tasks` |
 | `home_settings_v1` | enables `home_settings_get` and controller-only `home_settings_update` for the home `settings.toml` (`telemetry.enabled` only) |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
