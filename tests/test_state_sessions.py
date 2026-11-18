@@ -19,6 +19,7 @@ from zeta import attention_records, storage_format
 from zeta.core import agent_progress
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
+from zeta.protocol.types import ToolCall
 from zeta.server import ZetaServer, protocol
 from zeta.tools._shared.process import background_tasks_for_session
 
@@ -27,7 +28,7 @@ METHODS = {"state_sessions", "state_session", "state_agents", "state_background_
 START = "2026-11-08T00:00:00+00:00"
 
 
-async def seed(home, cwd):
+async def seed(home, cwd, case):
     manager = await asyncio.to_thread(SessionManager, home)
     with ExitStack() as cleanup:
         opened = await asyncio.to_thread(manager.create, provider="codex", model="offline", cwd=cwd, auto_project=False,
@@ -44,8 +45,17 @@ async def seed(home, cwd):
             child = direct if i == 0 else ConversationStore(direct.session_dir / "agents", session_id=str(i))
             if i:
                 cleanup.callback(child.close)
+            parent = direct if i else root
+            background = i == 0 and case in {"running_background_agent", "finished_background_agent"}
+            parent.register_agent_child(
+                ToolCall(f"call-{run_id}", "agent", {}), child_session_path=str(child.session_dir),
+                child_instance_id=run_id, description=MARKER, background=background,
+            )
             child.start_agent_lifecycle(handle=run_id, started_at=START, depth=2 if i else 1,
                                         agent_type="general", description=MARKER)
+            if i == 0 and case == "finished_background_agent":
+                child.finish_agent_lifecycle("completed", final_result=MARKER, finished_at=START)
+                parent.finish_agent_child(run_id)
             paths.append(child.agent_lifecycle_path)
             cleanup.callback(agent_progress.remove_live_agent_lifecycle, paths[-1])
         registry = background_tasks_for_session(root, command_niceness=10)
@@ -70,7 +80,10 @@ async def seed(home, cwd):
         return sid, direct_run, runs, tasks, paths, attention
 
 
-@pytest.mark.parametrize("case", ("operations", "attention", "agents", "background_tasks", "state_agents", "state_background_tasks"))
+@pytest.mark.parametrize("case", (
+    "operations", "attention", "agents", "background_tasks", "state_agents", "state_background_tasks",
+    "running_background_agent", "finished_background_agent",
+))
 async def test_session_state_websocket(tmp_path, monkeypatch, case):
     home = tmp_path / "home"
     session_count = 8
@@ -82,7 +95,7 @@ async def test_session_state_websocket(tmp_path, monkeypatch, case):
                                name=f"older {i}", auto_project=False).store.close()
 
         await asyncio.to_thread(seed_older_sessions)
-    sid, direct_run, runs, tasks, paths, attention = await seed(home, tmp_path)
+    sid, direct_run, runs, tasks, paths, attention = await seed(home, tmp_path, case)
     server = ZetaServer(home=home, socket_path=short_socket_path(home), ws_port=0,
                         ws_discovery=tmp_path / "websocket.json", provider="codex")
     await await_or_fail(server.start(), what="serve start")
@@ -146,6 +159,15 @@ async def test_session_state_websocket(tmp_path, monkeypatch, case):
                 assert session["child_count"] == 1
                 assert session["background_count"] == 5
                 assert session["title"] == "synthetic"
+                return
+
+            if case in {"running_background_agent", "finished_background_agent"}:
+                finished = case == "finished_background_agent"
+                for method, filters in (("state_agents", {}), ("state_session", {"collection": "agents"})):
+                    reply = await call(method, {"session_id": sid, **filters})
+                    row = next(row for row in reply["result"]["items"] if row["run_id"] == direct_run)
+                    assert row["status"] == ("finished" if finished else "running")
+                    assert row["background"] is (None if finished else True), method
                 return
 
             detail = not case.startswith("state_")
