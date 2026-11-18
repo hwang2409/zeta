@@ -18,6 +18,8 @@ from zeta.storage_format import WRITER_EPOCH
 
 FEATURE = "state_read_v1"
 METHOD = "state_catalog"
+PROJECT_METHODS = ["state_projects", "state_memory", "state_memory_detail", "state_inbox",
+                   "state_inbox_detail", "state_attention"]
 KINDS = {"profiles": "agents", "skills": "skills", "commands": "commands"}
 MARKER = "PRIVATE-DEFINITION-BODY"
 INVALID = {"code": -32602, "message": "invalid params", "data": {"code": "invalid_params"}}
@@ -43,8 +45,9 @@ async def _connect(server, *, observer=False, negotiated=True):
         })
         assert MARKER not in json.dumps(response)
         assert set(response["result"]["capabilities"].get("features", [])) == set(features)
-        assert [method for method in response["result"]["capabilities"]["requests"] if method.startswith("state_")] == (
-            [METHOD] if negotiated else []
+        assert {method for method in response["result"]["capabilities"]["requests"] if method.startswith("state_")} == (
+            {METHOD, *(m for m in PROJECT_METHODS if not observer or not m.endswith("_detail"))}
+            if negotiated else set()
         )
         yield client
 

@@ -13,3 +13,17 @@ async def state_catalog(client, request_id, params):
         raise ProtocolError(ErrorDescriptor.INVALID_STATE_PARAMS, "invalid params") from None
     except TooLarge:
         raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit") from None
+
+
+def project_state_handler(method):
+    async def read(client, request_id, params):
+        try:
+            return await client.connections.state_reader.project_state(
+                client.server.home, method, params, lambda result: client.codec.response_fits(request_id, result),
+            )
+        except InvalidParams:
+            raise ProtocolError(ErrorDescriptor.INVALID_STATE_PARAMS, "invalid params") from None
+        except TooLarge:
+            raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit") from None
+
+    return read

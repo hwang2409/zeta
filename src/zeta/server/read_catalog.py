@@ -12,6 +12,7 @@ from ..core.slash import home_slash_registry
 from ..read_page import InvalidParams, Key, page_result, page_room, resume
 from ..skills.agent_catalog import discover_session_agents
 from ..skills.catalog import discover_session_skills
+from . import project_state
 from .protocol import ErrorDescriptor, ProtocolError
 
 _ORDER = (Key("name", str), Key("source", str))
@@ -63,7 +64,7 @@ def _stable_snapshot[T](generation: Callable[[], object], read: Callable[[], T])
         before = generation()
         try:
             result = read()
-        except (OSError, ProtocolError):
+        except (OSError, ValueError, ProtocolError):
             if generation() == before:
                 raise
         else:
@@ -111,7 +112,7 @@ class ReadCatalog:
     def __init__(self, run: Callable[[Callable[[], Any]], Awaitable[Any]]) -> None:
         self._run = run
         self._slot = asyncio.Lock()
-        self._pending: dict[tuple[Path, str], asyncio.Task[list[dict[str, str]]]] = {}
+        self._pending: dict[tuple, asyncio.Task[Any]] = {}
 
     def close(self) -> None:
         for task in self._pending.values():
@@ -143,15 +144,25 @@ class ReadCatalog:
         async with self._slot:
             return await self._run(page)
 
+    async def project_state(
+        self, home: Path, method: str, params: dict[str, Any], fits: Callable[[dict[str, Any]], bool],
+    ) -> dict[str, Any]:
+        scope, start, limit = project_state.request(method, params)
+        rows = await self._share((home, *scope), lambda: project_state.snapshot(home, scope, _stable_snapshot))
+        async with self._slot:
+            return await self._run(lambda: project_state.page(method, rows, start, limit, fits))
+
     async def _rows(self, home: Path, kind: str) -> list[dict[str, str]]:
-        key = (home, kind)
+        return await self._share((home, kind), lambda: _snapshot(home, kind))
+
+    async def _share(self, key: tuple, snapshot: Callable[[], Any]) -> Any:
         task = self._pending.get(key)
         if task is None or task.done():
-            async def read() -> list[dict[str, str]]:
+            async def read() -> Any:
                 async with self._slot:
-                    return await self._run(lambda: _snapshot(home, kind))
+                    return await self._run(snapshot)
 
-            def finished(done: asyncio.Task[list[dict[str, str]]]) -> None:
+            def finished(done: asyncio.Task[Any]) -> None:
                 if self._pending.get(key) is done:
                     del self._pending[key]
                 if not done.cancelled():
