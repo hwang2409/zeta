@@ -129,20 +129,27 @@ def project_request(body: bytes, home_id: str) -> tuple[list[dict[str, Any]], in
     rows: list[dict[str, Any]] = []
     foreign = 0
     for resource_spans in request.resource_spans:
-        resource = _attributes(resource_spans.resource.attributes)
-        if resource.get(HOME_ID_ATTRIBUTE) != home_id:
-            foreign += sum(len(scope.spans) for scope in resource_spans.scope_spans)
-            continue
-        service_version = _version(resource.get("service.version"), zeta_version)
-        for scope_spans in resource_spans.scope_spans:
-            scope = scope_spans.scope
-            _attributes(scope.attributes)  # enforces the per-object cap; scope attributes are dropped
-            if scope.name != "zeta":
-                raise Reject("unknown instrumentation scope")
-            scope_version = _version(scope.version, zeta_version)
-            for span in scope_spans.spans:
-                rows.append(_project_span(span, service_version, scope_version))
+        resource_rows, resource_foreign = _project_resource(resource_spans, home_id, zeta_version)
+        rows.extend(resource_rows)
+        foreign += resource_foreign
     return rows, foreign
+
+
+def _project_resource(resource_spans: Any, home_id: str, zeta_version: str) -> tuple[list[dict[str, Any]], int]:
+    """One resource's projected rows, or none and its span count when the resource is not ``home_id``'s."""
+    resource = _attributes(resource_spans.resource.attributes)
+    if resource.get(HOME_ID_ATTRIBUTE) != home_id:
+        return [], sum(len(scope.spans) for scope in resource_spans.scope_spans)
+    service_version = _version(resource.get("service.version"), zeta_version)
+    rows: list[dict[str, Any]] = []
+    for scope_spans in resource_spans.scope_spans:
+        scope = scope_spans.scope
+        _attributes(scope.attributes)  # enforces the per-object cap; scope attributes are dropped
+        if scope.name != "zeta":
+            raise Reject("unknown instrumentation scope")
+        scope_version = _version(scope.version, zeta_version)
+        rows.extend(_project_span(span, service_version, scope_version) for span in scope_spans.spans)
+    return rows, 0
 
 
 def _version(value: object, zeta_version: str) -> str:

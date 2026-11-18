@@ -247,8 +247,8 @@ class _Exporter:
     def export(self, spans: object) -> object:
         from opentelemetry.sdk.trace.export import SpanExportResult
 
-        if self._receiver is not None and not self._receiver.may_export():
-            self._cell.publish("export_unavailable")  # another home's receiver holds the port: send nothing
+        if self._receiver is not None and not self._receiver.may_export(len(spans)):
+            self._cell.publish("export_unavailable")  # this home's receiver is not confirmed: send nothing
             return SpanExportResult.FAILURE
         try:
             result = self._delegate.export(spans)
@@ -355,7 +355,7 @@ class _Runtime:
 
 def configure(endpoint: str, receiver: object | None = None) -> _Runtime:
     """``receiver`` is the built-in receiver's supervisor: spans carry its ``home_id``, and
-    export stops while its ``may_export()`` is false."""
+    export sends only while its ``may_export()`` is true."""
     endpoint = validate_loopback_endpoint(endpoint)
     for name, value in os.environ.items():
         if name.startswith(("OTEL_EXPORTER_OTLP", "OTEL_PYTHON_EXPORTER_OTLP")) and value:

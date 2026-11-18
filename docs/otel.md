@@ -148,6 +148,10 @@ collector, and zeta never starts anything for it.
   nothing, sends no spans, and `/status` shows
   `error (port 4323 held by another zeta home)`. It checks again every 10
   seconds.
+- Zeta sends spans only after a `/health` check confirmed this home's
+  receiver. A flush before that (for example at shutdown) first makes one
+  `/health` check with a 1 second limit; if it does not confirm this home, the
+  spans are dropped, and `/status` shows the last export as an error.
 
 `zeta otel receiver` still works by hand, for example with an external
 endpoint or to see its errors. Started by hand without `--idle-exit`, it

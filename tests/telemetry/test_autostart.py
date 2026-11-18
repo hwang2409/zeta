@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -245,3 +246,91 @@ def test_a_foreign_home_receiver_is_reported_and_gets_no_spans(tmp_path: Path, m
         assert live_view(instance)["last_export"] == "error"
     finally:
         instance.shutdown()
+
+
+def test_a_flush_before_the_first_health_check_sends_nothing_to_a_foreign_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from opentelemetry.exporter.otlp.proto.http import trace_exporter
+    from opentelemetry.sdk.trace.export import SpanExportResult
+
+    sent: list[object] = []
+    flush_requested, released = threading.Event(), threading.Event()
+
+    class Recorder:
+        def __init__(self, **_options: object) -> None:
+            pass
+
+        def export(self, spans: object) -> SpanExportResult:
+            sent.append(spans)
+            return SpanExportResult.SUCCESS
+
+        def shutdown(self) -> None:
+            pass
+
+    def health() -> str | None:
+        if threading.current_thread().name == "zeta-otel-receiver":
+            released.wait(30)  # the supervisor's first check answers only after the test ends
+            return "e" * 32
+        assert flush_requested.is_set(), "health was checked before the flush"
+        return "e" * 32  # another home's receiver, answering only now
+
+    monkeypatch.setattr(trace_exporter, "OTLPSpanExporter", Recorder)
+    # test-contract: seam a launch would start a real process; this test needs the supervisor still starting
+    monkeypatch.setattr(autostart, "_launch", lambda home: pytest.fail("launched a receiver"))
+    # test-contract: seam the health check is where the receiver on the port identifies its home
+    monkeypatch.setattr(autostart, "_health", health)
+    instance = Telemetry.configure(OTLP_URL, tmp_path)
+    try:
+        with instance.turn_span(conversation_id="test", turn_number=1, notification=False):
+            pass
+        assert instance.receiver() == ReceiverState("starting")
+        flush_requested.set()
+        assert instance._implementation._provider.force_flush(10_000)
+
+        assert sent == [], "a flush before the first health check exported to another home's receiver"
+        assert instance._receiver.dropped_spans == 1
+        assert live_view(instance)["last_export"] == "error"
+    finally:
+        released.set()
+        instance.shutdown()
+
+
+def test_launched_receivers_that_exit_while_the_starter_lives_are_reaped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / "home"
+    barrier = threading.Barrier(2)
+    children: list[subprocess.Popen] = []
+    popen = subprocess.Popen
+
+    def launch(command: list[str], **options: object) -> subprocess.Popen:
+        barrier.wait(timeout=20)  # both starters launch before either sees a receiver
+        child = popen([sys.executable, "-c", "pass"], **options)  # a losing launch, or a winner's idle exit
+        children.append(child)
+        return child
+
+    monkeypatch.setattr(autostart.subprocess, "Popen", launch)
+    starters = [autostart.supervisor_for(home, OTLP_URL), autostart.supervisor_for(home, OTLP_URL)]
+    checks = Checks(monkeypatch, health=lambda: starters[0].home_id if len(children) == 2 else None)
+    try:
+        for starter in starters:
+            starter.start()
+        checks.until(lambda: all(starter.snapshot() == ReceiverState("ready") for starter in starters), "both starters see a receiver")
+        for child in children:
+            try:
+                os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)  # until it exits; leaves it for the reaper
+            except ChildProcessError:
+                pass  # already reaped
+        for reaper in [thread for thread in threading.enumerate() if thread.name == "zeta-otel-reaper"]:
+            reaper.join(10)
+
+        states = {child.pid: _ps_state(popen, child.pid) for child in children}
+        assert not [pid for pid, state in states.items() if state.startswith("Z")], f"launched receivers left zombies: {states}"
+    finally:
+        for starter in starters:
+            starter.stop()
+        for child in children:
+            child.wait(timeout=10)
+
+
+def _ps_state(popen: type[subprocess.Popen], pid: int) -> str:
+    """The process state letters ``ps`` reports for ``pid`` (Z for a zombie), or "" when it is gone."""
+    with popen(["ps", "-o", "stat=", "-p", str(pid)], stdout=subprocess.PIPE, text=True) as ps:
+        return ps.communicate(timeout=10)[0].strip()

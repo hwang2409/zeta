@@ -7,7 +7,8 @@ outlives the process that started it, because the home's other zeta processes ex
 it exits by itself after ``IDLE_EXIT_SECONDS`` without ingest or health checks, so after the last
 supervisor stops, or stop it with a signal. Health checks and launches run on one daemon thread, and ``snapshot()``
 only reads an attribute, so status never waits on the receiver. When another home's receiver
-holds the port, the supervisor starts nothing and export stops until the port is free.
+holds the port, the supervisor starts nothing. Export sends only after a health check confirmed
+this home's receiver. Every launched child is reaped by a daemon thread, so none stays a zombie.
 """
 
 from __future__ import annotations
@@ -70,6 +71,7 @@ class ReceiverSupervisor:
         self._home = home
         self.home_id = home_id  # exported as the zeta.home.id resource attribute
         self._state = ReceiverState("starting")
+        self.dropped_spans = 0  # spans refused because this home's receiver was not confirmed
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._run, name="zeta-otel-receiver", daemon=True)
 
@@ -79,9 +81,16 @@ class ReceiverSupervisor:
     def snapshot(self) -> ReceiverState:
         return self._state
 
-    def may_export(self) -> bool:
-        """False while another home's receiver holds the port, so this home's spans never reach it."""
-        return self._state.error != FOREIGN_HOME
+    def may_export(self, spans: int) -> bool:
+        """True only when a health check confirmed this home's receiver, so no span reaches another home's.
+
+        Until the supervisor confirms it, the caller (the SDK exporter thread, never an event loop) makes
+        one bounded check of its own; a refused batch is dropped and counted in ``dropped_spans``.
+        """
+        if self._state.state == "ready" or _health() == self.home_id:
+            return True
+        self.dropped_spans += spans
+        return False
 
     def stop(self) -> None:
         self._stopped.set()
@@ -113,12 +122,13 @@ class ReceiverSupervisor:
             child = _launch(self._home)
         except OSError:
             return False
+        # the child outlives this call and maybe this process; while this process lives, reap it when it exits
+        threading.Thread(target=child.wait, name="zeta-otel-reaper", daemon=True).start()
         deadline = time.monotonic() + STARTUP_SECONDS
         while time.monotonic() < deadline and not self._stopped.is_set():
             if _health() is not None:  # this home's receiver, or another home's that the next check reports
                 return True
             # a launch that lost the lock exits at once; keep watching, the winner may still be starting
-            child.poll()
             self._stopped.wait(STARTUP_POLL_SECONDS)
         if self._stopped.is_set():
             return False
