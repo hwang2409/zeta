@@ -419,7 +419,7 @@ def child_run_directories(directory_fd: int) -> list[str]:
 
 
 def read_child_run_metadata(directory_fd: int, session_dir: Path, session_id: str):
-    """Yield child metadata from lifecycle files, using the same live/durable selection as /runs."""
+    """Yield child metadata with a nullable background flag from the parent marker."""
     def descend(parent_fd: int, parent_dir: Path, parent_id: str):
         children = child_run_directories(parent_fd)
         if not children:
@@ -429,9 +429,9 @@ def read_child_run_metadata(directory_fd: int, session_dir: Path, session_id: st
             markers = _parse_agent_state(value, parent_dir / "session_state.json")["agent_children"]
         except FileNotFoundError:
             markers = {}
-        background_ids = {
-            marker.get("child_instance_id") for marker in markers.values()
-            if marker.get("background") is True
+        background_by_id = {
+            marker.get("child_instance_id"): marker.get("background", False)
+            for marker in markers.values()
         }
         with child_directory(parent_fd, "agents") as agents_fd:
             for name in children:
@@ -445,7 +445,7 @@ def read_child_run_metadata(directory_fd: int, session_dir: Path, session_id: st
                             loaded.value, live_agent_lifecycle(path / "agent_lifecycle.json")
                         )
                         if isinstance(lifecycle, dict) and lifecycle.get("handle") == run_id:
-                            yield run_id, lifecycle, run_id in background_ids
+                            yield run_id, lifecycle, background_by_id.get(run_id)
                     yield from descend(child_fd, path, run_id)
 
     yield from descend(directory_fd, session_dir, session_id)
