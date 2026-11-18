@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -160,6 +161,15 @@ async def test_provider_failure_writes_terminal_truth_and_cleanup(tmp_path: Path
     assert artifact["status"] == "failed"
     assert artifact["cleanup"]["disposable_home_removed"]
     assert backend.closed and fixture.closed
+
+
+def test_prepare_home_does_not_change_process_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZETA_HOME", "sentinel-home")
+    monkeypatch.setenv("ZETA_ACCOUNT_HOME", "sentinel-account")
+    before = {key: os.environ.get(key) for key in ("ZETA_HOME", "ZETA_ACCOUNT_HOME")}
+    run_module.prepare_home(tmp_path)
+    after = {key: os.environ.get(key) for key in before}
+    assert after == before
 
 
 def test_reset_removes_only_run_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

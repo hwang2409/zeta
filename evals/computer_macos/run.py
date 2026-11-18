@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import platform
@@ -67,9 +68,22 @@ def prepare_home(run_dir: Path) -> Path:
     settings = home / "settings.toml"
     if not settings.exists():
         settings.write_text('[computer]\nenabled = true\ndefault_app_access = "allow"\n')
-    os.environ["ZETA_HOME"] = str(home)
-    os.environ["ZETA_ACCOUNT_HOME"] = str(real)
     return home
+
+
+@contextlib.contextmanager
+def _home_environment(home: Path):
+    previous = {key: os.environ.get(key) for key in ("ZETA_HOME", "ZETA_ACCOUNT_HOME")}
+    os.environ["ZETA_HOME"] = str(home)
+    os.environ["ZETA_ACCOUNT_HOME"] = str(Path.home() / ".zeta")
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -291,7 +305,8 @@ async def run_trial(
             owned = await browser.open_owned(url)
         if provider.provider != EXPECTED_PROVIDER or provider.model != EXPECTED_MODEL:
             raise RuntimeError("provider/model contract mismatch")
-        metrics = await _run_zeta_loop(provider, backend, run_dir / f"trial-{trial}")
+        with _home_environment(run_dir / "zeta-home"):
+            metrics = await _run_zeta_loop(provider, backend, run_dir / f"trial-{trial}")
         grade = grade_trial(trial_state(fixture_dir, trial))
         terminal.update({"provider": provider.provider, "model": provider.model, "metrics": metrics,
                          "grade": {"trial": trial, **grade}, "status": "complete" if grade["pass"] else "failed"})
@@ -371,7 +386,6 @@ async def pilot(
 ) -> dict[str, Any]:
     if trials != 3:
         raise ValueError("the pilot is exactly three trials")
-    old = {key: os.environ.get(key) for key in ("ZETA_HOME", "ZETA_ACCOUNT_HOME")}
     results: list[dict[str, Any]] = []
     status, error = "failed", None
     try:
@@ -421,9 +435,6 @@ async def pilot(
                    "trials": results, "cleanup": cleanup}
         _atomic_json(run_dir / "cleanup.json", cleanup)
         _atomic_json(run_dir / "pilot.json", payload)
-        for key, value in old.items():
-            if value is None: os.environ.pop(key, None)
-            else: os.environ[key] = value
     return payload
 
 def _production_backend() -> Any:
