@@ -19,8 +19,7 @@ from typing import Protocol
 
 from .process import OwnedProcess
 
-MAX_SECONDS = 120
-MAX_PCM_BYTES = 3_840_000
+MAX_PCM_BYTES = 3_840_000  # 120 s of 16 kHz mono s16le; the writer stops storing past it
 CAPTURE_NAME = "capture.wav"
 PID_NAME = "ffmpeg.json"
 LOCK_NAME = "lock"
@@ -56,6 +55,7 @@ class MicrophoneSource:
         fixture = os.environ.get("ZETA_VOICE_INPUT_FILE")
         source = ["-re", "-i", fixture] if fixture else ["-f", "avfoundation", "-i", ":0"]
         argv = ["ffmpeg", "-hide_banner", "-loglevel", "error", *source]
+        # -t 125 caps media time (120 s accepted plus margin); it is not a wall clock
         argv += ["-t", "125", "-ac", "1", "-ar", "16000", "-f", "s16le", "-"]
         try:
             self._process = await OwnedProcess.spawn(argv, stdout_sink=writer)
