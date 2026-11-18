@@ -4,6 +4,8 @@ import asyncio
 import inspect
 import io
 import json
+import sys
+from types import ModuleType
 
 import pytest
 from rich.console import Console
@@ -29,6 +31,7 @@ from zeta.server.event_contract import tool_end
 from zeta.server.handlers.history_projection import _history_group, history_projection
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
+from zeta.tools import registry as registry_module
 from zeta.tools.agent.approval import ChildApprovalPolicy
 from zeta.tui.checkpoints import render_replayed_message
 from zeta.tui.transcript.transcript import TranscriptWidget
@@ -44,8 +47,6 @@ async def run_script(tmp_path, script, *, policy=None, delegated=False, configur
         policy = ChildApprovalPolicy(policy, store, "proof", "code-child", child_cwd=tmp_path)
     registry = ToolRegistry(tmp_path, session_store=store, skill_catalog=skills,
                             approval_policy=policy, code_mode_enabled=True)
-    if configure is not None:
-        configure(registry)
     backend = FakeBackend([
         ScriptedTurn(tool_calls=[ToolCall("outer", "code", {"script": script})]),
         ScriptedTurn(content=[TextContent("finished")]),
@@ -62,6 +63,8 @@ async def run_script(tmp_path, script, *, policy=None, delegated=False, configur
                     await await_or_fail(reply, what="test event handler")
 
     try:
+        if configure is not None:
+            configure(registry)
         await await_or_fail(collect(), what="code mode turn settles")
         outer = store.tool_result("outer")
         assert outer is not None
@@ -260,3 +263,41 @@ async def test_cancel_pending_inner_approval(tmp_path, delegated):
         assert not (tmp_path / "never").exists()
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("packaged", [False, True], ids=["dynamic", "packaged"])
+async def test_unlisted_tool_has_no_authority(tmp_path, monkeypatch, packaged):
+    hits = []
+    name = "slice_probe"
+
+    async def handler(arguments, signal):
+        hits.append(arguments)
+        return "ran"
+
+    def register(registry):
+        registry.register(name, handler)
+
+    if packaged:
+        fake = ModuleType("zeta.tools.slice_probe")
+        fake.register = register
+        monkeypatch.setitem(sys.modules, fake.__name__, fake)
+        found = registry_module._discover_tool_modules()
+        monkeypatch.setattr(registry_module, "_discover_tool_modules", lambda: [*found, fake.__name__])
+
+    def configure(registry):
+        if not packaged:
+            register(registry)
+        origin = registry.definition_reference(name).origin
+        assert origin is (registry_module.ToolOrigin.PACKAGED_BUILTIN if packaged
+                          else registry_module.ToolOrigin.DYNAMIC)
+        assert any(schema["name"] == name for schema in registry.schemas)
+
+    result, events, _ = await run_script(tmp_path, """
+        let value = 'ran';
+        try { await tools.call('slice_probe', {}); }
+        catch (error) { value = error.message; }
+        output(value);
+        """, configure=configure)
+    assert result.content == json.dumps("tool 'slice_probe' is not exposed to code mode")
+    assert not hits
+    assert not [event for event in events if event.data.get("code_parent_id") == "outer"]
