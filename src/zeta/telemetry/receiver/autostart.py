@@ -4,7 +4,8 @@ Only the exact built-in endpoint starts a receiver; any other endpoint is an ext
 The receiver's own lock decides the owner, so concurrent starters are safe: a losing launch exits
 and the next health check finds the winner. A launched receiver runs in its own session and
 outlives the process that started it, because the home's other zeta processes export to it too;
-stop it with a signal. Health checks and launches run on one daemon thread, and ``snapshot()``
+it exits by itself after ``IDLE_EXIT_SECONDS`` without ingest or health checks, so after the last
+supervisor stops, or stop it with a signal. Health checks and launches run on one daemon thread, and ``snapshot()``
 only reads an attribute, so status never waits on the receiver. When another home's receiver
 holds the port, the supervisor starts nothing and export stops until the port is free.
 """
@@ -54,7 +55,7 @@ def _health() -> str | None:
 def _launch(home: Path) -> subprocess.Popen:
     # no pipes: the receiver outlives this process, and a write to a closed pipe would kill it
     return subprocess.Popen(
-        [sys.executable, "-c", _COMMAND, "otel", "receiver"],
+        [sys.executable, "-c", _COMMAND, "otel", "receiver", "--idle-exit"],
         env={**os.environ, "ZETA_HOME": str(home)},
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,  # a terminal's SIGINT or SIGHUP to this process group does not reach it

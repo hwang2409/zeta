@@ -119,10 +119,14 @@ Every zeta process with this exact endpoint (the TUI, `zeta -p`, and
 other endpoint, even another loopback address or path, is an external
 collector, and zeta never starts anything for it.
 
-- The receiver runs as `zeta otel receiver` in its own process session. It
-  outlives the zeta process that started it, because the home's other zeta
-  processes export to it too. Stop it with `kill <pid>`; the next zeta
-  process starts it again.
+- The receiver runs as `zeta otel receiver --idle-exit` in its own process
+  session. It outlives the zeta process that started it, because the home's
+  other zeta processes export to it too. It exits by itself, and releases its
+  lock, after 15 minutes with no OTLP ingest and no `/health` request. Every
+  running zeta process with this endpoint checks `/health` every 10 seconds,
+  so the receiver stays up while one runs, and exits about 15 minutes after
+  the last one ends or turns telemetry off. Stop it sooner with `kill <pid>`;
+  the next zeta process starts it again.
 - When several processes start at the same time, the receiver's lock on
   `$ZETA_HOME/telemetry/receiver.lock` keeps one; the others exit. The lock is
   released when the process ends, also after a crash, so a new receiver can
@@ -146,7 +150,8 @@ collector, and zeta never starts anything for it.
   seconds.
 
 `zeta otel receiver` still works by hand, for example with an external
-endpoint or to see its errors. It exits with `already running at
+endpoint or to see its errors. Started by hand without `--idle-exit`, it
+never exits when idle; it runs until you stop it. It exits with `already running at
 http://127.0.0.1:4323` when the home's receiver already runs.
 
 ## status

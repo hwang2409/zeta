@@ -61,7 +61,7 @@ class Launches:
     def __call__(self, command: list[str], **options: object) -> subprocess.Popen:
         if self.barrier is not None:
             self.barrier.wait(timeout=20)  # both starters launch together, before either sees a receiver
-        self.options.append(dict(options))
+        self.options.append({**options, "command": command})
         output = self.directory / f"receiver-{len(self.children)}.log"
         with output.open("wb") as file:
             child = self._popen(command, **{**options, "stdout": file, "stderr": file})
@@ -100,6 +100,7 @@ def test_concurrent_starters_produce_one_receiver(tmp_path: Path, builtin_port: 
         assert "cannot listen" not in loser_output, f"the loser got past the receiver lock: {loser_output!r}"
         assert "already running at http://127.0.0.1:4323" in loser_output or "another receiver holds" in loser_output, loser_output
         assert all(options["start_new_session"] is True and options["stdin"] == subprocess.DEVNULL for options in launches.options)
+        assert all(options["command"][-3:] == ["otel", "receiver", "--idle-exit"] for options in launches.options)
         assert receiver_ready(home)
     finally:
         for starter in starters:

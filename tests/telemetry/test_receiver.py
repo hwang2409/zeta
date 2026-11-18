@@ -404,3 +404,82 @@ def test_second_process_exits_and_bind_failure_releases_lock(tmp_path, builtin_p
         owner.stdout.close()
         owner.stderr.close()
     assert owner.returncode == -signal.SIGTERM  # uvicorn shuts down gracefully, then re-raises the signal
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_idle_receiver_exits_after_the_timeout(tmp_path):
+    import asyncio
+    import socket
+
+    import uvicorn
+
+    from zeta.telemetry.receiver.app import IdleExitServer, IdleTimer
+    from zeta.telemetry.receiver.process import IDLE_EXIT_SECONDS
+
+    clock = _Clock()
+    idle = IdleTimer(IDLE_EXIT_SECONDS, clock)
+    clock.now = IDLE_EXIT_SECONDS - 1
+    assert not idle.expired()
+    clock.now = IDLE_EXIT_SECONDS
+    assert idle.expired()
+
+    directory = tmp_path / "telemetry"
+    directory.mkdir()
+    app = create_app(directory, HOME_ID, idle)
+    server = IdleExitServer(uvicorn.Config(app, log_level="warning", lifespan="on"), idle)
+    listener = socket.create_server(("127.0.0.1", 0))
+    try:
+        asyncio.run(asyncio.wait_for(server.serve(sockets=[listener]), 10))  # returns only when the idle tick stops it
+    finally:
+        listener.close()
+    assert server.started
+    assert not app.state.writer._thread.is_alive()  # the lifespan closed the writer: a clean shutdown
+
+
+@pytest.mark.parametrize("request_kind", ["health", "ingest"])
+def test_health_or_ingest_resets_the_idle_timer(tmp_path, request_kind):
+    from zeta.telemetry.receiver.app import IdleTimer
+    from zeta.telemetry.receiver.process import IDLE_EXIT_SECONDS
+
+    clock = _Clock()
+    idle = IdleTimer(IDLE_EXIT_SECONDS, clock)
+    directory = tmp_path / "telemetry"
+    directory.mkdir()
+    with TestClient(create_app(directory, HOME_ID, idle), base_url="http://127.0.0.1:4323") as client:
+        clock.now = IDLE_EXIT_SECONDS - 1
+        if request_kind == "health":
+            assert client.get("/health").status_code == 200
+        else:
+            assert client.post("/v1/traces", content=_body(_span(1)), headers=PROTOBUF).status_code == 200
+        clock.now = 2 * IDLE_EXIT_SECONDS - 2
+        assert not idle.expired(), f"{request_kind} did not reset the idle timer"
+        clock.now = 2 * IDLE_EXIT_SECONDS - 1
+        assert idle.expired()
+
+
+@pytest.mark.parametrize(("arguments", "exits_when_idle"), [([], False), (["--idle-exit"], True)], ids=["manual", "auto-started"])
+def test_only_the_auto_started_receiver_idle_exits(tmp_path, monkeypatch, arguments, exits_when_idle):
+    import socket
+
+    from zeta.cli.main import main
+    from zeta.telemetry.receiver import process
+    from zeta.telemetry.receiver.app import IdleTimer
+
+    served: list[float] = []
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    create_server = socket.create_server
+    monkeypatch.setattr(process.socket, "create_server", lambda address: create_server(("127.0.0.1", 0)))  # not the fixed port
+    monkeypatch.setattr(process, "_serve", lambda listener, directory, home_id, idle_seconds: served.append(idle_seconds) or 0)
+
+    assert main(["otel", "receiver", *arguments]) == 0
+    clock = _Clock()
+    idle = IdleTimer(served[0], clock)
+    clock.now = 10.0**12
+    assert idle.expired() is exits_when_idle

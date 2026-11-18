@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
 import queue
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
+import uvicorn
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
 from starlette.middleware import Middleware
@@ -30,6 +33,31 @@ _SECURITY_HEADERS = [
     (b"cross-origin-resource-policy", b"same-origin"),
     (b"cache-control", b"no-store"),
 ]
+
+
+class IdleTimer:
+    """Time since the last ingest or ``/health`` request; ``seconds=math.inf`` never expires."""
+
+    def __init__(self, seconds: float, clock: Callable[[], float] = time.monotonic) -> None:
+        self.seconds, self._clock = seconds, clock
+        self._last = clock()
+
+    def touch(self) -> None:
+        self._last = self._clock()
+
+    def expired(self) -> bool:
+        return self._clock() - self._last >= self.seconds
+
+
+class IdleExitServer(uvicorn.Server):
+    """A uvicorn server that shuts down gracefully, like on SIGTERM, once ``idle`` expires."""
+
+    def __init__(self, config: uvicorn.Config, idle: IdleTimer) -> None:
+        super().__init__(config)
+        self._idle = idle
+
+    async def on_tick(self, counter: int) -> bool:
+        return await super().on_tick(counter) or self._idle.expired()
 
 
 def _error(status: int, message: str) -> JSONResponse:
@@ -65,8 +93,12 @@ class _Guard:
             await self.app(scope, receive, send_with_headers)
 
 
-def create_app(directory: Path, home_id: str) -> Starlette:
-    """Migrate ``directory/telemetry.sqlite3`` and build the app; the writer runs during its lifespan."""
+def create_app(directory: Path, home_id: str, idle: IdleTimer | None = None) -> Starlette:
+    """Migrate ``directory/telemetry.sqlite3`` and build the app; the writer runs during its lifespan.
+
+    Each ingest and ``/health`` request touches ``idle``.
+    """
+    idle = idle or IdleTimer(math.inf)
     database = directory / "telemetry.sqlite3"
     open_database(database)
     writer = Writer(database)
@@ -75,6 +107,7 @@ def create_app(directory: Path, home_id: str) -> Starlette:
 
     async def ingest(request: Request) -> Response:
         nonlocal dropped_foreign_home
+        idle.touch()
         media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if media_type != "application/x-protobuf":
             return _error(415, "content type must be application/x-protobuf")
@@ -114,6 +147,7 @@ def create_app(directory: Path, home_id: str) -> Starlette:
         return Response(response.SerializeToString(), media_type="application/x-protobuf")
 
     async def health(request: Request) -> Response:
+        idle.touch()
         return JSONResponse({
             "home_id": home_id,
             "schema_version": SCHEMA_VERSION,
