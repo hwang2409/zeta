@@ -153,6 +153,10 @@ class ErrorDescriptor(Enum):
         "an MCP tools/list refresh failed",
     )
     INVALID_TELEMETRY_PARAMS = (-32602, "invalid_params", "telemetry read parameters or cursor are invalid")
+    INVALID_STATE_PARAMS = (-32602, "invalid_params", "state read parameters or cursor are invalid")
+    STATE_READ_UNAVAILABLE = (-32005, "state_unavailable", "stored state is not available to read")
+    CORRUPT_STATE = (-32000, "corrupt_state", "stored state is invalid or unsupported")
+    STALE_STATE_SNAPSHOT = (-32009, "stale_state_snapshot", "the stored state changed during the read")
     TRACE_NOT_FOUND = (-32602, "trace_not_found", "the requested trace does not exist")
     TELEMETRY_OFF = (-32005, "telemetry_off", "no telemetry database exists")
     TELEMETRY_SCHEMA_MISMATCH = (
@@ -306,6 +310,7 @@ FEATURES = (
     "session_park",
     "tool_approval_origin",
     "telemetry_read_v1",
+    "state_read_v1",
     "home_settings_v1",
 )
 
@@ -407,6 +412,7 @@ class MethodDescriptor(Enum):
         "mcp_refresh_tools",
         Access.SESSION_MUTATION,
     )
+    STATE_CATALOG = ("state_catalog", None, "state_read_v1", Access.READ)
     TELEMETRY_STATUS = ("telemetry_status", None, "telemetry_read_v1", Access.READ)
     TELEMETRY_SESSIONS = ("telemetry_sessions", None, "telemetry_read_v1", Access.READ)
     TELEMETRY_TRACE = ("telemetry_trace", None, "telemetry_read_v1", Access.READ)

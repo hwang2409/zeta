@@ -16,9 +16,9 @@ from tests.support.serve_close import close_serve
 from tests.support.serve_contract import ServeContract
 from tests.support.server_client import read, request, send
 from tests.support.sockets import short_socket_path
+from zeta.read_page import TooLarge
 from zeta.server import ZetaServer
 from zeta.telemetry.receiver import reader
-from zeta.telemetry.receiver.page import TooLarge
 from zeta.telemetry.receiver.projector import SPAN_COLUMNS
 from zeta.telemetry.receiver.store import Writer, open_database
 

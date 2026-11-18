@@ -28,6 +28,7 @@ from . import (
 )
 from .run_work import cancel_background_task, list_run_work
 from .settings import home_settings_get, home_settings_update
+from .state import state_catalog
 from .telemetry import (
     telemetry_agent_tree,
     telemetry_errors,
@@ -484,6 +485,7 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.CHILD_RUN_LIST: child_run_list,
     MethodDescriptor.CHILD_RUN_SEND: child_run_send,
     MethodDescriptor.MCP_REFRESH_TOOLS: mcp_refresh_tools,
+    MethodDescriptor.STATE_CATALOG: state_catalog,
     MethodDescriptor.TELEMETRY_STATUS: telemetry_status,
     MethodDescriptor.TELEMETRY_SESSIONS: telemetry_sessions,
     MethodDescriptor.TELEMETRY_TRACE: telemetry_trace,

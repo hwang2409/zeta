@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ...config.settings import load_settings
+from ...read_page import InvalidParams, TooLarge
 from ...telemetry import Telemetry
 from ..protocol import ErrorDescriptor, FrameCodec, ProtocolError
 
@@ -80,11 +81,11 @@ async def _read(client, request_id, read: Callable[[Any, Callable[[object], bool
 
     def run() -> dict[str, Any]:
         # imported here: the projector imports serve's method table, so a top-level import is circular
-        from ...telemetry.receiver import page, reader
+        from ...telemetry.receiver import reader
 
         try:
             result = read(reader, fits)
-        except page.InvalidParams:
+        except InvalidParams:
             raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, "invalid params") from None
         except reader.TraceNotFound as exc:
             raise ProtocolError(ErrorDescriptor.TRACE_NOT_FOUND, "resource not found", {"id": exc.trace_id}) from None
@@ -92,7 +93,7 @@ async def _read(client, request_id, read: Callable[[Any, Callable[[object], bool
             raise ProtocolError(ErrorDescriptor.TELEMETRY_OFF, "state unavailable", {"retryable": True}) from None
         except reader.SchemaMismatch:
             raise ProtocolError(ErrorDescriptor.TELEMETRY_SCHEMA_MISMATCH, "telemetry schema is unsupported") from None
-        except page.TooLarge:
+        except TooLarge:
             raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit") from None
         if not fits(result):  # every page is cut to fit; status is bounded far below the frame; this is the backstop
             raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit")

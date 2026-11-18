@@ -1140,6 +1140,30 @@ STRUCTURED_ERROR_FIXTURES = (
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
     ),
     (
+        ErrorDescriptor.INVALID_STATE_PARAMS,
+        "invalid params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
+    ),
+    (
+        ErrorDescriptor.STATE_READ_UNAVAILABLE,
+        "state unavailable",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32005,"message":"state unavailable","data":{"code":"state_unavailable","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.CORRUPT_STATE,
+        "stored state is invalid",
+        {"resource": "storage-format.json"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"stored state is invalid","data":{"code":"corrupt_state","resource":"storage-format.json"}}}\n',
+    ),
+    (
+        ErrorDescriptor.STALE_STATE_SNAPSHOT,
+        "snapshot changed; retry",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"snapshot changed; retry","data":{"code":"stale_state_snapshot","retryable":true}}}\n',
+    ),
+    (
         ErrorDescriptor.TRACE_NOT_FOUND,
         "resource not found",
         {"id": "00112233445566778899aabbccddeeff"},
