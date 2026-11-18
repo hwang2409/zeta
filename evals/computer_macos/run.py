@@ -32,13 +32,6 @@ class SafariOwnership:
     tab_id: str
 
 
-@dataclasses.dataclass(frozen=True)
-class SafariObservedState:
-    frontmost_bundle: str
-    owned_window_id: str | None
-    tab_ids: tuple[str, ...]
-
-
 class BrowserAdapter(Protocol):
     async def open_owned(self, url: str) -> SafariOwnership: ...
     async def cleanup_owned(self, ownership: SafariOwnership) -> dict[str, Any]: ...
@@ -56,7 +49,7 @@ def _empty_cleanup() -> CleanupEvidence:
         "owned_window_tabs_changed": False,
         "close_failed": False,
         "other_app_frontmost": False,
-        "error": None,
+        "errors": [],
     }
 
 
@@ -203,60 +196,41 @@ class MacSafari:
             raise RuntimeError("Safari did not return an ownership token")
         return SafariOwnership(parts[0], parts[1])
 
-    async def _observe_cleanup(self, ownership: SafariOwnership) -> SafariObservedState:
-        status = await self._osascript("""tell application \"System Events\"
-   set frontmostBundle to \"\"
+    async def cleanup_owned(self, ownership: SafariOwnership) -> CleanupEvidence:
+        status = await self._osascript("""tell application "System Events"
+   set frontmostBundle to ""
    try
      set frontmostBundle to bundle identifier of first application process whose frontmost is true
    end try
-   return (exists application process \"Safari\") & tab & frontmostBundle
+   return (exists application process "Safari") & tab & frontmostBundle
  end tell""")
         status_parts = status.rstrip("\n").split("\t")
         if len(status_parts) != 2 or not status_parts[0]:
             raise RuntimeError("Safari cleanup process observation was invalid")
-        frontmost_bundle = status_parts[1]
-        if status_parts[0] != "true":
-            return SafariObservedState(frontmost_bundle, None, ())
-        output = await self._osascript(f"""tell application \"Safari\"
-   set ownedWindowId to \"\"
-   set ownedTabIds to \"\"
-   try
-     set ownedWindow to window id {ownership.window_id}
-     set ownedWindowId to id of ownedWindow as text
-     repeat with candidate in tabs of ownedWindow
-       if ownedTabIds is not \"\" then set ownedTabIds to ownedTabIds & \",\"
-       set ownedTabIds to ownedTabIds & (id of candidate as text)
-     end repeat
-   end try
-   return ownedWindowId & tab & ownedTabIds
- end tell""")
-        parts = output.rstrip("\n").split("\t")
-        if len(parts) != 2:
-            raise RuntimeError("Safari cleanup observation was invalid")
-        return SafariObservedState(frontmost_bundle, parts[0] or None, tuple(filter(None, parts[1].split(","))))
-
-    async def cleanup_owned(self, ownership: SafariOwnership) -> dict[str, Any]:
-        observed = await self._observe_cleanup(ownership)
-        result = {
-            "owned_browser_state_removed": False,
-            "owned_window_missing": observed.owned_window_id != ownership.window_id,
-            "owned_window_tabs_changed": False,
-            "close_failed": False,
-            "other_app_frontmost": observed.frontmost_bundle != "com.apple.Safari",
-            "error": None,
-        }
-        if result["owned_window_missing"]:
+        running, frontmost_bundle = status_parts
+        result = _empty_cleanup()
+        result["other_app_frontmost"] = frontmost_bundle != "com.apple.Safari"
+        if running != "true":
+            result["owned_window_missing"] = True
             return result
-        if observed.tab_ids != (ownership.tab_id,):
-            result["owned_window_tabs_changed"] = True
-            return result
+        # shortcut: one script narrows the check-to-close gap but does not lock Safari.
         try:
-            await self._osascript(f'tell application "Safari" to close window id {ownership.window_id}')
+            outcome = (await self._osascript(f"""tell application "Safari"
+   if not (exists window id {ownership.window_id}) then return "owned_window_missing"
+   set ownedWindow to window id {ownership.window_id}
+   set tabIds to id of every tab of ownedWindow
+   if (count of tabIds) is not 1 then return "owned_window_tabs_changed"
+   if (item 1 of tabIds as text) is not "{ownership.tab_id}" then return "owned_window_tabs_changed"
+   close ownedWindow
+   return "closed"
+ end tell""")).strip()
+            if outcome not in {"closed", "owned_window_missing", "owned_window_tabs_changed"}:
+                raise RuntimeError("Safari cleanup outcome was invalid")
         except BaseException as exc:  # noqa: BLE001 - retain truthful partial evidence
             result["close_failed"] = True
-            result["error"] = str(exc) or type(exc).__name__
+            result["errors"].append(str(exc) or type(exc).__name__)
         else:
-            result["owned_browser_state_removed"] = True
+            result["owned_browser_state_removed" if outcome == "closed" else outcome] = True
         return result
 
 
@@ -333,6 +307,7 @@ async def _cleanup_trial(
     ownership: SafariOwnership | None,
 ) -> CleanupEvidence:
     evidence = _empty_cleanup()
+    errors: list[str] = evidence["errors"]
     steps: list[tuple[str, Callable[[], Any]]] = []
     if browser is not None and ownership is not None:
         steps.append(("browser", lambda: browser.cleanup_owned(ownership)))
@@ -341,9 +316,11 @@ async def _cleanup_trial(
         steps.append(("fixture", lambda: _close_fixture(fixture)))
     for name, action in steps:
         try:
-            evidence.update(await _cleanup_step(name, action))
+            step = await _cleanup_step(name, action)
+            errors.extend(step.pop("errors", ()))
+            evidence.update(step)
         except BaseException as exc:  # noqa: BLE001 - cleanup continues after cancellation/failure
-            evidence["error"] = str(exc) or type(exc).__name__
+            errors.append(str(exc) or type(exc).__name__)
     return evidence
 
 
@@ -428,7 +405,14 @@ async def pilot(
     if trials != 3:
         raise ValueError("the pilot is exactly three trials")
     with prepare_home(run_dir):
-        return await _pilot(run_dir, trials, provider_factory=provider_factory, backend_factory=backend_factory, fixture_factory=fixture_factory, browser_factory=browser_factory, timeout_factory=timeout_factory)
+        return await _pilot(
+            run_dir,
+            provider_factory=provider_factory or (lambda _: _production_provider(run_dir)),
+            backend_factory=backend_factory or (lambda _: _production_backend()),
+            fixture_factory=fixture_factory,
+            browser_factory=browser_factory or _production_browser,
+            timeout_factory=timeout_factory,
+        )
 
 
 def _aggregate_cleanup(trial_cleanup: list[CleanupEvidence]) -> CleanupEvidence:
@@ -440,7 +424,7 @@ def _aggregate_cleanup(trial_cleanup: list[CleanupEvidence]) -> CleanupEvidence:
         "owned_window_tabs_changed": any(item["owned_window_tabs_changed"] for item in trial_cleanup),
         "close_failed": any(item["close_failed"] for item in trial_cleanup),
         "other_app_frontmost": any(item["other_app_frontmost"] for item in trial_cleanup),
-        "errors": [item["error"] for item in trial_cleanup if item["error"]],
+        "errors": [error for item in trial_cleanup for error in item["errors"]],
         "disposable_home_removed": False,
     }
     if not trial_cleanup:
@@ -450,12 +434,11 @@ def _aggregate_cleanup(trial_cleanup: list[CleanupEvidence]) -> CleanupEvidence:
 
 async def _pilot(
     run_dir: Path,
-    trials: int,
     *,
-    provider_factory: Callable[[int], ProviderAdapter] | None,
-    backend_factory: Callable[[int], Any] | None,
+    provider_factory: Callable[[int], ProviderAdapter],
+    backend_factory: Callable[[int], Any],
     fixture_factory: Callable[[Path, int], Any] | None,
-    browser_factory: Callable[[], BrowserAdapter] | None,
+    browser_factory: Callable[[], BrowserAdapter | None],
     timeout_factory: Callable[[float], Any],
 ) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
@@ -465,9 +448,9 @@ async def _pilot(
     try:
         async with timeout_factory(PILOT_DEADLINE):
             for trial in range(1, 4):
-                provider = provider_factory(trial) if provider_factory else _production_provider(run_dir)
-                backend = backend_factory(trial) if backend_factory else _production_backend()
-                browser = browser_factory() if browser_factory else (MacSafari() if platform.system() == "Darwin" else None)
+                provider = provider_factory(trial)
+                backend = backend_factory(trial)
+                browser = browser_factory()
                 async with timeout_factory(TRIAL_DEADLINE):
                     results.append(await run_trial(run_dir, trial, provider, backend, fixture_factory=fixture_factory, browser=browser))
                     trial_cleanup.append(results[-1]["cleanup"])
@@ -488,12 +471,16 @@ async def _pilot(
             cleanup["disposable_home_removed"] = not home.exists()
         except OSError as exc:
             cleanup["home_error"] = str(exc)
-        if not all(value for key, value in cleanup.items() if key in {"disposable_home_removed"}):
+        if not cleanup["disposable_home_removed"]:
             status = "failed"
         payload = {"status": status, "error": error, "provider": EXPECTED_PROVIDER, "model": EXPECTED_MODEL, "trials": results if status == "complete" else [], "cleanup": cleanup}
         _atomic_json(run_dir / "cleanup.json", cleanup)
         _atomic_json(run_dir / "pilot.json", payload)
     return payload
+
+
+def _production_browser() -> BrowserAdapter | None:
+    return MacSafari() if platform.system() == "Darwin" else None
 
 
 def _production_backend() -> Any:

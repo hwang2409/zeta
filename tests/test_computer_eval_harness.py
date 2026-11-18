@@ -91,7 +91,7 @@ class Browser:
         self.cleaned = True
         self.cleanup_tokens.append(ownership)
         self.after = self.before
-        return {"owned_browser_state_removed": True, "owned_window_missing": False, "owned_window_tabs_changed": False, "close_failed": False, "other_app_frontmost": False, "error": None}
+        return {"owned_browser_state_removed": True, "owned_window_missing": False, "owned_window_tabs_changed": False, "close_failed": False, "other_app_frontmost": False, "errors": []}
 
 
 def provider(x: int = 301, y: int = 201) -> ProviderBackend:
@@ -223,56 +223,81 @@ def test_prepare_home_restores_set_and_unset_environment(tmp_path: Path, monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("name", "observation", "failure", "expected"),
+    ("outcome", "fact"),
     [
-        ("closed", "owned\tcreated\n", None, {"owned_browser_state_removed": True}),
-        ("gone", "\t\n", None, {"owned_window_missing": True}),
-        ("changed", "other\tcreated\n", None, {"owned_window_missing": True}),
-        ("extra-tab", "owned\tcreated,user\n", None, {"owned_window_tabs_changed": True}),
-        ("close-fails", "owned\tcreated\n", RuntimeError("close failed"), {"close_failed": True, "error": "close failed"}),
+        ("closed", "owned_browser_state_removed"),
+        ("owned_window_missing", "owned_window_missing"),
+        ("owned_window_tabs_changed", "owned_window_tabs_changed"),
+        (RuntimeError("close failed"), "close_failed"),
     ],
 )
-async def test_safari_cleanup_production_path(name, observation, failure, expected, monkeypatch):
-    token = SafariOwnership("owned", "created")
-    calls = iter(["true\tcom.apple.Safari\n", observation, failure] if failure else ["true\tcom.apple.Safari\n", observation, ""])
+async def test_safari_cleanup_production_path(outcome, fact, monkeypatch):
+    token = SafariOwnership("42", "99")
     scripts = []
 
     async def fake_osascript(source):
         scripts.append(source)
-        value = next(calls)
-        if isinstance(value, Exception):
-            raise value
-        return value
+        if len(scripts) == 1:
+            return "true\tcom.apple.Safari\n"
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome + "\n"
 
     # test-contract: seam replaces the subprocess boundary; no live Safari is allowed.
     monkeypatch.setattr(MacSafari, "_osascript", staticmethod(fake_osascript))
     result = await MacSafari().cleanup_owned(token)
-    # test-contract: seam through MacSafari cleanup evidence.
-    assert all(result[key] == value for key, value in expected.items()), name
-    expected_calls = 3 if name in {"closed", "close-fails"} else 2
-    assert len(scripts) == expected_calls
-    if name == "close-fails":
-        assert result["error"] == "close failed"
+    assert result[fact]
+    assert result["owned_browser_state_removed"] is (fact == "owned_browser_state_removed")
+    assert result["errors"] == (["close failed"] if fact == "close_failed" else [])
+    assert len(scripts) == 2
+    assert 'tell application "Safari"' not in scripts[0]
 
 
 @pytest.mark.asyncio
-async def test_safari_cleanup_executor_observes_once_then_one_call_per_action(monkeypatch: pytest.MonkeyPatch) -> None:
-    token = SafariOwnership("42", "99")
-    scripts: list[str] = []
-    responses = iter(["true\tcom.apple.Safari\n", "42\t99\n", ""])
+async def test_safari_cleanup_preserves_a_user_tab_added_before_close(monkeypatch):
+    windows = {42: [99]}
 
-    async def fake_osascript(source: str) -> str:
-        scripts.append(source)
-        return next(responses)
+    async def fake_osascript(source):
+        if 'tell application "System Events"' in source:
+            return "true\tcom.apple.Safari\n"
+        if "close " not in source:
+            return f"42\t{','.join(map(str, windows[42]))}\n"
+        # A user opens a tab between the preceding call and the call that can close.
+        windows[42].append(100)
+        before_close = source.partition("close ")[0]
+        if 'then return "owned_window_tabs_changed"' in before_close and windows[42] != [99]:
+            return "owned_window_tabs_changed\n"
+        del windows[42]
+        return "closed\n"
 
-    # test-contract: seam replaces the subprocess boundary; no live Safari is allowed.
+    # test-contract: seam models Safari at the subprocess boundary.
     monkeypatch.setattr(MacSafari, "_osascript", staticmethod(fake_osascript))
-    result = await MacSafari().cleanup_owned(token)
-    assert result["owned_browser_state_removed"]
-    assert len(scripts) == 3
-    assert "tell application \"Safari\"" not in scripts[0]
-    assert "close" not in scripts[1]
-    assert all(source.count("tell application") == 1 for source in scripts[2:])
+    result = await MacSafari().cleanup_owned(SafariOwnership("42", "99"))
+    # test-contract: seam checks the retained window and user tab in the Safari model.
+    assert windows.get(42) == [99, 100]
+    assert result["owned_window_tabs_changed"]
+    assert not result["owned_browser_state_removed"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_trial_preserves_browser_and_backend_errors(monkeypatch):
+    async def fake_osascript(source):
+        if 'tell application "System Events"' in source:
+            return "true\tcom.apple.Safari\n"
+        if "close " in source:
+            raise RuntimeError("Safari close failed")
+        return "42\t99\n"
+
+    class Backend:
+        def close(self):
+            raise RuntimeError("backend close failed")
+
+    # test-contract: seam exercises real browser and trial cleanup with no live Safari.
+    monkeypatch.setattr(MacSafari, "_osascript", staticmethod(fake_osascript))
+    evidence = await _cleanup_trial(Backend(), None, MacSafari(), SafariOwnership("42", "99"))
+    # test-contract: seam checks ordered cleanup evidence on both revisions.
+    assert evidence.get("errors", [evidence.get("error")]) == ["Safari close failed", "backend close failed"]
+    assert evidence["close_failed"]
 
 
 @pytest.mark.asyncio
@@ -305,7 +330,7 @@ async def test_cleanup_trial_preserves_browser_close_error() -> None:
                 "owned_window_tabs_changed": False,
                 "close_failed": True,
                 "other_app_frontmost": False,
-                "error": "close failed",
+                "errors": ["close failed"],
             }
 
     class Backend:
@@ -315,7 +340,7 @@ async def test_cleanup_trial_preserves_browser_close_error() -> None:
             self.closed = True
 
     evidence = await _cleanup_trial(Backend(), None, BrowserWithCloseError(), object())
-    assert evidence["error"] == "close failed"
+    assert evidence["errors"] == ["close failed"]
     assert evidence["close_failed"]
 
 
