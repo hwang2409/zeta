@@ -249,10 +249,17 @@ class AgentNotificationMixin:
         turn_span: SpanHandle | None = None
         run_id = self.agent_instance_id
         outcome = "finished"
+        failure: object | None = None
+
+        def settle(span: SpanHandle, span_outcome: str) -> None:
+            span.set_outcome(span_outcome)
+            # a stream ERROR fails the turn without an exception; turn_limit is a designed stop, not an error
+            if span_outcome == "failed" and failure is not None:
+                span.fail(failure)
 
         def close_turn(turn_outcome: str, exc: BaseException | None = None) -> None:
             if turn_span is not None:
-                turn_span.set_outcome(turn_outcome)
+                settle(turn_span, turn_outcome)
                 turn_span.__exit__(None if exc is None else type(exc), exc, None)
 
         with telemetry.agent_span(
@@ -283,7 +290,8 @@ class AgentNotificationMixin:
                             close_turn("finished")
                             turn_span = None
                         elif event.type is StreamEventType.ERROR:
-                            outcome = "turn_limit" if getattr(event.error, "code", None) == "max_turns" else "failed"
+                            failure = event.error
+                            outcome = "turn_limit" if getattr(failure, "code", None) == "max_turns" else "failed"
                         yield event
                 finally:
                     try:
@@ -303,14 +311,14 @@ class AgentNotificationMixin:
                         self._background_owner.notify_wake()
             except BaseException as exc:
                 outcome = "cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt)) else "failed"
-                agent_span.set_outcome(outcome)
+                settle(agent_span, outcome)
                 close_turn(outcome, exc)
                 raise
             if self._abort_admitted:
                 outcome = "interrupted"
             elif self.child_turn_control is not None and self.child_turn_control.exhausted:
                 outcome = "turn_limit"
-            agent_span.set_outcome(outcome)
+            settle(agent_span, outcome)
             close_turn(outcome)
 
     def set_background_wake_callback(self, callback: Callable[[], None] | None) -> None:
