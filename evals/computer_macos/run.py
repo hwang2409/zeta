@@ -193,36 +193,47 @@ class MacSafari:
 
     async def open_owned(self, url: str) -> SafariOwnership:
         escaped = url.replace('\\', '\\\\').replace('"', '\\"')
-        output = await self._osascript(f"""tell application \"System Events\" to set prior to bundle identifier of first application process whose frontmost is true
- tell application \"Safari\"
+        output = await self._osascript(f"""tell application \"Safari\"
    set ownedTab to make new document with properties {{URL:\"{escaped}\"}}
    set ownedWindow to window of ownedTab
-   return prior & tab & (id of ownedWindow as text) & tab & (id of ownedTab as text)
+   return (id of ownedWindow as text) & tab & (id of ownedTab as text)
  end tell""")
         parts = output.strip().split("\t")
-        if len(parts) != 3 or not all(parts):
+        if len(parts) != 2 or not all(parts):
             raise RuntimeError("Safari did not return an ownership token")
-        return SafariOwnership(parts[1], parts[2])
+        return SafariOwnership(parts[0], parts[1])
 
     async def _observe_cleanup(self, ownership: SafariOwnership) -> SafariObservedState:
-        output = await self._osascript(f"""tell application "System Events" to set frontmostBundle to bundle identifier of first application process whose frontmost is true
- tell application "Safari"
-   set ownedWindowId to ""
-   set ownedTabIds to ""
+        status = await self._osascript("""tell application \"System Events\"
+   set frontmostBundle to \"\"
+   try
+     set frontmostBundle to bundle identifier of first application process whose frontmost is true
+   end try
+   return (exists application process \"Safari\") & tab & frontmostBundle
+ end tell""")
+        status_parts = status.rstrip("\n").split("\t")
+        if len(status_parts) != 2 or not status_parts[0]:
+            raise RuntimeError("Safari cleanup process observation was invalid")
+        frontmost_bundle = status_parts[1]
+        if status_parts[0] != "true":
+            return SafariObservedState(frontmost_bundle, None, ())
+        output = await self._osascript(f"""tell application \"Safari\"
+   set ownedWindowId to \"\"
+   set ownedTabIds to \"\"
    try
      set ownedWindow to window id {ownership.window_id}
      set ownedWindowId to id of ownedWindow as text
      repeat with candidate in tabs of ownedWindow
-       if ownedTabIds is not "" then set ownedTabIds to ownedTabIds & ","
+       if ownedTabIds is not \"\" then set ownedTabIds to ownedTabIds & \",\"
        set ownedTabIds to ownedTabIds & (id of candidate as text)
      end repeat
    end try
-   return frontmostBundle & tab & ownedWindowId & tab & ownedTabIds
+   return ownedWindowId & tab & ownedTabIds
  end tell""")
         parts = output.rstrip("\n").split("\t")
-        if len(parts) != 3 or not parts[0]:
+        if len(parts) != 2:
             raise RuntimeError("Safari cleanup observation was invalid")
-        return SafariObservedState(parts[0], parts[1] or None, tuple(filter(None, parts[2].split(","))))
+        return SafariObservedState(frontmost_bundle, parts[0] or None, tuple(filter(None, parts[1].split(","))))
 
     async def cleanup_owned(self, ownership: SafariOwnership) -> dict[str, Any]:
         observed = await self._observe_cleanup(ownership)
@@ -461,20 +472,9 @@ async def _pilot(
                     results.append(await run_trial(run_dir, trial, provider, backend, fixture_factory=fixture_factory, browser=browser))
                     trial_cleanup.append(results[-1]["cleanup"])
         status = "complete"
-    except asyncio.CancelledError as exc:
-        status, error = "cancelled", type(exc).__name__
-        cleanup = getattr(exc, "cleanup", None)
-        if cleanup is not None:
-            trial_cleanup.append(cleanup)
-        raise
-    except TimeoutError as exc:
-        status, error = "timeout", type(exc).__name__
-        cleanup = getattr(exc, "cleanup", None)
-        if cleanup is not None:
-            trial_cleanup.append(cleanup)
-        raise
-    except Exception as exc:
-        error = str(exc) or type(exc).__name__
+    except BaseException as exc:
+        status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "timeout" if isinstance(exc, TimeoutError) else "failed"
+        error = type(exc).__name__ if status != "failed" else str(exc) or type(exc).__name__
         cleanup = getattr(exc, "cleanup", None)
         if cleanup is not None:
             trial_cleanup.append(cleanup)
