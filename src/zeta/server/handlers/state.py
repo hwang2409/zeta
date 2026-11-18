@@ -2,7 +2,7 @@
 
 from ...read_page import InvalidParams, TooLarge
 from ..protocol import ErrorDescriptor, MethodDescriptor, ProtocolError
-from ..read_home_state import read_home_state
+from ..read_home_state import accounts_page, retention_result, settings_page, storage_page
 from ..read_sessions import read_session_page
 
 
@@ -77,11 +77,11 @@ async def state_background_tasks(client, request_id, params):
     return await _session_read(client, request_id, params, MethodDescriptor.STATE_BACKGROUND_TASKS, collection="background_tasks")
 
 
-def _home_state_handler(method):
+def _home_state_handler(owner_read):
     async def read(client, request_id, params):
         try:
-            return await client.connections.run_blocking(lambda: read_home_state(
-                client.server.home, method, params, lambda result: client.codec.response_fits(request_id, result),
+            return await client.connections.run_blocking(lambda: owner_read(
+                client.server.home, params, lambda result: client.codec.response_fits(request_id, result),
             ))
         except InvalidParams:
             raise ProtocolError(ErrorDescriptor.INVALID_STATE_PARAMS, "invalid params") from None
@@ -91,7 +91,7 @@ def _home_state_handler(method):
     return read
 
 
-state_settings = _home_state_handler(MethodDescriptor.STATE_SETTINGS)
-state_accounts = _home_state_handler(MethodDescriptor.STATE_ACCOUNTS)
-state_storage = _home_state_handler(MethodDescriptor.STATE_STORAGE)
-state_retention = _home_state_handler(MethodDescriptor.STATE_RETENTION)
+state_settings = _home_state_handler(settings_page)
+state_accounts = _home_state_handler(accounts_page)
+state_storage = _home_state_handler(storage_page)
+state_retention = _home_state_handler(retention_result)
