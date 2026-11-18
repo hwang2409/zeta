@@ -53,9 +53,16 @@ class SpanHandle:
             return self._implementation.exit(exc_type, exc, traceback)
         return False
 
-    def set_usage(self, *, input_tokens: int, output_tokens: int, total_tokens: int) -> None:
+    def set_usage(
+        self, *, input_tokens: int, output_tokens: int, total_tokens: int,
+        cache_read_tokens: int | None = None, cache_write_tokens: int | None = None,
+    ) -> None:
+        """Cache counts are ``None`` when the provider did not report them; they are part of ``input_tokens``."""
         if self._implementation is not None:
-            self._implementation.set_usage(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens)
+            self._implementation.set_usage(
+                input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=total_tokens,
+                cache_read_tokens=cache_read_tokens, cache_write_tokens=cache_write_tokens,
+            )
 
     def retry(self, *, attempt: int, reason: str, delay: int, after: bool) -> None:
         """Record one provider retry decision; ``delay`` is in milliseconds."""
@@ -72,9 +79,18 @@ class SpanHandle:
         if self._implementation is not None:
             self._implementation.approval_resolved(decision=decision, scope=scope, duration=duration)
 
-    def set_response(self, *, finish_reason: str | None = None, model: str | None = None) -> None:
+    def set_response(
+        self, *, finish_reason: str | None = None, model: str | None = None,
+        ttft_ns: int | None = None, retry_count: int | None = None,
+    ) -> None:
+        """``ttft_ns`` is the span start to the first decoded model progress; ``None`` when none came."""
         if self._implementation is not None:
-            self._implementation.set_response(finish_reason=finish_reason, model=model)
+            self._implementation.set_response(finish_reason=finish_reason, model=model, ttft_ns=ttft_ns, retry_count=retry_count)
+
+    def set_outcome(self, outcome: str) -> None:
+        """How an ``invoke_agent`` or ``turn`` span ended; a value outside the closed set exports as ``_invalid``."""
+        if self._implementation is not None:
+            self._implementation.set_outcome(outcome)
 
     def set_tool_count(self, *, tool_count: int) -> None:
         if self._implementation is not None:
@@ -98,10 +114,12 @@ class SpanHandle:
         if self._implementation is not None:
             self._implementation.set_mcp_request(request_id=request_id, protocol_version=protocol_version)
 
-    def fail(self, exc: BaseException | type[BaseException] | None) -> None:
-        """Mark the span failed; ``None`` is a failure with no exception (error.type ``_OTHER``)."""
+    def fail(self, error: object | None, *, code: str | None = None) -> None:
+        """Mark the span failed. ``error`` is an exception, an exception class, or an ``ErrorInfo``;
+        anything but an exception has error.type ``_OTHER``. ``code`` overrides the mapped ``zeta.error.code``.
+        """
         if self._implementation is not None:
-            self._implementation.fail(exc)
+            self._implementation.fail(error, code=code)
 
 
 # the disabled facade hands out this one handle, so a disabled span allocates nothing.
@@ -178,14 +196,17 @@ class Telemetry:
             self._implementation.inject(carrier)
 
     def agent_span(
-        self, profile: str, *, agent_name: str, conversation_id: str, model: str, depth: int, background: bool
+        self, profile: str, *, agent_name: str, conversation_id: str, model: str, depth: int, background: bool,
+        run_id: str | None = None, parent_run_id: str | None = None,
     ) -> SpanHandle:
+        """``run_id`` is a child's public run id (its ``child_instance_id``); ``None`` for a top-level agent."""
         if self._implementation is None:
             return _NOOP
         return self._span(f"invoke_agent {profile}", operation="agent", attributes={
             "gen_ai.operation.name": "invoke_agent", "zeta.agent.name": agent_name,
             "gen_ai.conversation.id": conversation_id, "gen_ai.request.model": model,
             "zeta.agent.depth": depth, "zeta.background": background,
+            "zeta.agent.run_id": run_id, "zeta.agent.parent_run_id": parent_run_id,
         })
 
     def turn_span(self, *, conversation_id: str, turn_number: int, notification: bool) -> SpanHandle:

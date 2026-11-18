@@ -1,4 +1,4 @@
-"""The telemetry database: exact slice-1 schema and its one writer thread.
+"""The telemetry database: its schema, forward migrations, and its one writer thread.
 
 Only the receiver's writer thread writes. ``zeta serve`` reads through ``reader.py`` with a
 read-only connection. An OTLP batch is acknowledged only after its transaction commits.
@@ -17,11 +17,12 @@ from typing import Any
 
 from .projector import EVENT_COLUMNS, SPAN_COLUMNS, root_session_id
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 INGEST_QUEUE_CAPACITY = 64
 GRACEFUL_COMMIT_TIMEOUT_SECONDS = 5.0
 BUSY_TIMEOUT_MS = 5_000
 
+# the schema-1 tables; a new database also runs every entry of MIGRATIONS, so both paths reach one shape
 SCHEMA = """
 CREATE TABLE viewer_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -150,6 +151,20 @@ CREATE INDEX sessions_last ON sessions(last_ns DESC, root_session_id DESC);
 CREATE INDEX sessions_profile_last ON sessions(profile, last_ns DESC, root_session_id DESC);
 CREATE INDEX sessions_model_last ON sessions(model, last_ns DESC, root_session_id DESC);
 """
+
+# MIGRATIONS[n] moves a database from schema n - 1 to n.
+MIGRATIONS = {
+    2: (
+        "ALTER TABLE spans ADD COLUMN error_code TEXT",
+        "ALTER TABLE spans ADD COLUMN run_id TEXT",
+        "ALTER TABLE spans ADD COLUMN parent_run_id TEXT",
+        "ALTER TABLE spans ADD COLUMN outcome TEXT",
+        "ALTER TABLE spans ADD COLUMN cache_read_tokens INTEGER CHECK (cache_read_tokens IS NULL OR cache_read_tokens >= 0)",
+        "ALTER TABLE spans ADD COLUMN cache_write_tokens INTEGER CHECK (cache_write_tokens IS NULL OR cache_write_tokens >= 0)",
+        "ALTER TABLE spans ADD COLUMN ttft_ns INTEGER CHECK (ttft_ns IS NULL OR ttft_ns >= 0)",
+        "ALTER TABLE spans ADD COLUMN retry_count INTEGER CHECK (retry_count IS NULL OR retry_count >= 0)",
+    ),
+}
 
 _TRACE_UPSERT = """
 INSERT INTO traces (
@@ -344,15 +359,22 @@ def open_database(path: Path) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if version == SCHEMA_VERSION:
             return
-        if version != 0:
+        if not 0 <= version < SCHEMA_VERSION:
             raise RuntimeError(f"telemetry database schema {version} is not supported (expected {SCHEMA_VERSION})")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("BEGIN IMMEDIATE")
         try:
-            for statement in SCHEMA.split(";"):
-                if statement.strip():
+            if version == 0:
+                for statement in SCHEMA.split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
+                connection.execute("INSERT INTO viewer_meta (singleton, schema_version) VALUES (1, 1)")
+                version = 1
+            # one transaction: a crash leaves the old schema whole, never a half-migrated one
+            for target in range(version + 1, SCHEMA_VERSION + 1):
+                for statement in MIGRATIONS[target]:
                     connection.execute(statement)
-            connection.execute("INSERT INTO viewer_meta (singleton, schema_version) VALUES (1, ?)", (SCHEMA_VERSION,))
+            connection.execute("UPDATE viewer_meta SET schema_version = ? WHERE singleton = 1", (SCHEMA_VERSION,))
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         except BaseException:

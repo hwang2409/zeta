@@ -40,11 +40,12 @@ _SESSION_COLUMNS = (
 _TRACE_COLUMNS = ("trace_id", "first_ns", "last_ns", "root_span_id", "root_session_id", "status", "span_count", "error_count")
 _SPAN_COLUMNS = (
     "span_id", "parent_span_id", "operation", "start_ns", "end_ns", "duration_ns", "status", "error_type",
-    "session_id", "agent_name", "agent_depth", "background", "turn_number", "notification", "provider",
-    "request_model", "response_model", "stream", "input_tokens", "output_tokens", "total_tokens", "finish_reason",
-    "tool_name", "tool_type", "tool_call_id", "tool_argument_bytes", "tool_result_bytes", "tool_count", "emergency",
-    "tokens_before", "tokens_after", "rpc_method", "mcp_method", "mcp_server", "mcp_tool", "mcp_prompt",
-    "mcp_protocol", "request_id",
+    "error_code", "session_id", "agent_name", "agent_depth", "background", "run_id", "parent_run_id",
+    "turn_number", "notification", "outcome", "provider", "request_model", "response_model", "stream",
+    "input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_write_tokens", "finish_reason",
+    "ttft_ns", "retry_count", "tool_name", "tool_type", "tool_call_id", "tool_argument_bytes", "tool_result_bytes",
+    "tool_count", "emergency", "tokens_before", "tokens_after", "rpc_method", "mcp_method", "mcp_server", "mcp_tool",
+    "mcp_prompt", "mcp_protocol", "request_id",
 )
 _EVENT_COLUMNS = (
     "name", "time_ns", "retry_attempt", "retry_reason", "retry_delay", "retry_after", "decision", "scope", "duration_ns",

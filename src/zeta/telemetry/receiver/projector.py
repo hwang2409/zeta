@@ -65,6 +65,15 @@ _SPAN_COLUMNS = {
     "gen_ai.prompt.name": "mcp_prompt",
     "mcp.protocol.version": "mcp_protocol",
     "jsonrpc.request.id": "request_id",
+    # schema 2 columns; store.py adds them in this order
+    "zeta.error.code": "error_code",
+    "zeta.agent.run_id": "run_id",
+    "zeta.agent.parent_run_id": "parent_run_id",
+    "zeta.outcome": "outcome",
+    "gen_ai.usage.cache_read.input_tokens": "cache_read_tokens",
+    "gen_ai.usage.cache_creation.input_tokens": "cache_write_tokens",
+    "zeta.response.time_to_first_token": "ttft_ns",
+    "zeta.retry.count": "retry_count",
 }
 _EVENT_COLUMNS = {
     "gen_ai.retry.attempt": "retry_attempt",

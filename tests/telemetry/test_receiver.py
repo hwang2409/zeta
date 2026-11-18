@@ -164,6 +164,91 @@ def test_receiver_retains_only_allowlisted_metadata(receiver):
     assert "SECRET" not in dump
 
 
+def test_schema_2_fields_are_closed(receiver):
+    client, _, database = receiver
+    secret = "SECRET-CONTENT-MARKER"
+    chat = _span(1, name="chat qwen3:4b", status=Status.STATUS_CODE_ERROR, attributes={
+        "gen_ai.request.model": "qwen3:4b",
+        "zeta.error.code": f"rate_limit: {secret}",  # a message, not a closed code
+        "gen_ai.usage.cache_read.input_tokens": secret,  # not an integer
+        "gen_ai.usage.cache_creation.input_tokens": 4,
+        "zeta.response.time_to_first_token": 1_500_000,
+        "zeta.retry.count": 2,
+    })
+    agent = _span(2, name="invoke_agent worker", attributes={
+        "zeta.agent.name": "worker", "zeta.agent.run_id": f"{ROOT}:1:{secret}",
+        "zeta.agent.parent_run_id": f"{ROOT}:1", "zeta.outcome": secret,
+    })
+    turn = _span(3, attributes={"zeta.outcome": "turn_limit", "zeta.error.code": "overloaded"})
+
+    assert client.post("/v1/traces", content=_body(chat, agent, turn), headers=PROTOBUF).status_code == 200
+
+    stored = {span["span_id"]: span for span in _trace(database, TRACE.hex())["spans"]}
+    chat_row, agent_row, turn_row = (stored[n.to_bytes(8, "big").hex()] for n in (1, 2, 3))
+    assert (chat_row["error_code"], chat_row["cache_read_tokens"], chat_row["cache_write_tokens"]) == ("_invalid", 0, 4)
+    assert (chat_row["ttft_ns"], chat_row["retry_count"]) == (1_500_000, 2)
+    assert (agent_row["run_id"], agent_row["parent_run_id"], agent_row["outcome"]) == ("_invalid", f"{ROOT}:1", "_invalid")
+    assert (turn_row["outcome"], turn_row["error_code"], turn_row["run_id"]) == ("turn_limit", "overloaded", None)
+    assert secret not in "\n".join(sqlite3.connect(database).iterdump())
+
+
+def _schema_1_database(path: Path) -> None:
+    """A database exactly as the schema-1 receiver left it, with one span, event, trace, and session."""
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(store_module.SCHEMA)
+        connection.execute("INSERT INTO viewer_meta (singleton, schema_version, committed_sequence) VALUES (1, 1, 1)")
+        connection.execute(
+            "INSERT INTO spans (trace_id, span_id, operation, kind, start_ns, end_ns, duration_ns, status, session_id, "
+            "root_session_id, service_version, scope_version, request_model, input_tokens) "
+            "VALUES (?, ?, 'chat', 1, 100, 200, 100, 'ok', ?, ?, 'v', 'v', 'qwen3:4b', 9)",
+            (TRACE, (1).to_bytes(8, "big"), ROOT, ROOT),
+        )
+        connection.execute(
+            "INSERT INTO span_events (trace_id, span_id, event_index, name, time_ns, retry_attempt) "
+            "VALUES (?, ?, 0, 'gen_ai.client.retry', 150, 1)", (TRACE, (1).to_bytes(8, "big")),
+        )
+        connection.execute(
+            "INSERT INTO traces (trace_id, first_ns, last_ns, root_span_id, root_session_id, status, span_count) "
+            "VALUES (?, 100, 200, ?, ?, 'ok', 1)", (TRACE, (1).to_bytes(8, "big"), ROOT),
+        )
+        connection.execute(
+            "INSERT INTO sessions (root_session_id, first_ns, last_ns, last_trace_id, last_span_id, span_count, model_count, "
+            "input_tokens) VALUES (?, 100, 200, ?, ?, 1, 1, 9)", (ROOT, TRACE, (1).to_bytes(8, "big")),
+        )
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_receiver_start_migrates_a_schema_1_database_and_keeps_its_rows(tmp_path):
+    directory = tmp_path / "telemetry"
+    directory.mkdir()
+    database = directory / "telemetry.sqlite3"
+    _schema_1_database(database)
+    with pytest.raises(reader.SchemaMismatch):  # serve refuses it and never migrates it
+        _trace(database, TRACE.hex())
+
+    app = create_app(directory, "f" * 32)  # receiver start migrates
+    with TestClient(app, base_url="http://127.0.0.1:4323") as client:
+        body = _body(_span(2, trace=TRACE, name="chat qwen3:4b", start=300, end=400,
+                           attributes={"gen_ai.request.model": "qwen3:4b", "zeta.retry.count": 1}))
+        assert client.post("/v1/traces", content=body, headers=PROTOBUF).status_code == 200
+
+    old, new = _trace(database, TRACE.hex())["spans"]
+    assert (old["request_model"], old["input_tokens"], old["retry_count"], old["ttft_ns"]) == ("qwen3:4b", 9, None, None)
+    assert [event["retry_attempt"] for event in old["events"]] == [1]
+    assert new["retry_count"] == 1
+    assert _sessions(database)["items"][0]["span_count"] == 2
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("SELECT schema_version, committed_sequence FROM viewer_meta").fetchone() == (2, 2)
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "body",
     [

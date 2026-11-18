@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import threading
 import time
@@ -192,6 +193,10 @@ async def test_trace_pages_spans_in_order_with_their_events(tmp_path: Path) -> N
         assert ordered == [(span).to_bytes(8, "big").hex() for span in (1, 2, 3, 4, 5)]
         last = pages[-1]["spans"][0]
         assert last["stream"] is True
+        # the served Span is exactly the documented frame: same keys, same order
+        document = (Path(__file__).parents[2] / "docs" / "serve-protocol.md").read_text()
+        example = json.loads(next(line for line in document.splitlines() if line.startswith('{"trace":{')))["spans"][0]
+        assert list(last) == list(example)
         assert last["events"] == [{"name": "gen_ai.client.retry", "time_ns": last["start_ns"], "retry_attempt": 1,
                                    "retry_reason": None, "retry_delay": None, "retry_after": False, "decision": None,
                                    "scope": None, "duration_ns": None}]
@@ -216,9 +221,11 @@ MISMATCH = {"code": -32000, "message": "telemetry schema is unsupported", "data"
 @pytest.mark.parametrize(("change", "status_error", "data_error"), [
     (None, None, OFF),  # no database file
     ("PRAGMA user_version = 0", MISMATCH, MISMATCH),
-    ("PRAGMA user_version = 2", MISMATCH, MISMATCH),
+    ("PRAGMA user_version = 1", MISMATCH, MISMATCH),  # schema 1: the receiver has not migrated it yet
+    ("PRAGMA user_version = 3", MISMATCH, MISMATCH),
     ("DROP TABLE viewer_meta", MISMATCH, MISMATCH),
-    ("UPDATE viewer_meta SET schema_version = 2", MISMATCH, MISMATCH),
+    ("UPDATE viewer_meta SET schema_version = 1", MISMATCH, MISMATCH),
+    ("UPDATE viewer_meta SET schema_version = 3", MISMATCH, MISMATCH),
 ])
 async def test_only_a_missing_database_is_off_and_every_bad_schema_is_refused(
     tmp_path: Path, change: str | None, status_error: dict | None, data_error: dict,
