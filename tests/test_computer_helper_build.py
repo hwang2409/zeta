@@ -72,6 +72,19 @@ def test_helper_builds_and_answers_hello() -> None:
     assert isinstance(reply["accessibility"], bool)
 
 
+def test_selftest_scroll_reads_unposted_axis_values() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["sh", str(BUILD_SCRIPT), tmp], check=True, capture_output=True, timeout=300
+        )
+        output = subprocess.check_output(
+            [str(Path(tmp) / "zeta-computer-helper"), "--selftest-scroll"],
+            text=True,
+            timeout=15,
+        )
+    assert output.strip() == "scroll self-test ok"
+
+
 def test_selftest_lifecycle_refuses_raced_capture_and_orders_shutdown() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         subprocess.run(
