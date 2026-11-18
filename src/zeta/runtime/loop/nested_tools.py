@@ -3,20 +3,60 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Final
 
 from ...agent.tool_results import validated_tool_result
 from ...core.abort import AbortSignal
 from ...core.tool_dispatch import execute_owned_tool
-from ...protocol.types import StreamEvent, StreamEventType, ToolCall, ToolResult
-from ...tools.code import CODE_MODE_ALLOWED_NAMES, authority_snapshot
+from ...protocol.types import (
+    StreamEvent,
+    StreamEventType,
+    ToolCall,
+    ToolResult,
+    ToolSchema,
+)
 from ...tools.registry import ToolOrigin
 from ..execution import NestedToolParent
 
 if TYPE_CHECKING:
+    from ...tools.registry import ToolDefinition, ToolRegistry
     from .agent import AgentLoop
+
+
+CODE_MODE_ALLOWED_NAMES: Final = frozenset({
+    "read", "write", "edit", "bash", "fetch", "websearch", "project",
+    "recall_history", "run_background", "task_output",
+})
+
+
+def authority_snapshot(registry: ToolRegistry, schemas: Sequence[ToolSchema]) -> Mapping[str, ToolDefinition]:
+    return MappingProxyType({
+        name: definition
+        for schema in schemas
+        if (definition := registry.definition_reference(name := schema["name"])) is not None
+        and definition.origin is ToolOrigin.PACKAGED_BUILTIN
+    })
+
+
+def describe_code(registry: ToolRegistry, schemas: Sequence[ToolSchema]) -> None:
+    code = next((schema for schema in schemas if schema["name"] == "code"), None)
+    definition = registry.definition_reference("code")
+    if code is None or definition is None or definition.origin is not ToolOrigin.PACKAGED_BUILTIN:
+        return
+    names = ", ".join(sorted(CODE_MODE_ALLOWED_NAMES.intersection(authority_snapshot(registry, schemas)))) or "none"
+    code["description"] = (
+        "Run JavaScript to combine results from several tools. Pass {script: string}. "
+        "Use await tools.call(name, args) or await tools[name](args). "
+        f"Available tools: {names}. "
+        "Only output(value), called once, sends JSON to the model. "
+        "Inner approvals still apply; catch ToolDenied or ToolError. "
+        "Use at most 50 sequential calls, 64 KiB of script and 60 seconds of active JavaScript. "
+        "No filesystem, network, clocks, timers or persistent state except through tools. "
+        "Use ordinary calls for one tool or shell commands that already return selective output."
+    )
 
 
 class LoopNestedToolExecutor:
@@ -29,7 +69,7 @@ class LoopNestedToolExecutor:
         self.environment = environment
         registry = loop.tool_registry
         self.authority = authority_snapshot(registry, loop._active_tool_schemas())
-        self.exposed_names = frozenset(self.authority)
+        self.exposed_names = CODE_MODE_ALLOWED_NAMES.intersection(self.authority)
         self._seen: set[str] = set()
         self._serial = asyncio.Lock()
 

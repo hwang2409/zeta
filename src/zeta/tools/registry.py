@@ -419,9 +419,10 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                     continue
                 schema = filtered
             schemas.append(schema)
-        from .code import describe_code
+        if "code" in self._tools:
+            from ..runtime.loop.nested_tools import describe_code
 
-        describe_code(self, schemas)
+            describe_code(self, schemas)
         return schemas
     @property
     def tool_schemas(self) -> list[ToolSchema]:
@@ -469,6 +470,19 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
 
         return frozenset(
             name for name in self._tools if self.tool_is_allowed_by_policy(name)
+        )
+
+    def _registration_origin(self) -> ToolOrigin:
+        frame = inspect.currentframe()
+        caller = None if frame is None else frame.f_back
+        del frame  # Do not keep a self-referencing frame alive with GC disabled.
+        caller = None if caller is None else caller.f_back
+        if caller is not None and caller.f_code is ToolRegistry.register_session_tool.__code__:
+            caller = caller.f_back
+        return (
+            ToolOrigin.PACKAGED_BUILTIN
+            if caller is not None and caller.f_code is self._discovery_register
+            else ToolOrigin.DYNAMIC
         )
 
     def register(
@@ -548,19 +562,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                     else f"bound approval action {name}({binding_actions[0]})"
                 )
                 raise ValueError(f"{capability} must accept execution_context")
-        frame = inspect.currentframe()
-        caller = None if frame is None else frame.f_back
-        del frame  # Do not keep a self-referencing frame alive with GC disabled.
-        if caller is not None and caller.f_code is ToolRegistry.register_session_tool.__code__:
-            caller = caller.f_back
-        origin = (
-            ToolOrigin.PACKAGED_BUILTIN
-            if caller is not None and caller.f_code is self._discovery_register
-            else ToolOrigin.DYNAMIC
-        )
         definition = ToolDefinition(
             name=name,
-            origin=origin,
+            origin=self._registration_origin(),
             description=description,
             parameters=normalized,
             handler=handler,

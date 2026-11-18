@@ -5,14 +5,20 @@ import inspect
 import io
 import json
 import sys
-from types import ModuleType
+from contextlib import asynccontextmanager
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
-from zeta.core.approval import ApprovalPolicy
+from zeta.core.approval import (
+    ApprovalDecision,
+    ApprovalPolicy,
+    ApprovalRequest,
+    ApprovalRule,
+)
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -25,11 +31,13 @@ from zeta.protocol.types import (
 )
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
+from zeta.runtime.execution import NestedToolParent
 from zeta.runtime.loop import nested_tools
 from zeta.runtime.loop.agent import AgentLoop
 from zeta.server.event_contract import tool_end
 from zeta.server.handlers.history_projection import _history_group, history_projection
 from zeta.skills import SkillCatalog
+from zeta.submission.pipeline import SubmissionPipeline
 from zeta.tools import ToolRegistry
 from zeta.tools import registry as registry_module
 from zeta.tools.agent.approval import ChildApprovalPolicy
@@ -302,3 +310,219 @@ async def test_unlisted_tool_has_no_authority(tmp_path, monkeypatch, packaged):
     assert result.content == json.dumps("tool 'slice_probe' is not exposed to code mode")
     assert not hits
     assert not [event for event in events if event.data.get("code_parent_id") == "outer"]
+
+
+@asynccontextmanager
+async def nested_owner(tmp_path, *, delegated=False):
+    policy = ApprovalPolicy()
+    store = ConversationStore(tmp_path / "session", session_id="table")
+    outer = ToolCall("outer", "code", {"script": "output(null)"})
+    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(outer)]))
+    tools_policy = ChildApprovalPolicy(policy, store, "proof", "code-child", child_cwd=tmp_path) if delegated else policy
+    skills = SkillCatalog.empty()
+    registry = ToolRegistry(tmp_path, session_store=store, skill_catalog=skills,
+                            approval_policy=tools_policy, code_mode_enabled=True)
+    loop = AgentLoop(FakeBackend([]), store, registry=registry, skill_catalog=skills, skip_mcp_mount=True)
+    try:
+        yield loop, policy, outer
+    finally:
+        await await_or_fail(loop.close(), what="close section-4 owner")
+        store.close()
+
+
+def assert_settled_once(store, call, decision, *, canceled=False):
+    entries = [store.entry(ref) for ref in store.branch_refs()]
+    decisions = [entry.data["decision"] for entry in entries
+                 if entry.type == "approval_resolution" and entry.data["request_id"] == call.id]
+    results = [result for entry in entries if entry.type == "message"
+               if (result := Message.from_dict(entry.data["message"]).tool_result) is not None
+               and result.tool_call_id == call.id]
+    assert decisions == [decision]
+    assert len(results) == 1 and results[0].is_canceled is canceled
+
+
+@pytest.mark.parametrize("mode", ["direct-always", "delegated-always", "parent-grant"])
+async def test_nested_grants(tmp_path, mode):
+    async with nested_owner(tmp_path, delegated=mode != "direct-always") as (loop, policy, outer):
+        ask = asyncio.Event()
+        events = []
+        messages = []
+        host = SimpleNamespace(loop=loop, _approval_policy=policy, _print_system=messages.append,
+                               _present_pending_approvals=lambda: None, _invalidate_prompt=lambda: None)
+        pipeline = SubmissionPipeline(host)
+        registry = loop.tool_registry
+
+        def publish(event):
+            events.append(event.type)
+            if event.type is StreamEventType.TOOL_APPROVAL_START:
+                ask.set()
+
+        if mode == "parent-grant":
+            policy.remember_allow(ApprovalRequest("prior", ToolCall("prior", "write", {"path": "other"})))
+        execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None)
+        call = ToolCall("outer:code:1", "write", {"path": "first", "content": "written"})
+        task = asyncio.create_task(execute(call, NestedToolParent(outer.id, 1)))
+        try:
+            if mode != "parent-grant":
+                await await_or_fail(ask.wait(), what="inner write approval")
+                await await_or_fail(pipeline.approval_command(ApprovalDecision.ALLOW, None, always=True),
+                                    what="resolve the /always command")
+                if mode == "delegated-always":
+                    assert policy.session_allow == frozenset()
+                    assert any("cannot always allow delegated approvals" in message for message in messages)
+                    assert loop.store.approval_state_now(call.id)[1] is None
+                    assert policy.approve(call.id, child_instance_id="code-child")
+            assert not (await await_or_fail(task, what="inner write settles")).is_error
+            assert (tmp_path / "first").read_text() == "written"
+            if mode == "parent-grant":
+                assert StreamEventType.TOOL_APPROVAL_START not in events
+                assert loop.store.approval_state_now(call.id) is None
+            else:
+                assert_settled_once(loop.store, call, "allow")
+            if mode == "direct-always":
+                assert policy.session_allow == {ApprovalRule("write")}
+                assert policy.decide(registry.resolve_call("read", {"path": "first"})) is ApprovalDecision.ASK
+                again = ToolCall("outer:code:2", "write", {"path": "second", "content": "written"})
+                assert not (await await_or_fail(execute(again, NestedToolParent(outer.id, 2)),
+                                                what="repeat write uses its inner grant")).is_error
+                assert events.count(StreamEventType.TOOL_APPROVAL_START) == 1
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await await_or_fail(task, what="drain inner grant task")
+            await await_or_fail(pipeline.close(), what="close grant command pipeline")
+
+
+@pytest.mark.parametrize("case", ["duplicate", "admission", "settlement"])
+async def test_nested_overlap(tmp_path, monkeypatch, case):
+    async with nested_owner(tmp_path) as (loop, policy, outer):
+        registry = loop.tool_registry
+        first_ask, second_entered = asyncio.Event(), asyncio.Event()
+        settling, release = asyncio.Event(), asyncio.Event()
+        in_handler, release_handler = asyncio.Event(), asyncio.Event()
+        entered = []
+        events = []
+        original_abort = registry.abort_approval
+
+        async def pause_settlement(call):
+            settling.set()
+            await await_or_fail(release.wait(), what="allow durable settlement to continue")
+            return await original_abort(call)
+
+        if case == "settlement":
+            # test-contract: seam hold settlement at the real registry's durable abort boundary.
+            monkeypatch.setattr(registry, "abort_approval", pause_settlement)
+
+        async def hook(name, arguments):
+            entered.append((name, arguments["path"]))
+            if case == "duplicate":
+                in_handler.set()
+                await await_or_fail(release_handler.wait(), what="let admitted call finish")
+            return True
+
+        def publish(event):
+            events.append((event.type, event.tool_call.id))
+            if event.type is StreamEventType.TOOL_APPROVAL_START:
+                first_ask.set()
+
+        registry.set_pre_execute_hook(hook)
+        execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None)
+        first = ToolCall("outer:code:1", "write", {"path": "first", "content": "written"})
+        second = ToolCall("outer:code:2", "write", {"path": "second", "content": "written"})
+
+        async def queued():
+            second_entered.set()
+            return await execute(second, NestedToolParent(outer.id, 2))
+
+        task = asyncio.create_task(execute(first, NestedToolParent(outer.id, 1)))
+        waiting = None
+        duplicate = None
+        try:
+            await await_or_fail(first_ask.wait(), what="first call holds admission through its approval")
+            waiting = asyncio.create_task(queued())
+            await await_or_fail(second_entered.wait(), what="second call reaches admission lock")
+            if case == "duplicate":
+                duplicate = asyncio.create_task(execute(second, NestedToolParent(outer.id, 2)))
+                assert (await await_or_fail(duplicate, what="reject duplicate of queued call")).content == "duplicate_tool_call"
+                assert (await await_or_fail(execute(first, NestedToolParent(outer.id, 1)),
+                                            what="reject duplicate while approval holds admission")).content == "duplicate_tool_call"
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(waiting, what="drain canceled admission waiter")
+            assert loop.store.approval_state_now(second.id) is None
+            assert not any(call_id == second.id for _, call_id in events)
+            assert not (tmp_path / "second").exists()
+            if case == "settlement":
+                task.cancel()
+                await await_or_fail(settling.wait(), what="canceled admitted call reaches settlement")
+                task.cancel()
+                # Ready callbacks run in order: give the second cancellation its turn before releasing settlement.
+                delivered = asyncio.Event()
+                asyncio.get_running_loop().call_soon(delivered.set)
+                await await_or_fail(delivered.wait(), what="deliver cancellation while settlement is held")
+                release.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await await_or_fail(task, what="wait for shielded settlement before cancellation returns")
+                assert_settled_once(loop.store, first, "abort", canceled=True)
+                assert entered == []
+                return
+            assert policy.approve(first.id)
+            if case == "duplicate":
+                await await_or_fail(in_handler.wait(), what="call is running after approval")
+                assert (await await_or_fail(execute(first, NestedToolParent(outer.id, 1)),
+                                            what="reject duplicate during execution")).content == "duplicate_tool_call"
+                release_handler.set()
+            assert not (await await_or_fail(task, what="first call completes after admission test")).is_error
+            if case == "duplicate":
+                assert (await await_or_fail(execute(first, NestedToolParent(outer.id, 1)),
+                                            what="reject duplicate of completed call")).content == "duplicate_tool_call"
+            assert entered == [("write", "first")]
+            assert events.count((StreamEventType.TOOL_EXECUTION_START, first.id)) == 1
+            assert_settled_once(loop.store, first, "allow")
+        finally:
+            release.set()
+            release_handler.set()
+            for pending in (task, waiting, duplicate):
+                if pending is not None and not pending.done():
+                    pending.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await await_or_fail(pending, what="drain overlap task")
+
+
+@pytest.mark.parametrize("failure", [
+    StreamEventType.TOOL_APPROVAL_START, StreamEventType.TOOL_APPROVAL_END,
+    StreamEventType.TOOL_EXECUTION_START, StreamEventType.TOOL_EXECUTION_UPDATE,
+    StreamEventType.TOOL_EXECUTION_END,
+])
+async def test_nested_publication_failure(tmp_path, failure):
+    async with nested_owner(tmp_path) as (loop, policy, outer):
+        registry = loop.tool_registry
+        call = ToolCall("outer:code:1", "bash", {"command": "printf x >> receipt; printf progress", "cwd": str(tmp_path)})
+        asked = asyncio.Event()
+        events = []
+
+        def publish(event):
+            events.append(event.type)
+            if event.type is StreamEventType.TOOL_APPROVAL_START:
+                asked.set()
+            if event.type is failure:
+                raise RuntimeError(f"{failure.value} failed")
+            if event.type is StreamEventType.TOOL_EXECUTION_END:
+                raise RuntimeError("later failure must not replace the first")
+
+        execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None)
+        task = asyncio.create_task(execute(call, NestedToolParent(outer.id, 1)))
+        try:
+            await await_or_fail(asked.wait(), what="approval was published before the injected error")
+            assert policy.approve(call.id)
+            result = await await_or_fail(task, what="settle the call after publication failure")
+            assert_settled_once(loop.store, call, "allow")
+            assert (tmp_path / "receipt").read_text() == "x"
+            assert events.count(StreamEventType.TOOL_EXECUTION_END) == 1
+            assert result.is_error and result.content == f"tool lifecycle publication failed: {failure.value} failed"
+        finally:
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await await_or_fail(task, what="drain publication-fault call")

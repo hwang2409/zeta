@@ -53,6 +53,10 @@ class ApprovalPipelineMixin:
         )
         if message.decision is ApprovalDecision.ALLOW:
             if message.always:
+                if request.child_instance_id is not None:
+                    self._host._print_system("approval · cannot always allow delegated approvals")
+                    self._ack_action(message)
+                    return
                 try:
                     rule = policy.remember_allow(request)
                 except ValueError as exc:

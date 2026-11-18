@@ -1,57 +1,18 @@
-"""The code tool and its fixed registry authority."""
+"""The code tool and its guest result bridge."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
-from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
 
-from ...protocol.types import ToolCall, ToolResult, ToolSchema
+from ...protocol.types import ToolCall, ToolResult
 from ...runtime.execution import NestedToolParent, ToolExecutionContext
 from .._results import text_block
 from ._guest import FRAME, GuestError, run_guest
 
 if TYPE_CHECKING:
-    from ..registry import ToolDefinition, ToolRegistry
-
-CODE_MODE_ALLOWED_NAMES: Final = frozenset({
-    "read", "write", "edit", "bash", "fetch", "websearch", "project",
-    "recall_history", "run_background", "task_output",
-})
-
-
-def authority_snapshot(registry: ToolRegistry, schemas: Sequence[ToolSchema]) -> Mapping[str, ToolDefinition]:
-    from ..registry import ToolOrigin
-
-    return MappingProxyType({
-        name: definition
-        for schema in schemas
-        if (name := schema["name"]) in CODE_MODE_ALLOWED_NAMES
-        and (definition := registry.definition_reference(name)) is not None
-        and definition.origin is ToolOrigin.PACKAGED_BUILTIN
-    })
-
-
-def describe_code(registry: ToolRegistry, schemas: Sequence[ToolSchema]) -> None:
-    from ..registry import ToolOrigin
-
-    code = next((schema for schema in schemas if schema["name"] == "code"), None)
-    definition = registry.definition_reference("code")
-    if code is None or definition is None or definition.origin is not ToolOrigin.PACKAGED_BUILTIN:
-        return
-    names = ", ".join(sorted(authority_snapshot(registry, schemas))) or "none"
-    code["description"] = (
-        "Run JavaScript to combine results from several tools. Pass {script: string}. "
-        "Use await tools.call(name, args) or await tools[name](args). "
-        f"Available tools: {names}. "
-        "Only output(value), called once, sends JSON to the model. "
-        "Inner approvals still apply; catch ToolDenied or ToolError. "
-        "Use at most 50 sequential calls, 64 KiB of script and 60 seconds of active JavaScript. "
-        "No filesystem, network, clocks, timers or persistent state except through tools. "
-        "Use ordinary calls for one tool or shell commands that already return selective output."
-    )
+    from ..registry import ToolRegistry
 
 
 def _bounded_output(data: bytes) -> str:
