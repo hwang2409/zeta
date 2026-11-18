@@ -370,7 +370,7 @@ def _series(split: tuple[int, int, int, int], group: str, size: int | None) -> t
   SELECT key, bucket, 'trace' AS kind, trace_id AS id FROM raw
   UNION SELECT key, bucket, 'session', CAST(sid AS BLOB) FROM raw WHERE sid IS NOT NULL
   UNION SELECT group_key, {hour_bucket}, identity_kind, identity_key FROM hourly_distinct
-    WHERE group_by = ? AND hour_ns >= ? AND hour_ns < ?
+    WHERE +group_by = ? AND hour_ns >= ? AND hour_ns < ?  -- unary +: seek the hour range on the primary key
 ), counted AS (
   SELECT key, bucket, SUM(kind = 'session') AS sessions, SUM(kind = 'trace') AS traces FROM ids GROUP BY key, bucket
 ), series AS (
