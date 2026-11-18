@@ -34,6 +34,16 @@ def test_cursor_position_uses_nearest_integer_rule() -> None:
     assert 'Int(loc.y.rounded())' in source
 
 
+def test_native_scroll_keeps_quartz_line_wheel_signs() -> None:
+    from zeta.tools.computer import _SCROLL_UNIT
+
+    assert _SCROLL_UNIT == {"up": (0, 1), "down": (0, -1), "left": (1, 0), "right": (-1, 0)}
+    source = HELPER_SOURCE.read_text()
+    assert "units: .line" in source
+    assert "wheel1: Int32(dy)" in source
+    assert "wheel2: Int32(dx)" in source
+
+
 def test_indicator_lifecycle_and_interruptible_steps_are_present() -> None:
     source = HELPER_SOURCE.read_text()
     assert 'NSStatusBar.system.statusItem' in source
@@ -60,6 +70,24 @@ def test_helper_builds_and_answers_hello() -> None:
     assert reply["version"] == "0.1.0"
     assert isinstance(reply["screen_recording"], bool)
     assert isinstance(reply["accessibility"], bool)
+
+
+def test_selftest_lifecycle_refuses_raced_capture_and_orders_shutdown() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        subprocess.run(
+            ["sh", str(BUILD_SCRIPT), tmp], check=True, capture_output=True, timeout=300
+        )
+        output = subprocess.check_output(
+            [str(Path(tmp) / "zeta-computer-helper"), "--selftest-lifecycle"],
+            text=True,
+            timeout=15,
+        )
+    result = json.loads(output)
+    assert result["capture"] == "refused"
+    assert result["safety_calls"] == 2
+    assert result["events"][-2:] == ["mouse_up", "key_up"]
+    assert result["events"].count("mouse_up") == 1
+    assert result["events"].count("key_up") == 1
 
 
 def test_selftest_kill_interrupts_steps_and_releases_drag() -> None:

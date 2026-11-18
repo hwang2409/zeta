@@ -65,7 +65,7 @@ _ACTION_CASES = [
     ({"action": "left_mouse_up", "coordinate": [2, 3]}, [("state",), ("mouse_up", 2, 3, "left"), ("state",), ("screenshot", None)]),
     ({"action": "type", "text": "hi"}, [("state",), ("type_text", "hi"), ("state",), ("screenshot", None)]),
     ({"action": "key", "text": "cmd+s"}, [("state",), ("key", "cmd+s"), ("state",), ("screenshot", None)]),
-    ({"action": "scroll", "coordinate": [1, 1], "scroll_direction": "down", "scroll_amount": 3}, [("state",), ("scroll", 1, 1, 0, 3), ("state",), ("screenshot", None)]),
+    ({"action": "scroll", "coordinate": [1, 1], "scroll_direction": "down", "scroll_amount": 3}, [("state",), ("scroll", 1, 1, 0, -3), ("state",), ("screenshot", None)]),
     ({"action": "cursor_position"}, [("state",), ("cursor_position",)]),
     ({"action": "wait"}, [("state",), ("state",), ("screenshot", None)]),
 ]
@@ -123,7 +123,7 @@ async def test_computer_action_acceptance_table(tmp_path: Path, monkeypatch: pyt
         ("backend_error", {"action": "left_click", "coordinate": [1, 2]}, "com.example.app", "idle", True, [("state",), ("click", 1, 2, "left", 1)], "input failed"),
         ("focus_change", {"action": "left_click", "coordinate": [1, 2]}, "com.denied.app", "denied", False, [("state",), ("click", 1, 2, "left", 1), ("state",)], "screenshot failed"),
         ("capture_failure", {"action": "left_click", "coordinate": [1, 2]}, "com.changed.app", "idle", False, [("state",), ("click", 1, 2, "left", 1), ("state",), ("screenshot", None)], "done; screenshot failed"),
-        ("malformed_args", {"action": "left_click"}, "com.example.app", "idle", True, [("state",)], "coordinate"),
+        ("optional_coordinate", {"action": "left_click"}, "com.example.app", "idle", False, [("state",), ("cursor_position",), ("click", 0, 0, "left", 1), ("state",), ("screenshot", None)], "screenshot"),
     ],
 )
 async def test_computer_exit_acceptance_table(tmp_path: Path, case: str, arguments: dict, frontmost: str | None, control: str, is_error: bool, expected_actions: list[tuple], message: str) -> None:
@@ -162,7 +162,7 @@ async def test_computer_exit_acceptance_table(tmp_path: Path, case: str, argumen
         "control": control,
         "kill_switch": "ctrl+opt+cmd+esc",
         "frontmost_bundle_id": frontmost,
-        "has_screenshot": False,
+        "has_screenshot": bool(expected_actions) and case != "capture_failure" and expected_actions[-1][0] == "screenshot",
     }
     actual_actions = [] if backend is None else backend.actions
     assert actual_actions == expected_actions
@@ -288,6 +288,28 @@ async def test_schema_actions_have_one_reachable_handler(tmp_path: Path) -> None
 
 def _tool_names(registry: ToolRegistry) -> set[str]:
     return {schema["name"] for schema in registry.schemas}
+
+
+@pytest.mark.asyncio
+async def test_native_action_semantics_are_bounded_and_ordered(tmp_path: Path) -> None:
+    backend = FakeBackend(cursor=(8, 9))
+    async with _computer_registry(tmp_path, backend=backend) as registry:
+        registry.computer_geometry = ScreenGeometry(100, 100, 100, 100, 1, 0, 0)
+        repeat = await registry.execute(ToolCall("k", "computer", {
+            "action": "key", "text": "a", "repeat": 2, "hold": True,
+        }))
+        drag = await registry.execute(ToolCall("d", "computer", {
+            "action": "left_click_drag", "path": [[1, 2], [3, 4], [5, 6]],
+        }))
+        wait = await registry.execute(ToolCall("w", "computer", {
+            "action": "wait", "duration": 11,
+        }))
+    assert repeat["isError"] is False
+    assert drag["isError"] is False
+    assert wait["isError"] is True
+    assert ("key", "a", 2, True, False) in backend.actions
+    assert ("drag", [(1, 2), (3, 4), (5, 6)]) in backend.actions
+    assert "duration" in wait["content"][0]["text"]
 
 
 @pytest.mark.asyncio

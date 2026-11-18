@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from ...config.settings import ComputerUseConfig
-from .backend import Button, ComputerError, ScreenFrame, ScreenState
+from .backend import Button, ComputerError, Modifiers, ScreenFrame, ScreenState
 from .helper_client import HelperClient, HelperError, HelperProtocolError, HelperTimeout
 
 # default build output of scripts/build-computer-helper.sh, used when the env var is unset.
@@ -58,6 +58,7 @@ class MacBackend:
         self._client = HelperClient(argv)
         self._started = False
         self._start_lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task[None] | None = None
 
     async def _call(self, op: str, **args: object) -> dict:
         if not self._started:
@@ -67,10 +68,37 @@ class MacBackend:
                     self._started = True
         try:
             return await asyncio.to_thread(self._client.request, op, **args)
+        except asyncio.CancelledError:
+            cleanup = self._cleanup_task
+            if cleanup is None or cleanup.done():
+                cleanup = asyncio.create_task(self._cleanup())
+                self._cleanup_task = cleanup
+            # Cleanup is owned by one task. Repeated cancellation may interrupt
+            # the wait, but never the cancel/close/reset sequence itself.
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            await cleanup
+            raise
         except HelperError as exc:
             raise ComputerError(exc.code, exc.message) from exc
         except (HelperTimeout, HelperProtocolError) as exc:
             raise ComputerError("internal", str(exc)) from exc
+
+    async def _cleanup(self) -> None:
+        try:
+            try:
+                await asyncio.to_thread(self._client.cancel)
+            except (OSError, RuntimeError, HelperError, HelperTimeout, HelperProtocolError) as exc:
+                _ = exc
+            try:
+                await asyncio.to_thread(self._client.close)
+            except (OSError, RuntimeError) as exc:
+                _ = exc
+        finally:
+            self._started = False
 
     async def screenshot(self, display: int | None = None) -> ScreenFrame:
         args = {} if display is None else {"display": display}
@@ -88,8 +116,11 @@ class MacBackend:
     async def move(self, x: int, y: int) -> None:
         await self._call("move", x=x, y=y)
 
-    async def click(self, x: int, y: int, button: Button, count: int) -> None:
-        await self._call("click", x=x, y=y, button=button, count=count)
+    async def click(self, x: int | None, y: int | None, button: Button, count: int, modifiers: Modifiers = ()) -> None:
+        args: dict[str, object] = {"button": button, "count": count, "modifiers": list(modifiers)}
+        if x is not None and y is not None:
+            args.update(x=x, y=y)
+        await self._call("click", **args)
 
     async def mouse_down(self, x: int, y: int, button: Button) -> None:
         await self._call("mouse_down", x=x, y=y, button=button)
@@ -103,11 +134,14 @@ class MacBackend:
     async def type_text(self, text: str) -> None:
         await self._call("type", text=text)
 
-    async def key(self, combo: str) -> None:
-        await self._call("key", combo=combo)
+    async def key(self, combo: str, repeat: int = 1, hold: bool = False, release: bool = False) -> None:
+        await self._call("key", combo=combo, repeat=repeat, hold=hold, release=release)
 
-    async def scroll(self, x: int, y: int, dx: int, dy: int) -> None:
-        await self._call("scroll", x=x, y=y, dx=dx, dy=dy)
+    async def scroll(self, x: int | None, y: int | None, dx: int, dy: int, modifiers: Modifiers = ()) -> None:
+        args: dict[str, object] = {"dx": dx, "dy": dy, "modifiers": list(modifiers)}
+        if x is not None and y is not None:
+            args.update(x=x, y=y)
+        await self._call("scroll", **args)
 
     async def cursor_position(self) -> tuple[int, int]:
         reply = await self._call("cursor_position")
