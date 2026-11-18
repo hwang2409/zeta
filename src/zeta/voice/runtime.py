@@ -102,6 +102,9 @@ class VoiceRuntime:
         if self._state is VoiceState.CLOSED:
             return
         self._generation += 1
+        if self._state is VoiceState.IDLE and self._directory is None:
+            self._set_state(VoiceState.CLOSED)  # never used: close without yielding to the loop
+            return
         self._cleanup = asyncio.create_task(self._discard(VoiceState.CLOSED))
         await _finish(self._cleanup)
 
