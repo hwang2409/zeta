@@ -51,7 +51,7 @@ def download_model(path: Path, stop: threading.Event, url: str = MODEL_URL) -> N
     temporary = path.with_name(f".{path.name}.{os.urandom(6).hex()}.partial")
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with urllib.request.urlopen(url, timeout=30) as response, os.fdopen(fd, "wb") as output:
+        with os.fdopen(fd, "wb") as output, urllib.request.urlopen(url, timeout=30) as response:
             total = 0
             while chunk := response.read(1024 * 1024):
                 if stop.is_set():

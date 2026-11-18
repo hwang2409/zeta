@@ -26,9 +26,14 @@ class VoiceInputMixin:
 
     _active_session: Any
 
-    def _init_voice(self, zeta_home: Path) -> None:
+    def _init_voice(self, zeta_home: Path, voice_engine: str, voice_model: str) -> None:
         app = weakref.proxy(self)  # no cycle: a closed TUI must be freed without gc
-        self._voice = VoiceRuntime(zeta_home=zeta_home, progress=lambda state: app._voice_progress(state))
+        self._voice = VoiceRuntime(
+            zeta_home=zeta_home,
+            voice_engine=voice_engine,
+            voice_model=voice_model,
+            progress=lambda state: app._voice_progress(state),
+        )
         self._voice_tasks: set[asyncio.Task[None]] = set()
         self._voice_error: str | None = None
         self._voice_started_at = 0.0

@@ -218,6 +218,8 @@ class TUIApp(
         observer_host: Any | None = None,
         telemetry: Telemetry | None = None,
         otel_endpoint: str | None = None,
+        voice_engine: str = "whisper.cpp",
+        voice_model: str = "small.en",
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
@@ -330,7 +332,7 @@ class TUIApp(
         self._account_switch_finished = asyncio.Event()
         self._account_switch_finished.set()
         self._zeta_home = Path(zeta_home).resolve() if zeta_home is not None else None
-        self._init_voice(self._zeta_home or env_home())
+        self._init_voice(self._zeta_home or env_home(), voice_engine, voice_model)
         if project_dir is None:
             discovery = discover_project(self.loop.store.cwd)
             repo_root = discovery.primary_root or discovery.cwd
