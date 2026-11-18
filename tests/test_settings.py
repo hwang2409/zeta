@@ -95,6 +95,22 @@ def test_project_retention_days_is_ignored_with_warning(tmp_path: Path) -> None:
     assert any("retention" in warning for warning in loaded.warnings)
 
 
+def test_project_voice_is_ignored_with_warning(tmp_path: Path) -> None:
+    _write(tmp_path / "project", '[voice]\nmodel = "evil.bin"\n')
+    loaded = load_settings(home=tmp_path / "home", project_dir=tmp_path / "project")
+    assert loaded.settings.voice_model == "small.en"
+    assert any("ignoring voice" in warning for warning in loaded.warnings)
+
+
+@pytest.mark.parametrize(
+    "body", ["voice = 1", "[voice]\nengine = 3", '[voice]\nmodel = "tiny"', '[voice]\nspeed = "fast"']
+)
+def test_global_voice_rejects_wrong_types_and_values(tmp_path: Path, body: str) -> None:
+    _write(tmp_path / "home", body + "\n")
+    with pytest.raises(SettingsError, match="voice"):
+        load_settings(home=tmp_path / "home")
+
+
 def test_project_settings_can_only_lower_limits(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
