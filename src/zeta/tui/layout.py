@@ -507,6 +507,8 @@ def status_toolbar(app: Any, terminal_width: int | None = None) -> list[tuple[st
         if app.restart_pending:
             text = "restart pending · " + text
         return [("class:status-bar", text.ljust(width)[:width])]
+    if voice := app.voice_status():
+        return [("class:status-bar", voice.ljust(width)[:width])]
     usage = dict(app._usage)
     usage.setdefault(
         "cache_read_input_tokens",
