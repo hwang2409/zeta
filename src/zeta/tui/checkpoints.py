@@ -910,7 +910,9 @@ def render_replayed_message(
         )
         result = message.tool_result
         projection = code_projection(result.structured_content)
-        if event.tool_call is not None and event.tool_call.name == "code" and projection:
+        replay = getattr(presenter, "replay_tool_result", None)
+        is_code = event.tool_call is not None and event.tool_call.name == "code"
+        if is_code and projection:
             summaries = projection.get("calls")
             for summary in summaries if isinstance(summaries, list) else ():
                 if not isinstance(summary, dict):
@@ -928,17 +930,16 @@ def render_replayed_message(
                                            is_canceled=summary.get("state") == "canceled"),
                     data=data,
                 )
-                replay_inner = getattr(presenter, "replay_tool_result", None)
-                if replay_tool_results and callable(replay_inner):
-                    replay_inner(inner)
+                if callable(replay):
+                    replay(inner)
                 else:
                     print_unit(render_event(inner))
         if event.tool_call is not None:
             parent, _, _ = result.tool_call_id.rpartition(":code:")
             if parent in tool_calls and tool_calls[parent].name == "code":
                 event = replace(event, data=nested_call_data(result.tool_call_id, parent))
-        replay = getattr(presenter, "replay_tool_result", None)
-        if replay_tool_results and callable(replay):
+        # Code cells need disclosure controls even in normal history replay.
+        if callable(replay) and (replay_tool_results or is_code or event.data.get("code_parent_id")):
             replay(event)
         else:
             print_unit(render_event(event))
