@@ -25,6 +25,7 @@ RAW_DAYS = 14
 ROLLUP_DAYS = 90
 MAX_BYTES = 1 << 30
 PRUNE_CHUNK = 1_000
+VACUUM_MAX_BYTES = 64 << 20  # the one-time VACUUM of a larger pre-v3 file could outlast the auto-start deadline
 INGEST_QUEUE_CAPACITY = 64
 GRACEFUL_COMMIT_TIMEOUT_SECONDS = 5.0
 BUSY_TIMEOUT_MS = 5_000
@@ -399,6 +400,10 @@ def _upsert_series(connection: sqlite3.Connection, row: dict[str, Any], hour: in
     model = row["operation"] == "chat" and (row.get("response_model") or row.get("request_model")) is not None
     tool = row["operation"] == "execute_tool" and row.get("tool_name") is not None
     connection.execute("""INSERT INTO hourly_series VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hour_ns,group_by,group_key) DO UPDATE SET spans=spans+1,errors=errors+excluded.errors,model_calls=model_calls+excluded.model_calls,tool_calls=tool_calls+excluded.tool_calls,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,total_tokens=total_tokens+excluded.total_tokens,duration_ns=duration_ns+excluded.duration_ns""", (hour, group, key, 1, int(row["status"] == "error"), int(model), int(tool), row.get("input_tokens") or 0 if model else 0, row.get("output_tokens") or 0 if model else 0, row.get("total_tokens") or 0 if model else 0, row["duration_ns"]))
+    _insert_distinct(connection, row, hour, group, key)
+
+
+def _insert_distinct(connection: sqlite3.Connection, row: dict[str, Any], hour: int, group: str, key: str) -> None:
     for kind, identity in (("trace", row["trace_id"]), ("session", row.get("root_session_id") or row.get("session_id"))):
         if identity is not None:
             connection.execute("INSERT OR IGNORE INTO hourly_distinct VALUES(?,?,?,?,?)", (hour, group, key, kind, identity.encode() if isinstance(identity, str) else identity))
@@ -432,7 +437,7 @@ def open_database(path: Path) -> None:
     try:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if not 0 <= version <= SCHEMA_VERSION: raise RuntimeError(f"telemetry database schema {version} is not supported (expected {SCHEMA_VERSION})")
-        _enable_incremental_vacuum(connection)
+        _enable_incremental_vacuum(connection, path)
         if version == SCHEMA_VERSION: return
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("BEGIN IMMEDIATE")
@@ -451,9 +456,12 @@ def open_database(path: Path) -> None:
     finally: connection.close()
 
 
-def _enable_incremental_vacuum(connection: sqlite3.Connection) -> None:
+def _enable_incremental_vacuum(connection: sqlite3.Connection, path: Path) -> None:
     """Size reclaim needs ``auto_vacuum=INCREMENTAL``; an existing file only changes mode through ``VACUUM``."""
     if connection.execute("PRAGMA auto_vacuum").fetchone()[0] == 2: return
+    if path.stat().st_size > VACUUM_MAX_BYTES:  # keep auto_vacuum=0; the size stall rule and page reuse still bound it
+        print("zeta otel receiver: database is too large to enable incremental vacuum; size reclaim is limited", file=sys.stderr)
+        return
     connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
     try: connection.execute("VACUUM")
     except sqlite3.OperationalError:  # disk full: keep auto_vacuum=0; the size stall rule still keeps the rows
@@ -510,6 +518,9 @@ class Writer:
         self._ready = threading.Event(); self._startup_error: BaseException | None = None
         self._stalled_bytes: int | None = None  # in memory only: a restart may try one size victim again
         self._sweep = dict(_SWEEP_START)
+        # a projection is swept once its cursor ends a pass that began at the start after the last deletion and found no orphan
+        self._clean_pass = dict.fromkeys(_SWEEP_KEY, True)
+        self._swept: set[str] = set()
         self.committed_sequence = 0
 
     def start(self) -> None:
@@ -592,47 +603,67 @@ class Writer:
         except BaseException: c.rollback(); raise
         return len(victims)
 
-    def _sweep_orphans(self) -> int:
-        """Delete leftover orphans, examining at most ``PRUNE_CHUNK`` keys of each projection from a cursor."""
-        c = self._connection; changes = c.total_changes; c.execute("BEGIN IMMEDIATE")
+    def _sweep_orphans(self) -> tuple[int, int]:
+        """Delete leftover orphans, examining at most ``PRUNE_CHUNK`` keys of each projection from a cursor.
+
+        Returns the keys examined and the orphans deleted, and records each projection whose cursor ended a clean pass.
+        """
+        c = self._connection; changes = c.total_changes; examined = 0; wrapped = []; c.execute("BEGIN IMMEDIATE")
         try:
             for table, key in _SWEEP_KEY.items():
                 keys = c.execute(f"SELECT {key} FROM {table} WHERE {key} > ? ORDER BY {key} LIMIT ?", (self._sweep[table], PRUNE_CHUNK)).fetchall()
-                c.executemany(_ORPHAN_DELETE[table], keys)
-                self._sweep[table] = keys[-1][0] if len(keys) == PRUNE_CHUNK else _SWEEP_START[table]
+                c.executemany(_ORPHAN_DELETE[table], keys); examined += len(keys)
+                if len(keys) == PRUNE_CHUNK: self._sweep[table] = keys[-1][0]
+                else: self._sweep[table] = _SWEEP_START[table]; wrapped.append(table)
             c.commit()
         except BaseException: c.rollback(); raise
-        return c.total_changes - changes
+        deleted = c.total_changes - changes
+        if not deleted: self._swept.update(table for table in wrapped if self._clean_pass[table])
+        self._clean_pass.update(dict.fromkeys(wrapped, True))
+        return examined, deleted
+
+    def _forget_sweeps(self) -> None:
+        """After any deletion, only a pass that starts after it can prove there are no orphans."""
+        self._swept.clear()
+        self._clean_pass = {table: self._sweep[table] == _SWEEP_START[table] for table in _SWEEP_KEY}
+
+    def _age_step(self, now_ns: int) -> tuple[str | None, int]:
+        """Delete one chunk from the oldest family with rows past its age."""
+        fingerprint_cutoff = now_ns - ROLLUP_DAYS * DAY_NS
+        cutoffs = {"raw": now_ns - RAW_DAYS * DAY_NS, "fingerprints": fingerprint_cutoff, "rollups": fingerprint_cutoff // HOUR_NS * HOUR_NS}
+        for family, table, column, order in _RETENTION_ORDER:
+            if rows := self._delete_chunk(table, f"{column} < ?", (cutoffs[family],), order):
+                return family, rows
+        return None, 0
+
+    def _size_step(self, measured: int) -> tuple[str | None, int, int, bool]:
+        """Over the cap, delete one oldest chunk and stall if it did not reduce the measured bytes."""
+        if measured <= MAX_BYTES:
+            self._stalled_bytes = None; return None, 0, measured, False
+        if self._stalled_bytes is not None and measured <= self._stalled_bytes:
+            return None, 0, measured, True
+        family, rows = None, 0
+        for family, table, _column, order in _RETENTION_ORDER:
+            if rows := self._delete_chunk(table, "1", (), order): break
+        after = self._reclaim()
+        stalled = not rows or after >= measured
+        self._stalled_bytes = after if stalled else None
+        return family if rows else None, rows, after, stalled
 
     def maintenance_step(self, now_ns: int) -> dict[str, Any]:
         """One bounded retention step; the only code that deletes for age or size. It never loops.
 
         It deletes one age chunk from the oldest expired family, sweeps one chunk of orphans, then, over the cap,
         deletes one size chunk and stalls if that did not reduce db+WAL+SHM bytes. A stalled writer deletes
-        no further size victim until the measured size grows past the stalled size.
+        no further size victim until the measured size grows past the stalled size. It is caught up once no age
+        row is due, it is under the cap, and both projections had a clean sweep pass since the last deletion.
         """
         before = _database_bytes(self._path)
-        raw_cutoff = now_ns - RAW_DAYS * DAY_NS; fingerprint_cutoff = now_ns - ROLLUP_DAYS * DAY_NS
-        cutoffs = {"raw": raw_cutoff, "fingerprints": fingerprint_cutoff, "rollups": fingerprint_cutoff // HOUR_NS * HOUR_NS}
-        age_family, age_rows = None, 0
-        for family, table, column, order in _RETENTION_ORDER:
-            if age_rows := self._delete_chunk(table, f"{column} < ?", (cutoffs[family],), order):
-                age_family = family; break
-        orphans = self._sweep_orphans()
-        measured = after = self._reclaim()
-        size_family, size_rows, stalled = None, 0, False
-        if measured <= MAX_BYTES:
-            self._stalled_bytes = None
-        elif self._stalled_bytes is not None and measured <= self._stalled_bytes:
-            stalled = True
-        else:
-            for family, table, _column, order in _RETENTION_ORDER:
-                if size_rows := self._delete_chunk(table, "1", (), order):
-                    size_family = family; break
-            after = self._reclaim()
-            stalled = not size_rows or after >= measured
-            self._stalled_bytes = after if stalled else None
+        age_family, age_rows = self._age_step(now_ns)
+        swept_keys, orphans = self._sweep_orphans()
+        size_family, size_rows, after, stalled = self._size_step(self._reclaim())
+        if age_rows or orphans or size_rows: self._forget_sweeps()
         over = after > MAX_BYTES
         return {"age_family": age_family, "age_rows": age_rows, "size_family": size_family, "size_rows": size_rows,
-                "bytes_before": before, "bytes_after": after, "caught_up": age_family is None and not orphans and not over,
-                "over_cap": over, "stalled": stalled}
+                "swept_keys": swept_keys, "bytes_before": before, "bytes_after": after,
+                "caught_up": age_family is None and self._swept == set(_SWEEP_KEY) and not over, "over_cap": over, "stalled": stalled}

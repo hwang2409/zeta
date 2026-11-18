@@ -109,6 +109,8 @@ class Case:
     start_at_now: bool = False  # startup catch-up runs at NOW instead of clock 0
     chunk: int = store.PRUNE_CHUNK
     orphans: int = 0  # traces and sessions without spans, inserted after startup
+    early_orphans: int = 0  # the same, inserted before startup
+    vacuum_max: int | None = None  # ``VACUUM_MAX_BYTES`` for the migration
     cap: Callable[[Path], int] | None = None
     steps: int = 0
     late: tuple[dict, ...] = ()  # spans submitted again after the steps
@@ -135,6 +137,8 @@ CASES = (
          cap=_measured_minus_one, steps=1, expect={"spans": 200}, result={"size_rows": 200, "stalled": False}),
     Case("orphan sweep is bounded by the chunk", orphans=3, chunk=1, steps=1, expect={"traces": 2, "sessions": 2}),
     Case("orphan sweep completes over steps", orphans=3, chunk=1, steps=3, expect={"traces": 0, "sessions": 0}),
+    Case("a clean key before an orphan does not end startup catch-up", seed=(span(1, NOW - DAY, session=A),), early_orphans=1,
+         chunk=1, expect={"spans": 1, "traces": 1, "sessions": 1}),
     Case("expired span removes its session projection in the same step",
          seed=(span(1, NOW - 15 * DAY, session=A), span(3, NOW - DAY, session=B)), chunk=1, steps=1,
          expect={"spans": 1, "traces": 1, "sessions": 1}),
@@ -142,6 +146,8 @@ CASES = (
          expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 3, "spans": 1, "hourly_series": 3}),
     Case("schema 2 migrates to incremental vacuum", schema=2, seed=(span(1, NOW - DAY),),
          expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 3, "spans": 1, "hourly_series": 3}),
+    Case("a file over the vacuum bound migrates without vacuum", schema=2, seed=(span(1, NOW - DAY),), vacuum_max=0,
+         expect={"PRAGMA auto_vacuum": 0, "PRAGMA user_version": 3, "spans": 1, "hourly_series": 3}),
     Case("late duplicate after a migrated prune is not recounted", schema=2, seed=(span(1, NOW - 30 * DAY),), start_at_now=True,
          late=(span(1, NOW - 30 * DAY),),
          expect={"spans": 0, "span_fingerprints": 1, "SELECT sum(spans) FROM hourly_series WHERE group_by='operation'": 1}),
@@ -169,6 +175,16 @@ def _old_database(path: Path, schema: int, rows: tuple[dict, ...]) -> None:
         db.close()
 
 
+def _insert_orphans(connection: sqlite3.Connection, count: int) -> None:
+    """Traces and sessions without spans, keyed after every seeded trace and session."""
+    for index in range(count):
+        trace = (1_000 + index).to_bytes(16, "big")
+        connection.execute("INSERT INTO traces (trace_id, first_ns, last_ns, status) VALUES (?, 1, 1, 'ok')", (trace,))
+        connection.execute("INSERT INTO sessions (root_session_id, first_ns, last_ns, last_trace_id, last_span_id) "
+                           "VALUES (?, 1, 1, ?, ?)", (f"f{index:031x}", trace, bytes(8)))
+    connection.commit()
+
+
 async def _drive(case: Case, directory: Path, monkeypatch) -> tuple[dict | None, list[tuple[bool, bool]]]:
     from zeta.telemetry.receiver.app import create_app
 
@@ -194,13 +210,7 @@ async def _drive(case: Case, directory: Path, monkeypatch) -> tuple[dict | None,
     result = None
     async with app.router.lifespan_context(app):
         startup_calls = list(calls)
-        connection = writer._connection
-        for index in range(case.orphans):
-            trace = (1_000 + index).to_bytes(16, "big")
-            connection.execute("INSERT INTO traces (trace_id, first_ns, last_ns, status) VALUES (?, 1, 1, 'ok')", (trace,))
-            connection.execute("INSERT INTO sessions (root_session_id, first_ns, last_ns, last_trace_id, last_span_id) "
-                               "VALUES (?, 1, 1, ?, ?)", (f"{index:032x}", trace, bytes(8)))
-        connection.commit()
+        _insert_orphans(writer._connection, case.orphans)
         if case.cap is not None:
             monkeypatch.setattr(store, "MAX_BYTES", case.cap(path))
         for _ in range(case.steps):
@@ -215,11 +225,16 @@ def test_storage_bounds_contract(case: Case, tmp_path: Path, monkeypatch) -> Non
     pytest.importorskip("starlette")
     path = tmp_path / "telemetry.sqlite3"
     monkeypatch.setattr(store, "PRUNE_CHUNK", case.chunk)
+    if case.vacuum_max is not None:
+        monkeypatch.setattr(store, "VACUUM_MAX_BYTES", case.vacuum_max)
     if case.schema < 3:
         _old_database(path, case.schema, case.seed)
     elif case.seed:
         open_database(path)
         asyncio.run(write(path, list(case.seed), 0))
+    if case.early_orphans:
+        with contextlib.closing(sqlite3.connect(path)) as db:
+            _insert_orphans(db, case.early_orphans)
     result, startup_calls = asyncio.run(_drive(case, tmp_path, monkeypatch))
     if case.result:
         assert result is not None and {key: result[key] for key in case.result} == case.result
