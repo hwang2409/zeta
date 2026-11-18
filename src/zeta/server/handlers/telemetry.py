@@ -32,11 +32,11 @@ async def telemetry_status(client, request_id, params):
         raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, "invalid params")
     home = client.server.home
     live = live_view(client.server.telemetry)
-    return await _read(client, request_id, lambda reader, fits: reader.status(home, load_settings(home=home).settings.otel_endpoint, live))
+    return await _read(client, request_id, lambda reader, fits: reader.status(home, _endpoint(home), live))
 
 
 async def telemetry_sessions(client, request_id, params):
-    return await _read(client, request_id, lambda reader, fits: reader.sessions(client.server.home, params))
+    return await _read(client, request_id, lambda reader, fits: reader.sessions(client.server.home, params, fits))
 
 
 async def telemetry_trace(client, request_id, params):
@@ -44,7 +44,9 @@ async def telemetry_trace(client, request_id, params):
 
 
 async def telemetry_overview(client, request_id, params):
-    return await _read(client, request_id, lambda reader, fits: reader.overview(client.server.home, params, fits))
+    home = client.server.home
+    live = live_view(client.server.telemetry)
+    return await _read(client, request_id, lambda reader, fits: reader.overview(home, params, fits, _endpoint(home), live))
 
 
 async def telemetry_models(client, request_id, params):
@@ -67,17 +69,22 @@ async def telemetry_agent_tree(client, request_id, params):
     return await _read(client, request_id, lambda reader, fits: reader.agent_tree(client.server.home, params, fits))
 
 
+def _endpoint(home):
+    """The configured ``[otel].endpoint``; read in the read executor, never on the event loop."""
+    return load_settings(home=home).settings.otel_endpoint
+
+
 async def _read(client, request_id, read: Callable[[Any, Callable[[object], bool]], dict[str, Any]]) -> dict[str, Any]:
     def fits(result: object) -> bool:
         return _CODEC.response_fits(request_id, result)
 
     def run() -> dict[str, Any]:
         # imported here: the projector imports serve's method table, so a top-level import is circular
-        from ...telemetry.receiver import reader
+        from ...telemetry.receiver import page, reader
 
         try:
             result = read(reader, fits)
-        except reader.InvalidParams:
+        except page.InvalidParams:
             raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, "invalid params") from None
         except reader.TraceNotFound as exc:
             raise ProtocolError(ErrorDescriptor.TRACE_NOT_FOUND, "resource not found", {"id": exc.trace_id}) from None
@@ -85,9 +92,9 @@ async def _read(client, request_id, read: Callable[[Any, Callable[[object], bool
             raise ProtocolError(ErrorDescriptor.TELEMETRY_OFF, "state unavailable", {"retryable": True}) from None
         except reader.SchemaMismatch:
             raise ProtocolError(ErrorDescriptor.TELEMETRY_SCHEMA_MISMATCH, "telemetry schema is unsupported") from None
-        except reader.TooLarge:
+        except page.TooLarge:
             raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit") from None
-        if not fits(result):  # sessions and status pages are bounded far below the frame; this is the backstop
+        if not fits(result):  # every page is cut to fit; status is bounded far below the frame; this is the backstop
             raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit")
         return result
 

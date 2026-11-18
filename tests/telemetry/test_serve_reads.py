@@ -18,6 +18,7 @@ from tests.support.server_client import read, request, send
 from tests.support.sockets import short_socket_path
 from zeta.server import ZetaServer
 from zeta.telemetry.receiver import reader
+from zeta.telemetry.receiver.page import TooLarge
 from zeta.telemetry.receiver.projector import SPAN_COLUMNS
 from zeta.telemetry.receiver.store import Writer, open_database
 
@@ -242,7 +243,7 @@ async def test_trace_pages_spans_in_order_with_their_events(tmp_path: Path) -> N
         assert len(large) > 1, "an oversized page was not cut to the frame budget"
         assert 0 < len(large[0]["spans"]) < 60
         assert [span["span_id"] for page in large for span in page["spans"]] == [n.to_bytes(8, "big").hex() for n in range(1, 61)]
-        with pytest.raises(reader.TooLarge):
+        with pytest.raises(TooLarge):
             reader.trace(home, {"trace_id": "ee" * 16}, lambda result: not result["spans"])
     finally:
         await contract.close()
