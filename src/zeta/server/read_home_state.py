@@ -12,7 +12,7 @@ from ..core.session import account_home
 from ..core.session_files import child_directory
 from ..mcp.config import home_config_path, load_mcp_config
 from ..read_page import InvalidParams, Key, TooLarge, page_result, resume
-from ..telemetry.receiver.reader import used_bytes
+from ..telemetry.receiver.paths import used_bytes
 from ..telemetry.receiver.store import MAX_BYTES, RAW_DAYS, ROLLUP_DAYS
 from .protocol import MethodDescriptor
 from .read_catalog import validated_state_read

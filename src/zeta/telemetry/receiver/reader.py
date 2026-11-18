@@ -19,6 +19,7 @@ from typing import Any
 from ...read_page import InvalidParams, Key, resume
 from ..runtime import _SESSION_ID
 from .page import keyset_page
+from .paths import database_path, used_bytes
 from .process import OTLP_URL, receiver_ready
 from .store import (
     BUSY_TIMEOUT_MS,
@@ -96,10 +97,6 @@ class SchemaMismatch(Exception):
 
 
 Fits = Callable[[dict[str, Any]], bool]
-
-
-def database_path(home: Path) -> Path:
-    return home / "telemetry" / "telemetry.sqlite3"
 
 
 def status(home: Path, endpoint: str | None, live: dict[str, Any]) -> dict[str, Any]:
@@ -544,17 +541,6 @@ def _snapshot[T](home: Path, read: Callable[[sqlite3.Connection], T]) -> T:
             connection.rollback()
     finally:
         connection.close()
-
-
-def used_bytes(home: Path) -> int:
-    path = database_path(home)
-    total = 0
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            total += path.with_name(path.name + suffix).stat().st_size
-        except FileNotFoundError:
-            pass
-    return total
 
 
 def _only(params: dict[str, Any], allowed: set[str]) -> None:
