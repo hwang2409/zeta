@@ -11,6 +11,7 @@ from tests.support.sockets import short_socket_path
 from tests.test_state_catalog import INVALID, _connect
 from zeta import attention_records, project_inbox, project_registry
 from zeta.core.session import SessionManager
+from zeta.memory.entry_store import AddOperation, MemorySource
 from zeta.server import ZetaServer, protocol
 from zeta.storage_format import WRITER_EPOCH, advance
 
@@ -33,7 +34,11 @@ def seed(home):
     try:
         # test-contract: seam freeze the writer clock to exercise the public id tie-breaker
         with patch.object(project_registry, "_now", return_value=WHEN):
-            projects = [registry.create_project(f"synthetic-{i}", "synthetic scope", str(home / f"repo-{i}")) for i in range(3)]
+            projects = [
+                registry.create_project("synthetic-0", "synthetic scope", str(home / "repo-0")),
+                registry.create_project("synthetic-1", "synthetic scope", memory_profile="zeta"),
+                registry.create_project("synthetic-2", "synthetic scope"),
+            ]
         project_id = projects[0].project_id
         registry.compare_and_swap_memory(
             project_id, expected_digest=registry.memory_digest(project_id),
@@ -42,6 +47,13 @@ def seed(home):
         session = manager.create(provider="codex", model="gpt-5.6-luna", cwd=str(home), project_id=project_id)
         session_id = session.metadata.session_id
         session.store.close()
+        entry_project = projects[1].project_id
+        current = registry._entry_memory_state(entry_project)
+        sources = (MemorySource(session_id, 1, 1, ("user",), WHEN, 6),)
+        registry._compare_and_swap_entries(
+            entry_project, expected_digest=current.digest, reconciliation_key="f" * 64,
+            operations=(AddOperation("brief", "synthetic brief", sources),),
+        )
         inbox = project_inbox.ProjectInbox(registry, sessions_root=home / "sessions")
         message_ids = [f"{i:032x}" for i in range(1, 4)]
         # test-contract: seam freeze the writer clock to exercise the public id tie-breaker
@@ -55,6 +67,8 @@ def seed(home):
             attention_ids = [store.request(session_id=session_id, project_id=project_id, entry_id=None,
                                            entry_seq=None, title="safe title", why=MARKER).id for _ in range(3)]
         return project_id, {
+            "entries": entry_project,
+            "headings": projects[2].project_id,
             "state_projects": sorted((p.project_id for p in projects), reverse=True),
             "state_memory": ["state.md", "brief.md", "backlog.md"],
             "state_inbox": list(reversed(message_ids)),
@@ -73,15 +87,18 @@ def state_stat(home):
     ]
 
 
-@pytest.mark.parametrize(("method", "key", "keys", "filter_name", "filter_value"), [
-    ("state_projects", "project_id", PROJECT_KEYS, None, None),
-    ("state_memory", "memory_id", MEMORY_KEYS, "kind", "legacy"),
-    ("state_inbox", "message_id", INBOX_KEYS, "status", "new"),
-    ("state_attention", "attention_id", ATTENTION_KEYS, "status", "open"),
-    ("state_memory_detail", "memory_id", MEMORY_KEYS, None, None),
-    ("state_inbox_detail", "message_id", INBOX_KEYS, None, None),
+@pytest.mark.parametrize(("method", "key", "keys", "filter_name", "filter_value", "shape"), [
+    ("state_projects", "project_id", PROJECT_KEYS, None, None, None),
+    ("state_memory", "memory_id", MEMORY_KEYS, "kind", "legacy", None),
+    ("state_inbox", "message_id", INBOX_KEYS, "status", "new", None),
+    ("state_attention", "attention_id", ATTENTION_KEYS, "status", "open", None),
+    ("state_memory_detail", "memory_id", MEMORY_KEYS, None, None, None),
+    ("state_inbox_detail", "message_id", INBOX_KEYS, None, None, None),
+    pytest.param("state_memory", "memory_id", MEMORY_KEYS, None, None, "brief", id="brief-kind"),
+    pytest.param("state_projects", "project_id", PROJECT_KEYS, None, None, "path", id="rootless-path"),
+    pytest.param("state_memory", "memory_id", MEMORY_KEYS, None, None, "heading", id="heading-only"),
 ])
-async def test_project_state_websocket(tmp_path, monkeypatch, method, key, keys, filter_name, filter_value):
+async def test_project_state_websocket(tmp_path, monkeypatch, method, key, keys, filter_name, filter_value, shape):
     home = tmp_path / "home"
     project_id, ids = await await_or_fail(asyncio.to_thread(seed, home), what="seed state")
     server = ZetaServer(home=tmp_path / "serve", socket_path=short_socket_path(home), ws_port=0,
@@ -92,7 +109,29 @@ async def test_project_state_websocket(tmp_path, monkeypatch, method, key, keys,
     params = {"project_id": project_id} if method != "state_projects" else {}
     try:
         async with _connect(server, observer=True) as observer, _connect(server) as controller:
-            if method.endswith("_detail"):
+            if shape == "brief":
+                params["project_id"] = ids["entries"]
+                rows = (await observer.request("read", method, params))["result"]["items"]
+                row = next(row for row in rows if row["summary"] == "synthetic brief")
+                assert row["kind"] == "brief"
+                brief = await observer.request("read", method, {**params, "kind": "brief"})
+                assert brief["result"]["items"] == [row]
+                legacy = await observer.request("read", method, {**params, "kind": "legacy"})
+                assert legacy["result"]["items"] == []
+            elif shape == "path":
+                rows = (await observer.request("read", method, params))["result"]["items"]
+                by_id = {row[key]: row for row in rows}
+                assert by_id[ids["headings"]]["path"] is None
+                assert by_id[project_id]["path"] == str(home / "repo-0")
+            elif shape == "heading":
+                params["project_id"] = ids["headings"]
+                rows = (await observer.request("read", method, params))["result"]["items"]
+                assert len(rows) == 5
+                assert {row["has_body"] for row in rows} == {False}
+                projects = (await observer.request("read", "state_projects", {}))["result"]["items"]
+                project = next(row for row in projects if row["project_id"] == ids["headings"])
+                assert project["memory_count"] == len(rows)
+            elif method.endswith("_detail"):
                 message = method.startswith("state_inbox")
                 row_key = "message" if message else "memory"
                 params[key] = ids[method.removesuffix("_detail")][0]

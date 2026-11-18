@@ -6,6 +6,7 @@ from time import time_ns
 from typing import Any
 
 from .. import attention_records, storage_format
+from ..memory.transaction import STATE_MEMORY_KINDS
 from ..project_inbox import ProjectInbox
 from ..project_inbox import is_message_id as _valid_message_id
 from ..project_registry import ProjectRegistry
@@ -22,7 +23,7 @@ _ORDER = {
 }
 _STATUSES = ("new", "claimed", "done")
 _FILTERS = {
-    "memory": ("kind", ("decision", "state", "backlog", "changelog", "legacy")),
+    "memory": ("kind", STATE_MEMORY_KINDS),
     "inbox": ("status", _STATUSES),
     "attention": ("status", ("open", "done")),
 }
@@ -136,7 +137,7 @@ def _project_row(project, session_count, registry, inbox):
     project_id = project.project_id
     messages = inbox.state_rows(project_id)
     return {
-        "project_id": project_id, "name": project.name, "path": project.canonical_integration_root or project.scope,
+        "project_id": project_id, "name": project.name, "path": project.canonical_integration_root,
         "session_count": session_count, "memory_count": len(registry.memory_transactions.state_rows(project_id)),
         "inbox": {state: sum(row["status"] == state for row in messages) for state in _STATUSES},
         "updated_ns": timestamp_ns(project.updated_at),

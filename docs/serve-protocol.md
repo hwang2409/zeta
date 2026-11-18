@@ -965,7 +965,7 @@ requested method. Without feature negotiation the methods return `-32601`.
 | `state_attention` | `project_id?`, `status?`, `limit?`, `cursor?` | Page of Attention | `created_ns`, `attention_id` |
 
 Ids are strings. Use `null` or omit a filter to include all values. Memory
-`kind` is `decision`, `state`, `backlog`, `changelog`, or `legacy`; inbox
+`kind` is `brief`, `decision`, `state`, `backlog`, `changelog`, or `legacy`; inbox
 `status` is `new`, `claimed`, or `done`; attention `status` is `open` or `done`.
 The page shape is `{items, next_cursor, as_of_ns}`. `limit` defaults to 50
 (range 1–200). Omit `cursor` or use `null` on the first page. Continue with
@@ -978,6 +978,10 @@ Memory    {memory_id, project_id, kind, automatic, summary, created_ns, updated_
 Inbox     {message_id, project_id, kind, status, sender, summary, created_ns, updated_ns, trusted_assignment, has_body}
 Attention {attention_id, project_id, session_id, kind, status, title, created_ns, updated_ns}
 ```
+
+Project `path` is the canonical integration root, or `null` when there is none.
+`memory_count` counts all listed memory rows, including legacy files whose
+only content is a heading. These rows have `has_body: false`.
 
 Counts and nanosecond timestamps are integers. `source_session_id` and the
 attention project and session ids may be `null`. Inbox kinds are `bug_report`,

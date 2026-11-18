@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -23,12 +24,15 @@ if TYPE_CHECKING:
     from ..project_registry import ProjectRegistry
 
 
+STATE_MEMORY_KINDS = ("brief", "decision", "state", "backlog", "changelog", "legacy")
+
+
 def _state_kind(entry: MemoryEntry) -> str:
     if entry.representation == "legacy_document":
         return "legacy"
     if entry.kind == "decisions":
         return "decision"
-    return entry.kind if entry.kind in {"decision", "state", "backlog", "changelog"} else "legacy"
+    return entry.kind if entry.kind in STATE_MEMORY_KINDS else "legacy"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +114,8 @@ class MemoryTransactions:
         """Project the current owner snapshot without taking a memory lock."""
         registry = self._registry
         with registry.state_project_fd(project_id) as fd:
-            if registry._memory_format_locked(fd, project_id) == 2:
+            legacy = registry._memory_format_locked(fd, project_id) == 1
+            if not legacy:
                 snapshot = registry._entry_snapshot_locked(fd)
                 entries = (
                     (e.id, _state_kind(e),
@@ -134,7 +139,10 @@ class MemoryTransactions:
                     "memory_id": ident, "project_id": project_id, "kind": entry_kind,
                     "automatic": automatic, "summary": clip(text.partition("\n")[0], 512)[0],
                     "created_ns": created, "updated_ns": updated,
-                    "source_session_id": source, "has_body": bool(text),
+                    "source_session_id": source,
+                    "has_body": bool(text) and not (
+                        legacy and re.fullmatch(r"#{1,6}(?:[ \t]+[^\n]*)?", text.strip())
+                    ),
                 }
                 if memory_id is not None:
                     body, truncated = clip(text, BODY_BYTES)
