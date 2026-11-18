@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -160,11 +161,38 @@ async def test_provider_failure_writes_terminal_truth_and_cleanup(tmp_path: Path
     assert backend.closed and fixture.closed
 
 
+def test_prepare_home_restores_set_and_unset_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from evals.computer_macos.run import prepare_home
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "outer-home"))
+    monkeypatch.delenv("ZETA_ACCOUNT_HOME", raising=False)
+    before = dict(os.environ)
+    try:
+        with prepare_home(tmp_path) as home:
+            assert os.environ["ZETA_HOME"] == str(home)
+            assert os.environ["ZETA_ACCOUNT_HOME"] == str(Path.home() / ".zeta")
+            raise OSError("artifact write failed")
+    except OSError as exc:
+        assert str(exc) == "artifact write failed"
+    except TypeError:
+        pytest.fail("prepare_home must be an exception-safe environment context manager")
+    assert dict(os.environ) == before
+
+    monkeypatch.setenv("ZETA_ACCOUNT_HOME", str(tmp_path / "outer-account"))
+    before = dict(os.environ)
+    with pytest.raises(OSError, match="artifact write failed"):
+        with prepare_home(tmp_path):
+            assert os.environ["ZETA_HOME"] == str(tmp_path / "zeta-home")
+            assert os.environ["ZETA_ACCOUNT_HOME"] == str(Path.home() / ".zeta")
+            raise OSError("artifact write failed")
+    assert dict(os.environ) == before
+
+
 def test_reset_removes_only_run_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZETA_HOME", str(tmp_path / "outer-home"))
     from evals.computer_macos.run import prepare_home
-    home = prepare_home(tmp_path)
-    (home / "settings.toml").write_text("safe")
+    with prepare_home(tmp_path) as home:
+        (home / "settings.toml").write_text("safe")
     result = reset(tmp_path, verify=True)
     assert result["pass"]
     assert not home.exists()
