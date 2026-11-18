@@ -8,6 +8,7 @@ from tests.support.owned import await_or_fail
 from zeta.telemetry.receiver import reader
 from zeta.telemetry.receiver.projector import SPAN_COLUMNS
 from zeta.telemetry.receiver.store import Writer, open_database
+import zeta.telemetry.receiver.store as store
 
 DAY = 86_400 * 10**9
 
@@ -70,6 +71,37 @@ def test_rollups_survive_raw_age_pruning_and_duplicates_do_not_change_them(tmp_p
     status = reader.status(home, None, {"receiver": None, "last_export": None, "last_export_ns": None})
     assert status["oldest_raw_ns"] == recent["start_ns"]
     assert status["oldest_rollup_ns"] is not None
+
+
+def test_pruning_deletes_the_oldest_chunk_first(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "telemetry.sqlite3"
+    open_database(path)
+    now = 200 * DAY
+    monkeypatch.setattr(store, "PRUNE_CHUNK", 1)
+    asyncio.run(write(path, [span(1, now - 20 * DAY), span(2, now - 19 * DAY)], now))
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT trace_id FROM spans").fetchall() == [((2).to_bytes(16, "big"),)]
+
+
+async def _cap_write(path: Path, now: int, cap: int) -> None:
+    writer = Writer(path, clock_ns=lambda: now)
+    writer.start()
+    try:
+        await await_or_fail(writer.submit([span(1, now - DAY)]), what="cap commit")
+        path.with_name(path.name + "-wal").write_bytes(b"x" * 100)
+        store.MAX_BYTES = cap
+        writer._enforce_size(writer._connection)
+        assert writer._connection.execute("SELECT count(*) FROM spans").fetchone()[0] == 0
+    finally:
+        await asyncio.to_thread(writer.close)
+
+
+def test_size_cap_counts_wal_bytes(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "telemetry.sqlite3"
+    open_database(path)
+    cap = path.stat().st_size + 1
+    monkeypatch.setattr(store, "MAX_BYTES", cap)
+    asyncio.run(_cap_write(path, 200 * DAY, cap))
 
 
 def test_rollup_dimensions_and_histogram_are_bounded(tmp_path: Path) -> None:

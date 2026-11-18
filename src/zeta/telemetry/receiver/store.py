@@ -552,32 +552,25 @@ class Writer:
 
     @staticmethod
     def _delete_rollups_before(connection: sqlite3.Connection, cutoff: int) -> None:
-        while True:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                connection.execute("DELETE FROM hourly_rollups WHERE rowid IN (SELECT rowid FROM hourly_rollups WHERE hour_ns < ? ORDER BY hour_ns LIMIT ?)", (cutoff, PRUNE_CHUNK))
-                deleted = connection.execute("SELECT changes()").fetchone()[0]
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
-            if not deleted:
-                return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("DELETE FROM hourly_rollups WHERE rowid IN (SELECT rowid FROM hourly_rollups WHERE hour_ns < ? ORDER BY hour_ns LIMIT ?)", (cutoff, PRUNE_CHUNK))
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
 
     @staticmethod
     def _delete_spans_before(connection: sqlite3.Connection, cutoff: int) -> None:
-        while True:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                connection.execute("DELETE FROM spans WHERE rowid IN (SELECT rowid FROM spans WHERE end_ns < ? ORDER BY end_ns, trace_id, span_id LIMIT ?)", (cutoff, PRUNE_CHUNK))
-                deleted = connection.execute("SELECT changes()").fetchone()[0]
-                connection.execute("DELETE FROM traces WHERE NOT EXISTS (SELECT 1 FROM spans WHERE spans.trace_id = traces.trace_id)")
-                connection.commit()
-            except BaseException:
-                connection.rollback()
-                raise
-            if not deleted:
-                return
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute("DELETE FROM spans WHERE rowid IN (SELECT rowid FROM spans WHERE end_ns < ? ORDER BY end_ns, trace_id, span_id LIMIT ?)", (cutoff, PRUNE_CHUNK))
+            connection.execute("SELECT changes()")
+            connection.execute("DELETE FROM traces WHERE NOT EXISTS (SELECT 1 FROM spans WHERE spans.trace_id = traces.trace_id)")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
 
     def _enforce_size(self, connection: sqlite3.Connection) -> None:
         while _database_bytes(self._path) > MAX_BYTES:
