@@ -88,9 +88,15 @@ def status(home: Path, endpoint: str | None, live: dict[str, Any]) -> dict[str, 
     """
     present = True
     try:
-        oldest = _snapshot(home, lambda connection: connection.execute("SELECT MIN(first_ns) FROM traces").fetchone()[0])
+        oldest, oldest_rollup = _snapshot(
+            home,
+            lambda connection: (
+                connection.execute("SELECT MIN(start_ns) FROM spans").fetchone()[0],
+                connection.execute("SELECT MIN(hour_ns) FROM hourly_rollups").fetchone()[0],
+            ),
+        )
     except Unavailable:
-        present, oldest = False, None
+        present, oldest, oldest_rollup = False, None, None
     return {
         "enabled": present and endpoint is not None,
         "receiver": live["receiver"] or ("ready" if receiver_ready(home) else "stopped"),
@@ -102,7 +108,7 @@ def status(home: Path, endpoint: str | None, live: dict[str, Any]) -> dict[str, 
         "max_bytes": MAX_BYTES,
         "used_bytes": _used_bytes(database_path(home)),
         "oldest_raw_ns": oldest,
-        "oldest_rollup_ns": None,
+        "oldest_rollup_ns": oldest_rollup,
     }
 
 
