@@ -5,10 +5,9 @@ import sqlite3
 from pathlib import Path
 
 from tests.support.owned import await_or_fail
-from zeta.telemetry.receiver import reader
+from zeta.telemetry.receiver import reader, store
 from zeta.telemetry.receiver.projector import SPAN_COLUMNS
 from zeta.telemetry.receiver.store import Writer, open_database
-import zeta.telemetry.receiver.store as store
 
 DAY = 86_400 * 10**9
 
