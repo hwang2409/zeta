@@ -282,6 +282,7 @@ async def test_unlisted_tool_has_no_authority(tmp_path, monkeypatch, packaged):
         fake.register = register
         monkeypatch.setitem(sys.modules, fake.__name__, fake)
         found = registry_module._discover_tool_modules()
+        # test-contract: seam inject one more packaged module without changing the allow-list.
         monkeypatch.setattr(registry_module, "_discover_tool_modules", lambda: [*found, fake.__name__])
 
     def configure(registry):
