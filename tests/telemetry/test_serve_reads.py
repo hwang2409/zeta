@@ -103,7 +103,7 @@ async def test_missing_database_is_unavailable_and_is_never_created(tmp_path: Pa
         assert status["result"] == {
             "enabled": False, "receiver": "stopped", "endpoint": None, "last_export": None, "last_export_ns": None,
             "raw_days": 14, "rollup_days": 90, "max_bytes": 1 << 30, "used_bytes": 0, "oldest_raw_ns": None,
-            "oldest_rollup_ns": None,
+            "oldest_rollup_ns": None, "over_cap": False,
         }
         unavailable = {"code": -32005, "message": "state unavailable", "data": {"code": "telemetry_off", "retryable": True}}
         assert sessions["error"] == trace["error"] == unavailable
