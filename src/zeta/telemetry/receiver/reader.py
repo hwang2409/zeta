@@ -13,6 +13,7 @@ import json
 import re
 import sqlite3
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -57,11 +58,7 @@ class InvalidParams(ValueError):
 
 
 class Unavailable(Exception):
-    """No readable database: ``code`` is ``telemetry_off`` or ``receiver_unavailable``."""
-
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
+    """No database to read: telemetry is off or the receiver has not created it."""
 
 
 class TraceNotFound(LookupError):
@@ -70,8 +67,12 @@ class TraceNotFound(LookupError):
         self.trace_id = trace_id
 
 
-class CorruptState(Exception):
-    """The database has a schema this zeta cannot read."""
+class SchemaMismatch(Exception):
+    """The database's schema version is not the one this zeta reads."""
+
+
+class TooLarge(Exception):
+    """Not even one item fits the caller's size budget."""
 
 
 def database_path(home: Path) -> Path:
@@ -79,19 +80,17 @@ def database_path(home: Path) -> Path:
 
 
 def status(home: Path, endpoint: str | None) -> dict[str, Any]:
-    """``TelemetryStatus``; ``endpoint`` is the configured ``[otel].endpoint``. Never raises for a missing db."""
+    """``TelemetryStatus``; ``endpoint`` is the configured ``[otel].endpoint``.
+
+    Never raises for a missing database: enabled means configured and a database exists.
+    """
+    present = True
     try:
-        connection = _open(home, endpoint)
+        oldest = _snapshot(home, lambda connection: connection.execute("SELECT MIN(first_ns) FROM traces").fetchone()[0])
     except Unavailable:
-        connection = None
-    oldest = None
-    if connection is not None:
-        try:
-            oldest = connection.execute("SELECT MIN(first_ns) FROM traces").fetchone()[0]
-        finally:
-            connection.close()
+        present, oldest = False, None
     return {
-        "enabled": endpoint is not None,
+        "enabled": present and endpoint is not None,
         "receiver": "ready" if _receiver_ready(home) else "stopped",
         "endpoint": None if endpoint is None else "builtin" if endpoint == OTLP_URL else "external",
         "last_export": None,  # shortcut: serve does not see exporter results yet; the auto-start slice fills these
@@ -105,7 +104,7 @@ def status(home: Path, endpoint: str | None) -> dict[str, Any]:
     }
 
 
-def sessions(home: Path, endpoint: str | None, params: dict[str, Any]) -> dict[str, Any]:
+def sessions(home: Path, params: dict[str, Any]) -> dict[str, Any]:
     """``Page<Session>`` ordered by ``last_ns desc, session_id desc``."""
     _only(params, {"limit", "cursor", "start_ns", "end_ns", "status", "profile", "model"})
     limit = _limit(params.get("limit"), DEFAULT_SESSION_PAGE, MAX_SESSION_PAGE)
@@ -134,11 +133,7 @@ def sessions(home: Path, endpoint: str | None, params: dict[str, Any]) -> dict[s
         values += [after_ns, after_ns, after_id]
     query += " ORDER BY last_ns DESC, root_session_id DESC LIMIT ?"
     values.append(limit + 1)
-    connection = _open(home, endpoint)
-    try:
-        rows = connection.execute(query, values).fetchall()
-    finally:
-        connection.close()
+    rows = _snapshot(home, lambda connection: connection.execute(query, values).fetchall())
     items = [_session(row) for row in rows[:limit]]
     next_cursor = None
     if len(rows) > limit:
@@ -146,8 +141,12 @@ def sessions(home: Path, endpoint: str | None, params: dict[str, Any]) -> dict[s
     return {"items": items, "next_cursor": next_cursor, "as_of_ns": time.time_ns()}
 
 
-def trace(home: Path, endpoint: str | None, params: dict[str, Any]) -> dict[str, Any]:
-    """``{"trace", "spans", "next_cursor"}``: one page of spans ordered by ``start_ns, span_id``."""
+def trace(home: Path, params: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+    """``{"trace", "spans", "next_cursor"}``: spans ordered by ``start_ns, span_id``.
+
+    A page is the largest prefix of up to ``limit`` spans whose result ``fits``; its cursor
+    continues after the last span returned. ``TooLarge`` when not even one span fits.
+    """
     _only(params, {"trace_id", "cursor", "limit"})
     trace_id = params.get("trace_id")
     if not isinstance(trace_id, str) or not _TRACE_ID.match(trace_id):
@@ -168,58 +167,71 @@ def trace(home: Path, endpoint: str | None, params: dict[str, Any]) -> dict[str,
         values += [after[0], after[0], bytes.fromhex(after[1])]
     spans_query += " ORDER BY start_ns, span_id LIMIT ?"
     values.append(limit + 1)
-    connection = _open(home, endpoint)
-    try:
-        connection.execute("BEGIN")  # one snapshot for the trace row, its spans, and their events
-        try:
-            trace_row = connection.execute(
-                f"SELECT {', '.join(_TRACE_COLUMNS)} FROM traces WHERE trace_id = ?", (key,)
-            ).fetchone()
-            span_rows = connection.execute(spans_query, values).fetchall()
-            page = span_rows[:limit]
-            event_rows = connection.execute(
-                f"SELECT span_id, {', '.join(_EVENT_COLUMNS)} FROM span_events WHERE trace_id = ? "
-                f"AND span_id IN ({', '.join('?' * len(page))}) ORDER BY span_id, time_ns, event_index",
-                (key, *(row["span_id"] for row in page)),
-            ).fetchall() if page else []
-        finally:
-            connection.rollback()
-    finally:
-        connection.close()
+
+    def read(connection: sqlite3.Connection) -> tuple[Any, list[Any], list[Any]]:
+        trace_row = connection.execute(f"SELECT {', '.join(_TRACE_COLUMNS)} FROM traces WHERE trace_id = ?", (key,)).fetchone()
+        span_rows = connection.execute(spans_query, values).fetchall()
+        page = span_rows[:limit]
+        event_rows = connection.execute(
+            f"SELECT span_id, {', '.join(_EVENT_COLUMNS)} FROM span_events WHERE trace_id = ? "
+            f"AND span_id IN ({', '.join('?' * len(page))}) ORDER BY span_id, time_ns, event_index",
+            (key, *(row["span_id"] for row in page)),
+        ).fetchall() if page else []
+        return trace_row, span_rows, event_rows
+
+    trace_row, span_rows, event_rows = _snapshot(home, read)
     if trace_row is None:
         raise TraceNotFound(trace_id)
     events: dict[bytes, list[dict[str, Any]]] = {}
     for row in event_rows:
         events.setdefault(row["span_id"], []).append(_project(row, _EVENT_COLUMNS))
-    spans = [{**_project(row, _SPAN_COLUMNS), "events": events.get(row["span_id"], [])} for row in page]
-    next_cursor = None
-    if len(span_rows) > limit:
-        next_cursor = _encode(binding, [spans[-1]["start_ns"], spans[-1]["span_id"]])
-    return {"trace": _project(trace_row, _TRACE_COLUMNS), "spans": spans, "next_cursor": next_cursor}
+    spans = [{**_project(row, _SPAN_COLUMNS), "events": events.get(row["span_id"], [])} for row in span_rows[:limit]]
+    summary = _project(trace_row, _TRACE_COLUMNS)
+
+    def result(count: int) -> dict[str, Any]:
+        more = count < len(span_rows)
+        cursor = _encode(binding, [spans[count - 1]["start_ns"], spans[count - 1]["span_id"]]) if more else None
+        return {"trace": summary, "spans": spans[:count], "next_cursor": cursor}
+
+    if fits(full := result(len(spans))):
+        return full
+    low, high = 0, len(spans)  # result(low) fits once low >= 1; result(high) does not
+    while high - low > 1:
+        middle = (low + high) // 2
+        if fits(result(middle)):
+            low = middle
+        else:
+            high = middle
+    if low == 0:
+        raise TooLarge(trace_id)
+    return result(low)
 
 
-def _open(home: Path, endpoint: str | None) -> sqlite3.Connection:
-    """A read-only connection to a migrated database, or ``Unavailable``. Never creates the file."""
+def _snapshot[T](home: Path, read: Callable[[sqlite3.Connection], T]) -> T:
+    """Run ``read`` in one read transaction after checking the schema. Never creates the file."""
     path = database_path(home)
     try:
         connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, isolation_level=None)
     except sqlite3.OperationalError:
         if path.exists():
             raise
-        raise Unavailable("telemetry_off" if endpoint is None else "receiver_unavailable") from None
+        raise Unavailable from None
     try:
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-    except BaseException:
+        connection.execute("BEGIN")
+        try:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            if version == 0:  # an empty file the receiver has not migrated yet
+                raise Unavailable
+            stored = connection.execute("SELECT schema_version FROM viewer_meta").fetchone() if version == SCHEMA_VERSION else None
+            if stored is None or stored[0] != SCHEMA_VERSION:
+                raise SchemaMismatch(f"telemetry schema {version} is not {SCHEMA_VERSION}")
+            return read(connection)
+        finally:
+            connection.rollback()
+    finally:
         connection.close()
-        raise
-    if version != SCHEMA_VERSION:
-        connection.close()
-        if version == 0:  # the receiver has created the file and is migrating it
-            raise Unavailable("receiver_unavailable")
-        raise CorruptState(f"telemetry schema {version} is not supported")
-    return connection
 
 
 def _receiver_ready(home: Path) -> bool:

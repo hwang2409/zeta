@@ -199,6 +199,9 @@ feature. Observer connections receive only methods with `read` access.
 | `child_run_list` | `1.0` | `child_runs` | `read` |
 | `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 | `mcp_refresh_tools` | `1.0` | `mcp_refresh_tools` | `session_mutation` |
+| `telemetry_status` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_sessions` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_trace` | `1.0` | `telemetry_read_v1` | `read` |
 
 ## common JSON-RPC shapes
 
@@ -637,6 +640,96 @@ surface.
 ```json
 {"jsonrpc":"2.0","id":5,"result":{"session_id":"abc123","servers":["page"]}}
 ```
+
+### telemetry reads (`telemetry_read_v1` feature)
+
+These methods read the built-in OTLP receiver's database,
+`$ZETA_HOME/telemetry/telemetry.sqlite3`. Controllers and observers may call
+them after `hello` negotiated `telemetry_read_v1`; otherwise they return
+`-32601`. They need no session, take no lock, and change nothing: serve opens
+the database read-only (SQLite `mode=ro`), never creates or migrates it, and
+runs each read in its bounded read executor, off the event loop. Each read is
+one SQLite read transaction that first checks `PRAGMA user_version` and
+`viewer_meta.schema_version`. The receiver
+(`zeta otel receiver`) is the only writer. Serve sends no telemetry
+notifications; a client polls (for example every 5 seconds while a view is
+visible).
+
+Values carry metadata only: never prompts, reasoning, model output, tool
+arguments or results, request bodies, environment values, attachments,
+exception messages, status descriptions, or links. Timestamps and durations are
+integer Unix nanoseconds; ids are lowercase hex strings; absent values are
+`null`. Results contain exactly the keys below.
+
+`telemetry_status` takes `{}` and returns:
+
+```json
+{"enabled":true,"receiver":"ready","endpoint":"builtin","last_export":null,"last_export_ns":null,"raw_days":14,"rollup_days":90,"max_bytes":1073741824,"used_bytes":0,"oldest_raw_ns":null,"oldest_rollup_ns":null}
+```
+
+- `enabled`: `[otel].endpoint` is configured and the database exists.
+- `receiver`: `ready` when the receiver on `127.0.0.1:4323` reports this
+  home's id, else `stopped`. `starting` and `error` are reserved.
+- `endpoint`: `builtin` for exactly `http://127.0.0.1:4323/v1/traces`,
+  `external` for another configured endpoint, or `null`.
+- `last_export` and `last_export_ns` are `null` in this version.
+- `used_bytes`: the database file plus its `-wal` and `-shm` files.
+- `oldest_raw_ns`: the earliest stored span start, or `null`.
+- `oldest_rollup_ns` is `null` in this version.
+
+A missing database is not an error here: a home without telemetry returns
+`enabled:false`, `receiver:"stopped"`, and `used_bytes:0`.
+
+`telemetry_sessions` params are all optional:
+`{"limit":50,"cursor":null,"start_ns":null,"end_ns":null,"status":"all","profile":null,"model":null}`.
+`limit` is 1 to 200. The range defaults to the 24 hours before `end_ns`, and
+`end_ns` defaults to now; `start_ns` must be less than `end_ns`. A session is
+in range when `last_ns >= start_ns` and `first_ns < end_ns`. `status` is `all`
+or `error` (sessions with `error_count > 0`). `profile` and `model` match
+exactly (1 to 256 bytes). The result is a page ordered by `last_ns` descending,
+then `session_id` descending:
+
+```json
+{"items":[{"session_id":"0123456789abcdef0123456789abcdef","first_ns":0,"last_ns":0,"last_trace_id":"00112233445566778899aabbccddeeff","profile":null,"model":null,"span_count":0,"turn_count":0,"model_count":0,"tool_count":0,"error_count":0,"input_tokens":0,"output_tokens":0,"total_tokens":0}],"next_cursor":null,"as_of_ns":0}
+```
+
+`session_id` is the 32-hex root conversation id; child agents count toward
+their root. Token totals sum `chat` spans only. `profile` and `model` are the
+latest `invoke_agent` agent name and `chat` model.
+
+`telemetry_trace` params are `{"trace_id":"<32 hex>","cursor":null,"limit":500}`
+(`limit` 1 to 500). It returns the trace summary on every page and one page of
+spans ordered by `start_ns`, then `span_id`. A page holds the largest prefix of
+up to `limit` spans whose response fits the 1 MiB frame, and `next_cursor`
+continues after its last span, so a page can be shorter than `limit` while
+`next_cursor` is not `null`:
+
+```json
+{"trace":{"trace_id":"00112233445566778899aabbccddeeff","first_ns":0,"last_ns":0,"root_span_id":null,"root_session_id":null,"status":"ok","span_count":0,"error_count":0},"spans":[{"span_id":"0011223344556677","parent_span_id":null,"operation":"turn","start_ns":0,"end_ns":0,"duration_ns":0,"status":"ok","error_type":null,"session_id":null,"agent_name":null,"agent_depth":null,"background":null,"turn_number":null,"notification":null,"provider":null,"request_model":null,"response_model":null,"stream":null,"input_tokens":null,"output_tokens":null,"total_tokens":null,"finish_reason":null,"tool_name":null,"tool_type":null,"tool_call_id":null,"tool_argument_bytes":null,"tool_result_bytes":null,"tool_count":null,"emergency":null,"tokens_before":null,"tokens_after":null,"rpc_method":null,"mcp_method":null,"mcp_server":null,"mcp_tool":null,"mcp_prompt":null,"mcp_protocol":null,"request_id":null,"events":[{"name":"gen_ai.client.retry","time_ns":0,"retry_attempt":null,"retry_reason":null,"retry_delay":null,"retry_after":null,"decision":null,"scope":null,"duration_ns":null}]}],"next_cursor":null}
+```
+
+`operation` is one of `invoke_agent`, `turn`, `chat`, `execute_tool`,
+`context_compact`, `serve`, or `mcp`; `status` is `unset`, `ok`, or `error`.
+`background`, `notification`, `stream`, `emergency`, and `retry_after` are
+booleans. Events are ordered by `time_ns`. The trace, spans, and events of one
+page come from one database snapshot; later pages may see spans that arrived
+since.
+
+Cursors are opaque strings. A cursor belongs to the method and filters that
+made it (`telemetry_sessions`: `status`, `profile`, `model`, and the given
+`start_ns`/`end_ns`; `telemetry_trace`: `trace_id`) and keeps the first
+page's resolved time range. A malformed cursor, or one used with other
+filters, returns `-32602` with `data.code` `invalid_params`.
+
+Errors:
+
+- invalid params or cursor: `{"code":-32602,"message":"invalid params: ...","data":{"code":"invalid_params"}}`
+- unknown trace: `{"code":-32602,"message":"resource not found","data":{"code":"trace_not_found","id":"<trace_id>"}}`
+- no database (or one the receiver has not migrated yet), data methods only:
+  `{"code":-32005,"message":"state unavailable","data":{"code":"telemetry_off","retryable":true}}`
+- a schema version this zeta does not read, any method:
+  `{"code":-32000,"message":"stored state is invalid","data":{"code":"telemetry_schema_mismatch"}}`
+- one span alone larger than the frame: `{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}`
 
 ### `send`
 
@@ -1443,6 +1536,11 @@ Error descriptors are:
 | `session_id_ambiguous` | `-32602` | `session_id_ambiguous` | the session id prefix matches more than one session |
 | `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
 | `mcp_tool_refresh_failed` | `-32005` | `mcp_tool_refresh_failed` | an MCP tools/list refresh failed |
+| `invalid_telemetry_params` | `-32602` | `invalid_params` | telemetry read parameters or cursor are invalid |
+| `trace_not_found` | `-32602` | `trace_not_found` | the requested trace does not exist |
+| `telemetry_off` | `-32005` | `telemetry_off` | no telemetry database exists |
+| `telemetry_schema_mismatch` | `-32000` | `telemetry_schema_mismatch` | the telemetry database schema is not the one this zeta reads |
+| `result_too_large` | `-32007` | `result_too_large` | not even one item fits one frame |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. With `session_park`, a swap over the park limit returns
@@ -2211,6 +2309,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_mcp_bindings` | allows controllers to bind transient headers for trusted global MCP servers on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `tool_approval_origin` | adds `approval_origin: "automatic" | "user"` to live `tool_start` calls and replayed history `tool_use` calls |
+| `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, and `telemetry_trace` methods |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
 | `child_run_events` | enables the atomic newest-page and live child lifecycle join; the server advertises the feature and request only when the client also requests `session_replay_seq`, `child_run_history`, and `child_runs` |

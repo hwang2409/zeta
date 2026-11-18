@@ -100,11 +100,11 @@ def receiver(tmp_path):
 
 
 def _sessions(database: Path, **params) -> dict:
-    return reader.sessions(database.parents[1], None, {"start_ns": 0, **params})
+    return reader.sessions(database.parents[1], {"start_ns": 0, **params})
 
 
 def _trace(database: Path, trace_id: str) -> dict:
-    return reader.trace(database.parents[1], None, {"trace_id": trace_id})
+    return reader.trace(database.parents[1], {"trace_id": trace_id}, lambda result: True)
 
 
 def _rows(database: Path, table: str) -> list[tuple]:
@@ -118,7 +118,7 @@ def _rows(database: Path, table: str) -> list[tuple]:
 def _committed_sequence(database: Path) -> int:
     connection = sqlite3.connect(database)
     try:
-        return connection.execute("SELECT committed_sequence FROM receiver_meta").fetchone()[0]
+        return connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
     finally:
         connection.close()
 

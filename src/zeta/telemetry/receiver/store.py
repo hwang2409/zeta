@@ -23,7 +23,7 @@ GRACEFUL_COMMIT_TIMEOUT_SECONDS = 5.0
 BUSY_TIMEOUT_MS = 5_000
 
 SCHEMA = """
-CREATE TABLE receiver_meta (
+CREATE TABLE viewer_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
     committed_sequence INTEGER NOT NULL DEFAULT 0 CHECK (committed_sequence >= 0)
@@ -352,7 +352,7 @@ def open_database(path: Path) -> None:
             for statement in SCHEMA.split(";"):
                 if statement.strip():
                     connection.execute(statement)
-            connection.execute("INSERT INTO receiver_meta (singleton, schema_version) VALUES (1, ?)", (SCHEMA_VERSION,))
+            connection.execute("INSERT INTO viewer_meta (singleton, schema_version) VALUES (1, ?)", (SCHEMA_VERSION,))
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         except BaseException:
@@ -372,7 +372,7 @@ class Writer:
         )
         self._thread = threading.Thread(target=self._run, name="zeta-otel-receiver-writer", daemon=True)
         # the last committed sequence; set only after its transaction commits
-        self.committed_sequence = self._connection.execute("SELECT committed_sequence FROM receiver_meta").fetchone()[0]
+        self.committed_sequence = self._connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
 
     def start(self) -> None:
         self._thread.start()
@@ -429,8 +429,8 @@ class Writer:
                 if session is not None:
                     connection.execute(_SESSION_UPSERT, session)
             if inserted:
-                connection.execute("UPDATE receiver_meta SET committed_sequence = committed_sequence + 1 WHERE singleton = 1")
-            sequence = connection.execute("SELECT committed_sequence FROM receiver_meta").fetchone()[0]
+                connection.execute("UPDATE viewer_meta SET committed_sequence = committed_sequence + 1 WHERE singleton = 1")
+            sequence = connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
             connection.commit()
         except BaseException:
             connection.rollback()

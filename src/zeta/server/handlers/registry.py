@@ -18,7 +18,15 @@ from ..protocol import (
     protocol_error,
 )
 from ..session_replay import join_history_and_subscribe
-from . import child_runs, lifecycle, path_completion, session, settings, telemetry, validation
+from . import (
+    child_runs,
+    lifecycle,
+    path_completion,
+    session,
+    settings,
+    telemetry,
+    validation,
+)
 from .run_work import cancel_background_task, list_run_work
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]

@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 from ...config.settings import load_settings
@@ -16,41 +14,39 @@ _CODEC = FrameCodec()
 async def telemetry_status(client, request_id, params):
     if params:
         raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, "invalid params: telemetry_status takes no params")
-    return await _read(client, request_id, lambda reader, home, endpoint: reader.status(home, endpoint))
+    home = client.server.home
+    return await _read(client, request_id, lambda reader, fits: reader.status(home, load_settings(home=home).settings.otel_endpoint))
 
 
 async def telemetry_sessions(client, request_id, params):
-    return await _read(client, request_id, lambda reader, home, endpoint: reader.sessions(home, endpoint, params))
+    return await _read(client, request_id, lambda reader, fits: reader.sessions(client.server.home, params))
 
 
 async def telemetry_trace(client, request_id, params):
-    return await _read(client, request_id, lambda reader, home, endpoint: reader.trace(home, endpoint, params))
+    return await _read(client, request_id, lambda reader, fits: reader.trace(client.server.home, params, fits))
 
 
-async def _read(client, request_id, read: Callable[[Any, Path, str | None], dict[str, Any]]) -> dict[str, Any]:
-    home = client.server.home
+async def _read(client, request_id, read: Callable[[Any, Callable[[object], bool]], dict[str, Any]]) -> dict[str, Any]:
+    def fits(result: object) -> bool:
+        return _CODEC.response_fits(request_id, result)
 
     def run() -> dict[str, Any]:
         # imported here: the projector imports serve's method table, so a top-level import is circular
         from ...telemetry.receiver import reader
 
         try:
-            result = read(reader, home, load_settings(home=home).settings.otel_endpoint)
+            result = read(reader, fits)
         except reader.InvalidParams as exc:
             raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, f"invalid params: {exc}") from None
         except reader.TraceNotFound as exc:
             raise ProtocolError(ErrorDescriptor.TRACE_NOT_FOUND, "resource not found", {"id": exc.trace_id}) from None
-        except reader.Unavailable as exc:
-            descriptor = (
-                ErrorDescriptor.TELEMETRY_OFF if exc.code == "telemetry_off" else ErrorDescriptor.TELEMETRY_RECEIVER_UNAVAILABLE
-            )
-            raise ProtocolError(descriptor, "state unavailable", {"retryable": True}) from None
-        except sqlite3.OperationalError:
-            raise  # busy or unreadable file: an internal error, not corrupt data
-        except (reader.CorruptState, sqlite3.DatabaseError):
-            raise ProtocolError(ErrorDescriptor.CORRUPT_STATE, "stored state is invalid", {"resource": "telemetry"}) from None
-        # sized off the loop: a page with many large spans must fail with a typed error, not a dropped frame
-        if not _CODEC.response_fits(request_id, result):
+        except reader.Unavailable:
+            raise ProtocolError(ErrorDescriptor.TELEMETRY_OFF, "state unavailable", {"retryable": True}) from None
+        except reader.SchemaMismatch:
+            raise ProtocolError(ErrorDescriptor.TELEMETRY_SCHEMA_MISMATCH, "stored state is invalid") from None
+        except reader.TooLarge:
+            raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit") from None
+        if not fits(result):  # sessions and status pages are bounded far below the frame; this is the backstop
             raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit")
         return result
 

@@ -154,14 +154,13 @@ class ErrorDescriptor(Enum):
     )
     INVALID_TELEMETRY_PARAMS = (-32602, "invalid_params", "telemetry read parameters or cursor are invalid")
     TRACE_NOT_FOUND = (-32602, "trace_not_found", "the requested trace does not exist")
-    TELEMETRY_OFF = (-32005, "telemetry_off", "telemetry is not configured and no telemetry is stored")
-    TELEMETRY_RECEIVER_UNAVAILABLE = (
-        -32005,
-        "receiver_unavailable",
-        "the built-in receiver has not created the telemetry database",
+    TELEMETRY_OFF = (-32005, "telemetry_off", "no telemetry database exists")
+    TELEMETRY_SCHEMA_MISMATCH = (
+        -32000,
+        "telemetry_schema_mismatch",
+        "the telemetry database schema is not the one this zeta reads",
     )
-    RESULT_TOO_LARGE = (-32007, "result_too_large", "the result does not fit one frame")
-    CORRUPT_STATE = (-32000, "corrupt_state", "stored state is invalid or unsupported")
+    RESULT_TOO_LARGE = (-32007, "result_too_large", "not even one item fits one frame")
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
         self.code = code
