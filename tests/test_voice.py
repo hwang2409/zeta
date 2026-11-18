@@ -86,7 +86,7 @@ class FakeTranscriber:
         self.child_pid = process.pid
         try:
             self.reached.set()
-            await process.wait()
+            await asyncio.wait_for(process.wait(), 30)  # held until the runtime cancels transcription
             return "late text"
         finally:
             await process.kill()
@@ -162,9 +162,9 @@ async def test_cancellation_at_every_phase_cleans_up_before_it_propagates(
 
     def progress(state: VoiceState) -> None:
         # insertion handoff: the transcript exists, but the caller has not taken it yet
-        if phase == "insertion_handoff" and state is VoiceState.IDLE and states[-1:] == [VoiceState.TRANSCRIBING]:
-            if not triggered and not (caller is not None and caller.cancelled()):
-                fire()
+        handoff = phase == "insertion_handoff" and state is VoiceState.IDLE and states[-1:] == [VoiceState.TRANSCRIBING]
+        if handoff and not triggered and not (caller is not None and caller.cancelled()):
+            fire()
         states.append(state)
 
     runtime = VoiceRuntime(zeta_home=tmp_path, progress=progress, source=source, transcriber=transcriber)
@@ -205,7 +205,7 @@ async def test_cancellation_at_every_phase_cleans_up_before_it_propagates(
     assert list((tmp_path / "tmp" / "voice").iterdir()) == []
 
 
-def _voice_app(tmp_path: Path, transcriber: FakeTranscriber) -> TUIApp:
+def _voice_app(tmp_path: Path, transcriber: FakeTranscriber, changed: asyncio.Event | None = None) -> TUIApp:
     app = TUIApp(
         AgentLoop(FakeBackend([]), ConversationStore(tmp_path / "sessions"), skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -213,26 +213,37 @@ def _voice_app(tmp_path: Path, transcriber: FakeTranscriber) -> TUIApp:
         zeta_home=tmp_path / "home",
         console=Console(file=open(os.devnull, "w"), force_terminal=False, width=120),  # noqa: SIM115
     )
-    app._voice = VoiceRuntime(
-        zeta_home=tmp_path / "home", progress=app._voice_progress, source=FakeSource(), transcriber=transcriber
-    )
+
+    def progress(state: VoiceState) -> None:
+        app._voice_progress(state)
+        if changed is not None:
+            changed.set()
+
+    app._voice = VoiceRuntime(zeta_home=tmp_path / "home", progress=progress, source=FakeSource(), transcriber=transcriber)
     return app
 
 
-async def _until(predicate: Callable[[], bool], what: str) -> None:
-    async def poll() -> None:
-        while not predicate():
-            await asyncio.sleep(0.01)
-
-    await await_or_fail(poll(), what=what)
+async def _until(changed: asyncio.Event, predicate: Callable[[], bool], what: str) -> None:
+    """Wait for ``predicate`` after each editor, voice-state, or submit change."""
+    while True:
+        changed.clear()
+        if predicate():
+            return
+        await await_or_fail(changed.wait(), what=what)
 
 
 @pytest.mark.asyncio
 async def test_voice_toggle_inserts_editable_transcript_through_real_tui(tmp_path: Path) -> None:
     transcriber = FakeTranscriber(tmp_path, text="spoken words")
-    app = _voice_app(tmp_path, transcriber)
+    changed = asyncio.Event()
+    app = _voice_app(tmp_path, transcriber, changed)
     submitted: list[str] = []
-    app._submit_input = submitted.append  # type: ignore[method-assign]
+
+    def submit(value: str) -> None:
+        submitted.append(value)
+        changed.set()
+
+    app._submit_input = submit  # type: ignore[method-assign]
     with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
         session = app._make_session()
         input_ready = asyncio.Event()
@@ -247,17 +258,18 @@ async def test_voice_toggle_inserts_editable_transcript_through_real_tui(tmp_pat
         try:
             await await_or_fail(input_ready.wait(), what="tui input ready")
             buffer = session.default_buffer
+            buffer.on_text_changed += lambda _buffer: changed.set()
             pipe.send_text("say: ")
-            await _until(lambda: buffer.text == "say: ", "draft typed")
+            await _until(changed, lambda: buffer.text == "say: ", "draft typed")
 
             def toolbar() -> str:
                 return "".join(text for _style, text in app._status_toolbar())
 
             pipe.send_text("\x18\x16")  # c-x c-v starts
-            await _until(lambda: app._voice.state is VoiceState.RECORDING, "recording")
+            await _until(changed, lambda: app._voice.state is VoiceState.RECORDING, "recording")
             assert "voice: recording 0:00" in toolbar()
             pipe.send_text("\x18\x16")  # c-x c-v stops and transcribes
-            await _until(lambda: buffer.text == "say: spoken words", "transcript inserted at cursor")
+            await _until(changed, lambda: buffer.text == "say: spoken words", "transcript inserted at cursor")
             assert app._voice.state is VoiceState.IDLE
             assert "voice:" not in toolbar()
             assert submitted == []  # nothing is sent until enter
@@ -268,35 +280,35 @@ async def test_voice_toggle_inserts_editable_transcript_through_real_tui(tmp_pat
             buffer.start_selection()
             buffer.cursor_position = len(buffer.text)
             pipe.send_text("\x18\x16")
-            await _until(lambda: app._voice.state is VoiceState.RECORDING, "second recording")
+            await _until(changed, lambda: app._voice.state is VoiceState.RECORDING, "second recording")
             pipe.send_text("\x18\x16")
-            await _until(lambda: buffer.text == "say: voice", "selection replaced")
+            await _until(changed, lambda: buffer.text == "say: voice", "selection replaced")
 
             # a session change during transcription drops the late transcript
             transcriber.block = "transcribe"
             pipe.send_text("\x18\x16")
-            await _until(lambda: app._voice.state is VoiceState.RECORDING, "third recording")
+            await _until(changed, lambda: app._voice.state is VoiceState.RECORDING, "third recording")
             pipe.send_text("\x18\x16")
             await await_or_fail(transcriber.reached.wait(), what="transcription started")
             assert "voice: transcribing" in toolbar()
             app._agent_navigation.transcript_control.view_path = tmp_path / "other-session"
             app._viewed_session_changed()
-            await _until(lambda: app._voice.state is VoiceState.IDLE, "cancelled by session change")
+            await _until(changed, lambda: app._voice.state is VoiceState.IDLE, "cancelled by session change")
             _assert_reaped(transcriber.child_pid)
             assert buffer.text == "say: voice"
 
             # escape cancels a recording without touching the editor
             pipe.send_text("\x18\x16")
-            await _until(lambda: app._voice.state is VoiceState.RECORDING, "fourth recording")
+            await _until(changed, lambda: app._voice.state is VoiceState.RECORDING, "fourth recording")
             pipe.send_bytes(b"\x1b")
-            await _until(lambda: app._voice.state is VoiceState.IDLE, "escape cancelled")
+            await _until(changed, lambda: app._voice.state is VoiceState.IDLE, "escape cancelled")
             assert buffer.text == "say: voice"
 
             pipe.send_text(" edited")
-            await _until(lambda: buffer.text == "say: voice edited", "edit typed")
+            await _until(changed, lambda: buffer.text == "say: voice edited", "edit typed")
             assert submitted == []
             pipe.send_text("\r")
-            await _until(lambda: submitted == ["say: voice edited"], "enter submits")
+            await _until(changed, lambda: submitted == ["say: voice edited"], "enter submits")
         finally:
             app.request_exit()
             await await_or_fail(running, what="tui shutdown")
