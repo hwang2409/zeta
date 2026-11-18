@@ -27,6 +27,7 @@ def reset(run_dir: Path, verify: bool) -> dict:
         (run_dir / "cleanup.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
         return result
 
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path, required=True)

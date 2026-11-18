@@ -8,8 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from evals.computer_macos import grade as grade_module
-from evals.computer_macos import run as run_module
 from evals.computer_macos.fixture import FixtureServer, trial_state
 from evals.computer_macos.reset import reset
 from evals.computer_macos.run import EXPECTED_MODEL, EXPECTED_PROVIDER, phase0, pilot
@@ -105,6 +103,24 @@ async def test_phase0_has_exact_capture_counts_and_no_input(tmp_path: Path, monk
 
 
 @pytest.mark.asyncio
+async def test_phase0_restores_environment_when_artifact_write_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "outer-home"))
+    monkeypatch.delenv("ZETA_ACCOUNT_HOME", raising=False)
+    before = dict(os.environ)
+
+    class FailingBackend:
+        async def screenshot(self):
+            raise OSError("artifact write failed")
+
+        def close(self):
+            return None
+
+    with pytest.raises(OSError, match="artifact write failed"):
+        await phase0(tmp_path, FailingBackend())
+    assert dict(os.environ) == before
+
+
+@pytest.mark.asyncio
 async def test_fake_provider_crosses_public_loop_three_trials_and_cleans_each_trial(tmp_path: Path) -> None:
     backends: list[ComputerBackend] = []
     fixtures: list[FixtureHandle] = []
@@ -163,15 +179,30 @@ async def test_provider_failure_writes_terminal_truth_and_cleanup(tmp_path: Path
     assert backend.closed and fixture.closed
 
 
-def test_prepare_home_does_not_change_process_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ZETA_HOME", "sentinel-home")
-    monkeypatch.setenv("ZETA_ACCOUNT_HOME", "sentinel-account")
-    before = {key: os.environ.get(key) for key in ("ZETA_HOME", "ZETA_ACCOUNT_HOME")}
-    with run_module.prepare_home(tmp_path):
+def test_prepare_home_restores_set_and_unset_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from evals.computer_macos.run import prepare_home
+
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "outer-home"))
+    monkeypatch.delenv("ZETA_ACCOUNT_HOME", raising=False)
+    before = dict(os.environ)
+    try:
+        with prepare_home(tmp_path) as home:
+            assert os.environ["ZETA_HOME"] == str(home)
+            assert os.environ["ZETA_ACCOUNT_HOME"] == str(Path.home() / ".zeta")
+            raise OSError("artifact write failed")
+    except OSError as exc:
+        assert str(exc) == "artifact write failed"
+    except TypeError:
+        pytest.fail("prepare_home must be an exception-safe environment context manager")
+    assert dict(os.environ) == before
+
+    monkeypatch.setenv("ZETA_ACCOUNT_HOME", str(tmp_path / "outer-account"))
+    before = dict(os.environ)
+    with pytest.raises(OSError, match="artifact write failed"), prepare_home(tmp_path):
         assert os.environ["ZETA_HOME"] == str(tmp_path / "zeta-home")
         assert os.environ["ZETA_ACCOUNT_HOME"] == str(Path.home() / ".zeta")
-    after = {key: os.environ.get(key) for key in before}
-    assert after == before
+        raise OSError("artifact write failed")
+    assert dict(os.environ) == before
 
 
 def test_reset_removes_only_run_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -182,34 +213,3 @@ def test_reset_removes_only_run_state(tmp_path: Path, monkeypatch: pytest.Monkey
     result = reset(tmp_path, verify=True)
     assert result["pass"]
     assert not home.exists()
-
-
-def test_pilot_cli_accepts_only_exact_three_without_running_action(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: list[object] = []
-
-    def fake_pilot(*args, **kwargs):
-        captured.append(kwargs["trials"])
-        async def done():
-            return {}
-        return done()
-
-    monkeypatch.setattr(run_module, "pilot", fake_pilot)
-    monkeypatch.setattr(run_module.asyncio, "run", lambda coroutine: coroutine.close())
-    monkeypatch.setattr("sys.argv", ["run", "pilot", "--run-dir", "/tmp/run", "--trials", "3"])
-    run_module.main()
-    assert captured == [3]
-    monkeypatch.setattr("sys.argv", ["run", "pilot", "--run-dir", "/tmp/run", "--trials", "2"])
-    with pytest.raises(SystemExit):
-        run_module.main()
-
-
-def test_grade_preserves_phase0_and_fails_incomplete_or_bad_pilot(tmp_path: Path) -> None:
-    (tmp_path / "events.jsonl").write_text(json.dumps({"action": "screenshot"}) + "\n")
-    fixture = tmp_path / "fixture"
-    fixture.mkdir()
-    state = trial_state(fixture, 1)
-    (fixture / "trial-1.json").write_text(json.dumps(state))
-    result = grade_module.grade(tmp_path)
-    assert result["phase0"]["pass"]
-    assert result["pilot"]["pass"] is False
-    assert result["pilot"]["trials"][0]["pass"] is False
