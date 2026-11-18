@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -59,12 +60,16 @@ def _span(
     trace: bytes = TRACE,
     parent: int | None = None,
     name: str = "zeta.turn",
-    start: int = 100,
-    end: int = 200,
+    start: int | None = None,
+    end: int | None = None,
     status: int = Status.STATUS_CODE_OK,
     attributes: dict[str, object] | None = None,
     events: tuple[Span.Event, ...] = (),
 ) -> Span:
+    if start is None:
+        start = time.time_ns() - 100
+    if end is None:
+        end = start + 100
     return Span(
         trace_id=trace,
         span_id=span_id.to_bytes(8, "big"),
