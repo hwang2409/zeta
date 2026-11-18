@@ -822,9 +822,11 @@ Errors:
 
 - unknown, duplicate, or extra keys, a non-boolean value, or a malformed
   revision: `{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}`
-- a custom endpoint, or an `otel` inline table or dotted key, is set; the
-  file is not changed:
+- a custom endpoint or custom dotted `otel` value is set; the file is not
+  changed:
   `{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}`
+  The built-in dotted `otel.endpoint` is an on no-op and is removed when
+  disabling telemetry. An `otel` inline table remains custom.
 - the file changed since `expected_revision`:
   `{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:<64 hex>"}}`
 - another zeta writer held the lock for 250 ms:

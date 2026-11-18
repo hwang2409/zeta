@@ -10,7 +10,6 @@ import os
 import re
 import secrets
 import socket
-import sqlite3
 import stat
 import sys
 from pathlib import Path
@@ -73,15 +72,11 @@ def _serve(listener: socket.socket, directory: Path, home_id: str, idle_seconds:
     from .app import IdleExitServer, IdleTimer, create_app
 
     idle = IdleTimer(idle_seconds)
-    try:
-        app = create_app(directory, home_id, idle)
-    except (OSError, RuntimeError, sqlite3.Error) as exc:
-        print(f"zeta otel receiver: cannot open the telemetry database: {exc}", file=sys.stderr)
-        return 1
+    app = create_app(directory, home_id, idle)
     print(f"zeta otel receiver: {OTLP_URL}", flush=True)  # the listener already accepts into its backlog
     server = IdleExitServer(uvicorn.Config(app, log_level="warning", access_log=False, lifespan="on"), idle)
     server.run(sockets=[listener])
-    return 0
+    return 0 if server.started else 1  # a failed migration fails the lifespan startup
 
 
 def _running_home_id(host: str, port: int) -> str | None:

@@ -103,7 +103,7 @@ async def test_missing_database_is_unavailable_and_is_never_created(tmp_path: Pa
         assert status["result"] == {
             "enabled": False, "receiver": "stopped", "endpoint": None, "last_export": None, "last_export_ns": None,
             "raw_days": 14, "rollup_days": 90, "max_bytes": 1 << 30, "used_bytes": 0, "oldest_raw_ns": None,
-            "oldest_rollup_ns": None,
+            "oldest_rollup_ns": None, "over_cap": False,
         }
         unavailable = {"code": -32005, "message": "state unavailable", "data": {"code": "telemetry_off", "retryable": True}}
         assert sessions["error"] == trace["error"] == unavailable
@@ -222,10 +222,10 @@ MISMATCH = {"code": -32000, "message": "telemetry schema is unsupported", "data"
     (None, None, OFF),  # no database file
     ("PRAGMA user_version = 0", MISMATCH, MISMATCH),
     ("PRAGMA user_version = 1", MISMATCH, MISMATCH),  # schema 1: the receiver has not migrated it yet
-    ("PRAGMA user_version = 3", MISMATCH, MISMATCH),
+    ("PRAGMA user_version = 4", MISMATCH, MISMATCH),
     ("DROP TABLE viewer_meta", MISMATCH, MISMATCH),
     ("UPDATE viewer_meta SET schema_version = 1", MISMATCH, MISMATCH),
-    ("UPDATE viewer_meta SET schema_version = 3", MISMATCH, MISMATCH),
+    ("UPDATE viewer_meta SET schema_version = 4", MISMATCH, MISMATCH),
 ])
 async def test_only_a_missing_database_is_off_and_every_bad_schema_is_refused(
     tmp_path: Path, change: str | None, status_error: dict | None, data_error: dict,

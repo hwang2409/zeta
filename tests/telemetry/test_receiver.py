@@ -12,6 +12,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -59,12 +60,16 @@ def _span(
     trace: bytes = TRACE,
     parent: int | None = None,
     name: str = "zeta.turn",
-    start: int = 100,
-    end: int = 200,
+    start: int | None = None,
+    end: int | None = None,
     status: int = Status.STATUS_CODE_OK,
     attributes: dict[str, object] | None = None,
     events: tuple[Span.Event, ...] = (),
 ) -> Span:
+    if start is None:
+        start = time.time_ns() - 100
+    if end is None:
+        end = start + 100
     return Span(
         trace_id=trace,
         span_id=span_id.to_bytes(8, "big"),
@@ -231,6 +236,7 @@ def test_receiver_start_migrates_a_schema_1_database_and_keeps_its_rows(tmp_path
         _trace(database, TRACE.hex())
 
     app = create_app(directory, "f" * 32)  # receiver start migrates
+    app.state.writer._clock_ns = lambda: 0
     with TestClient(app, base_url="http://127.0.0.1:4323") as client:
         body = _body(_span(2, trace=TRACE, name="chat qwen3:4b", start=300, end=400,
                            attributes={"gen_ai.request.model": "qwen3:4b", "zeta.retry.count": 1}))
@@ -243,8 +249,8 @@ def test_receiver_start_migrates_a_schema_1_database_and_keeps_its_rows(tmp_path
     assert _sessions(database)["items"][0]["span_count"] == 2
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
-        assert connection.execute("SELECT schema_version, committed_sequence FROM viewer_meta").fetchone() == (2, 2)
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("SELECT schema_version, committed_sequence FROM viewer_meta").fetchone() == (3, 2)
     finally:
         connection.close()
 
@@ -411,7 +417,9 @@ def test_projection_is_identical_in_both_orders(tmp_path):
 
     def ingest(order: list[Span], home: Path) -> tuple[list[tuple], list[tuple]]:
         home.mkdir()
-        with TestClient(create_app(home, HOME_ID), base_url="http://127.0.0.1:4323") as client:
+        app = create_app(home, HOME_ID)
+        app.state.writer._clock_ns = lambda: 0
+        with TestClient(app, base_url="http://127.0.0.1:4323") as client:
             for span in order:
                 assert client.post("/v1/traces", content=_body(span), headers=PROTOBUF).status_code == 200
         database = home / "telemetry.sqlite3"

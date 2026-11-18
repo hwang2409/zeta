@@ -21,7 +21,7 @@ from starlette.routing import Route
 
 from .process import AUTHORITY, OTLP_URL, URL
 from .projector import MAX_BODY_BYTES, Reject, project_request
-from .store import SCHEMA_VERSION, Writer, open_database
+from .store import SCHEMA_VERSION, Writer
 
 _SECURITY_HEADERS = [
     (b"content-security-policy", (
@@ -94,14 +94,12 @@ class _Guard:
 
 
 def create_app(directory: Path, home_id: str, idle: IdleTimer | None = None) -> Starlette:
-    """Migrate ``directory/telemetry.sqlite3`` and build the app; the writer runs during its lifespan.
+    """Build the app; during its lifespan the writer thread migrates ``directory/telemetry.sqlite3`` and catches up.
 
     Each ingest and ``/health`` request touches ``idle``.
     """
     idle = idle or IdleTimer(math.inf)
-    database = directory / "telemetry.sqlite3"
-    open_database(database)
-    writer = Writer(database)
+    writer = Writer(directory / "telemetry.sqlite3")
     accepting = True
     dropped_foreign_home = 0  # spans from another zeta home's exporter; only the count is kept
 
@@ -160,7 +158,7 @@ def create_app(directory: Path, home_id: str, idle: IdleTimer | None = None) -> 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         nonlocal accepting
-        writer.start()
+        await asyncio.to_thread(writer.start)  # migration and catch-up block; ingest is accepted only after them
         try:
             yield
         finally:
