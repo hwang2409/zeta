@@ -127,16 +127,14 @@ class Telemetry:
             return cls.disabled()
         from .runtime import configure
 
-        implementation = configure(endpoint)
-        if home is None:
-            return cls(implementation)
-        from .receiver.autostart import supervise
+        receiver = None
+        if home is not None:
+            from .receiver.autostart import supervisor_for
 
-        try:
-            receiver = supervise(home, endpoint)
-        except TelemetryError:
-            implementation.shutdown()
-            raise
+            receiver = supervisor_for(home, endpoint)
+        implementation = configure(endpoint, receiver)
+        if receiver is not None:
+            receiver.start()
         return cls(implementation, receiver)
 
     def enabled(self) -> bool:

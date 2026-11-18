@@ -216,14 +216,18 @@ class _SpanHandle(SpanHandle):
 
 
 class _Exporter:
-    def __init__(self, delegate: object, cell: StatusCell, session: object) -> None:
+    def __init__(self, delegate: object, cell: StatusCell, session: object, receiver: object | None) -> None:
         self._delegate = delegate
         self._cell = cell
         self._session = session
+        self._receiver = receiver
 
     def export(self, spans: object) -> object:
         from opentelemetry.sdk.trace.export import SpanExportResult
 
+        if self._receiver is not None and not self._receiver.may_export():
+            self._cell.publish("export_unavailable")  # another home's receiver holds the port: send nothing
+            return SpanExportResult.FAILURE
         try:
             result = self._delegate.export(spans)
         except Exception:  # noqa: BLE001 - exporter failures must never escape the SDK worker
@@ -327,7 +331,9 @@ class _Runtime:
             context.detach(token)
 
 
-def configure(endpoint: str) -> _Runtime:
+def configure(endpoint: str, receiver: object | None = None) -> _Runtime:
+    """``receiver`` is the built-in receiver's supervisor: spans carry its ``home_id``, and
+    export stops while its ``may_export()`` is false."""
     endpoint = validate_loopback_endpoint(endpoint)
     for name, value in os.environ.items():
         if name.startswith(("OTEL_EXPORTER_OTLP", "OTEL_PYTHON_EXPORTER_OTLP")) and value:
@@ -353,7 +359,7 @@ def configure(endpoint: str) -> _Runtime:
     session.trust_env = False
     cell = StatusCell()
     delegate = OTLPSpanExporter(endpoint=endpoint, headers={}, timeout=5, session=session)
-    exporter = _Exporter(delegate, cell, session)
+    exporter = _Exporter(delegate, cell, session, receiver)
     limits = SpanLimits(
         max_attributes=128,
         max_events=128,
@@ -367,7 +373,10 @@ def configure(endpoint: str) -> _Runtime:
     from importlib.metadata import version
 
     provider = TracerProvider(
-        resource=Resource({"service.name": "zeta", "service.version": version("zeta")}),
+        resource=Resource({
+            "service.name": "zeta", "service.version": version("zeta"),
+            **({} if receiver is None else {"zeta.home.id": receiver.home_id}),
+        }),
         sampler=ParentBased(ALWAYS_ON),
         span_limits=limits,
     )

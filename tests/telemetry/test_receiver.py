@@ -38,6 +38,7 @@ VERSION = importlib.metadata.version("zeta")
 ROOT = "0123456789abcdef0123456789abcdef"
 TRACE = bytes.fromhex("00112233445566778899aabbccddeeff")
 PROTOBUF = {"content-type": "application/x-protobuf"}
+HOME_ID = "f" * 32
 
 
 def _value(value: object) -> AnyValue:
@@ -81,7 +82,7 @@ def _span(
 def _body(*spans: Span, resource: dict[str, object] | None = None, scope_name: str = "zeta") -> bytes:
     request = ExportTraceServiceRequest()
     resource_spans = request.resource_spans.add()
-    resource_spans.resource.attributes.extend(_attributes(resource or {"service.name": "zeta", "service.version": VERSION}))
+    resource_spans.resource.attributes.extend(_attributes(resource or {"service.name": "zeta", "service.version": VERSION, "zeta.home.id": HOME_ID}))
     scope_spans = resource_spans.scope_spans.add()
     scope_spans.scope.name = scope_name
     scope_spans.scope.version = VERSION
@@ -93,7 +94,7 @@ def _body(*spans: Span, resource: dict[str, object] | None = None, scope_name: s
 def receiver(tmp_path):
     directory = tmp_path / "telemetry"
     directory.mkdir()
-    app = create_app(directory, "f" * 32)
+    app = create_app(directory, HOME_ID)
     with TestClient(app, base_url="http://127.0.0.1:4323") as client:
         yield client, app, directory / "telemetry.sqlite3"
 
@@ -148,7 +149,7 @@ def test_receiver_retains_only_allowlisted_metadata(receiver):
     span.status.message = secret
     span.trace_state = secret
     span.links.add(trace_id=TRACE, span_id=(9).to_bytes(8, "big"), attributes=_attributes({"link": secret}))
-    body = _body(span, resource={"service.name": "zeta", "service.version": VERSION, "host.name": secret})
+    body = _body(span, resource={"service.name": "zeta", "service.version": VERSION, "zeta.home.id": HOME_ID, "host.name": secret})
 
     assert client.post("/v1/traces", content=body, headers=PROTOBUF).status_code == 200
 
@@ -232,6 +233,27 @@ def test_request_shape_rules(receiver):
     assert health.headers["x-content-type-options"] == "nosniff"
 
 
+def test_spans_from_another_home_are_dropped_and_counted(receiver):
+    from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+        ExportTraceServiceResponse,
+    )
+
+    client, _app, database = receiver
+    other = {"service.name": "zeta", "service.version": VERSION, "zeta.home.id": "e" * 32}
+    unmarked = {"service.name": "zeta", "service.version": VERSION}
+
+    own = client.post("/v1/traces", content=_body(_span(1)), headers=PROTOBUF)
+    foreign = client.post("/v1/traces", content=_body(_span(2), _span(3), resource=other), headers=PROTOBUF)
+    legacy = client.post("/v1/traces", content=_body(_span(4), resource=unmarked), headers=PROTOBUF)
+    health = client.get("/health").json()
+
+    assert [response.status_code for response in (own, foreign, legacy)] == [200, 200, 200]
+    assert [span["span_id"] for span in _trace(database, TRACE.hex())["spans"]] == [(1).to_bytes(8, "big").hex()], "another home's spans were stored"
+    rejected = ExportTraceServiceResponse.FromString(foreign.content).partial_success
+    assert (rejected.rejected_spans, rejected.error_message) == (2, "foreign_home")
+    assert health["dropped"] == {"foreign_home": 3}
+
+
 def test_duplicate_batch_and_span_count_once(receiver):
     client, app, database = receiver
     event = Span.Event(name="zeta.approval.requested", time_unix_nano=150, attributes=_attributes({"decision": "ask", "scope": "once"}))
@@ -263,7 +285,7 @@ def test_commit_failure_acknowledges_and_publishes_nothing(tmp_path, monkeypatch
     monkeypatch.setattr(store_module.sqlite3, "connect", functools.partial(sqlite3.connect, factory=CrashingConnection))
     directory = tmp_path / "telemetry"
     directory.mkdir()
-    app = create_app(directory, "f" * 32)
+    app = create_app(directory, HOME_ID)
     database = directory / "telemetry.sqlite3"
     with TestClient(app, base_url="http://127.0.0.1:4323") as client:
         body = _body(_span(1), _span(2, parent=1, name="execute_tool read", attributes={"zeta.tool.name": "read"}))
@@ -304,7 +326,7 @@ def test_projection_is_identical_in_both_orders(tmp_path):
 
     def ingest(order: list[Span], home: Path) -> tuple[list[tuple], list[tuple]]:
         home.mkdir()
-        with TestClient(create_app(home, "f" * 32), base_url="http://127.0.0.1:4323") as client:
+        with TestClient(create_app(home, HOME_ID), base_url="http://127.0.0.1:4323") as client:
             for span in order:
                 assert client.post("/v1/traces", content=_body(span), headers=PROTOBUF).status_code == 200
         database = home / "telemetry.sqlite3"

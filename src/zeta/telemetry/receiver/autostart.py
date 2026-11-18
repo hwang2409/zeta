@@ -5,7 +5,8 @@ The receiver's own lock decides the owner, so concurrent starters are safe: a lo
 and the next health check finds the winner. A launched receiver runs in its own session and
 outlives the process that started it, because the home's other zeta processes export to it too;
 stop it with a signal. Health checks and launches run on one daemon thread, and ``snapshot()``
-only reads an attribute, so status never waits on the receiver.
+only reads an attribute, so status never waits on the receiver. When another home's receiver
+holds the port, the supervisor starts nothing and export stops until the port is free.
 """
 
 from __future__ import annotations
@@ -19,7 +20,8 @@ import time
 from pathlib import Path
 
 from .. import ReceiverState, TelemetryError
-from .process import OTLP_URL, receiver_ready
+from . import process
+from .process import HOST, OTLP_URL, PORT, _home_id
 
 POLL_SECONDS = 10.0
 STARTUP_SECONDS = 15.0
@@ -29,15 +31,24 @@ MAX_BACKOFF_SECONDS = 30.0
 _COMMAND = "import sys; from zeta.cli.main import main; sys.exit(main())"
 
 
-def supervise(home: Path, endpoint: str) -> ReceiverSupervisor | None:
-    """Start supervising ``home``'s receiver when ``endpoint`` is the built-in one."""
+def supervisor_for(home: Path, endpoint: str) -> ReceiverSupervisor | None:
+    """A supervisor for ``home``'s receiver when ``endpoint`` is the built-in one; the caller starts it."""
     if endpoint != OTLP_URL:
         return None
     if importlib.util.find_spec("uvicorn") is None or importlib.util.find_spec("starlette") is None:
         raise TelemetryError("OpenTelemetry support is not installed; install zeta[otel]")
-    supervisor = ReceiverSupervisor(home)
-    supervisor.start()
-    return supervisor
+    directory = home / "telemetry"
+    try:
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        home_id = _home_id(directory)
+    except (OSError, RuntimeError) as exc:
+        raise TelemetryError(f"cannot read the telemetry home id: {exc}") from None
+    return ReceiverSupervisor(home, home_id)
+
+
+def _health() -> str | None:
+    """The home id the receiver on the fixed port reports; blocks up to the health timeout."""
+    return process._running_home_id(HOST, PORT)
 
 
 def _launch(home: Path) -> subprocess.Popen:
@@ -50,9 +61,13 @@ def _launch(home: Path) -> subprocess.Popen:
     )
 
 
+FOREIGN_HOME = "port 4323 held by another zeta home"
+
+
 class ReceiverSupervisor:
-    def __init__(self, home: Path) -> None:
+    def __init__(self, home: Path, home_id: str) -> None:
         self._home = home
+        self.home_id = home_id  # exported as the zeta.home.id resource attribute
         self._state = ReceiverState("starting")
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._run, name="zeta-otel-receiver", daemon=True)
@@ -63,15 +78,20 @@ class ReceiverSupervisor:
     def snapshot(self) -> ReceiverState:
         return self._state
 
+    def may_export(self) -> bool:
+        """False while another home's receiver holds the port, so this home's spans never reach it."""
+        return self._state.error != FOREIGN_HOME
+
     def stop(self) -> None:
         self._stopped.set()
 
     def _run(self) -> None:
         failures = 0
         while not self._stopped.is_set():
-            if receiver_ready(self._home):
+            running = _health()
+            if running is not None:
                 failures = 0
-                self._state = ReceiverState("ready")
+                self._state = ReceiverState("ready") if running == self.home_id else ReceiverState("error", FOREIGN_HOME)
                 self._stopped.wait(POLL_SECONDS)
                 continue
             if failures >= MAX_LAUNCHES:
@@ -94,7 +114,7 @@ class ReceiverSupervisor:
             return False
         deadline = time.monotonic() + STARTUP_SECONDS
         while time.monotonic() < deadline and not self._stopped.is_set():
-            if receiver_ready(self._home):
+            if _health() is not None:  # this home's receiver, or another home's that the next check reports
                 return True
             # a launch that lost the lock exits at once; keep watching, the winner may still be starting
             child.poll()

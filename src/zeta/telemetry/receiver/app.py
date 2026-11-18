@@ -71,8 +71,10 @@ def create_app(directory: Path, home_id: str) -> Starlette:
     open_database(database)
     writer = Writer(database)
     accepting = True
+    dropped_foreign_home = 0  # spans from another zeta home's exporter; only the count is kept
 
     async def ingest(request: Request) -> Response:
+        nonlocal dropped_foreign_home
         media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if media_type != "application/x-protobuf":
             return _error(415, "content type must be application/x-protobuf")
@@ -89,9 +91,10 @@ def create_app(directory: Path, home_id: str) -> Starlette:
             if len(body) > MAX_BODY_BYTES:
                 return _error(413, "body too large")
         try:
-            rows = await asyncio.to_thread(project_request, bytes(body))
+            rows, foreign = await asyncio.to_thread(project_request, bytes(body), home_id)
         except Reject as exc:
             return _error(400, str(exc))
+        dropped_foreign_home += foreign
         try:
             committed = writer.submit(rows)
         except queue.Full:
@@ -104,7 +107,11 @@ def create_app(directory: Path, home_id: str) -> Starlette:
             ExportTraceServiceResponse,
         )
 
-        return Response(ExportTraceServiceResponse().SerializeToString(), media_type="application/x-protobuf")
+        response = ExportTraceServiceResponse()
+        if foreign:
+            response.partial_success.rejected_spans = foreign
+            response.partial_success.error_message = "foreign_home"
+        return Response(response.SerializeToString(), media_type="application/x-protobuf")
 
     async def health(request: Request) -> Response:
         return JSONResponse({
@@ -113,6 +120,7 @@ def create_app(directory: Path, home_id: str) -> Starlette:
             "protocol": "http/protobuf",
             "otlp_url": OTLP_URL,
             "ready": True,
+            "dropped": {"foreign_home": dropped_foreign_home},
         })
 
     @contextlib.asynccontextmanager

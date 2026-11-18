@@ -30,16 +30,16 @@ from zeta.telemetry.receiver.process import OTLP_URL, receiver_ready
 class Checks:
     """Wake the test after each of the supervisors' health checks, which run on their own threads."""
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, health: Callable[[], str | None] = autostart._health) -> None:
         self._changed = threading.Condition()
-        self._ready = autostart.receiver_ready
+        self._health = health
         monkeypatch.setattr(autostart, "POLL_SECONDS", 0.1)
         # test-contract: seam the health check is where the supervisor observes the receiver process
-        monkeypatch.setattr(autostart, "receiver_ready", self._check)
+        monkeypatch.setattr(autostart, "_health", self._check)
 
-    def _check(self, home: Path) -> bool:
+    def _check(self) -> str | None:
         try:
-            return self._ready(home)
+            return self._health()
         finally:
             with self._changed:
                 self._changed.notify_all()
@@ -87,7 +87,7 @@ def test_concurrent_starters_produce_one_receiver(tmp_path: Path, builtin_port: 
     launches = Launches(tmp_path, threading.Barrier(2))
     monkeypatch.setattr(autostart.subprocess, "Popen", launches)
     checks = Checks(monkeypatch)
-    starters = [autostart.ReceiverSupervisor(home), autostart.ReceiverSupervisor(home)]
+    starters = [autostart.supervisor_for(home, OTLP_URL), autostart.supervisor_for(home, OTLP_URL)]
     try:
         for starter in starters:
             starter.start()
@@ -112,7 +112,7 @@ def test_stale_lock_after_a_crash_is_recovered(tmp_path: Path, builtin_port: Non
     launches = Launches(tmp_path)
     monkeypatch.setattr(autostart.subprocess, "Popen", launches)
     checks = Checks(monkeypatch)
-    supervisor = autostart.ReceiverSupervisor(home)
+    supervisor = autostart.supervisor_for(home, OTLP_URL)
     try:
         supervisor.start()
         checks.until(lambda: supervisor.snapshot() == ReceiverState("ready"), "the first receiver starts")
@@ -210,3 +210,37 @@ async def test_serve_status_and_telemetry_status_show_the_same_receiver(tmp_path
     assert status["telemetry"]["last_export_ns"] == read["last_export_ns"]
     assert isinstance(read["last_export_ns"], int)
     assert read["endpoint"] == "builtin"
+
+
+def test_a_foreign_home_receiver_is_reported_and_gets_no_spans(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from opentelemetry.exporter.otlp.proto.http import trace_exporter
+    from opentelemetry.sdk.trace.export import SpanExportResult
+
+    sent: list[object] = []
+
+    class Recorder:
+        def __init__(self, **_options: object) -> None:
+            pass
+
+        def export(self, spans: object) -> SpanExportResult:
+            sent.append(spans)
+            return SpanExportResult.SUCCESS
+
+        def shutdown(self) -> None:
+            pass
+
+    monkeypatch.setattr(trace_exporter, "OTLPSpanExporter", Recorder)
+    # test-contract: seam a launch would start a real process; none may start while another home holds the port
+    monkeypatch.setattr(autostart, "_launch", lambda home: pytest.fail("started a receiver over another home's"))
+    checks = Checks(monkeypatch, health=lambda: "e" * 32)
+    instance = Telemetry.configure(OTLP_URL, tmp_path)
+    try:
+        checks.until(lambda: instance.receiver() == ReceiverState("error", autostart.FOREIGN_HOME), "the supervisor reports the other home")
+        with instance.turn_span(conversation_id="test", turn_number=1, notification=False):
+            pass
+        assert instance._implementation._provider.force_flush(10_000)
+
+        assert sent == [], "spans were exported to another home's receiver"
+        assert live_view(instance)["last_export"] == "error"
+    finally:
+        instance.shutdown()
