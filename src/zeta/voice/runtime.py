@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
-import os
-import signal
-import tempfile
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from .audio import AudioSource, MicrophoneSource, validate_wav
+from .audio import (
+    CAPTURE_NAME,
+    AudioSource,
+    MicrophoneSource,
+    claim_directory,
+    release_directory,
+    validate_wav,
+)
 from .whisper_cpp import Transcriber, WhisperCpp
 
 
@@ -30,7 +35,13 @@ class VoiceStateError(RuntimeError):
 
 
 class VoiceRuntime:
-    """Own capture, temporary audio, inference, and cleanup for one tui."""
+    """Own capture, temporary audio, inference, and cleanup for one tui.
+
+    Transitions happen synchronously on the loop, so they are serialized. Each
+    start or stop runs as one runtime-owned task; cancelling its caller, or
+    ``cancel``/``close``, cancels that task, then waits for shielded cleanup
+    (children reaped, files removed) before cancellation propagates.
+    """
 
     def __init__(
         self,
@@ -40,15 +51,15 @@ class VoiceRuntime:
         source: AudioSource | None = None,
         transcriber: Transcriber | None = None,
     ) -> None:
-        self._home = Path(zeta_home)
+        self._root = Path(zeta_home) / "tmp" / "voice"
         self._progress = progress
-        self._source = source or MicrophoneSource(zeta_home=self._home)
-        self._transcriber = transcriber or WhisperCpp(zeta_home=self._home)
+        self._source = source or MicrophoneSource()
+        self._transcriber = transcriber or WhisperCpp(zeta_home=Path(zeta_home))
         self._state = VoiceState.IDLE
-        self._lock = asyncio.Lock()
-        self._path: Path | None = None
-        self._operation: asyncio.Task[object] | None = None
         self._generation = 0
+        self._operation: asyncio.Task[object] | None = None
+        self._cleanup: asyncio.Task[None] | None = None
+        self._directory: tuple[Path, int] | None = None
 
     @property
     def state(self) -> VoiceState:
@@ -59,100 +70,128 @@ class VoiceRuntime:
         if self._progress is not None:
             self._progress(state)
 
+    def _begin(self, required: VoiceState, next_state: VoiceState, action: str) -> int:
+        if self._state is not required:
+            raise VoiceStateError(f"cannot {action} voice in {self._state.value}")
+        self._generation += 1
+        self._set_state(next_state)
+        return self._generation
+
     async def start_recording(self) -> None:
-        async with self._lock:
-            if self._state is not VoiceState.IDLE:
-                raise VoiceStateError(f"cannot start voice in {self._state.value}")
-            self._generation += 1
-            generation = self._generation
-            self._set_state(VoiceState.STARTING)
-            root = self._home / "tmp" / "voice"
-            await asyncio.to_thread(self._cleanup_stale, root)
-            await asyncio.to_thread(root.mkdir, parents=True, exist_ok=True, mode=0o700)
-            directory = Path(tempfile.mkdtemp(prefix="", dir=root))
-            self._path = directory / "capture.wav"
-            try:
-                await self._source.start(self._path)
-            except BaseException:
-                await asyncio.shield(self._source.close())
-                await asyncio.shield(self._remove_capture())
-                self._set_state(VoiceState.IDLE)
-                raise
-            if generation != self._generation:
-                raise asyncio.CancelledError
-            self._set_state(VoiceState.RECORDING)
+        generation = self._begin(VoiceState.IDLE, VoiceState.STARTING, "start")
+        await self._run(self._start(), generation)
 
     async def stop_and_transcribe(self) -> str:
-        async with self._lock:
-            if self._state is not VoiceState.RECORDING or self._path is None:
-                raise VoiceStateError(f"cannot stop voice in {self._state.value}")
-            self._set_state(VoiceState.STOPPING)
-            try:
-                await self._source.stop()
-                await asyncio.to_thread(validate_wav, self._path)
-                self._set_state(VoiceState.PREPARING)
-                self._set_state(VoiceState.TRANSCRIBING)
-                return await self._transcriber.transcribe(self._path)
-            except asyncio.CancelledError:
-                await asyncio.shield(self._source.close())
-                raise
-            finally:
-                await asyncio.shield(self._remove_capture())
-                if self._state is not VoiceState.CLOSED:
-                    self._set_state(VoiceState.IDLE)
+        generation = self._begin(VoiceState.RECORDING, VoiceState.STOPPING, "stop")
+        return await self._run(self._stop(), generation)
 
     async def cancel(self) -> None:
-        async with self._lock:
-            if self._state is VoiceState.CLOSED:
-                return
-            self._generation += 1
-            self._set_state(VoiceState.CANCELLING)
-            try:
-                await self._source.close()
-            finally:
-                await asyncio.shield(self._remove_capture())
-                self._set_state(VoiceState.IDLE)
+        if self._state is VoiceState.CLOSED:
+            return
+        self._generation += 1  # a finished transcript not yet handed back is dropped too
+        if self._cleanup is None and self._state is not VoiceState.IDLE:
+            self._cleanup = asyncio.create_task(self._discard(VoiceState.IDLE))
+        if self._cleanup is not None:
+            await _finish(self._cleanup)
 
     async def close(self) -> None:
-        async with self._lock:
-            if self._state is VoiceState.CLOSED:
-                return
-            self._generation += 1
-            self._set_state(VoiceState.CANCELLING)
-            try:
-                await self._source.close()
-                await self._transcriber.close()
-            finally:
-                await asyncio.shield(self._remove_capture())
-                self._set_state(VoiceState.CLOSED)
-
-    async def _remove_capture(self) -> None:
-        path = self._path
-        self._path = None
-        if path is None:
+        while self._cleanup is not None:
+            with contextlib.suppress(Exception):  # a failed cancel must not stop close
+                await _finish(self._cleanup)
+        if self._state is VoiceState.CLOSED:
             return
-        await asyncio.to_thread(self._remove_path, path)
+        self._generation += 1
+        self._cleanup = asyncio.create_task(self._discard(VoiceState.CLOSED))
+        await _finish(self._cleanup)
 
-    @staticmethod
-    def _cleanup_stale(root: Path) -> None:
-        if not root.is_dir():
-            return
-        for directory in root.iterdir():
-            record = directory / "process.pid"
-            try:
-                pid = int(record.read_text().strip())
-                os.kill(pid, signal.SIGTERM)
-            except (OSError, ValueError):
-                pass
-            record.unlink(missing_ok=True)
-            for child in directory.iterdir():
-                child.unlink(missing_ok=True)
-            directory.rmdir()
-
-    @staticmethod
-    def _remove_path(path: Path) -> None:
+    async def _run[T](self, operation: Awaitable[T], generation: int) -> T:
+        task = asyncio.ensure_future(operation)
+        self._operation = task  # type: ignore[assignment]
         try:
-            path.unlink(missing_ok=True)
-            path.parent.rmdir()
-        except OSError:
-            pass
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                await self.cancel()  # our caller was cancelled
+            raise
+        finally:
+            if self._operation is task:
+                self._operation = None
+        if generation != self._generation:
+            raise asyncio.CancelledError  # cancelled or closed during the hand-back
+        return result
+
+    async def _start(self) -> None:
+        try:
+            if self._directory is None:
+                claim = asyncio.ensure_future(asyncio.to_thread(claim_directory, self._root))
+                try:
+                    await _finish(claim)
+                finally:  # keep a claimed directory even when cancelled, so cleanup owns it
+                    if claim.exception() is None:
+                        self._directory = claim.result()
+            await self._source.start(self._directory[0] / CAPTURE_NAME)
+        except Exception:
+            await self._reset(VoiceState.IDLE)
+            raise
+        self._set_state(VoiceState.RECORDING)
+
+    async def _stop(self) -> str:
+        assert self._directory is not None
+        capture = self._directory[0] / CAPTURE_NAME
+        try:
+            await self._source.stop()
+            await asyncio.to_thread(validate_wav, capture)
+            self._set_state(VoiceState.PREPARING)
+            await self._transcriber.prepare()
+            self._set_state(VoiceState.TRANSCRIBING)
+            text = await self._transcriber.transcribe(capture)
+        except Exception:
+            await self._reset(VoiceState.IDLE)
+            raise
+        await self._reset(VoiceState.IDLE)
+        return text
+
+    async def _discard(self, final: VoiceState) -> None:
+        try:
+            self._set_state(VoiceState.CANCELLING)
+            operation = self._operation
+            if operation is not None:
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+            await self._reset(final)
+        finally:
+            self._cleanup = None
+
+    async def _reset(self, final: VoiceState) -> None:
+        """Reap capture, delete audio, and publish ``final``; survives cancellation."""
+        try:
+            await _finish(asyncio.ensure_future(self._source.close()))
+        finally:
+            directory = self._directory
+            if final is VoiceState.CLOSED:
+                self._directory = None
+            try:
+                if directory is not None:
+                    await _finish(asyncio.ensure_future(asyncio.to_thread(_remove_files, directory, final)))
+            finally:
+                self._set_state(final)
+
+
+def _remove_files(directory: tuple[Path, int], final: VoiceState) -> None:
+    if final is VoiceState.CLOSED:
+        release_directory(*directory)
+    else:
+        (directory[0] / CAPTURE_NAME).unlink(missing_ok=True)
+
+
+async def _finish[T](task: asyncio.Future[T]) -> T:
+    """Await ``task`` to completion even if we are cancelled, then re-raise."""
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    return task.result()

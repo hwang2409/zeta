@@ -345,6 +345,8 @@ def build_key_bindings(
     on_next_user: Callable[[], None] | None = None,
     on_toggle_agent: Callable[[], None] | None = None,
     on_voice_toggle: Callable[[], None] | None = None,
+    on_voice_cancel: Callable[[], None] | None = None,
+    voice_active: Callable[[], bool] | None = None,
     on_retry: Callable[[], None] | None = None,
     retry_available: Callable[[], bool] | None = None,
     on_undo: Callable[[], None] | None = None,
@@ -1104,6 +1106,14 @@ def build_key_bindings(
         def toggle_voice(event: KeyPressEvent) -> None:
             del event
             on_voice_toggle()
+
+    if on_voice_cancel is not None and voice_active is not None:
+
+        # added after the general escape handler so it wins while voice is busy
+        @bindings.add("escape", filter=Condition(voice_active) & ~panel_mode, eager=True)
+        def cancel_voice(event: KeyPressEvent) -> None:
+            del event
+            on_voice_cancel()
 
     if on_approve is not None and on_deny is not None:
 

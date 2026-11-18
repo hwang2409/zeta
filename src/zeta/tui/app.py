@@ -32,7 +32,7 @@ from ..core.project_context import (
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
     project_instructions_editor_command,
 )
-from ..core.session import SessionMetadata
+from ..core.session import SessionMetadata, env_home
 from ..core.slash import (
     SlashStatus,
     UsageTracker,
@@ -49,7 +49,6 @@ from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
 from ..telemetry import Telemetry
 from ..tools._shared.user_discovery import ExternalToolDiscovery
-from ..voice import VoiceRuntime, VoiceState
 from . import overlay, theme
 from .agent_card import (
     AgentNavigation,
@@ -82,6 +81,7 @@ from .paste_runtime import PasteRuntime
 from .runtime.overlay_opener import OverlayOpenerMixin
 from .runtime.prompt import PromptRuntimeMixin
 from .runtime.stream import StreamEventMixin
+from .runtime.voice import VoiceInputMixin
 from .runtime_close import RuntimeCloseMixin
 from .session_prompt_history import SessionPromptHistory
 from .slash_handlers import SlashHandlerMixin
@@ -179,6 +179,7 @@ class TUIApp(
     OverlayOpenerMixin,
     StreamEventMixin,
     PromptRuntimeMixin,
+    VoiceInputMixin,
 ):
     """Full-screen transcript, persistent composer, and follow-up queue."""
 
@@ -242,7 +243,6 @@ class TUIApp(
         self.console = console or Console(theme=RICH_THEME)
         self._active_task: asyncio.Task[None] | None = None
         self._paste_runtime = PasteRuntime(app)
-        self._voice = VoiceRuntime(zeta_home=Path(zeta_home or Path.home() / ".zeta"), progress=lambda _state: self._invalidate_prompt())
         self._on_session_close = on_session_close
         self._init_runtime_close()
         self._init_fork_runtime()
@@ -330,6 +330,7 @@ class TUIApp(
         self._account_switch_finished = asyncio.Event()
         self._account_switch_finished.set()
         self._zeta_home = Path(zeta_home).resolve() if zeta_home is not None else None
+        self._init_voice(self._zeta_home or env_home())
         if project_dir is None:
             discovery = discover_project(self.loop.store.cwd)
             repo_root = discovery.primary_root or discovery.cwd
@@ -546,6 +547,8 @@ class TUIApp(
             on_submit=lambda value: app._submit_input(value),
             on_paste=lambda event: app._paste_from_keybinding(event),
             on_voice_toggle=lambda: app._toggle_voice(),
+            on_voice_cancel=lambda: app._cancel_voice(),
+            voice_active=lambda: app.voice_active,
             on_status_close=lambda: app.close_status_card(),
             status_active=lambda: app.status_card_active,
             on_status_scroll=lambda amount: app._status_move(amount),
@@ -686,6 +689,7 @@ class TUIApp(
         if path == owner.view_path:
             return
         owner.view_path = path
+        self._cancel_voice()  # a late transcript must not reach another session
         self._agent_navigation.transcript_control.prompt_history.reset_navigation()
         finder = self._active_finder
         if finder.finder_active:
@@ -1147,21 +1151,6 @@ class TUIApp(
 
     def _status_toolbar(self) -> list[tuple[str, str]]:
         return status_toolbar(self, get_app().output.get_size().columns)
-
-    def _toggle_voice(self) -> None:
-        if self._voice.state is VoiceState.RECORDING:
-            asyncio.create_task(self._finish_voice())
-        elif self._voice.state is VoiceState.IDLE:
-            asyncio.create_task(self._voice.start_recording())
-
-    async def _finish_voice(self) -> None:
-        try:
-            text = await self._voice.stop_and_transcribe()
-        except (Exception, asyncio.CancelledError):
-            return
-        if text and isinstance(self._active_session, FullScreenPromptSession):
-            self._active_session.default_buffer.insert_text(text)
-        self._invalidate_prompt()
 
     def _consume_overlay_submission(self) -> None:
         session = self._active_session

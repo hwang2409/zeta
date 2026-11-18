@@ -286,6 +286,9 @@ class FinderRuntimeMixin:
         paste_runtime = getattr(self, "_paste_runtime", None)
         if paste_runtime is not None:
             await paste_runtime.reset()
+        voice = getattr(self, "_voice", None)
+        if voice is not None:
+            await voice.cancel()
 
     def _finder_toggle_preview(self) -> None:
         self._finder_target().finder_toggle_preview()
