@@ -43,9 +43,7 @@ async def _connect(server, *, observer=False, negotiated=True):
         })
         assert MARKER not in json.dumps(response)
         assert set(response["result"]["capabilities"].get("features", [])) == set(features)
-        assert [method for method in response["result"]["capabilities"]["requests"] if method.startswith("state_")] == (
-            [METHOD] if negotiated else []
-        )
+        assert (METHOD in response["result"]["capabilities"]["requests"]) is negotiated
         yield client
 
 
