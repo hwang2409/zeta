@@ -721,7 +721,7 @@ continues after its last span, so a page can be shorter than `limit` while
 `next_cursor` is not `null`:
 
 ```json
-{"trace":{"trace_id":"00112233445566778899aabbccddeeff","first_ns":0,"last_ns":0,"root_span_id":null,"root_session_id":null,"status":"ok","span_count":0,"error_count":0},"spans":[{"span_id":"0011223344556677","parent_span_id":null,"operation":"turn","start_ns":0,"end_ns":0,"duration_ns":0,"status":"ok","error_type":null,"error_code":null,"session_id":null,"agent_name":null,"agent_depth":null,"background":null,"run_id":null,"parent_run_id":null,"turn_number":null,"notification":null,"outcome":null,"provider":null,"request_model":null,"response_model":null,"stream":null,"input_tokens":null,"output_tokens":null,"total_tokens":null,"cache_read_tokens":null,"cache_write_tokens":null,"finish_reason":null,"ttft_ns":null,"retry_count":null,"tool_name":null,"tool_type":null,"tool_call_id":null,"tool_argument_bytes":null,"tool_result_bytes":null,"tool_count":null,"emergency":null,"tokens_before":null,"tokens_after":null,"rpc_method":null,"mcp_method":null,"mcp_server":null,"mcp_tool":null,"mcp_prompt":null,"mcp_protocol":null,"request_id":null,"events":[{"name":"gen_ai.client.retry","time_ns":0,"retry_attempt":null,"retry_reason":null,"retry_delay":null,"retry_after":null,"decision":null,"scope":null,"duration_ns":null}]}],"next_cursor":null}
+{"trace":{"trace_id":"00112233445566778899aabbccddeeff","first_ns":0,"last_ns":0,"root_span_id":null,"root_session_id":null,"status":"ok","span_count":0,"error_count":0},"spans":[{"span_id":"0011223344556677","parent_span_id":null,"operation":"turn","start_ns":0,"end_ns":0,"duration_ns":0,"status":"unset","error_type":null,"error_code":null,"session_id":null,"agent_name":null,"agent_depth":null,"background":null,"run_id":null,"parent_run_id":null,"turn_number":null,"notification":null,"outcome":null,"provider":null,"request_model":null,"response_model":null,"stream":null,"input_tokens":null,"output_tokens":null,"total_tokens":null,"cache_read_tokens":null,"cache_write_tokens":null,"finish_reason":null,"ttft_ns":null,"retry_count":null,"tool_name":null,"tool_type":null,"tool_call_id":null,"tool_argument_bytes":null,"tool_result_bytes":null,"tool_count":null,"emergency":null,"tokens_before":null,"tokens_after":null,"rpc_method":null,"mcp_method":null,"mcp_server":null,"mcp_tool":null,"mcp_prompt":null,"mcp_protocol":null,"request_id":null,"events":[{"name":"gen_ai.client.retry","time_ns":0,"retry_attempt":null,"retry_reason":null,"retry_delay":null,"retry_after":null,"decision":null,"scope":null,"duration_ns":null}]}],"next_cursor":null}
 ```
 
 `operation` is one of `invoke_agent`, `turn`, `chat`, `execute_tool`,
@@ -899,6 +899,43 @@ An agent's `parent_session_id` is its conversation id without the last
 span's name; `depth` is that span's depth, else the number of `:` segments;
 `status` is `error` when any of its spans failed, else `ok` when any span is
 `ok`, else `unset`.
+
+### state catalog (`state_read_v1` feature)
+
+Request `state_read_v1` in a protocol 1.2 `hello` and check that the server
+returns it in `capabilities.features`. On `feature/otel-viewer`, only
+`state_catalog` is implemented under this feature. The feature will only be
+advertised on `main` when the full v1 state read interface is available.
+
+Authenticated controllers and observers can call `state_catalog` without an
+active session or a telemetry receiver. Without negotiation it returns `-32601`.
+
+```json
+{"kind":"profiles","limit":50,"cursor":null}
+```
+
+`kind` is required and is `profiles`, `skills`, or `commands`. `limit` is
+optional (default 50, range 1–200). `cursor` is optional or `null` on the
+first page. Pass `next_cursor` unchanged for the same `kind` to continue.
+
+```json
+{"kind":"profiles","items":[{"name":"example","description":"Example profile","source":"home"}],"next_cursor":null}
+```
+
+Only built-in and home metadata is included. `source` is `built_in` or `home`.
+No profile prompts, skill instructions, command bodies, credentials, or MCP
+headers are returned. Items sort by name, then source, ascending, capped at
+1,000 per kind. Each response returns the largest ordered prefix that fits the
+1 MiB frame. A non-null `next_cursor` means there are more items, even if the
+page has fewer than `limit`. Each page reads a fresh snapshot.
+
+| error | `data.code` | when |
+|---|---|---|
+| `-32602` | `invalid_params` | invalid parameters or a malformed or mismatched cursor |
+| `-32005` | `state_unavailable` | the manifest is missing or the state cannot be read (`retryable: true`) |
+| `-32000` | `corrupt_state` | invalid stored state or a future storage epoch (`resource` identifies the kind or manifest) |
+| `-32009` | `stale_state_snapshot` | state kept changing after one retry (`retryable: true`) |
+| `-32007` | `result_too_large` | even one item cannot fit the response frame |
 
 ### home settings (`home_settings_v1` feature)
 
@@ -2610,7 +2647,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `child_run_history`, `child_run_events`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated, `content_read` when both `serve_observers` and `content_read` are negotiated, and `child_run_list` when `child_runs` is negotiated. `child_run_history` and `child_run_events` are available only when their respective features are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `child_run_history`, `child_run_events`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated, `content_read` when both `serve_observers` and `content_read` are negotiated, `child_run_list` when `child_runs` is negotiated, and `telemetry_*` and read-only `state_*` methods when their respective read features are negotiated. `child_run_history` and `child_run_events` are available only when their respective features are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 

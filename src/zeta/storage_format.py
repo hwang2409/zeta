@@ -330,6 +330,10 @@ class StorageFormatError(ValueError):
     """Raised when a home cannot be accessed by this stored-format version."""
 
 
+class MissingManifest(StorageFormatError):
+    """The home has no storage manifest to validate."""
+
+
 def reject_unknown_keys(payload: Mapping[str, object], shape: str) -> None:
     """Enforce the one authoritative accepted-key declaration for a payload."""
 
@@ -754,8 +758,8 @@ def _open_lock(home: Path) -> int:
     return fd
 
 
-def _missing_manifest_error(home: Path) -> StorageFormatError:
-    return StorageFormatError(
+def _missing_manifest_error(home: Path) -> MissingManifest:
+    return MissingManifest(
         f"stored-format manifest is missing at {home}; run "
         "zeta storage-format advance --expected-epoch 0 "
         f"--target-epoch {WRITER_EPOCH}"
@@ -779,7 +783,7 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
         epoch = value["writer_epoch"]
         if type(epoch) is not int or epoch < 0:
             raise ValueError
-    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+    except (UnicodeError, ValueError, KeyError) as exc:
         raise StorageFormatError(
             f"stored-format manifest is invalid at {home}"
         ) from exc
@@ -825,6 +829,17 @@ def _bootstrap_empty_home(fd: int, home: Path) -> None:
             _read_manifest(home)
         _publish_manifest(home, WRITER_EPOCH)
     fcntl.flock(fd, fcntl.LOCK_SH)
+
+
+@contextmanager
+def open_reader(home: str | Path) -> Iterator[None]:
+    """Validate an existing home without a lease, bootstrapping, or writes."""
+    epoch = _read_manifest(_canonical_home(home))
+    if epoch > WRITER_EPOCH:
+        raise StorageFormatError(
+            f"stored format {epoch} is newer than reader capability {WRITER_EPOCH}"
+        )
+    yield
 
 
 def open_writer(home: str | Path, *, capability: int | None = None) -> WriterLease:

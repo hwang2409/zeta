@@ -16,8 +16,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from ...read_page import InvalidParams, Key, resume
 from ..runtime import _SESSION_ID
-from .page import InvalidParams, Key, keyset_page, resume
+from .page import keyset_page
 from .process import OTLP_URL, receiver_ready
 from .store import (
     BUSY_TIMEOUT_MS,

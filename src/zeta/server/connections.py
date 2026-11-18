@@ -32,6 +32,7 @@ from .protocol import (
     ProtocolError,
     _Frame,
 )
+from .read_catalog import ReadCatalog
 from .session_replay import (
     DeferredFrame,
     ReplayScopeId,
@@ -219,6 +220,7 @@ class ConnectionRegistry(ReplayOutput):
         self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
         self._child_reader_lock = threading.Lock()
         self._reads = ThreadCallWorkers(loop, workers=2, name="zeta-read")
+        self.read_catalog = ReadCatalog(self.run_blocking)
 
     def register(self, connection: Any) -> None:
         if self._closed:
@@ -1219,6 +1221,7 @@ class ConnectionRegistry(ReplayOutput):
         self._unregister_child_run_sink()
         states = tuple(self._connections.values())
         await asyncio.to_thread(self.close_child_reader)
+        self.read_catalog.close()
         self._reads.close()
         for state in states:
             if state.output is not None:
