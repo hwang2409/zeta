@@ -204,6 +204,12 @@ feature. Observer connections receive only methods with `read` access.
 | `state_agents` | `1.0` | `state_read_v1` | `read` |
 | `state_background_tasks` | `1.0` | `state_read_v1` | `read` |
 | `state_catalog` | `1.0` | `state_read_v1` | `read` |
+| `state_projects` | `1.0` | `state_read_v1` | `read` |
+| `state_memory` | `1.0` | `state_read_v1` | `read` |
+| `state_memory_detail` | `1.0` | `state_read_v1` | `controller_read` |
+| `state_inbox` | `1.0` | `state_read_v1` | `read` |
+| `state_inbox_detail` | `1.0` | `state_read_v1` | `controller_read` |
+| `state_attention` | `1.0` | `state_read_v1` | `read` |
 | `telemetry_status` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_sessions` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_trace` | `1.0` | `telemetry_read_v1` | `read` |
@@ -941,6 +947,49 @@ page has fewer than `limit`. Each page reads a fresh snapshot.
 | `-32000` | `corrupt_state` | invalid stored state or a future storage epoch (`resource` identifies the kind or manifest) |
 | `-32009` | `stale_state_snapshot` | state kept changing after one retry (`retryable: true`) |
 | `-32007` | `result_too_large` | even one item cannot fit the response frame |
+
+### project state (`state_read_v1` feature)
+
+These methods need no active session or telemetry receiver. Both roles may
+call the four list methods. An observer calling either detail method receives
+`-32008` with `data.code: "observer_read_only"` and `data.method` set to the
+requested method. Without feature negotiation the methods return `-32601`.
+
+| method | params (optional fields marked `?`) | result | descending order |
+|---|---|---|---|
+| `state_projects` | `limit?`, `cursor?` | Page of Project | `updated_ns`, `project_id` |
+| `state_memory` | `project_id`, `kind?`, `limit?`, `cursor?` | Page of Memory | `updated_ns`, `memory_id` |
+| `state_memory_detail` | `project_id`, `memory_id` | `{memory, body, truncated}` | — |
+| `state_inbox` | `project_id`, `status?`, `limit?`, `cursor?` | Page of Inbox | `created_ns`, `message_id` |
+| `state_inbox_detail` | `project_id`, `message_id` | `{message, body, truncated}` | — |
+| `state_attention` | `project_id?`, `status?`, `limit?`, `cursor?` | Page of Attention | `created_ns`, `attention_id` |
+
+Ids are strings. Use `null` or omit a filter to include all values. Memory
+`kind` is `decision`, `state`, `backlog`, `changelog`, or `legacy`; inbox
+`status` is `new`, `claimed`, or `done`; attention `status` is `open` or `done`.
+The page shape is `{items, next_cursor, as_of_ns}`. `limit` defaults to 50
+(range 1–200). Omit `cursor` or use `null` on the first page. Continue with
+`next_cursor` and the same method and filters. Each page reads a fresh
+snapshot and returns the largest prefix that fits the frame.
+
+```text
+Project   {project_id, name, path, session_count, memory_count, inbox: {new, claimed, done}, updated_ns}
+Memory    {memory_id, project_id, kind, automatic, summary, created_ns, updated_ns, source_session_id, has_body}
+Inbox     {message_id, project_id, kind, status, sender, summary, created_ns, updated_ns, trusted_assignment, has_body}
+Attention {attention_id, project_id, session_id, kind, status, title, created_ns, updated_ns}
+```
+
+Counts and nanosecond timestamps are integers. `source_session_id` and the
+attention project and session ids may be `null`. Inbox kinds are `bug_report`,
+`change_request`, `question`, `info`, and `reply`; attention kinds are
+`answer`, `decided`, `deferred`, and `decision`. Trust comes from the inbox
+owner's origin and delegation rules, not from the message text.
+
+Lists have no body field. Memory and inbox summaries are capped at 512 UTF-8
+bytes. Detail bodies are capped at 64 KiB on a UTF-8 character boundary;
+`truncated` reports whether any bytes were omitted. Detail bodies are not
+cached. These methods share the state catalog's errors and single snapshot
+retry; invalid ids or a missing detail item return `-32602` `invalid_params`.
 
 ### session state (`state_read_v1` feature)
 
@@ -2658,7 +2707,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `tool_approval_origin` | adds `approval_origin: "automatic" | "user"` to live `tool_start` calls and replayed history `tool_use` calls |
 | `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, `telemetry_trace`, `telemetry_overview`, `telemetry_models`, `telemetry_tools`, `telemetry_errors`, `telemetry_series`, and `telemetry_agent_tree` methods |
-| `state_read_v1` | enables `state_catalog` and `state_sessions`, `state_session`, `state_agents`, and `state_background_tasks` for metadata-only reads |
+| `state_read_v1` | enables `state_catalog`, `state_projects`, `state_memory`, `state_memory_detail`, `state_inbox`, `state_inbox_detail`, `state_attention`, `state_sessions`, `state_session`, `state_agents`, and `state_background_tasks` |
 | `home_settings_v1` | enables `home_settings_get` and controller-only `home_settings_update` for the home `settings.toml` (`telemetry.enabled` only) |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |

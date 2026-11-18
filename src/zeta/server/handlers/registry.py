@@ -30,8 +30,14 @@ from .run_work import cancel_background_task, list_run_work
 from .settings import home_settings_get, home_settings_update
 from .state import (
     state_agents,
+    state_attention,
     state_background_tasks,
     state_catalog,
+    state_inbox,
+    state_inbox_detail,
+    state_memory,
+    state_memory_detail,
+    state_projects,
     state_session,
     state_sessions,
 )
@@ -496,6 +502,12 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.STATE_AGENTS: state_agents,
     MethodDescriptor.STATE_BACKGROUND_TASKS: state_background_tasks,
     MethodDescriptor.STATE_CATALOG: state_catalog,
+    MethodDescriptor.STATE_PROJECTS: state_projects,
+    MethodDescriptor.STATE_MEMORY: state_memory,
+    MethodDescriptor.STATE_MEMORY_DETAIL: state_memory_detail,
+    MethodDescriptor.STATE_INBOX: state_inbox,
+    MethodDescriptor.STATE_INBOX_DETAIL: state_inbox_detail,
+    MethodDescriptor.STATE_ATTENTION: state_attention,
     MethodDescriptor.TELEMETRY_STATUS: telemetry_status,
     MethodDescriptor.TELEMETRY_SESSIONS: telemetry_sessions,
     MethodDescriptor.TELEMETRY_TRACE: telemetry_trace,
