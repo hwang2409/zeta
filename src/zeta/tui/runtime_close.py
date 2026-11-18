@@ -72,6 +72,9 @@ class RuntimeCloseMixin:
             await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)
             await attempt_async(self._cancel_model_catalog_load)
+            voice = getattr(self, "_voice", None)
+            if voice is not None:
+                await attempt_async(voice.close)
             prepare_ui_session_change = getattr(
                 self, "_prepare_ui_session_change", None
             )

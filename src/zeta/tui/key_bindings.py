@@ -65,6 +65,7 @@ DEFAULTS: Final[Mapping[str, tuple[str, ...]]] = {
     # handles terminal state around the round-trip. Works in both vi and
     # emacs editing modes; the vi ``v``-in-normal shortcut still applies.
     "open-editor": ("c-x", "c-e"),
+    "voice-toggle": ("c-x", "c-v"),
     # Opens the attention-decisions popup. The default c-t shadows the Emacs
     # transpose-char editing chord; remap it (``open-decisions = "c-b"`` etc.)
     # to keep transpose. ``/decisions`` opens the same popup regardless.
@@ -343,6 +344,7 @@ def build_key_bindings(
     on_previous_user: Callable[[], None] | None = None,
     on_next_user: Callable[[], None] | None = None,
     on_toggle_agent: Callable[[], None] | None = None,
+    on_voice_toggle: Callable[[], None] | None = None,
     on_retry: Callable[[], None] | None = None,
     retry_available: Callable[[], bool] | None = None,
     on_undo: Callable[[], None] | None = None,
@@ -1095,6 +1097,13 @@ def build_key_bindings(
         def toggle_agent(event: KeyPressEvent) -> None:
             del event
             on_toggle_agent()
+
+    if on_voice_toggle is not None:
+
+        @bindings.add(*resolved_keys["voice-toggle"], filter=~panel_mode, eager=True)
+        def toggle_voice(event: KeyPressEvent) -> None:
+            del event
+            on_voice_toggle()
 
     if on_approve is not None and on_deny is not None:
 
