@@ -23,10 +23,9 @@ def grade(run_dir: Path) -> dict:
     for path in sorted(fixture_dir.glob("trial-*.json")):
         state = json.loads(path.read_text())
         clicks = state.get("clicks", [])
-        result = grade_trial(state)
-        trials.append({"trial": state["trial"], **result, "nonce_match": all(c.get("nonce") == state["nonce"] for c in clicks)})
-    if trials:
-        result["pilot"] = {"pass": all(t["pass"] for t in trials), "trials": trials}
+        trial_result = grade_trial(state)
+        trials.append({"trial": state["trial"], **trial_result, "nonce_match": all(c.get("nonce") == state["nonce"] for c in clicks)})
+    result["pilot"] = {"pass": len(trials) == 3 and all(t["pass"] and t["nonce_match"] for t in trials), "trials": trials}
     (run_dir / "grader.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return result
 
@@ -36,7 +35,7 @@ def main() -> None:
     parser.add_argument("--run-dir", type=Path, required=True)
     args = parser.parse_args()
     result = grade(args.run_dir)
-    raise SystemExit(0 if result["phase0"]["pass"] else 1)
+    raise SystemExit(0 if result["phase0"]["pass"] and result.get("pilot", {"pass": True})["pass"] else 1)
 
 
 if __name__ == "__main__":

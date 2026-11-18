@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from evals.computer_macos import grade as grade_module
+from evals.computer_macos import run as run_module
 from evals.computer_macos.fixture import FixtureServer, trial_state
 from evals.computer_macos.reset import reset
 from evals.computer_macos.run import EXPECTED_MODEL, EXPECTED_PROVIDER, phase0, pilot
@@ -168,3 +170,34 @@ def test_reset_removes_only_run_state(tmp_path: Path, monkeypatch: pytest.Monkey
     result = reset(tmp_path, verify=True)
     assert result["pass"]
     assert not home.exists()
+
+
+def test_pilot_cli_accepts_only_exact_three_without_running_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: list[object] = []
+
+    def fake_pilot(*args, **kwargs):
+        captured.append(kwargs["trials"])
+        async def done():
+            return {}
+        return done()
+
+    monkeypatch.setattr(run_module, "pilot", fake_pilot)
+    monkeypatch.setattr(run_module.asyncio, "run", lambda coroutine: coroutine.close())
+    monkeypatch.setattr("sys.argv", ["run", "pilot", "--run-dir", "/tmp/run", "--trials", "3"])
+    run_module.main()
+    assert captured == [3]
+    monkeypatch.setattr("sys.argv", ["run", "pilot", "--run-dir", "/tmp/run", "--trials", "2"])
+    with pytest.raises(SystemExit):
+        run_module.main()
+
+
+def test_grade_preserves_phase0_and_fails_incomplete_or_bad_pilot(tmp_path: Path) -> None:
+    (tmp_path / "events.jsonl").write_text(json.dumps({"action": "screenshot"}) + "\n")
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    state = trial_state(fixture, 1)
+    (fixture / "trial-1.json").write_text(json.dumps(state))
+    result = grade_module.grade(tmp_path)
+    assert result["phase0"]["pass"]
+    assert result["pilot"]["pass"] is False
+    assert result["pilot"]["trials"][0]["pass"] is False
