@@ -16,12 +16,10 @@ from zeta.protocol.types import (
     Message,
     MessageOrigin,
     MessageRole,
-
     StreamEventType,
     TextContent,
     ToolCall,
     ToolUseContent,
-
 )
 from zeta.providers.anthropic_payload import build_messages_payload
 from zeta.providers.codex_payload import build_responses_payload
