@@ -14,6 +14,7 @@ from .audio import (
     MicrophoneSource,
     claim_directory,
     release_directory,
+    remove_file,
     validate_wav,
 )
 from .whisper_cpp import Transcriber, WhisperCpp
@@ -181,7 +182,7 @@ def _remove_files(directory: tuple[Path, int], final: VoiceState) -> None:
     if final is VoiceState.CLOSED:
         release_directory(*directory)
     else:
-        (directory[0] / CAPTURE_NAME).unlink(missing_ok=True)
+        remove_file(directory[0] / CAPTURE_NAME)
 
 
 async def _finish[T](task: asyncio.Future[T]) -> T:

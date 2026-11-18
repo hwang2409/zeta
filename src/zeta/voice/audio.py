@@ -87,7 +87,7 @@ class MicrophoneSource:
         if process is not None:
             await process.kill()
         if self._writer is not None:
-            await asyncio.to_thread(_remove, self._writer.path.parent / PID_NAME)
+            await asyncio.to_thread(remove_file, self._writer.path.parent / PID_NAME)
             self._writer = None
 
 
@@ -189,7 +189,7 @@ def claim_directory(root: Path) -> tuple[Path, int]:
 
 def release_directory(directory: Path, fd: int) -> None:
     for name in _KNOWN_NAMES:
-        _remove(directory / name)
+        remove_file(directory / name)
     try:
         directory.rmdir()
     finally:
@@ -217,7 +217,7 @@ def sweep_stale(root: Path) -> None:
         try:
             _end_recorded_process(directory / PID_NAME)
             for name in _KNOWN_NAMES:
-                _remove(directory / name)
+                remove_file(directory / name)
             try:
                 directory.rmdir()
             except OSError:
@@ -249,7 +249,7 @@ def _end_recorded_process(record: Path) -> None:
             time.sleep(0.05)  # not our child, so there is no wait() to block on
 
 
-def _remove(path: Path) -> None:
+def remove_file(path: Path) -> None:
     try:
         path.unlink()
     except FileNotFoundError:
