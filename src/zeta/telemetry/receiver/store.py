@@ -149,6 +149,7 @@ CREATE INDEX spans_session_start ON spans(root_session_id, start_ns);
 CREATE INDEX spans_provider_model_start ON spans(provider, request_model, start_ns);
 CREATE INDEX spans_tool_start ON spans(tool_name, start_ns);
 CREATE INDEX spans_error_start ON spans(start_ns) WHERE status = 'error';
+CREATE INDEX spans_start ON spans(start_ns, span_id);
 CREATE INDEX span_events_span_time ON span_events(trace_id, span_id, time_ns);
 CREATE INDEX span_events_name_time ON span_events(name, time_ns);
 CREATE INDEX traces_first ON traces(first_ns);
@@ -169,7 +170,7 @@ CREATE TABLE hourly_distinct(hour_ns INTEGER NOT NULL, group_by TEXT NOT NULL CH
 CREATE TABLE hourly_models(hour_ns INTEGER NOT NULL, model_key TEXT NOT NULL, provider TEXT, model TEXT NOT NULL, calls INTEGER NOT NULL CHECK(calls>=0), errors INTEGER NOT NULL CHECK(errors>=0), duration_ns INTEGER NOT NULL CHECK(duration_ns>=0), input_tokens INTEGER NOT NULL CHECK(input_tokens>=0), output_tokens INTEGER NOT NULL CHECK(output_tokens>=0), total_tokens INTEGER NOT NULL CHECK(total_tokens>=0), last_ns INTEGER NOT NULL CHECK(last_ns>=0), PRIMARY KEY(hour_ns,model_key)) STRICT;
 CREATE TABLE hourly_tools(hour_ns INTEGER NOT NULL, tool_key TEXT NOT NULL, tool_name TEXT NOT NULL, tool_type TEXT, calls INTEGER NOT NULL CHECK(calls>=0), errors INTEGER NOT NULL CHECK(errors>=0), duration_ns INTEGER NOT NULL CHECK(duration_ns>=0), argument_bytes INTEGER NOT NULL CHECK(argument_bytes>=0), result_bytes INTEGER NOT NULL CHECK(result_bytes>=0), last_ns INTEGER NOT NULL CHECK(last_ns>=0), PRIMARY KEY(hour_ns,tool_key)) STRICT;
 CREATE TABLE hourly_latency(hour_ns INTEGER NOT NULL, family TEXT NOT NULL CHECK(family IN('model','tool')), family_key TEXT NOT NULL, bucket INTEGER NOT NULL CHECK(bucket BETWEEN 0 AND 63), calls INTEGER NOT NULL CHECK(calls>=0), PRIMARY KEY(hour_ns,family,family_key,bucket)) STRICT;
-CREATE INDEX hourly_distinct_range ON hourly_distinct(group_by,group_key,hour_ns,identity_kind);
+CREATE INDEX IF NOT EXISTS spans_start ON spans(start_ns, span_id);CREATE INDEX hourly_distinct_range ON hourly_distinct(group_by,group_key,hour_ns,identity_kind);
 CREATE INDEX hourly_models_range ON hourly_models(hour_ns,provider,model);
 CREATE INDEX hourly_tools_range ON hourly_tools(hour_ns,tool_name,tool_type);
 CREATE INDEX hourly_latency_range ON hourly_latency(family,family_key,hour_ns,bucket);""").split(';')
@@ -438,7 +439,10 @@ def open_database(path: Path) -> None:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         if not 0 <= version <= SCHEMA_VERSION: raise RuntimeError(f"telemetry database schema {version} is not supported (expected {SCHEMA_VERSION})")
         _enable_incremental_vacuum(connection, path)
-        if version == SCHEMA_VERSION: return
+        if version == SCHEMA_VERSION:
+            connection.execute("CREATE INDEX IF NOT EXISTS spans_start ON spans(start_ns, span_id)")
+            connection.commit()
+            return
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("BEGIN IMMEDIATE")
         try:

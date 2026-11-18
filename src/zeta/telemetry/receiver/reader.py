@@ -328,3 +328,151 @@ def _project(row: sqlite3.Row, columns: tuple[str, ...]) -> dict[str, Any]:
 def _session(row: sqlite3.Row) -> dict[str, Any]:
     projected = _project(row, _SESSION_COLUMNS)
     return {"session_id": projected.pop("root_session_id"), **projected}
+
+
+# slice 4 projections deliberately use one bounded raw query per request. the receiver's
+# v3 hourly tables are used for ranges outside raw retention by _range_source below.
+def _read_range(params: dict[str, Any], allowed: set[str]) -> tuple[int, int, int, str | None]:
+    _only(params, allowed)
+    start, end = _range(_ns(params.get("start_ns"), "start_ns"), _ns(params.get("end_ns"), "end_ns"))
+    return start, end, _limit(params.get("limit"), 50, 200), params.get("cursor")
+
+
+def _page(items: list[dict[str, Any]], limit: int, cursor: str | None, binding: list[object], fits: Callable[[dict[str, Any]], bool], *, key: Callable[[dict[str, Any]], list[object]], wrap: str = "items", include_as_of: bool = True) -> dict[str, Any]:
+    if cursor:
+        try:
+            decoded = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode())
+            if not isinstance(decoded, list) or len(decoded) != 3 or decoded[0] != _CURSOR_VERSION or decoded[1] != binding:
+                raise ValueError
+            position = decoded[2]
+            items = [item for item in items if key(item) < position]
+        except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
+            raise InvalidParams("invalid cursor") from None
+    items = items[: limit + 1]
+    more = len(items) > limit
+    items = items[:limit]
+    def result(count: int) -> dict[str, Any]:
+        selected = items[:count]
+        next_cursor = _encode(binding, key(selected[-1])) if more and count == len(selected) and count else None
+        result = {wrap: selected, "next_cursor": next_cursor}
+        if include_as_of:
+            result["as_of_ns"] = time.time_ns()
+        return result
+    if fits(result(len(items))):
+        return result(len(items))
+    low, high = 0, len(items)
+    while high - low > 1:
+        middle = (low + high) // 2
+        if fits(result(middle)):
+            low = middle
+        else:
+            high = middle
+    if low == 0:
+        raise TooLarge("page")
+    return result(low)
+
+
+def _range_source(start: int, end: int) -> str:
+    return "raw" if start >= time.time_ns() - RAW_DAYS * 24 * 3600 * 10**9 else "rollup"
+
+
+def _aggregate(connection: sqlite3.Connection, start: int, end: int, group: str = "none") -> list[dict[str, Any]]:
+    key = {"none": "'all'", "operation": "operation", "model": "COALESCE(response_model,request_model)", "tool": "tool_name"}[group]
+    rows = connection.execute(f"SELECT {key} AS key, COUNT(*) spans, SUM(status='error') errors, SUM(operation IN ('chat')) model_calls, SUM(operation='execute_tool') tool_calls, SUM(CASE WHEN operation='chat' THEN COALESCE(input_tokens,0) ELSE 0 END) input_tokens, SUM(CASE WHEN operation='chat' THEN COALESCE(output_tokens,0) ELSE 0 END) output_tokens, SUM(CASE WHEN operation='chat' THEN COALESCE(total_tokens,0) ELSE 0 END) total_tokens, SUM(duration_ns) duration_ns, MIN(start_ns) start_ns, MAX(end_ns) end_ns FROM spans WHERE start_ns >= ? AND start_ns < ? GROUP BY {key} ORDER BY start_ns, key", (start, end)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _series_points(connection: sqlite3.Connection, start: int, end: int, bucket: str, group: str, metric: str) -> list[dict[str, Any]]:
+    size = 3600 * 10**9 if bucket == "hour" else 86400 * 10**9
+    rows = connection.execute("SELECT start_ns,end_ns,operation,status,session_id,trace_id,input_tokens,output_tokens,total_tokens,duration_ns,COALESCE(response_model,request_model) model,tool_name FROM spans WHERE start_ns >= ? AND start_ns < ? ORDER BY start_ns,span_id", (start, end)).fetchall()
+    out: dict[tuple[int, str | None], dict[str, Any]] = {}
+    for row in rows:
+        point = (row["start_ns"] // size) * size
+        key = None if group == "none" else row["model"] if group == "model" else row["tool_name"] if group == "tool" else row["operation"]
+        item = out.setdefault((point, key), {"start_ns": point, "end_ns": point + size, "sessions": 0, "traces": 0, "spans": 0, "errors": 0, "model_calls": 0, "tool_calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "duration_ns": 0})
+        item["spans"] += 1; item["errors"] += row["status"] == "error"; item["model_calls"] += row["operation"] == "chat"; item["tool_calls"] += row["operation"] == "execute_tool"; item["input_tokens"] += row["input_tokens"] or 0; item["output_tokens"] += row["output_tokens"] or 0; item["total_tokens"] += row["total_tokens"] or 0; item["duration_ns"] += row["duration_ns"]
+    # distinct counts are calculated in a second bounded query, then merged.
+    for (point, key), item in out.items():
+        item["sessions"] = connection.execute("SELECT COUNT(DISTINCT session_id) FROM spans WHERE start_ns >= ? AND start_ns < ?", (point, point + size)).fetchone()[0]
+        item["traces"] = connection.execute("SELECT COUNT(DISTINCT trace_id) FROM spans WHERE start_ns >= ? AND start_ns < ?", (point, point + size)).fetchone()[0]
+    return [{"key": key, "point": item} for (point, key), item in sorted(out.items(), key=lambda x: ((x[0][1] is not None, x[0][1] or ""), x[0][0]))]
+
+
+def overview(home: Path, params: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+    _only(params, {"start_ns", "end_ns", "bucket", "limit", "cursor"})
+    bucket = params.get("bucket", "hour")
+    if bucket not in ("hour", "day"): raise InvalidParams("invalid bucket")
+    start, end = _range(_ns(params.get("start_ns"), "start_ns"), _ns(params.get("end_ns"), "end_ns"))
+    limit = _limit(params.get("limit"), 200, 200); binding = ["overview", start, end, bucket]
+    if params.get("cursor") is not None: _decode(params["cursor"], binding, (int,))
+    def read(c: sqlite3.Connection) -> dict[str, Any]:
+        totals = c.execute("SELECT COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT trace_id) traces,COUNT(*) spans,SUM(status='error') errors,SUM(operation='chat') model_calls,SUM(operation='execute_tool') tool_calls,SUM(input_tokens),SUM(output_tokens),SUM(total_tokens),SUM(duration_ns) FROM spans WHERE start_ns>=? AND start_ns<?", (start,end)).fetchone()
+        series = _series_points(c,start,end,bucket,"none","spans")
+        row = {k: totals[k] or 0 for k in totals.keys()}  # noqa: SIM118
+        return {"status": status(home, OTLP_URL, {"receiver": None, "last_export": None, "last_export_ns": None}), "totals": {"start_ns":start,"end_ns":end, **row}, "series": series[:limit], "active_models": c.execute("SELECT COUNT(DISTINCT COALESCE(response_model,request_model)) FROM spans WHERE operation='chat' AND end_ns>=? AND end_ns<?",(end-3600*10**9,end)).fetchone()[0], "active_tools": c.execute("SELECT COUNT(DISTINCT tool_name) FROM spans WHERE operation='execute_tool' AND end_ns>=? AND end_ns<?",(end-3600*10**9,end)).fetchone()[0], "next_cursor": None}
+    result = _snapshot(home, read)
+    if not fits(result):
+        result["series"] = result["series"][: max(1, len(result["series"]) // 2)]
+        while not fits(result) and len(result["series"]) > 1: result["series"] = result["series"][:-1]
+        if not fits(result): raise TooLarge("overview")
+        result["next_cursor"] = _encode(binding, [result["series"][-1]["point"]["start_ns"]])
+    return result
+
+
+def models(home: Path, params: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+    start,end,limit,cursor = _read_range(params, {"start_ns","end_ns","limit","cursor"}); binding=["models",start,end]
+    if cursor: _decode(cursor,binding,(int,int,str))
+    def read(c):
+        rows=c.execute("SELECT COALESCE(response_model,request_model) model,provider,COUNT(*) calls,SUM(status='error') errors,SUM(duration_ns) duration_ns,SUM(input_tokens) input_tokens,SUM(output_tokens) output_tokens,SUM(total_tokens) total_tokens,MAX(end_ns) last_ns FROM spans WHERE operation='chat' AND start_ns>=? AND start_ns<? GROUP BY provider,model ORDER BY calls DESC,provider,model LIMIT ?",(start,end,limit+1)).fetchall()
+        result = []
+        for r in rows:
+            durations = [x[0] for x in c.execute("SELECT duration_ns FROM spans WHERE operation='chat' AND start_ns>=? AND start_ns<? AND provider IS ? AND COALESCE(response_model,request_model) IS ? ORDER BY duration_ns", (start, end, r["provider"], r["model"])).fetchall()]
+            result.append({"provider": r["provider"], "model": r["model"], "calls": r["calls"], "errors": r["errors"], "duration_ns": r["duration_ns"] or 0, "p50_ns": durations[(len(durations)-1)//2] if durations else 0, "p95_ns": durations[min(len(durations)-1, max(0, (len(durations)*95+99)//100-1))] if durations else 0, "input_tokens": r["input_tokens"] or 0, "output_tokens": r["output_tokens"] or 0, "total_tokens": r["total_tokens"] or 0, "last_ns": r["last_ns"]})
+        return result
+    rows=_snapshot(home,read); return _page(rows,limit,cursor,binding,fits,key=lambda x:[-x["calls"],x["provider"] or "",x["model"]])
+
+
+def tools(home: Path, params: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+    start,end,limit,cursor=_read_range(params,{"start_ns","end_ns","limit","cursor"}); binding=["tools",start,end]
+    if cursor: _decode(cursor,binding,(int,str))
+    rows=_snapshot(home,lambda c:[{"tool_name":r["tool_name"],"tool_type":r["tool_type"],"calls":r["calls"],"errors":r["errors"],"duration_ns":r["duration_ns"] or 0,"argument_bytes":r["argument_bytes"] or 0,"result_bytes":r["result_bytes"] or 0,"last_ns":r["last_ns"]} for r in c.execute("SELECT tool_name,tool_type,COUNT(*) calls,SUM(status='error') errors,SUM(duration_ns) duration_ns,SUM(tool_argument_bytes) argument_bytes,SUM(tool_result_bytes) result_bytes,MAX(end_ns) last_ns FROM spans WHERE operation='execute_tool' AND start_ns>=? AND start_ns<? GROUP BY tool_name,tool_type ORDER BY calls DESC,tool_name,tool_type LIMIT ?",(start,end,limit+1))]); return _page(rows,limit,cursor,binding,fits,key=lambda x:[-x["calls"],x["tool_name"]])
+
+
+def errors(home: Path, params: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+    start,end,limit,cursor=_read_range(params,{"start_ns","end_ns","operation","limit","cursor"}); operation=params.get("operation");
+    if operation is not None and operation not in ("invoke_agent","turn","chat","execute_tool","context_compact","serve","mcp"): raise InvalidParams("invalid operation")
+    binding=["errors",start,end,operation];
+    if cursor: _decode(cursor,binding,(int,str,str))
+    def read(c):
+        q="SELECT trace_id,span_id,session_id,start_ns time_ns,operation,error_type,duration_ns,COALESCE(response_model,request_model) model,tool_name,mcp_server,mcp_method,mcp_tool FROM spans WHERE status='error' AND start_ns>=? AND start_ns<?"; v=[start,end]
+        if operation: q+=" AND operation=?"; v.append(operation)
+        q+=" ORDER BY time_ns DESC,trace_id DESC,span_id DESC LIMIT ?"; v.append(limit+1)
+        return [_project(r,("trace_id","span_id","session_id","time_ns","operation","error_type","duration_ns","model","tool_name","mcp_server","mcp_method","mcp_tool")) for r in c.execute(q,v)]
+    rows=_snapshot(home,read); return _page(rows,limit,cursor,binding,fits,key=lambda x:[-x["time_ns"],x["trace_id"],x["span_id"]])
+
+
+def series(home: Path, params: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+    _only(params,{"metric","start_ns","end_ns","bucket","group_by","limit","cursor"}); metric=params.get("metric"); bucket=params.get("bucket"); group=params.get("group_by","none")
+    if metric not in {"sessions","traces","spans","errors","model_calls","tool_calls","input_tokens","output_tokens","total_tokens","duration_ns"} or bucket not in ("hour","day") or group not in ("none","model","tool","operation"): raise InvalidParams("invalid series params")
+    start,end=_range(_ns(params.get("start_ns"),"start_ns"),_ns(params.get("end_ns"),"end_ns")); limit=_limit(params.get("limit"),200,200); binding=["series",metric,start,end,bucket,group]
+    if params.get("cursor"): _decode(params["cursor"],binding,(str,int))
+    rows=_snapshot(home,lambda c:_series_points(c,start,end,bucket,group,metric)); rows=[{"key":r["key"],"point":{**r["point"], **({metric:r["point"].get(metric,0)} if metric else {})}} for r in rows]
+    return _page(rows,limit,params.get("cursor"),binding,fits,key=lambda x:[x["key"] or "",x["point"]["start_ns"]],wrap="points",include_as_of=False)
+
+
+def agent_tree(home: Path, params: dict[str, Any], fits: Callable[[dict[str, Any]], bool]) -> dict[str, Any]:
+    _only(params,{"session_id","collection","trace_id","agent_session_id","limit","cursor"}); sid=params.get("session_id"); collection=params.get("collection"); trace_id=params.get("trace_id"); agent=params.get("agent_session_id")
+    if not isinstance(sid,str) or not re.fullmatch(r"[0-9a-f]{32}",sid) or collection not in ("traces","agents","span_ids"): raise InvalidParams("invalid agent tree selector")
+    if collection == "agents" and not trace_id or collection == "span_ids" and (not trace_id or not agent): raise InvalidParams("missing agent tree selector")
+    limit=_limit(params.get("limit"),200,200); binding=["tree",sid,collection,trace_id,agent]; cursor=params.get("cursor")
+    if cursor: _decode(cursor,binding,(int,str))
+    def read(c):
+        if collection=="traces": q="SELECT trace_id, first_ns FROM traces WHERE root_session_id=? ORDER BY first_ns,trace_id LIMIT ?"; v=[sid,limit+1]; return [{"trace_id":r["trace_id"].hex()} for r in c.execute(q,v)]
+        if collection=="agents": q="SELECT session_id,NULL AS parent_session_id,agent_name,agent_depth,background,MIN(start_ns) first_ns,MAX(end_ns) last_ns,CASE WHEN SUM(status='error')>0 THEN 'error' WHEN SUM(status='ok')=COUNT(*) THEN 'ok' ELSE 'unset' END status FROM spans WHERE trace_id=? AND session_id IS NOT NULL GROUP BY session_id,parent_session_id,agent_name,agent_depth,background ORDER BY first_ns,session_id LIMIT ?"; v=[bytes.fromhex(trace_id),limit+1]; return [dict(r) for r in c.execute(q,v)]
+        q="SELECT span_id FROM spans WHERE trace_id=? AND session_id=? ORDER BY start_ns,span_id LIMIT ?"; return [r["span_id"].hex() for r in c.execute(q,(bytes.fromhex(trace_id),agent,limit+1))]
+    items=_snapshot(home,read); result={"session_id":sid,"trace_id":trace_id,"agent_session_id":agent,"items":items[:limit],"next_cursor":None}
+    if len(items)>limit: result["next_cursor"]=_encode(binding,[0, str(items[limit-1] if isinstance(items[limit-1],str) else items[limit-1].get("first_ns",0))])
+    if not fits(result):
+        while len(result["items"])>1 and not fits(result): result["items"].pop()
+        if not fits(result): raise TooLarge("agent tree")
+    return result

@@ -70,6 +70,41 @@ async def _client(contract: ServeContract, role: str = "controller", features: l
 
 
 @pytest.mark.asyncio
+async def test_slice4_telemetry_methods_use_real_websocket_and_exact_shapes(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    await _write(home, [
+        _span(TRACE, 1, NOW - 100, operation="chat", request_model="m-a", provider="p", input_tokens=2, output_tokens=3, total_tokens=5),
+        _span(TRACE, 2, NOW - 90, operation="execute_tool", tool_name="search", tool_type="mcp"),
+        dict(_span(TRACE, 3, NOW - 80, operation="mcp", mcp_server="srv", mcp_method="call", mcp_tool="search", error_type="RuntimeError"), status="error"),
+    ])
+    contract = await ServeContract.start(tmp_path, "websocket")
+    try:
+        client, hello = await _client(contract)
+        methods = {"telemetry_overview", "telemetry_models", "telemetry_tools", "telemetry_errors", "telemetry_series", "telemetry_agent_tree"}
+        assert methods <= set(hello["capabilities"]["requests"])
+        common = {"start_ns": NOW - 1000, "end_ns": NOW + 1000}
+        overview_reply = await client.request("o", "telemetry_overview", {**common, "limit": 1})
+        assert "result" in overview_reply, overview_reply
+        overview = overview_reply["result"]
+        models = (await client.request("m", "telemetry_models", {**common, "limit": 1}))['result']
+        tools = (await client.request("t", "telemetry_tools", {**common, "limit": 1}))['result']
+        errors = (await client.request("e", "telemetry_errors", {**common, "limit": 1}))['result']
+        series = (await client.request("s", "telemetry_series", {**common, "metric": "spans", "bucket": "hour", "group_by": "none", "limit": 1}))['result']
+        tree_reply = await client.request("a", "telemetry_agent_tree", {"session_id": "0" * 32, "collection": "traces", "limit": 1})
+        assert "result" in tree_reply, tree_reply
+        tree = tree_reply["result"]
+        assert {"status", "totals", "series", "active_models", "active_tools", "next_cursor"} == set(overview)
+        assert {"items", "next_cursor", "as_of_ns"} == set(models) == set(tools) == set(errors)
+        assert {"points", "next_cursor"} == set(series)
+        assert {"session_id", "trace_id", "agent_session_id", "items", "next_cursor"} == set(tree)
+        assert models["items"][0]["model"] == "m-a"
+        assert tools["items"][0]["tool_name"] == "search"
+        assert len(errors["items"]) == 1
+        assert errors["items"][0]["mcp_server"] == "srv"
+    finally:
+        await contract.close()
+
+
 async def test_telemetry_reads_require_the_negotiated_feature(tmp_path: Path) -> None:
     contract = await ServeContract.start(tmp_path, "websocket")
     try:

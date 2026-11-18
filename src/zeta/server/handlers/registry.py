@@ -28,7 +28,17 @@ from . import (
 )
 from .run_work import cancel_background_task, list_run_work
 from .settings import home_settings_get, home_settings_update
-from .telemetry import telemetry_sessions, telemetry_status, telemetry_trace
+from .telemetry import (
+    telemetry_agent_tree,
+    telemetry_errors,
+    telemetry_models,
+    telemetry_overview,
+    telemetry_series,
+    telemetry_sessions,
+    telemetry_status,
+    telemetry_tools,
+    telemetry_trace,
+)
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
 
@@ -477,6 +487,12 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.TELEMETRY_STATUS: telemetry_status,
     MethodDescriptor.TELEMETRY_SESSIONS: telemetry_sessions,
     MethodDescriptor.TELEMETRY_TRACE: telemetry_trace,
+    MethodDescriptor.TELEMETRY_OVERVIEW: telemetry_overview,
+    MethodDescriptor.TELEMETRY_MODELS: telemetry_models,
+    MethodDescriptor.TELEMETRY_TOOLS: telemetry_tools,
+    MethodDescriptor.TELEMETRY_ERRORS: telemetry_errors,
+    MethodDescriptor.TELEMETRY_SERIES: telemetry_series,
+    MethodDescriptor.TELEMETRY_AGENT_TREE: telemetry_agent_tree,
     MethodDescriptor.HOME_SETTINGS_GET: home_settings_get,
     MethodDescriptor.HOME_SETTINGS_UPDATE: home_settings_update,
 }

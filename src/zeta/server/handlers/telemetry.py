@@ -43,6 +43,30 @@ async def telemetry_trace(client, request_id, params):
     return await _read(client, request_id, lambda reader, fits: reader.trace(client.server.home, params, fits))
 
 
+async def telemetry_overview(client, request_id, params):
+    return await _read(client, request_id, lambda reader, fits: reader.overview(client.server.home, params, fits))
+
+
+async def telemetry_models(client, request_id, params):
+    return await _read(client, request_id, lambda reader, fits: reader.models(client.server.home, params, fits))
+
+
+async def telemetry_tools(client, request_id, params):
+    return await _read(client, request_id, lambda reader, fits: reader.tools(client.server.home, params, fits))
+
+
+async def telemetry_errors(client, request_id, params):
+    return await _read(client, request_id, lambda reader, fits: reader.errors(client.server.home, params, fits))
+
+
+async def telemetry_series(client, request_id, params):
+    return await _read(client, request_id, lambda reader, fits: reader.series(client.server.home, params, fits))
+
+
+async def telemetry_agent_tree(client, request_id, params):
+    return await _read(client, request_id, lambda reader, fits: reader.agent_tree(client.server.home, params, fits))
+
+
 async def _read(client, request_id, read: Callable[[Any, Callable[[object], bool]], dict[str, Any]]) -> dict[str, Any]:
     def fits(result: object) -> bool:
         return _CODEC.response_fits(request_id, result)
