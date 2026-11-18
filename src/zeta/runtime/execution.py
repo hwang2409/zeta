@@ -37,6 +37,18 @@ class ToolStreamPublisher(Protocol):
     def set_metadata(self, metadata: Mapping[str, object]) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class NestedToolParent:
+    call_id: str
+    call_index: int
+
+
+class NestedToolExecutor(Protocol):
+    exposed_names: frozenset[str]
+
+    async def __call__(self, call: ToolCall, parent: NestedToolParent) -> ToolResult: ...
+
+
 @dataclass(slots=True)
 class ToolExecutionContext:
     """Per-call state passed to handlers that need execution ownership."""
@@ -47,6 +59,7 @@ class ToolExecutionContext:
     approved_execution: ApprovedExecution | None = None
     host_environment: Mapping[str, str] = field(default_factory=dict)
     path_binding_consumed: bool = False
+    nested_tool_executor: NestedToolExecutor | None = None
 
     def consume_path_binding(self, raw_path: str) -> ApprovedPathExecution | None:
         """Consume this call's path binding exactly once through the shared opener."""

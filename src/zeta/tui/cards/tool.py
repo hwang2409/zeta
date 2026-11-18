@@ -417,6 +417,22 @@ def bash_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     )
 
 
+@register_tool_card("code")
+def code_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    call = event.tool_call
+    if call is None:
+        return tool_card(event, running=running)
+    script = call.arguments.get("script", "")
+    if not isinstance(script, str):
+        script = ""
+    header = header_with_status(Text("code", style=theme.COMMAND), Text(f"· {len(script.splitlines())} lines", style=theme.DIM))
+    if running:
+        return tool_panel(call, Text("running…", style=theme.DIM), header=header)
+    output = tool_body(event)
+    source = Syntax(strip_terminal_controls(script), "javascript", word_wrap=True)
+    return tool_panel(call, Group(source, output) if output is not None else source, header=header)
+
+
 @register_tool_card("todo")
 def todo_tool_card(event: StreamEvent, running: bool) -> RenderableType:
     call = event.tool_call

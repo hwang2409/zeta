@@ -27,6 +27,7 @@ from .context_parts.admission import (
     SessionRequestAdmission,
     ollama_model_window_guidance,
 )
+from .code_audit import nested_approval_anchors
 from .store import ConversationEntry, ConversationStore
 from .store._client_delivery import without_client_delivery_marker
 from ..context_eviction import (
@@ -90,6 +91,13 @@ def _with_interrupted_results(
         if entry.type == "message"
         for request in entry.data.get("approval_requests", ())
     }
+    nested = nested_approval_anchors(entries)
+    if nested:
+        anchors = set(nested.values())
+        items = [item for item in items if (
+            (item.entry is None or item.entry.id not in anchors)
+            and (item.message.tool_result is None or item.message.tool_result.tool_call_id not in nested)
+        )]
     return repair_tool_batches(
         items,
         lambda item: item.message,

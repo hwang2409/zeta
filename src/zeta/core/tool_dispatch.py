@@ -123,6 +123,17 @@ async def _traced_execute(
         return result
 
 
+async def execute_owned_tool(
+    loop: _AgentLoop, call: ToolCall, validate_result: Callable[[object, str], ToolResult],
+    **options: Any,
+) -> ToolResult:
+    try:
+        value = await _traced_execute(loop, call, **options)
+    except Exception as exc:
+        value = ToolResult(call.id, str(exc), is_error=True)
+    return await _prepare_tool_result(call, validate_result(value, call.id))
+
+
 def _json_bytes(value: object) -> int:
     return len(json.dumps(value, ensure_ascii=False, default=str).encode())
 
@@ -182,7 +193,7 @@ async def dispatch_tool_calls(
                 )
             )
 
-    active_task: asyncio.Task[StructuredToolResult] | None = None
+    active_task: asyncio.Task[ToolResult] | None = None
     parallel_tasks: dict[asyncio.Task[StructuredToolResult], tuple[int, ToolCall]] = {}
     parallel_results: list[ToolResult | None] = [None] * len(calls)
     try:
@@ -300,10 +311,15 @@ async def dispatch_tool_calls(
                 continue
 
             tool_call = calls[call_index]
+            nested_factory = getattr(loop, "_nested_executor_for", None)
+            nested = (
+                nested_factory(tool_call, abort_signal, enqueue_tool_update, host_environment)
+                if nested_factory is not None and tool_call.name == "code"
+                else None
+            )
             active_task = loop._create_task(
-                _traced_execute(
-                    loop,
-                    tool_call,
+                execute_owned_tool(
+                    loop, tool_call, validate_result,
                     abort_signal=abort_signal,
                     _scope_signal=abort_signal,
                     _host_environment=host_environment,
@@ -315,11 +331,10 @@ async def dispatch_tool_calls(
                         )
                     ),
                     _lifecycle_payload_sink=(
-                        lambda kind, data, call=tool_call: enqueue_tool_lifecycle(
-                            kind, call, data
-                        )
+                        lambda kind, data, call=tool_call: enqueue_tool_lifecycle(kind, call, data)
                     ),
                     _retain_approval_origin=True,
+                    **({"_nested_tool_executor": nested} if nested is not None else {}),
                 )
             )
             try:
@@ -345,8 +360,6 @@ async def dispatch_tool_calls(
                 active_task = None
             except Exception as exc:
                 result = ToolResult(tool_call.id, str(exc), is_error=True)
-            result = validate_result(result, tool_call.id)
-            result = await _prepare_tool_result(tool_call, result)
             result = loop._finalize_tool_results([tool_call], [result])[0]
             completed_tool_indexes.add(call_index)
             yield StreamEvent(
