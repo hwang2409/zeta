@@ -13,7 +13,6 @@ import sqlite3
 import stat
 import subprocess
 import sys
-import time
 import warnings
 from pathlib import Path
 
@@ -360,17 +359,13 @@ def test_second_process_exits_and_bind_failure_releases_lock(tmp_path):
         assert ready, "viewer did not report ready"
         assert owner.stdout.readline().startswith(b"zeta otel view: http://127.0.0.1:4323/")
         home_id = (owner_home / "telemetry" / "home-id").read_text().strip()
-        deadline = time.monotonic() + 10
-        while True:
-            try:
-                connection = http.client.HTTPConnection("127.0.0.1", 4323, timeout=2)
-                connection.request("GET", "/health")
-                health = json.loads(connection.getresponse().read())
-                connection.close()
-                break
-            except OSError:
-                assert time.monotonic() < deadline, "viewer health did not answer"
-                time.sleep(0.05)
+        # the ready line follows listen(), so this request waits in the backlog until uvicorn serves it
+        connection = http.client.HTTPConnection("127.0.0.1", 4323, timeout=10)
+        try:
+            connection.request("GET", "/health")
+            health = json.loads(connection.getresponse().read())
+        finally:
+            connection.close()
         assert health["home_id"] == home_id
         assert stat.S_IMODE((owner_home / "telemetry").stat().st_mode) == 0o700
         assert stat.S_IMODE((owner_home / "telemetry" / "home-id").stat().st_mode) == 0o600
