@@ -1018,7 +1018,9 @@ nanoseconds; missing times are null.
   tasks), `attention_count` (stored attention records), and `bytes` (top-level transcript size, read from file metadata).
 - Agent rows contain `run_id`, `session_id`, `parent_run_id`, `profile`, `status`
   (`running`, `idle`, `waiting`, `finished`, `failed`, `cancelled`, or `unknown`),
-  `background`, `started_ns`, and `ended_ns`. The owning `session_id` joins to
+  `background` (`true` or `false` or `null`), `started_ns`, and `ended_ns`.
+  `background` is null after the run finished; zeta does not store the flag durably.
+  The owning `session_id` joins to
   trace `zeta.session.id`. `run_id` is the existing `child_instance_id` and joins
   to span `zeta.agent.run_id`; direct children have null `parent_run_id`.
 - Task rows contain `task_id`, `session_id`, `kind`, `status` (`running`,
