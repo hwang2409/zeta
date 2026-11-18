@@ -8,6 +8,7 @@ import enum
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from ..config.settings import DEFAULT_VOICE_ENGINE, DEFAULT_VOICE_MODEL
 from .audio import (
     CAPTURE_NAME,
     AudioSource,
@@ -48,6 +49,8 @@ class VoiceRuntime:
         self,
         *,
         zeta_home: str | Path,
+        voice_engine: str = DEFAULT_VOICE_ENGINE,
+        voice_model: str = DEFAULT_VOICE_MODEL,
         progress: Callable[[VoiceState], object] | None = None,
         source: AudioSource | None = None,
         transcriber: Transcriber | None = None,
@@ -55,7 +58,9 @@ class VoiceRuntime:
         self._root = Path(zeta_home) / "tmp" / "voice"
         self._progress = progress
         self._source = source or MicrophoneSource()
-        self._transcriber = transcriber or WhisperCpp(zeta_home=Path(zeta_home))
+        if voice_engine != DEFAULT_VOICE_ENGINE:
+            raise ValueError(f"unsupported voice engine: {voice_engine}")
+        self._transcriber = transcriber or WhisperCpp(zeta_home=Path(zeta_home), model=voice_model)
         self._state = VoiceState.IDLE
         self._generation = 0
         self._operation: asyncio.Task[object] | None = None

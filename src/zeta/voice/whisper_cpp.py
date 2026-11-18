@@ -9,6 +9,7 @@ import urllib.request
 from pathlib import Path
 from typing import Protocol
 
+from ..config.settings import DEFAULT_VOICE_MODEL
 from .process import OwnedProcess, run_stoppable
 
 MODEL_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-small.en.bin"
@@ -22,7 +23,7 @@ class Transcriber(Protocol):
 
 
 class WhisperCpp:
-    def __init__(self, *, zeta_home: Path, model: str = "small.en") -> None:
+    def __init__(self, *, zeta_home: Path, model: str = DEFAULT_VOICE_MODEL) -> None:
         self._model_path = zeta_home / "cache" / "voice" / "whisper.cpp" / f"ggml-{model}.bin"
 
     async def prepare(self) -> None:
@@ -51,7 +52,7 @@ def download_model(path: Path, stop: threading.Event, url: str = MODEL_URL) -> N
     temporary = path.with_name(f".{path.name}.{os.urandom(6).hex()}.partial")
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-        with urllib.request.urlopen(url, timeout=30) as response, os.fdopen(fd, "wb") as output:
+        with os.fdopen(fd, "wb") as output, urllib.request.urlopen(url, timeout=30) as response:
             total = 0
             while chunk := response.read(1024 * 1024):
                 if stop.is_set():

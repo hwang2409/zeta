@@ -18,6 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
 
+from ..core.thread_call import run_owned_thread_call
 from .process import OwnedProcess
 
 MAX_PCM_BYTES = 3_840_000  # 120 s of 16 kHz mono s16le; the writer stops storing past it
@@ -66,7 +67,11 @@ class MicrophoneSource:
             raise RuntimeError("ffmpeg is missing; run brew install whisper-cpp ffmpeg")
         loop = asyncio.get_running_loop()
         ready = loop.create_future()
-        writer = await asyncio.to_thread(WavWriter, path, lambda: loop.call_soon_threadsafe(_resolve, ready))
+        writer = await run_owned_thread_call(
+            lambda: WavWriter(path, lambda: loop.call_soon_threadsafe(_resolve, ready)),
+            WavWriter.close,
+            close_is_thread_safe=True,
+        )
         self._writer = writer
         fixture = os.environ.get("ZETA_VOICE_INPUT_FILE")
         source = ["-re", "-i", fixture] if fixture else ["-f", "avfoundation", "-i", ":0"]

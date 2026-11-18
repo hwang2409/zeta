@@ -57,6 +57,8 @@ from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR, provider_for_mod
 from .tool_policy import parse_tool_patterns, validate_tool_patterns
 
 SETTINGS_FILENAME = "settings.toml"
+DEFAULT_VOICE_ENGINE = "whisper.cpp"
+DEFAULT_VOICE_MODEL = "small.en"
 
 
 class SettingsError(ValueError):
@@ -154,8 +156,8 @@ class Settings:
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
     otel_endpoint: str | None = None
-    voice_engine: str = "whisper.cpp"
-    voice_model: str = "small.en"
+    voice_engine: str = DEFAULT_VOICE_ENGINE
+    voice_model: str = DEFAULT_VOICE_MODEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,8 +195,8 @@ class ResolvedConfig:
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
     otel_endpoint: str | None = None
-    voice_engine: str = "whisper.cpp"
-    voice_model: str = "small.en"
+    voice_engine: str = DEFAULT_VOICE_ENGINE
+    voice_model: str = DEFAULT_VOICE_MODEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,12 +554,12 @@ def _validated_mcp_limits(value: object) -> MCPCallLimits:
 def _validated_voice(voice: object) -> tuple[str, str]:
     if not isinstance(voice, Mapping) or set(voice) - _VOICE_KEYS:
         raise SettingsError("invalid voice settings")
-    voice_engine = voice.get("engine", "whisper.cpp")
-    voice_model = voice.get("model", "small.en")
-    if type(voice_engine) is not str or voice_engine != "whisper.cpp":
-        raise SettingsError("voice.engine must be 'whisper.cpp'")
-    if type(voice_model) is not str or voice_model != "small.en":
-        raise SettingsError("voice.model must be 'small.en'")
+    voice_engine = voice.get("engine", DEFAULT_VOICE_ENGINE)
+    voice_model = voice.get("model", DEFAULT_VOICE_MODEL)
+    if type(voice_engine) is not str or voice_engine != DEFAULT_VOICE_ENGINE:
+        raise SettingsError(f"voice.engine must be '{DEFAULT_VOICE_ENGINE}'")
+    if type(voice_model) is not str or voice_model != DEFAULT_VOICE_MODEL:
+        raise SettingsError(f"voice.model must be '{DEFAULT_VOICE_MODEL}'")
     return voice_engine, voice_model
 
 

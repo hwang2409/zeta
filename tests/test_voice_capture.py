@@ -202,17 +202,36 @@ def test_model_download_publishes_only_a_verified_private_file(tmp_path: Path, m
     assert sorted(path.name for path in target.parent.iterdir()) == [target.name]
 
 
-@pytest.mark.parametrize("fault", ["digest", "size"])
+@pytest.mark.parametrize("fault", ["digest", "size", "connection"])
 def test_model_download_rejects_bad_payload_and_removes_partial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
 ) -> None:
     url = _serve(tmp_path, b"model weights", monkeypatch, digest="0" * 64 if fault == "digest" else None)
     if fault == "size":
         monkeypatch.setattr(whisper_cpp, "MAX_MODEL_BYTES", 4)
+    if fault == "connection":
+        opened: list[int] = []
+        real_open = whisper_cpp.os.open
+
+        def capture_open(*args: object, **kwargs: object) -> int:
+            fd = real_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        monkeypatch.setattr(whisper_cpp.os, "open", capture_open)
+        monkeypatch.setattr(
+            whisper_cpp.urllib.request,
+            "urlopen",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("connection failed")),
+        )
     target = tmp_path / "cache" / "ggml-small.en.bin"
-    with pytest.raises(RuntimeError, match="sha256" if fault == "digest" else "exceeds"):
+    with pytest.raises((RuntimeError, OSError), match="sha256|exceeds|connection"):
         whisper_cpp.download_model(target, threading.Event(), url)
     assert list(target.parent.iterdir()) == []
+    if fault == "connection":
+        assert opened
+        with pytest.raises(OSError):
+            os.fstat(opened[0])
 
 
 @pytest.mark.parametrize("cached", [b"model weights", b"tampered"], ids=["verified", "tampered"])
