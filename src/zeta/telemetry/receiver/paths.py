@@ -1,4 +1,4 @@
-"""Database paths, sizes, and retention limits shared by the receiver and serve."""
+"""Import-free leaf (stdlib only) for receiver paths, sizes, and retention limits."""
 
 from pathlib import Path
 
