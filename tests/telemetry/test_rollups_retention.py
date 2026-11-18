@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sqlite3
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from tests.support.owned import await_or_fail
 from zeta.telemetry.receiver import reader, store
@@ -12,12 +19,12 @@ from zeta.telemetry.receiver.store import Writer, open_database
 DAY = 86_400 * 10**9
 
 
-def span(trace: int, start: int, *, operation: str = "chat", duration: int = 10) -> dict:
+def span(trace: int, start: int, *, operation: str = "chat", duration: int = 10, session: str | None = None) -> dict:
     row = dict.fromkeys(SPAN_COLUMNS)
     row.update(
         trace_id=trace.to_bytes(16, "big"), span_id=(trace + 1).to_bytes(8, "big"),
         parent_span_id=None, operation=operation, kind=1, start_ns=start,
-        end_ns=start + duration, duration_ns=duration, status="ok", session_id=None,
+        end_ns=start + duration, duration_ns=duration, status="ok", session_id=session,
         service_version="test", scope_version="test", events=[], provider="p",
         request_model="m", input_tokens=2, output_tokens=3, total_tokens=5,
     )
@@ -35,22 +42,6 @@ async def write(path: Path, rows: list[dict], clock: int) -> None:
 
 async def submit(writer: Writer, rows: list[dict], what: str) -> int:
     return await await_or_fail(writer.submit(rows), what=what)
-
-
-def test_schema_v2_migrates_to_v3_without_losing_rows(tmp_path: Path) -> None:
-    path = tmp_path / "telemetry.sqlite3"
-    open_database(path)
-    with sqlite3.connect(path) as db:
-        for table in ("hourly_series", "hourly_distinct", "hourly_models", "hourly_tools", "hourly_latency", "span_fingerprints"):
-            db.execute(f"DROP TABLE {table}")
-        db.execute("PRAGMA user_version = 2")
-        db.execute("UPDATE viewer_meta SET schema_version = 2")
-        db.commit()
-    open_database(path)
-    with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
-        assert db.execute("SELECT name FROM sqlite_master WHERE name = 'hourly_series'").fetchone()
-        assert db.execute("SELECT schema_version FROM viewer_meta").fetchone()[0] == 3
 
 
 def test_rollups_survive_raw_age_pruning_and_duplicates_do_not_change_them(tmp_path: Path) -> None:
@@ -76,129 +67,6 @@ def test_rollups_survive_raw_age_pruning_and_duplicates_do_not_change_them(tmp_p
     assert status["oldest_rollup_ns"] is not None
 
 
-def test_pruning_deletes_the_oldest_chunk_first(tmp_path: Path, monkeypatch) -> None:
-    path = tmp_path / "telemetry.sqlite3"
-    open_database(path)
-    now = 200 * DAY
-    monkeypatch.setattr(store, "PRUNE_CHUNK", 1)
-    asyncio.run(write(path, [span(1, now - 20 * DAY), span(2, now - 19 * DAY)], now))
-    with sqlite3.connect(path) as db:
-        assert db.execute("SELECT trace_id FROM spans").fetchall() == [((2).to_bytes(16, "big"),)]
-
-
-async def _cap_write(path: Path, now: int, cap: int) -> None:
-    writer = Writer(path, clock_ns=lambda: now)
-    writer.start()
-    try:
-        await await_or_fail(writer.submit([span(1, now - DAY)]), what="cap commit")
-        path.with_name(path.name + "-wal").write_bytes(b"x" * 100)
-        store.MAX_BYTES = cap
-        writer._enforce_size(writer._connection)
-        assert writer._connection.execute("SELECT count(*) FROM spans").fetchone()[0] == 0
-    finally:
-        await asyncio.to_thread(writer.close)
-
-
-def test_size_cap_counts_wal_bytes(tmp_path: Path, monkeypatch) -> None:
-    path = tmp_path / "telemetry.sqlite3"
-    open_database(path)
-    cap = path.stat().st_size + 1
-    monkeypatch.setattr(store, "MAX_BYTES", cap)
-    asyncio.run(_cap_write(path, 200 * DAY, cap))
-
-
-def test_cap_below_sqlite_minimum_stalls_without_deleting_rows(tmp_path: Path, monkeypatch) -> None:
-    path = tmp_path / "telemetry.sqlite3"
-    open_database(path)
-    now = 200 * DAY
-    writer = Writer(path, clock_ns=lambda: now)
-    writer.start()
-    try:
-        asyncio.run(submit(writer, [span(1, now - DAY)], "cap minimum commit"))
-        monkeypatch.setattr(store, "MAX_BYTES", 1)
-        result = writer.maintenance_step(now)
-        assert result["over_cap"] is True
-        assert result["stalled"] is True
-        assert writer._connection.execute("SELECT count(*) FROM spans").fetchone()[0] == 1
-    finally:
-        asyncio.run(asyncio.to_thread(writer.close))
-
-
-def test_size_cap_deletes_raw_before_fingerprints(tmp_path: Path, monkeypatch) -> None:
-    path = tmp_path / "telemetry.sqlite3"
-    open_database(path)
-    now = 200 * DAY
-    writer = Writer(path, clock_ns=lambda: now)
-    writer.start()
-    try:
-        asyncio.run(submit(writer, [span(1, now - DAY), span(2, now - DAY)], "size order commit"))
-        monkeypatch.setattr(store, "MAX_BYTES", store._database_bytes(path) - 1)
-        monkeypatch.setattr(store, "PRUNE_CHUNK", 1)
-        result = writer.maintenance_step(now)
-        assert result["size_family"] == "raw"
-        assert writer._connection.execute("SELECT count(*) FROM spans").fetchone()[0] == 1
-    finally:
-        asyncio.run(asyncio.to_thread(writer.close))
-
-
-def test_startup_keeps_pruning_until_caught_up(tmp_path: Path, monkeypatch) -> None:
-    path = tmp_path / "telemetry.sqlite3"
-    open_database(path)
-    old = 100 * DAY
-    now = 200 * DAY
-    monkeypatch.setattr(store, "PRUNE_CHUNK", 1)
-    asyncio.run(write(path, [span(i, old) for i in range(1, 4)], old))
-    writer = Writer(path, clock_ns=lambda: now)
-    writer.start()
-    try:
-        assert writer._connection.execute("SELECT count(*) FROM spans").fetchone()[0] == 0
-    finally:
-        asyncio.run(asyncio.to_thread(writer.close))
-
-
-def test_last_trace_removes_its_session_projection(tmp_path: Path) -> None:
-    path = tmp_path / "telemetry.sqlite3"
-    open_database(path)
-    old = 100 * DAY
-    now = 200 * DAY
-    row = span(1, old)
-    row["session_id"] = "a" * 32
-    clock = [old]
-    writer = Writer(path, clock_ns=lambda: clock[0])
-    writer.start()
-    try:
-        asyncio.run(submit(writer, [row], "session cleanup commit"))
-        assert writer._connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 1
-        clock[0] = now
-        writer.maintenance_step(now)
-        assert writer._connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
-    finally:
-        asyncio.run(asyncio.to_thread(writer.close))
-
-
-def test_migration_fingerprint_deduplicates_after_raw_pruning(tmp_path: Path) -> None:
-    path = tmp_path / "telemetry.sqlite3"
-    open_database(path)
-    old = 100 * DAY
-    row = span(1, old)
-    asyncio.run(write(path, [row], old))
-    with sqlite3.connect(path) as db:
-        for table in ("hourly_series", "hourly_distinct", "hourly_models", "hourly_tools", "hourly_latency", "span_fingerprints"):
-            db.execute(f"DROP TABLE {table}")
-        db.execute("PRAGMA user_version = 2")
-        db.execute("UPDATE viewer_meta SET schema_version = 2")
-        db.commit()
-    open_database(path)
-    now = 150 * DAY
-    writer = Writer(path, clock_ns=lambda: now)
-    writer.start()
-    try:
-        asyncio.run(submit(writer, [row], "post-migration duplicate"))
-        assert writer._connection.execute("SELECT sum(spans) FROM hourly_series WHERE group_by='operation'").fetchone()[0] == 1
-    finally:
-        asyncio.run(asyncio.to_thread(writer.close))
-
-
 def test_non_chat_model_metadata_does_not_create_model_rows(tmp_path: Path) -> None:
     path = tmp_path / "telemetry.sqlite3"
     open_database(path)
@@ -219,3 +87,139 @@ def test_rollup_dimensions_and_histogram_are_bounded(tmp_path: Path) -> None:
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT count(*) FROM hourly_series WHERE group_by='operation'").fetchone()[0] == 1
         assert db.execute("SELECT count(*) FROM hourly_latency").fetchone()[0] > 0
+
+
+NOW = 200 * DAY
+A, B = "a" * 32, "b" * 32
+
+
+def _measured_minus_one(path: Path) -> int:
+    return store._database_bytes(path) - 1
+
+
+@dataclass(frozen=True)
+class Case:
+    """One storage-bounds contract row: seed, start the receiver, run ``maintenance_step`` at ``NOW``, check."""
+
+    id: str
+    expect: dict[str, int]  # a table's row count, or a ``PRAGMA``/``SELECT`` scalar
+    result: dict[str, Any] = field(default_factory=dict)  # a subset of the last step's result
+    seed: tuple[dict, ...] = ()  # spans written before startup, at clock 0
+    schema: int = 3  # below 3: an auto_vacuum=0 file of that schema holds the seed spans
+    start_at_now: bool = False  # startup catch-up runs at NOW instead of clock 0
+    chunk: int = store.PRUNE_CHUNK
+    orphans: int = 0  # traces and sessions without spans, inserted after startup
+    cap: Callable[[Path], int] | None = None
+    steps: int = 0
+    late: tuple[dict, ...] = ()  # spans submitted again after the steps
+
+
+CASES = (
+    Case("raw age expiry keeps younger spans", seed=(span(1, NOW - 15 * DAY), span(3, NOW - DAY)), steps=1,
+         expect={"spans": 1, "span_fingerprints": 2, "traces": 1}, result={"age_family": "raw"}),
+    Case("fingerprint age expiry after raw", seed=(span(1, NOW - 100 * DAY),), steps=2,
+         expect={"spans": 0, "span_fingerprints": 0, "hourly_series": 3}, result={"age_family": "fingerprints"}),
+    Case("rollup age expiry keeps rollups younger than 90 days", seed=(span(1, NOW - 100 * DAY), span(3, NOW - 30 * DAY)), steps=7,
+         expect={"spans": 0, "span_fingerprints": 1, "hourly_series": 3, "hourly_distinct": 3, "hourly_models": 1, "hourly_latency": 1},
+         result={"age_family": None, "caught_up": True}),
+    Case("size chunk deletes raw spans first", seed=(span(1, NOW - DAY), span(3, NOW - DAY)), chunk=1, cap=_measured_minus_one, steps=1,
+         expect={"spans": 1, "span_fingerprints": 2}, result={"size_family": "raw", "size_rows": 1}),
+    Case("cap counts WAL and SHM bytes", seed=(span(1, NOW - DAY),), cap=lambda path: path.stat().st_size + 1, steps=1,
+         expect={"span_fingerprints": 1}, result={"over_cap": True}),
+    Case("stall at a 172,031-byte cap keeps the other families", seed=(span(1, NOW - DAY, session=A),), cap=lambda path: 172_031, steps=1,
+         expect={"spans": 0, "traces": 0, "sessions": 0, "span_fingerprints": 1, "hourly_series": 3},
+         result={"size_family": "raw", "over_cap": True, "stalled": True}),
+    Case("no second size victim after a stall", seed=(span(1, NOW - DAY), span(3, NOW - DAY)), chunk=1, cap=_measured_minus_one, steps=2,
+         expect={"spans": 1, "span_fingerprints": 2}, result={"size_rows": 0, "over_cap": True, "stalled": True}),
+    Case("size chunk that frees pages does not stall", seed=tuple(span(2 * i + 1, NOW - DAY) for i in range(400)), chunk=200,
+         cap=_measured_minus_one, steps=1, expect={"spans": 200}, result={"size_rows": 200, "stalled": False}),
+    Case("orphan sweep is bounded by the chunk", orphans=3, chunk=1, steps=1, expect={"traces": 2, "sessions": 2}),
+    Case("orphan sweep completes over steps", orphans=3, chunk=1, steps=3, expect={"traces": 0, "sessions": 0}),
+    Case("expired span removes its session projection in the same step",
+         seed=(span(1, NOW - 15 * DAY, session=B), span(3, NOW - DAY, session=A)), chunk=1, steps=1,
+         expect={"spans": 1, "traces": 1, "sessions": 1}),
+    Case("schema 1 migrates to incremental vacuum", schema=1, seed=(span(1, NOW - DAY),),
+         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 3, "spans": 1, "hourly_series": 3}),
+    Case("schema 2 migrates to incremental vacuum", schema=2, seed=(span(1, NOW - DAY),),
+         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 3, "spans": 1, "hourly_series": 3}),
+    Case("late duplicate after a migrated prune is not recounted", schema=2, seed=(span(1, NOW - 30 * DAY),), start_at_now=True,
+         late=(span(1, NOW - 30 * DAY),),
+         expect={"spans": 0, "span_fingerprints": 1, "SELECT sum(spans) FROM hourly_series WHERE group_by='operation'": 1}),
+    Case("startup catches up over several steps", seed=tuple(span(2 * i + 1, NOW - 20 * DAY) for i in range(3)), chunk=1,
+         start_at_now=True, expect={"spans": 0, "span_fingerprints": 3}),
+)
+
+
+def _old_database(path: Path, schema: int, rows: tuple[dict, ...]) -> None:
+    """A schema-1 or schema-2 file as older receivers wrote it: no incremental auto-vacuum."""
+    db = sqlite3.connect(path)
+    try:
+        db.executescript(store.SCHEMA)
+        if schema == 2:
+            for statement in store.MIGRATIONS_2:
+                db.execute(statement)
+        columns = [column[1] for column in db.execute("PRAGMA table_info(spans)")]
+        db.executemany(f"INSERT INTO spans ({','.join(columns)}) VALUES ({','.join('?' * len(columns))})",
+                       [[row.get(column) for column in columns] for row in rows])
+        db.execute("INSERT INTO viewer_meta (singleton, schema_version) VALUES (1, ?)", (schema,))
+        db.execute(f"PRAGMA user_version = {schema}")
+        db.commit()
+        assert db.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+async def _drive(case: Case, directory: Path, monkeypatch) -> tuple[dict | None, list[threading.Thread], threading.Thread]:
+    from zeta.telemetry.receiver.app import create_app
+
+    path = directory / "telemetry.sqlite3"
+    threads: list[threading.Thread] = []
+
+    def recorded(function: Callable[..., Any]) -> Callable[..., Any]:
+        def call(*args: Any) -> Any:
+            threads.append(threading.current_thread())
+            return function(*args)
+        return call
+
+    monkeypatch.setattr(store, "open_database", recorded(store.open_database))
+    monkeypatch.setattr(Writer, "maintenance_step", recorded(Writer.maintenance_step))
+    app = create_app(directory, "f" * 32)
+    writer = app.state.writer
+    writer._clock_ns = lambda: NOW if case.start_at_now else 0
+    result = None
+    async with app.router.lifespan_context(app):
+        startup_threads = list(threads)
+        connection = writer._connection
+        for index in range(case.orphans):
+            trace = (1_000 + index).to_bytes(16, "big")
+            connection.execute("INSERT INTO traces (trace_id, first_ns, last_ns, status) VALUES (?, 1, 1, 'ok')", (trace,))
+            connection.execute("INSERT INTO sessions (root_session_id, first_ns, last_ns, last_trace_id, last_span_id) "
+                               "VALUES (?, 1, 1, ?, ?)", (f"{index:032x}", trace, bytes(8)))
+        connection.commit()
+        if case.cap is not None:
+            monkeypatch.setattr(store, "MAX_BYTES", case.cap(path))
+        for _ in range(case.steps):
+            result = writer.maintenance_step(NOW)
+        if case.late:
+            await submit(writer, list(case.late), "late duplicate commit")
+    return result, startup_threads, threading.current_thread()
+
+
+@pytest.mark.parametrize("case", CASES, ids=[case.id for case in CASES])
+def test_storage_bounds_contract(case: Case, tmp_path: Path, monkeypatch) -> None:
+    pytest.importorskip("starlette")
+    path = tmp_path / "telemetry.sqlite3"
+    monkeypatch.setattr(store, "PRUNE_CHUNK", case.chunk)
+    if case.schema < 3:
+        _old_database(path, case.schema, case.seed)
+    elif case.seed:
+        asyncio.run(write(path, list(case.seed), 0))
+    result, startup_threads, loop_thread = asyncio.run(_drive(case, tmp_path, monkeypatch))
+    if case.result:
+        assert result is not None and {key: result[key] for key in case.result} == case.result
+    with contextlib.closing(sqlite3.connect(path)) as db:
+        actual = {key: db.execute(key if key.startswith(("PRAGMA", "SELECT")) else f"SELECT count(*) FROM {key}").fetchone()[0]
+                  for key in case.expect}
+    assert actual == case.expect
+    # migration and catch-up ran on the writer thread, never on the event loop that serves requests
+    assert startup_threads and loop_thread not in startup_threads

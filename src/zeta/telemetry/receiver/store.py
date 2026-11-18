@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import sqlite3
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -424,19 +425,16 @@ def _project_rollup(connection: sqlite3.Connection, row: dict[str, Any]) -> None
 
 
 def open_database(path: Path) -> None:
+    """Create or migrate the database to ``SCHEMA_VERSION``; the receiver's writer thread calls it before serving."""
     descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     os.close(descriptor); os.chmod(path, 0o600)
     connection = _connect(path)
     try:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if not 0 <= version <= SCHEMA_VERSION: raise RuntimeError(f"telemetry database schema {version} is not supported (expected {SCHEMA_VERSION})")
+        _enable_incremental_vacuum(connection)
         if version == SCHEMA_VERSION: return
-        if not 0 <= version < SCHEMA_VERSION: raise RuntimeError(f"telemetry database schema {version} is not supported (expected {SCHEMA_VERSION})")
         connection.execute("PRAGMA journal_mode = WAL")
-        if version == 0:
-            connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
-        elif version == 2:
-            connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
-            connection.commit(); connection.execute("VACUUM")
         connection.execute("BEGIN IMMEDIATE")
         try:
             if version == 0:
@@ -446,39 +444,78 @@ def open_database(path: Path) -> None:
             if version == 1:
                 for statement in MIGRATIONS_2:
                     connection.execute(statement)
-                version = 2
-            if version == 2:
-                _set_v3_tables(connection)
-                connection.row_factory = sqlite3.Row
-                for raw in connection.execute("SELECT * FROM spans"):
-                    row = _row_dict(raw)
-                    connection.execute("INSERT OR IGNORE INTO span_fingerprints VALUES(?,?,?)", (row["trace_id"],row["span_id"],row["start_ns"]))
-                    _project_rollup(connection, row)
-            connection.execute("UPDATE viewer_meta SET schema_version=3 WHERE singleton=1")
-            connection.execute("PRAGMA user_version=3"); connection.commit()
+            _migrate_v3(connection)
+            connection.commit()
         except BaseException:
             connection.rollback(); raise
     finally: connection.close()
+
+
+def _enable_incremental_vacuum(connection: sqlite3.Connection) -> None:
+    """Size reclaim needs ``auto_vacuum=INCREMENTAL``; an existing file only changes mode through ``VACUUM``."""
+    if connection.execute("PRAGMA auto_vacuum").fetchone()[0] == 2: return
+    connection.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    try: connection.execute("VACUUM")
+    except sqlite3.OperationalError:  # disk full: keep auto_vacuum=0; the size stall rule still keeps the rows
+        print("zeta otel receiver: could not enable incremental vacuum; size reclaim is limited", file=sys.stderr)
+
+
+def _migrate_v3(connection: sqlite3.Connection) -> None:
+    """Create the v3 tables, backfill fingerprints and rollups from every raw span, and publish v3."""
+    _set_v3_tables(connection)
+    connection.row_factory = sqlite3.Row
+    for raw in connection.execute("SELECT * FROM spans"):
+        row = _row_dict(raw)
+        connection.execute("INSERT OR IGNORE INTO span_fingerprints VALUES(?,?,?)", (row["trace_id"],row["span_id"],row["start_ns"]))
+        _project_rollup(connection, row)
+    connection.execute("UPDATE viewer_meta SET schema_version=3 WHERE singleton=1")
+    connection.execute("PRAGMA user_version=3")
 
 
 def _histogram_bucket(duration_ns: int) -> int:
     return 0 if duration_ns == 0 else min(63, duration_ns.bit_length())
 
 
+DAY_NS = 86_400 * 10**9
+HOUR_NS = 3_600 * 10**9
+STARTUP_SECONDS = 2.0
+VACUUM_PAGES = 1_000
+_ROLLUP_TABLES = (
+    ("hourly_series", "hour_ns,group_by,group_key"), ("hourly_distinct", "hour_ns,group_by,group_key,identity_kind,identity_key"),
+    ("hourly_models", "hour_ns,model_key"), ("hourly_tools", "hour_ns,tool_key"), ("hourly_latency", "hour_ns,family,family_key,bucket"),
+)
+# (family, table, age column, oldest-first order); the same order picks age and size victims
+_RETENTION_ORDER = (
+    ("raw", "spans", "start_ns", "start_ns,trace_id,span_id"),
+    ("fingerprints", "span_fingerprints", "seen_ns", "seen_ns,trace_id,span_id"),
+    *(("rollups", table, "hour_ns", order) for table, order in _ROLLUP_TABLES),
+)
+# an orphan trace has no spans left; an orphan session has no traces left
+_ORPHAN_DELETE = {
+    "traces": "DELETE FROM traces WHERE trace_id=?1 AND NOT EXISTS(SELECT 1 FROM spans WHERE trace_id=?1)",
+    "sessions": "DELETE FROM sessions WHERE root_session_id=?1 AND NOT EXISTS(SELECT 1 FROM traces WHERE root_session_id=?1)",
+}
+_SWEEP_START: dict[str, bytes | str] = {"traces": b"", "sessions": ""}
+_SWEEP_KEY = {"traces": "trace_id", "sessions": "root_session_id"}
+
+
 class Writer:
+    """The receiver's one writer thread: it migrates, catches up retention, then commits ingest batches."""
+
     def __init__(self, path: Path, *, clock_ns: Callable[[], int] = time.time_ns) -> None:
-        self._connection = _connect(path); self._path = path; self._clock_ns = clock_ns
+        self._path = path; self._clock_ns = clock_ns
+        self._connection: sqlite3.Connection
         self._queue: queue.Queue[tuple[list[dict[str, Any]], Callable[[object], None]] | None] = queue.Queue(INGEST_QUEUE_CAPACITY)
         self._thread = threading.Thread(target=self._run, name="zeta-otel-receiver-writer", daemon=True)
-        self.committed_sequence = self._connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
+        self._ready = threading.Event(); self._startup_error: BaseException | None = None
+        self._stalled_bytes: int | None = None  # in memory only: a restart may try one size victim again
+        self._sweep = dict(_SWEEP_START)
+        self.committed_sequence = 0
 
     def start(self) -> None:
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            result = self.maintenance_step(self._clock_ns())
-            if result["caught_up"] or result["stalled"]:
-                break
-        self._thread.start()
+        """Start the writer thread and block until it has migrated and caught up; call it off the event loop."""
+        self._thread.start(); self._ready.wait()
+        if self._startup_error is not None: raise self._startup_error
 
     def submit(self, rows: list[dict[str, Any]]) -> asyncio.Future[int]:
         loop = asyncio.get_running_loop(); future: asyncio.Future[int] = loop.create_future()
@@ -490,7 +527,23 @@ class Writer:
         try: self._queue.put(None, timeout=GRACEFUL_COMMIT_TIMEOUT_SECONDS)
         except queue.Full: return
         self._thread.join(GRACEFUL_COMMIT_TIMEOUT_SECONDS)
+
+    def _catch_up(self) -> None:
+        self.committed_sequence = self._connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
+        deadline = time.monotonic() + STARTUP_SECONDS
+        while time.monotonic() < deadline:  # leftover catch-up continues with each ingest batch
+            result = self.maintenance_step(self._clock_ns())
+            if result["caught_up"] or result["stalled"]: break
+
     def _run(self) -> None:
+        try:
+            open_database(self._path)
+            self._connection = _connect(self._path)
+            try: self._catch_up()
+            except BaseException: self._connection.close(); raise
+        except BaseException as exc:  # noqa: BLE001 - start() re-raises it to the lifespan
+            self._startup_error = exc; return
+        finally: self._ready.set()
         try:
             while (item := self._queue.get()) is not None:
                 rows, reply = item
@@ -518,32 +571,68 @@ class Writer:
         except BaseException: c.rollback(); raise
         self.committed_sequence = sequence; self.maintenance_step(self._clock_ns()); return sequence
 
-    def _reclaim(self) -> None:
+    def _reclaim(self) -> int:
+        """Fixed checkpoint and vacuum work; returns db+WAL+SHM bytes."""
         self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        self._connection.execute("PRAGMA incremental_vacuum(1000)")
+        self._connection.execute(f"PRAGMA incremental_vacuum({VACUUM_PAGES})")
         self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return _database_bytes(self._path)
+
+    def _delete_chunk(self, table: str, where: str, args: tuple[Any, ...], order: str) -> int:
+        """Delete up to ``PRUNE_CHUNK`` oldest rows in one transaction, with the traces and sessions they orphan."""
+        c = self._connection; c.execute("BEGIN IMMEDIATE")
+        try:
+            columns = "rowid,trace_id,session_id" if table == "spans" else "rowid"
+            victims = c.execute(f"SELECT {columns} FROM {table} WHERE {where} ORDER BY {order} LIMIT ?", (*args, PRUNE_CHUNK)).fetchall()
+            c.executemany(f"DELETE FROM {table} WHERE rowid=?", [victim[:1] for victim in victims])
+            if table == "spans":
+                c.executemany(_ORPHAN_DELETE["traces"], {(victim[1],) for victim in victims})
+                c.executemany(_ORPHAN_DELETE["sessions"], {(root,) for victim in victims if (root := root_session_id(victim[2]))})
+            c.commit()
+        except BaseException: c.rollback(); raise
+        return len(victims)
+
+    def _sweep_orphans(self) -> int:
+        """Delete leftover orphans, examining at most ``PRUNE_CHUNK`` keys of each projection from a cursor."""
+        c = self._connection; changes = c.total_changes; c.execute("BEGIN IMMEDIATE")
+        try:
+            for table, key in _SWEEP_KEY.items():
+                keys = c.execute(f"SELECT {key} FROM {table} WHERE {key} > ? ORDER BY {key} LIMIT ?", (self._sweep[table], PRUNE_CHUNK)).fetchall()
+                c.executemany(_ORPHAN_DELETE[table], keys)
+                self._sweep[table] = keys[-1][0] if len(keys) == PRUNE_CHUNK else _SWEEP_START[table]
+            c.commit()
+        except BaseException: c.rollback(); raise
+        return c.total_changes - changes
 
     def maintenance_step(self, now_ns: int) -> dict[str, Any]:
-        before = _database_bytes(self._path); age_family = size_family = None; age_rows = size_rows = 0
-        cutoff_raw = now_ns - RAW_DAYS * 86_400 * 10**9; cutoff_roll = now_ns - ROLLUP_DAYS * 86_400 * 10**9
-        c = self._connection
-        def delete(table: str, where: str, args: tuple[Any,...], order: str) -> int:
-            c.execute("BEGIN IMMEDIATE"); rows = c.execute(f"SELECT rowid FROM {table} WHERE {where} ORDER BY {order} LIMIT ?", (*args, PRUNE_CHUNK)).fetchall()
-            if rows: c.executemany(f"DELETE FROM {table} WHERE rowid=?", rows)
-            c.commit(); return len(rows)
-        for table, where, args, order, family in (("spans","start_ns < ?",(cutoff_raw,),"start_ns,trace_id,span_id","spans"),("span_fingerprints","seen_ns < ?",(cutoff_roll,),"seen_ns,trace_id,span_id","fingerprints"),("hourly_series","hour_ns < ?",(cutoff_roll,),"hour_ns,group_by,group_key","rollups"),("hourly_distinct","hour_ns < ?",(cutoff_roll,),"hour_ns,group_by,group_key,identity_kind,identity_key","rollups"),("hourly_models","hour_ns < ?",(cutoff_roll,),"hour_ns,model_key","rollups"),("hourly_tools","hour_ns < ?",(cutoff_roll,),"hour_ns,tool_key","rollups"),("hourly_latency","hour_ns < ?",(cutoff_roll,),"hour_ns,family,family_key,bucket","rollups")):
-            age_rows = delete(table, where, args, order)
-            if age_rows: age_family = family; break
-        c.execute("BEGIN IMMEDIATE"); c.execute("DELETE FROM traces WHERE NOT EXISTS(SELECT 1 FROM spans WHERE spans.trace_id=traces.trace_id)"); c.execute("DELETE FROM sessions WHERE NOT EXISTS(SELECT 1 FROM spans WHERE spans.session_id=sessions.root_session_id OR spans.session_id LIKE sessions.root_session_id || ':%')"); c.commit()
-        self._reclaim(); after = _database_bytes(self._path); over = after > MAX_BYTES
-        if over and MAX_BYTES < 45 * c.execute("PRAGMA page_size").fetchone()[0]:
-            return {"age_family": age_family, "age_rows": age_rows, "size_family": None, "size_rows": 0, "bytes_before": before, "bytes_after": after, "caught_up": False, "over_cap": True, "stalled": True}
-        if over:
-            for table, order, family in (("spans","start_ns,trace_id,span_id","raw"),("span_fingerprints","seen_ns,trace_id,span_id","fingerprints"),("hourly_series","hour_ns,group_by,group_key","rollups"),("hourly_distinct","hour_ns,group_by,group_key,identity_kind,identity_key","rollups"),("hourly_models","hour_ns,model_key","rollups"),("hourly_tools","hour_ns,tool_key","rollups"),("hourly_latency","hour_ns,family,family_key,bucket","rollups")):
-                n = delete(table, "1", (), order)
-                if n: size_family,size_rows=family,n; break
-            self._reclaim(); after = _database_bytes(self._path); over = after > MAX_BYTES
-        return {"age_family":age_family,"age_rows":age_rows,"size_family":size_family,"size_rows":size_rows,"bytes_before":before,"bytes_after":after,"caught_up":not age_family and not over,"over_cap":over,"stalled":over and size_rows == 0}
+        """One bounded retention step; the only code that deletes for age or size. It never loops.
 
-    def _prune(self) -> None: self.maintenance_step(self._clock_ns())
-    def _enforce_size(self, connection: sqlite3.Connection) -> None: self.maintenance_step(self._clock_ns())
+        It deletes one age chunk from the oldest expired family, sweeps one chunk of orphans, then, over the cap,
+        deletes one size chunk and stalls if that did not reduce db+WAL+SHM bytes. A stalled writer deletes
+        no further size victim until the measured size grows past the stalled size.
+        """
+        before = _database_bytes(self._path)
+        raw_cutoff = now_ns - RAW_DAYS * DAY_NS; fingerprint_cutoff = now_ns - ROLLUP_DAYS * DAY_NS
+        cutoffs = {"raw": raw_cutoff, "fingerprints": fingerprint_cutoff, "rollups": fingerprint_cutoff // HOUR_NS * HOUR_NS}
+        age_family, age_rows = None, 0
+        for family, table, column, order in _RETENTION_ORDER:
+            if age_rows := self._delete_chunk(table, f"{column} < ?", (cutoffs[family],), order):
+                age_family = family; break
+        orphans = self._sweep_orphans()
+        measured = after = self._reclaim()
+        size_family, size_rows, stalled = None, 0, False
+        if measured <= MAX_BYTES:
+            self._stalled_bytes = None
+        elif self._stalled_bytes is not None and measured <= self._stalled_bytes:
+            stalled = True
+        else:
+            for family, table, _column, order in _RETENTION_ORDER:
+                if size_rows := self._delete_chunk(table, "1", (), order):
+                    size_family = family; break
+            after = self._reclaim()
+            stalled = not size_rows or after >= measured
+            self._stalled_bytes = after if stalled else None
+        over = after > MAX_BYTES
+        return {"age_family": age_family, "age_rows": age_rows, "size_family": size_family, "size_rows": size_rows,
+                "bytes_before": before, "bytes_after": after, "caught_up": age_family is None and not orphans and not over,
+                "over_cap": over, "stalled": stalled}
