@@ -103,6 +103,24 @@ async def test_phase0_has_exact_capture_counts_and_no_input(tmp_path: Path, monk
 
 
 @pytest.mark.asyncio
+async def test_phase0_restores_environment_when_artifact_write_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "outer-home"))
+    monkeypatch.delenv("ZETA_ACCOUNT_HOME", raising=False)
+    before = dict(os.environ)
+
+    class FailingBackend:
+        async def screenshot(self):
+            raise OSError("artifact write failed")
+
+        def close(self):
+            return None
+
+    with pytest.raises(OSError, match="artifact write failed"):
+        await phase0(tmp_path, FailingBackend())
+    assert dict(os.environ) == before
+
+
+@pytest.mark.asyncio
 async def test_fake_provider_crosses_public_loop_three_trials_and_cleans_each_trial(tmp_path: Path) -> None:
     backends: list[ComputerBackend] = []
     fixtures: list[FixtureHandle] = []
