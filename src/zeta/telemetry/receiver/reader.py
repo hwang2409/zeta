@@ -33,8 +33,7 @@ MAX_FILTER_BYTES = 256
 MAX_POINTS = 2_208  # overview and series points over all pages: 92 days of hours
 MAX_SERIES_KEYS = 20
 MAX_AGENTS = 1_000
-_TRACE_ID = re.compile(r"[0-9a-f]{32}\Z")
-_ROOT_SESSION_ID = re.compile(r"[0-9a-f]{32}\Z")
+_HEX_ID = re.compile(r"[0-9a-f]{32}\Z")
 _OPERATIONS = ("invoke_agent", "turn", "chat", "execute_tool", "context_compact", "serve", "mcp")
 _METRICS = (
     "sessions", "traces", "spans", "errors", "model_calls", "tool_calls", "input_tokens", "output_tokens",
@@ -111,23 +110,34 @@ def status(home: Path, endpoint: str | None, live: dict[str, Any]) -> dict[str, 
 
 def sessions(home: Path, params: dict[str, Any], fits: Fits) -> dict[str, Any]:
     """``Page<Session>`` ordered by ``last_ns desc, session_id desc``."""
-    _only(params, {"limit", "cursor", "start_ns", "end_ns", "status", "profile", "model"})
+    _only(params, {"limit", "cursor", "start_ns", "end_ns", "status", "profile", "model", "session_id"})
     limit = _limit(params.get("limit"), 50, 200)
-    status_filter = params.get("status", "all")
-    if status_filter not in ("all", "error"):
-        raise InvalidParams("status must be 'all' or 'error'")
-    profile, model = _filter(params.get("profile"), "profile"), _filter(params.get("model"), "model")
-    explicit = [_ns(params.get("start_ns"), "start_ns"), _ns(params.get("end_ns"), "end_ns")]
     order = (Key("last_ns", int, descending=True), Key("root_session_id", str, descending=True))
-    start = resume(params.get("cursor"), ["telemetry_sessions", status_filter, profile, model, *explicit], _range(*explicit), order)
-    query = f"SELECT {', '.join(_SESSION_COLUMNS)} FROM sessions WHERE last_ns >= ? AND first_ns < ?"
-    values: list[object] = list(start.pinned)
-    if status_filter == "error":
-        query += " AND error_count > 0"
-    for column, value in (("profile", profile), ("model", model)):
-        if value is not None:
-            query += f" AND {column} = ?"
-            values.append(value)
+    cursor = params.get("cursor")
+    query = f"SELECT {', '.join(_SESSION_COLUMNS)} FROM sessions WHERE "
+    values: list[object]
+    if "session_id" in params:
+        session_id = _hex_id(params["session_id"], "session_id")
+        if cursor is not None:
+            raise InvalidParams("cursor cannot be used with session_id")
+        start = resume(None, ["telemetry_sessions", session_id], [], order)
+        query += "root_session_id = ?"
+        values = [session_id]
+    else:
+        status_filter = params.get("status", "all")
+        if status_filter not in ("all", "error"):
+            raise InvalidParams("status must be 'all' or 'error'")
+        profile, model = _filter(params.get("profile"), "profile"), _filter(params.get("model"), "model")
+        explicit = [_ns(params.get("start_ns"), "start_ns"), _ns(params.get("end_ns"), "end_ns")]
+        start = resume(cursor, ["telemetry_sessions", status_filter, profile, model, *explicit], _range(*explicit), order)
+        query += "last_ns >= ? AND first_ns < ?"
+        values = list(start.pinned)
+        if status_filter == "error":
+            query += " AND error_count > 0"
+        for column, value in (("profile", profile), ("model", model)):
+            if value is not None:
+                query += f" AND {column} = ?"
+                values.append(value)
     as_of = time.time_ns()
     return _snapshot(home, lambda connection: keyset_page(
         connection, query, values, order, start, limit=limit, fits=fits,
@@ -301,9 +311,8 @@ def series(home: Path, params: dict[str, Any], fits: Fits) -> dict[str, Any]:
 def agent_tree(home: Path, params: dict[str, Any], fits: Fits) -> dict[str, Any]:
     """One root session's trace ids, one trace's agents, or one agent's span ids in that trace."""
     _only(params, {"session_id", "collection", "trace_id", "agent_session_id", "limit", "cursor"})
-    session_id, collection = params.get("session_id"), params.get("collection")
-    if not isinstance(session_id, str) or not _ROOT_SESSION_ID.match(session_id):
-        raise InvalidParams("session_id must be a 32-hex root session id")
+    session_id = _hex_id(params.get("session_id"), "session_id")
+    collection = params.get("collection")
     trace_id, agent = params.get("trace_id"), params.get("agent_session_id")
     needs = {"traces": (False, False), "agents": (True, False), "span_ids": (True, True)}
     if not isinstance(collection, str) or collection not in needs or needs[collection] != (trace_id is not None, agent is not None):
@@ -614,8 +623,7 @@ def _filter(value: object, name: str) -> str | None:
 
 
 def _hex_id(value: object, name: str) -> str:
-    """A 32-hex trace id, checked before any ``bytes.fromhex``."""
-    if not isinstance(value, str) or not _TRACE_ID.match(value):
+    if not isinstance(value, str) or not _HEX_ID.match(value):
         raise InvalidParams(f"{name} must be 32 lowercase hex characters")
     return value
 

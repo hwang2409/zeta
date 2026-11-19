@@ -357,6 +357,51 @@ _per_method("shape", _shape)
 _per_method("budget", _lowered_budget)
 
 
+async def _session_lookup(home: Path, session_id: str, filters: dict[str, Any], *, hit: bool) -> None:
+    method = METHODS["sessions"]
+    async with _serve(home) as client:
+        listed, _ = await _call(client, method)
+        reply = await client.request("lookup", method.name, {"session_id": session_id, **filters})
+    assert "result" in reply, reply
+    page = reply["result"]
+    expected = [item for item in listed["items"] if item["session_id"] == session_id]
+    assert len(expected) == int(hit)
+    assert page == {"items": expected, "next_cursor": None, "as_of_ns": page["as_of_ns"]}
+
+
+@row("session-id-hit", shared=True)
+async def _session_hit(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _session_lookup(root, ROOT, {}, hit=True)
+
+
+@row("session-id-miss", shared=True)
+async def _session_miss(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _session_lookup(root, "f" * 32, {}, hit=False)
+
+
+@row("session-id-invalid", shared=True)
+async def _session_invalid(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async with _serve(root) as client:
+        for invalid in ("A" * 32, ROOT + ":1", None):
+            reply = await client.request("invalid", METHODS["sessions"].name, {"session_id": invalid})
+            assert reply.get("error") == INVALID
+
+
+@row("session-id-with-cursor", shared=True)
+async def _session_cursor(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    method = METHODS["sessions"]
+    async with _serve(root) as client:
+        first, _ = await _call(client, method, limit=1)
+        assert first["next_cursor"] is not None
+        reply = await client.request("invalid", method.name, {"session_id": ROOT, "cursor": first["next_cursor"]})
+        assert reply.get("error") == INVALID
+
+
+@row("session-id-ignores-range-and-filters", shared=True)
+async def _session_ignores_filters(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _session_lookup(root, B_ROOT, {"start_ns": 1, "end_ns": 1, "status": "error", "profile": "other", "model": "other"}, hit=True)
+
+
 @row("values-raw-and-rollup", shared=True)
 async def _values(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async with _serve(root) as client:
