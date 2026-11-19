@@ -84,6 +84,42 @@ async def run_script(tmp_path, script, *, policy=None, delegated=False, configur
         store.close()
 
 
+async def test_code_gets_full_contents_of_ten_concurrent_reads(tmp_path):
+    # JSON escaping pushes the combined wire size over one frame.
+    for i in range(10):
+        (tmp_path / f"page-{i}").write_text(f'{i}"' * 3100)
+    result, _, _ = await run_script(tmp_path, '''
+        const reads = Array.from({length: 10}, (_, i) => tools.read({path: `page-${i}`}));
+        const replies = await Promise.all(reads);
+        output(replies.map((reply, i) => reply.content === `${i}"`.repeat(3100)));
+    ''')
+    assert not result.is_error and json.loads(result.content) == [True] * 10, result.content
+
+
+async def test_uncaught_tool_rejection_reaches_model_without_wasm_backtrace(tmp_path):
+    result, events, calls = await run_script(tmp_path, "await tools.read({path: 'missing-code-input'});")
+    assert result.is_error, result.content
+    messages, _ = calls[1]
+    model_result, = (m.tool_result for m in messages if m.tool_result is not None)
+    text = model_result.content
+    assert "wasm" not in text.lower() and "backtrace" not in text.lower(), text
+    assert text.startswith("Error: could not open path:") and "missing-code-input" in text, text
+
+
+    outer_end, = (event for event in events if event.type is StreamEventType.TOOL_EXECUTION_END
+                  and event.tool_call.id == "outer")
+    assert tool_end(outer_end, fidelity=True)["tool_result"]["content"] == text
+
+    console = Console(file=io.StringIO(), width=100, force_terminal=False)
+    widget = TranscriptWidget()
+    presenter = TranscriptPresenter(widget, console, lambda: True, console.print)
+    for event in events:
+        presenter.handle_tool_event(event, aborted=False)
+    assert widget.toggle_latest_agent()
+    rendered = widget.render(100)
+    assert "Error: could not open path:" in rendered and "wasm backtrace" not in rendered, rendered
+
+
 async def test_code_responses_tool_size_and_exposure(tmp_path):
     async def wire_tools(enabled, *, allow=None):
         registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty(),

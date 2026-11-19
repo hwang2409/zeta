@@ -94,6 +94,7 @@ class _Bridge:
         self.incoming = memoryview(b'{"event-loop":true,"simd-json-builtins":false}')
         self.frames = bytearray()
         self.output = bytearray()
+        self.stderr = bytearray()
         self.emitted = False
         self.running = False
         self.error: Exception | None = None
@@ -125,11 +126,24 @@ class _Bridge:
                 raise GuestError("invalid nested call")
             batch.append((call["tool"], call["args"], index))
         self.calls += len(batch)
-        data = self.request(batch)
-        self.incoming = memoryview(struct.pack("<I", len(data)) + data)
+        self.incoming = memoryview(self.request(batch))
+
+    def empty_environment(self, caller: Any, count: int, size: int) -> int:
+        # Rust checks the environment before it prints a Javy exception to stderr.
+        try:
+            mem = caller.get("memory")
+            length = mem.data_len(caller)
+            if not (0 <= count <= length - 4 and 0 <= size <= length - 4):
+                return 21  # EFAULT
+            mem.write(caller, b"\0" * 4, count)
+            mem.write(caller, b"\0" * 4, size)
+        except Exception as exc:  # noqa: BLE001 - do not leak through Wasmtime's global trampoline
+            self.error = exc
+            return 29
+        return 0
 
     def io(self, caller: Any, fd: int, table: int, num: int, out: int, *, reading: bool) -> int:
-        if fd != (0 if reading else 1) or (not reading and not self.running):
+        if (reading and fd != 0) or (not reading and (fd not in (1, 2) or not self.running)):
             return 8  # EBADF
         if self.error is not None:
             return 29  # EIO
@@ -153,12 +167,17 @@ class _Bridge:
                     if size:
                         mem.write(caller, self.incoming[:size], ptr)
                         self.incoming = self.incoming[size:]
+                elif fd == 2:
+                    # Keep the start of Javy's exception report, never a host descriptor.
+                    keep = min(size, 1024 - len(self.stderr))
+                    if keep:
+                        self.stderr.extend(mem.read(caller, ptr, ptr + keep))
                 else:
                     if size > FRAME - len(self.frames):
                         raise GuestError("request frame too large")
                     self.frames.extend(mem.read(caller, ptr, ptr + size))
                 count += size
-            if not reading and b"\n" in self.frames:
+            if not reading and fd == 1 and b"\n" in self.frames:
                 if self.frames.count(b"\n") != 1 or self.frames[-1] != 10:
                     raise GuestError("invalid frame boundary")
                 self.frame(self.frames[:-1])
@@ -188,6 +207,8 @@ def _invoke(wasm: Any, engine: Any, module: Any, source: bytes, bridge: _Bridge,
                 def callback(caller, fd, table, num, out, reading=imp.name == "fd_read"):
                     return bridge.io(caller, fd, table, num, out, reading=reading)
                 linker.define_func(WASI, imp.name, imp.type, callback, access_caller=True)
+            elif imp.name == "environ_sizes_get":
+                linker.define_func(WASI, imp.name, imp.type, bridge.empty_environment, access_caller=True)
             else:
                 linker.define_func(WASI, imp.name, imp.type, lambda *_: 76)  # ENOTCAPABLE
         api = linker.instantiate(store, module).exports(store)
@@ -204,6 +225,12 @@ def _invoke(wasm: Any, engine: Any, module: Any, source: bytes, bridge: _Bridge,
         bridge.running = True
         try:
             api["invoke"](store, ptr, length, 0, 0, 0)
+        except wasm.Trap as exc:
+            diagnostic = bridge.stderr.decode(errors="replace").partition("\n")[0].rstrip()
+            reason = exc.trap_code
+            if not diagnostic:
+                diagnostic = "script execution stopped" if reason is None else f"script execution stopped: {reason.name}"
+            raise GuestError(diagnostic) from exc
         finally:
             if bridge.error is not None:
                 raise GuestError(str(bridge.error)) from bridge.error
@@ -269,21 +296,23 @@ async def run_guest(
             await asyncio.gather(replies, *tasks, return_exceptions=True)
             raise
 
-        encoded = []
+        frames = bytearray()
         for (name, _, index), result in zip(batch, results, strict=True):
-            fallback = _json_bytes({"ok": False, "error": {"name": "ToolError", "tool": name,
-                                   "callId": index, "content": "inner result exceeds bridge limits",
-                                   "structuredContent": None, "canceled": False}})
             try:
                 data = _json_bytes(result)
             except (ValueError, TypeError, RecursionError):
-                data = fallback
-            encoded.append((data, fallback))
-        # Keep small siblings when replies would exceed the shared frame budget.
-        limit = FRAME
-        if 1 + sum(len(data) + 1 for data, _ in encoded) > FRAME:
-            limit = (FRAME - 1) // len(batch) - 1
-        return b"[" + b",".join(data if len(data) <= limit else fallback for data, fallback in encoded) + b"]"
+                data = b""
+            if not data or len(data) > FRAME:
+                error = (
+                    f"inner result is {len(data)} bytes; the code bridge limit is {FRAME} bytes per result"
+                    if data else "inner result is not JSON-compatible"
+                )
+                data = _json_bytes({"ok": False, "error": {"name": "ToolError", "tool": name,
+                                   "callId": index, "content": error,
+                                   "structuredContent": None, "canceled": False}})
+            frames.extend(struct.pack("<I", len(data)))
+            frames.extend(data)
+        return bytes(frames)
 
     def start_batch(batch: list[GuestCall], reply: Future[bytes]) -> None:
         nonlocal task, pending, active

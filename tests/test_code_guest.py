@@ -27,6 +27,24 @@ async def test_guest_runs_dependent_calls_without_ambient_io():
     assert entered == [("read", {"x": 1}, 1), ("read", {"x": 2}, 2)]
 
 
+async def test_guest_oversized_reply_leaves_siblings_intact():
+    sizes = [6200, 65536, 65514, 6200]
+    # Preserve both order and full content, without outputting the large replies to the model.
+    async def dispatch(name, args, index):
+        return {"ok": True, "value": str(index % 10) * sizes[index - 1]}
+
+    result = await await_or_fail(run_guest(f'''
+        const replies = await Promise.allSettled({json.dumps(sizes)}.map(() => tools.read({{}})));
+        output(replies.map((reply, i) => reply.status === 'fulfilled'
+            ? reply.value === String((i + 1) % 10).repeat({json.dumps(sizes)}[i])
+            : [reply.reason.name, reply.reason.message]));
+        ''', ["read"], dispatch), what="Javy multi-frame replies")
+    assert json.loads(result) == [
+        True, ["ToolError", "inner result is 65558 bytes; the code bridge limit is 65536 bytes per result"],
+        True, True,
+    ]
+
+
 async def test_cancel_drains_host_and_guest():
     both_entered = asyncio.Event()
     blocked = asyncio.Event()
