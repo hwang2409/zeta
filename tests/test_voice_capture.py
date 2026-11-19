@@ -26,6 +26,7 @@ from zeta.voice.audio import (
     sweep_stale,
     validate_wav,
 )
+from zeta.voice.process import OwnedProcess
 
 
 def _reaped(pid: int) -> bool:
@@ -109,6 +110,28 @@ async def test_record_exists_before_ffmpeg_runs(tmp_path: Path, monkeypatch: pyt
         await await_or_fail(source.close(), what="close fake capture")
         started.close()
     assert probe.read_text() == "recorded", "ffmpeg ran before its pid record existed"
+
+
+def test_owned_process_reaps_child_that_exits_before_group_signal(monkeypatch: pytest.MonkeyPatch) -> None:
+    killpg = os.killpg
+    with subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+        stdin=subprocess.PIPE,
+        start_new_session=True,
+    ) as child:
+        stdin = child.stdin
+        assert stdin is not None
+
+        def kill_after_exit(pgid: int, sig: int) -> None:
+            assert pgid == child.pid
+            # Let the child exit after poll(), but keep it unreaped for the real killpg().
+            stdin.close()
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+            killpg(pgid, sig)
+
+        monkeypatch.setattr(os, "killpg", kill_after_exit)
+        OwnedProcess(child, 0, 0).kill_blocking()
+        assert stdin.closed and child.returncode == 0 and _reaped(child.pid)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")

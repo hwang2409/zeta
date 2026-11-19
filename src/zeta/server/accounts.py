@@ -10,7 +10,6 @@ from typing import Any
 from ..accounts import AccountId, AccountStore, AccountUsage, account_provider
 from ..accounts.usage import UsageState, usage_json
 from ..core.session import account_home
-from ..providers.factory import build_backend
 from .protocol import ErrorDescriptor, ProtocolError
 from .runtime import ServerRuntime
 
@@ -110,12 +109,13 @@ async def switch(
     def prepare_backend(selected: AccountId) -> object | None:
         if selected.provider != current_provider:
             return None
-        backend, _ = build_backend(
+        backend, _ = runtime._build_backend(
             provider,
             loop.backend.model,
-            home=context.home,
+            context.home,
             account=selected,
             token_budget=loop.context_assembler.token_budget,
+            use_backend_factory=False,
         )
         return backend
 

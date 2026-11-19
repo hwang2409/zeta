@@ -115,6 +115,11 @@ class OwnedProcess:
                 os.killpg(self._popen.pid, sig)
             except ProcessLookupError:
                 break
+            except PermissionError:
+                # macOS can return EPERM if the child became a zombie after poll().
+                if self._popen.poll() is None:
+                    raise
+                break
             try:
                 self._popen.wait(timeout=deadline)
             except subprocess.TimeoutExpired:
