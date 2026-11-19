@@ -372,7 +372,9 @@ async def test_account_list_serializes_with_registry_writer(tmp_path, monkeypatc
         named_account_credentials(tmp_path, "codex", "work").save(OAuthTokens("access", "refresh", 9_999_999_999))
         await wire.rpc("hello", "hello", {"protocol_version": "1.2", "features": ["account_list_idle_v1"]})
         before = json.loads(await wire.rpc("before", "account_list"))["result"]
+        # test-contract: seam hold the writer while it owns the registry lock
         monkeypatch.setattr(store, "_write_registry", write)
+        # test-contract: seam signal when the reader reaches that lock without timing guesses
         monkeypatch.setattr(AccountStore, "_registry_guard", guard)
         writer = asyncio.create_task(asyncio.to_thread(store.rename, AccountId("codex", "work"), "renamed"))
         assert await asyncio.to_thread(writing.wait, 10), "registry writer never acquired its lock"
