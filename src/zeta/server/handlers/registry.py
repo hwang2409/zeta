@@ -17,6 +17,7 @@ from ..protocol import (
     feature_error,
     protocol_error,
 )
+from ..resource_protocol import ResourceDescriptor, require_access
 from ..session_replay import join_history_and_subscribe
 from . import (
     child_runs,
@@ -27,7 +28,6 @@ from . import (
     validation,
 )
 from .run_work import cancel_background_task, list_run_work
-from .settings import home_settings_get, home_settings_update
 from .state import (
     state_accounts,
     state_agents,
@@ -525,8 +525,6 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.TELEMETRY_ERRORS: telemetry_errors,
     MethodDescriptor.TELEMETRY_SERIES: telemetry_series,
     MethodDescriptor.TELEMETRY_AGENT_TREE: telemetry_agent_tree,
-    MethodDescriptor.HOME_SETTINGS_GET: home_settings_get,
-    MethodDescriptor.HOME_SETTINGS_UPDATE: home_settings_update,
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
@@ -571,14 +569,10 @@ async def dispatch(
     if handled:
         return result
     descriptor = MethodDescriptor.for_wire(method)
-    if getattr(client, "role", None) == "observer" and (
-        descriptor is None or descriptor.access is not Access.READ
-    ):
-        raise ProtocolError(
-            ErrorDescriptor.OBSERVER_READ_ONLY,
-            "method is unavailable to read-only observers",
-            {"method": method},
-        )
+    require_access(
+        getattr(client, "role", None), method, descriptor.access if descriptor is not None else None,
+        resource=isinstance(descriptor, ResourceDescriptor),
+    )
     if descriptor is None:
         raise ProtocolError(
             ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
@@ -593,8 +587,9 @@ async def dispatch(
         raise feature_error(descriptor)
     if descriptor.access is Access.DELIVERY:
         _require_attached_session(client.server.runtime, params)  # type: ignore[attr-defined]
+    handler = descriptor.handler if isinstance(descriptor, ResourceDescriptor) else HANDLERS[descriptor]
     if descriptor.access in {Access.SESSION_MUTATION, Access.CONTROLLER_WRITE}:
         # a queued wake may not start its setup while a state change runs
         with client.server.control.hold_wake_start():  # type: ignore[attr-defined]
-            return await HANDLERS[descriptor](client, request_id, params)
-    return await HANDLERS[descriptor](client, request_id, params)
+            return await handler(client, request_id, params)
+    return await handler(client, request_id, params)

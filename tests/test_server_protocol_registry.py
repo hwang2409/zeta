@@ -16,6 +16,7 @@ from zeta.server.protocol import (
     MethodDescriptor,
     SlashErrorCodeDescriptor,
     SlashResultKindDescriptor,
+    served_methods,
 )
 from zeta.skills import SkillCatalog
 
@@ -78,15 +79,12 @@ def _documented_slash_error_codes(document: str) -> set[str]:
 def test_method_registry_matches_documented_table() -> None:
     document = PROTOCOL_DOC.read_text(encoding="utf-8")
     section = _section(document, "## method table", "## common JSON-RPC shapes")
-    rows = re.findall(
-        r"^\| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \|$",
-        section,
-        re.MULTILINE,
-    )
-    assert rows == [
-        (item.wire, item.since or "1.0", item.feature or "none", item.access.value)
-        for item in MethodDescriptor
-    ], "document every method in descriptor order"
+    rows = re.compile(r"^\| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \|$", re.MULTILINE)
+    legacy = rows.findall(section)
+    families = rows.findall(_section(document, "## resource families", "## errors"))
+    expected = [(item.wire, item.since or "1.0", item.feature or "none", item.access.value) for item in served_methods()]
+    assert legacy == expected[:len(legacy)]
+    assert sorted(legacy + families) == sorted(expected), "document each resource method in its own family section"
 
 
 @pytest.mark.asyncio
@@ -888,7 +886,7 @@ class _DispatchMappingVisitor(ast.NodeVisitor):
 
 
 def _dispatch_mapping_bypasses(sources: dict[Path, str]) -> list[str]:
-    wires = {item.wire for item in MethodDescriptor}
+    wires = {item.wire for item in served_methods()}
     violations: list[str] = []
     for path, source in sources.items():
         tree = ast.parse(source)
@@ -935,9 +933,28 @@ def test_one_table_is_the_only_serve_method_dispatch_authority() -> None:
         and node.target.id == "HANDLERS"
     )
     assert isinstance(handlers, ast.Dict)
-    assert len(handlers.keys) == len(MethodDescriptor)
+    names = """
+        LIST_SESSIONS NEW_SESSION RESUME SEND STEER APPROVE DENY ABORT STATUS RENAME_SESSION
+        DELETE_SESSION REPAIR_TRANSCRIPT SESSION_TREE SESSION_HISTORY SESSION_HISTORY_AND_SUBSCRIBE
+        CHILD_RUN_HISTORY CHILD_RUN_EVENTS CONTENT_READ SWITCH_BRANCH FORK_MESSAGE MODEL_CATALOG
+        SESSION_SETTINGS SET_SETTINGS SET_COMPACTION SEND_IMAGES PATH_COMPLETE SLASH_LIST SLASH_RUN
+        ACCOUNT_LIST ACCOUNT_LOGOUT ACCOUNT_REFRESH ACCOUNT_SWITCH LOGIN_START LOGIN_STATUS
+        LOGIN_CANCEL LOGIN_PROVIDERS PING SET_TURN_CONTEXT LIST_PROJECTS PROJECT_SHOW
+        PROJECT_MEMORY_LOG PROJECT_INBOX CLEAR_STEERING DELIVERY_STATUS SESSION_GRANTS
+        REVOKE_SESSION_GRANTS RUN_WORK_LIST BACKGROUND_TASK_CANCEL CHILD_RUN_LIST CHILD_RUN_SEND
+        MCP_REFRESH_TOOLS STATE_SESSIONS STATE_SESSION STATE_AGENTS STATE_BACKGROUND_TASKS
+        STATE_CATALOG STATE_PROJECTS STATE_MEMORY STATE_MEMORY_DETAIL STATE_INBOX STATE_INBOX_DETAIL
+        STATE_ATTENTION STATE_SETTINGS STATE_ACCOUNTS STATE_STORAGE STATE_RETENTION TELEMETRY_STATUS
+        TELEMETRY_SESSIONS TELEMETRY_TRACE TELEMETRY_OVERVIEW TELEMETRY_MODELS TELEMETRY_TOOLS
+        TELEMETRY_ERRORS TELEMETRY_SERIES TELEMETRY_AGENT_TREE
+    """
+    legacy = frozenset(names.split())
+    message = "add new methods through src/zeta/server/resource_protocol.py and handlers/resources/, not the legacy registry"
+    assert {item.name for item in MethodDescriptor} == legacy, message
+    assert {ast.unparse(key).removeprefix("MethodDescriptor.") for key in handlers.keys} == legacy, message
+    assert len(handlers.keys) == len(legacy), message
     assert all(isinstance(value, ast.Name) for value in handlers.values)
-    assert len({value.id for value in handlers.values}) == len(MethodDescriptor)
+    assert len({value.id for value in handlers.values}) == len(legacy)
     assert not (
         violations := _dispatch_mapping_bypasses(_server_sources())
     ), "\n".join(violations)
@@ -1186,29 +1203,12 @@ STRUCTURED_ERROR_FIXTURES = (
         "result exceeds frame limit",
         None,
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}}\n',
-    ),    (
-        ErrorDescriptor.INVALID_HOME_SETTINGS_PARAMS,
-        "invalid params",
+    ),
+    (
+        ErrorDescriptor.RESOURCE_BUSY,
+        "another process is writing this resource",
         None,
-        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
-    ),
-    (
-        ErrorDescriptor.CUSTOM_HOME_SETTING,
-        "the setting has a custom value that serve does not change",
-        None,
-        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}}\n',
-    ),
-    (
-        ErrorDescriptor.STALE_REVISION,
-        "settings.toml changed since the given revision",
-        {"current_revision": "sha256:" + "0" * 64},
-        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}}}\n',
-    ),
-    (
-        ErrorDescriptor.SETTINGS_BUSY,
-        "another zeta process is writing settings.toml",
-        {"retryable": True},
-        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"another zeta process is writing settings.toml","data":{"code":"settings_busy","retryable":true}}}\n',
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32004,"message":"another process is writing this resource","data":{"code":"operation_busy"}}}\n',
     ),
     (
         ErrorDescriptor.SETTINGS_MALFORMED,
