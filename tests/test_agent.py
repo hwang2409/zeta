@@ -7430,9 +7430,11 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
     parent_cwd = tmp_path / "parent"
     child_cwd = tmp_path / "child"
     parent_cwd.mkdir()
-    child_cwd.mkdir()
+    active_cwd = child_cwd / "sub"
+    active_cwd.mkdir(parents=True)
     parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
     child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
+    child_store.set_bash_cwd(active_cwd)
     policy = ApprovalPolicy(store=parent_store)
     child_policy = ChildApprovalPolicy(
         policy,
@@ -7451,7 +7453,7 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
 
     assert request is not None
     assert request.effective_cwd is None
-    assert request.resolved_path == str(child_cwd / "src/file.py")
+    assert request.resolved_path == str(active_cwd / "src/file.py")
     output = StringIO()
     Console(file=output, force_terminal=False, width=200).print(
         render_approval_card(
@@ -7462,7 +7464,7 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
     )
     card = output.getvalue()
     assert "cwd=" not in card
-    assert f"resolved_path={child_cwd / 'src/file.py'}" in card
+    assert f"resolved_path={active_cwd / 'src/file.py'}" in card
 
 
 def test_child_shell_approval_shows_cwd(tmp_path: Path) -> None:
@@ -15632,9 +15634,10 @@ def _child_store_for(
 
 
 @pytest.mark.asyncio
-async def test_agent_cwd_relative_to_parent_cwd(tmp_path: Path) -> None:
+async def test_agent_cwd_relative_to_parent_bash_cwd(tmp_path: Path) -> None:
     parent_dir = tmp_path / "primary"
     parent_dir.mkdir()
+    (parent_dir / "sub" / "worktree").mkdir(parents=True)
     (parent_dir / "worktree").mkdir()
     store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
     backend = ChildCwdBackend(
@@ -15649,11 +15652,47 @@ async def test_agent_cwd_relative_to_parent_cwd(tmp_path: Path) -> None:
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    try:
+        changed = await loop.tool_registry.execute(
+            ToolCall("cd", "bash", {"command": "cd sub"})
+        )
+        assert changed["structuredContent"]["cwd_after"] == str(parent_dir / "sub")
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    assert (parent_dir / "worktree" / "relative_marker").exists()
-    assert not (parent_dir / "relative_marker").exists()
-    await loop.close()
+        assert (parent_dir / "sub" / "worktree" / "relative_marker").exists()
+        assert not (parent_dir / "worktree" / "relative_marker").exists()
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_child_without_cwd_edits_after_cd(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    sub = parent_dir / "sub"
+    sub.mkdir(parents=True)
+    (parent_dir / "data.txt").write_text("original in primary")
+    (sub / "data.txt").write_text("original in sub")
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildToolSequenceBackend(
+        child_arguments={"prompt": "child-work", "description": "edit after cd"},
+        child_tool_calls=[
+            ToolCall("cd", "bash", {"command": "cd sub"}),
+            ToolCall(
+                "edit", "edit",
+                {"path": "data.txt", "old_string": "original", "new_string": "edited"},
+            ),
+        ],
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+        assert (sub / "data.txt").read_text() == "edited in sub"
+        assert (parent_dir / "data.txt").read_text() == "original in primary"
+    finally:
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
