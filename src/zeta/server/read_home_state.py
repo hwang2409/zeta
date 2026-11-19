@@ -22,7 +22,7 @@ _ORDERS = {
     "accounts": (Key("provider", str), Key("account_id", str)),
     "warnings": (Key("text", str), Key("ordinal", int)),
 }
-STORAGE_ENTRY_LIMIT = 4096  # shared across the three trees; at most one stat per entry
+STORAGE_ENTRY_LIMIT = 4096  # per tree; at most 3x this many entry stats across all three
 _STORAGE_DEPTH = 16
 
 
@@ -67,7 +67,6 @@ def _warning_rows(warnings):
 
 def _storage(home: Path, accounts: Path, epoch: int):
     warnings = []
-    remaining = STORAGE_ENTRY_LIMIT
 
     def scan(fd, depth, count_depth):
         nonlocal remaining
@@ -97,6 +96,7 @@ def _storage(home: Path, accounts: Path, epoch: int):
 
     result = {"writer_epoch": epoch, "telemetry": {"bytes": used_bytes(home)}}
     for area, base, count_depth in (("sessions", home, 1), ("projects", home, 1), ("accounts", accounts, 2)):
+        remaining = STORAGE_ENTRY_LIMIT
         try:
             root = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
@@ -108,7 +108,7 @@ def _storage(home: Path, accounts: Path, epoch: int):
             count, size, complete = 0, 0, True
         if not complete:
             warnings.append(f"{area}: partial storage scan")
-        result[area] = {"count": count, "bytes": size}
+        result[area] = {"count": count, "bytes": size, "complete": complete}
     return result, _warning_rows(warnings)
 
 

@@ -141,15 +141,22 @@ async def test_state_home_websocket_secrets(tmp_path, monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
-async def test_state_storage_operation_cap(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fill_other_areas", [True, False], ids=["all-areas-capped", "only-sessions-capped"])
+async def test_state_storage_operation_cap(tmp_path, monkeypatch, fill_other_areas):
     home = tmp_path / "home"
     server = _server(home, monkeypatch)
     await await_or_fail(server.start(), what="serve start")
     try:
-        (home / "sessions").mkdir(exist_ok=True)
-        (home / "accounts" / "codex" / "example").mkdir(parents=True, exist_ok=True)
-        for i in range(read_home_state.STORAGE_ENTRY_LIMIT + 10):
-            (home / "sessions" / f"synthetic-transcript-{i}").write_bytes(b"x")
+        entry_limit = 8
+        monkeypatch.setattr(read_home_state, "STORAGE_ENTRY_LIMIT", entry_limit)
+        sessions = home / "sessions"
+        project = home / "projects" / "example"
+        account = home / "accounts" / "codex" / "example"
+        for directory in (sessions, project, account):
+            directory.mkdir(parents=True, exist_ok=True)
+            files = entry_limit + 1 if directory == sessions or fill_other_areas else 1
+            for i in range(files):
+                (directory / f"data-{i}").write_bytes(b"x")
         async with _connect(server, observer=True) as client:
             stat_count = 0
             scandir = os.scandir
@@ -173,12 +180,26 @@ async def test_state_storage_operation_cap(tmp_path, monkeypatch):
                 # test-contract: count metadata operations; the request still uses real files.
                 patch.setattr(os, "scandir", counted)
                 first = (await client.request("cap", "state_storage", {"limit": 1}))["result"]
-            assert stat_count == read_home_state.STORAGE_ENTRY_LIMIT
-            assert first["sessions"]["bytes"] == stat_count
-            assert first["warnings"] == ["accounts: partial storage scan"]
-            second = (await client.request("cap-next", "state_storage", {"cursor": first["next_cursor"]}))["result"]
-            assert second["warnings"] == ["sessions: partial storage scan"]
-            assert second["next_cursor"] is None
+            assert first["projects"]["count"] > 0
+            assert first["sessions"]["bytes"] == entry_limit
+            assert first["sessions"]["complete"] is False
+            if fill_other_areas:
+                assert stat_count == 3 * entry_limit
+                assert first["projects"]["complete"] is False
+                assert first["accounts"]["complete"] is False
+                assert first["warnings"] == ["accounts: partial storage scan"]
+                second = (await client.request(
+                    "cap-next", "state_storage", {"limit": 1, "cursor": first["next_cursor"]},
+                ))["result"]
+                assert second["warnings"] == ["projects: partial storage scan"]
+                last = (await client.request("cap-last", "state_storage", {"cursor": second["next_cursor"]}))["result"]
+                assert last["warnings"] == ["sessions: partial storage scan"]
+                assert last["next_cursor"] is None
+            else:
+                assert first["projects"] == {"count": 1, "bytes": 1, "complete": True}
+                assert first["accounts"] == {"count": 1, "bytes": 1, "complete": True}
+                assert first["warnings"] == ["sessions: partial storage scan"]
+                assert first["next_cursor"] is None
     finally:
         await await_or_fail(server.close(), what="serve close")
 

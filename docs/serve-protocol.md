@@ -1053,7 +1053,7 @@ without an attached session. It is advertised only with the full state method se
 |---|---|---|
 | `state_settings` | `{"collection":"mcp\|redacted_keys","limit"?:200,"cursor"?:null}` | `{"model":string\|null,"provider":string\|null,"approval_mode":string\|null,"max_depth":integer,"otel":{"enabled":boolean,"endpoint":"builtin\|external"\|null},"collection":string,"items":[{"name":string,"transport":string,"configured":boolean}\|string],"next_cursor":string\|null}` |
 | `state_accounts` | `{"collection":"accounts\|warnings","limit"?:200,"cursor"?:null}` | `{"collection":string,"items":[{"provider":string,"account_id":string,"status":"available\|selected\|exhausted\|error","selected":boolean,"refreshable":boolean,"last_checked_ns":integer\|null}\|string],"next_cursor":string\|null}` |
-| `state_storage` | `{"limit"?:200,"cursor"?:null}` | `{"writer_epoch":integer,"sessions":{"count":integer,"bytes":integer},"projects":{"count":integer,"bytes":integer},"accounts":{"count":integer,"bytes":integer},"telemetry":{"bytes":integer},"warnings":[string],"next_cursor":string\|null}` |
+| `state_storage` | `{"limit"?:200,"cursor"?:null}` | `{"writer_epoch":integer,"sessions":{"count":integer,"bytes":integer,"complete":boolean},"projects":{"count":integer,"bytes":integer,"complete":boolean},"accounts":{"count":integer,"bytes":integer,"complete":boolean},"telemetry":{"bytes":integer},"warnings":[string],"next_cursor":string\|null}` |
 | `state_retention` | `{}` | `{"session_days":integer\|null,"telemetry_raw_days":14,"telemetry_rollup_days":90,"telemetry_max_bytes":1073741824,"last_telemetry_prune_ns":integer\|null}` |
 
 - Settings are allowlisted. `approval_mode` is `allow` or `ask` if explicitly
@@ -1070,9 +1070,11 @@ without an attached session. It is advertised only with the full state method se
   refresh, contact providers, return email, or change selection.
 - Storage counts top-level session and project directories and provider/account
   directories; bytes are regular-file sizes. Symlinks are not counted. The
-  traversal examines at most 4,096 entries across those trees and descends to
-  at most 16 levels. A partial area returns a warning; its totals are lower
-  bounds. Telemetry bytes include the database, WAL and shared-memory file.
+  traversal has a separate budget of 4,096 entry stats per tree (at most
+  12,288 across the three trees) and descends to at most 16 levels. If an
+  area's scan stops early, `complete` is `false` and that area returns a
+  warning. Its totals are lower bounds: clients can show "at least N".
+  Telemetry bytes include the database, WAL and shared-memory file.
 - Retention reports the effective session setting and the receiver policy. The
   receiver does not store a last prune time, so `last_telemetry_prune_ns` is null.
 
