@@ -9,9 +9,10 @@ from __future__ import annotations
 import asyncio
 import importlib.metadata
 import json
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,9 +23,11 @@ from websockets.asyncio.client import connect
 from tests.support.owned import await_or_fail
 from tests.support.serve_contract import ServeClient
 from tests.support.sockets import short_socket_path
+from tests.telemetry.test_rollups_retention import _old_database
 from zeta.server import ZetaServer
 from zeta.server import protocol as protocol_module
 from zeta.server.protocol import MethodDescriptor
+from zeta.telemetry.receiver import store
 from zeta.telemetry.receiver.projector import SPAN_COLUMNS
 from zeta.telemetry.receiver.store import Writer, open_database
 
@@ -54,7 +57,8 @@ SESSION = {"session_id": 0, "first_ns": 0, "last_ns": 0, "last_trace_id": 0, "pr
            "turn_count": 0, "model_count": 0, "tool_count": 0, "error_count": 0, "input_tokens": 0, "output_tokens": 0,
            "total_tokens": 0}
 MODEL = {"provider": 0, "model": 0, "calls": 0, "errors": 0, "duration_ns": 0, "p50_ns": 0, "p95_ns": 0, "input_tokens": 0,
-         "output_tokens": 0, "total_tokens": 0, "last_ns": 0}
+         "output_tokens": 0, "total_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "last_ns": 0,
+         "ttft_p50_ns": 0, "ttft_p95_ns": 0}
 TOOL = {"tool_name": 0, "tool_type": 0, "calls": 0, "errors": 0, "duration_ns": 0, "p50_ns": 0, "p95_ns": 0, "argument_bytes": 0,
         "result_bytes": 0, "last_ns": 0}
 ERROR = {"trace_id": 0, "span_id": 0, "session_id": 0, "time_ns": 0, "operation": 0, "error_type": 0, "duration_ns": 0,
@@ -98,7 +102,7 @@ METHODS = {
     "tools": Method("telemetry_tools", {**RANGE}, "items", (("calls", True), ("key", False)), 200, _page(TOOL),
                     ({"end_ns": 1.5}, {"tool_name": "t1"}), {"end_ns": RANGE["end_ns"] + 1}),
     "errors": Method("telemetry_errors", {**RANGE}, "items", (("time_ns", True), ("trace_id", True), ("span_id", True)), 200,
-                     _page(ERROR), ({"operation": "chatty"}, {"operation": ["mcp"]}, {"status": "error"}), {"operation": "mcp"}),
+                     {**_page(ERROR), "classes": [{"error_type": 0, "count": 0}]}, ({"operation": "chatty"}, {"operation": ["mcp"]}, {"status": "error"}), {"operation": "mcp"}),
     "series": Method("telemetry_series", {**RANGE, "metric": "spans", "bucket": "hour", "group_by": "operation"}, "points",
                      (("key", False), ("start_ns", False)), 200, {"points": [{"key": 0, "point": POINT}], "next_cursor": 0},
                      ({"metric": "cost"}, {"group_by": "agent"}, {"start_ns": None}, {"bucket": None}), {"metric": "errors"}),
@@ -401,6 +405,97 @@ async def _quantiles(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         assert true <= model[field] < max(1, 2 * true), (field, true, model[field])
 
 
+@row("ttft-and-cache-cross-cutoff")
+async def _ttft_and_cache(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _write(root, [
+        _span(TRACE_A, 5, RECENT - HOUR),  # Keep the RECENT hour on the raw side of the cutoff.
+        _span(TRACE_A, 1, OLD, operation="chat", request_model="m", ttft_ns=8, cache_read_tokens=3, cache_write_tokens=5),
+        _span(TRACE_A, 2, RECENT, operation="chat", request_model="m", ttft_ns=128, cache_read_tokens=7, cache_write_tokens=11),
+        _span(TRACE_A, 3, RECENT + 1, operation="chat", request_model="missing"),
+        # The same raw hour, but outside the requested range: neither TTFT nor cache counts it.
+        _span(TRACE_A, 4, RECENT + 2, operation="chat", request_model="m", ttft_ns=0, cache_read_tokens=100),
+    ])
+    async with _serve(root) as client:
+        result, _ = await _call(client, METHODS["models"], start_ns=OLD - HOUR, end_ns=RECENT + 2)
+        raw, _ = await _call(client, METHODS["models"], start_ns=RECENT, end_ns=RECENT + 2)
+    assert [(m["model"], m["calls"], m["ttft_p50_ns"], m["ttft_p95_ns"], m["cache_read_tokens"], m["cache_write_tokens"])
+            for m in result["items"]] == [("m", 2, 15, 255, 10, 16), ("missing", 1, None, None, 0, 0)]
+    assert raw["items"][0]["ttft_p50_ns"] == 255
+
+
+@row("error-classes-full-range-and-filter")
+async def _error_classes(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _write(root, [
+        _span(TRACE_A, 1, OLD, operation="chat", status="error", error_type="Busy"),
+        _span(TRACE_A, 2, OLD, operation="chat", status="error"),
+        _span(TRACE_A, 3, RECENT, operation="chat", status="error", error_type="Busy"),
+        _span(TRACE_A, 4, RECENT + 1, operation="chat", status="error", error_type="Auth"),
+        _span(TRACE_A, 5, RECENT + 2, operation="mcp", status="error", error_type="Busy"),
+        _span(TRACE_A, 6, RECENT + 3, operation="chat", error_type="Ignored"),
+    ])
+    async with _serve(root) as client:
+        params = {"start_ns": OLD - HOUR, "end_ns": RECENT + HOUR, "limit": 1}
+        all_operations, _ = await _call(client, METHODS["errors"], **params)
+        pages = await _walk(client, METHODS["errors"], operation="chat", **params)
+    assert [[item["error_type"] for item in page["items"]] for page in pages] == [["Auth"], ["Busy"]]
+    assert all(page["classes"] == [
+        {"error_type": "Busy", "count": 2}, {"error_type": None, "count": 1}, {"error_type": "Auth", "count": 1},
+    ] for page in pages)
+    assert all_operations["classes"][0] == {"error_type": "Busy", "count": 3}
+
+
+@row("error-classes-other")
+async def _error_classes_other(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    await _write(root, [_span(TRACE_A, n, RECENT + n, status="error", error_type=f"Error{n:02d}") for n in range(54)])
+    async with _serve(root) as client:
+        result, _ = await _call(client, METHODS["errors"], limit=1)
+    assert result["classes"] == [
+        *({"error_type": f"Error{n:02d}", "count": 1} for n in range(50)), {"error_type": "other", "count": 4},
+    ]
+
+
+@row("v4-backfill")
+async def _v4_backfill(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = root / "telemetry" / "telemetry.sqlite3"
+    path.parent.mkdir(parents=True)
+    # The oldest retained hour is rollup-owned, even though its source rows still exist at migration.
+    retained = RECENT - HOUR
+    _old_database(path, 4, (
+        _span(TRACE_A, 1, retained, operation="chat", request_model="m", ttft_ns=3, cache_read_tokens=5,
+              status="error", error_type="Busy"),
+        _span(TRACE_A, 2, retained + 1, operation="chat", request_model="m", ttft_ns=8, cache_write_tokens=7,
+              status="error", error_type="Busy"),
+    ))
+    monkeypatch.setattr(store, "PRUNE_CHUNK", 1)
+    project = store._project_v5
+
+    def interrupt(db: sqlite3.Connection, row: dict) -> None:
+        project(db, row)
+        if row["span_id"] == (2).to_bytes(8, "big"):
+            raise RuntimeError("interrupted after projection")
+
+    with monkeypatch.context() as patch:
+        # test-contract: durability interrupt a real migration between projection and commit
+        patch.setattr(store, "_project_v5", interrupt)
+        with pytest.raises(RuntimeError, match="interrupted after projection"):
+            await _write(root, [])
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT schema_version FROM viewer_meta").fetchone() == (4,)
+        assert db.execute("SELECT SUM(calls) FROM hourly_ttft").fetchone() == (1,)
+    await _write(root, [])
+    await _write(root, [])  # Restarting again must not repeat the backfill.
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("PRAGMA user_version").fetchone() == (5,)
+        assert db.execute("SELECT schema_version FROM viewer_meta").fetchone() == (5,)
+    params = {"start_ns": retained, "end_ns": retained + HOUR}
+    async with _serve(root) as client:
+        models, _ = await _call(client, METHODS["models"], **params)
+        errors, _ = await _call(client, METHODS["errors"], **params)
+    model, = models["items"]
+    assert (model["calls"], model["ttft_p50_ns"], model["ttft_p95_ns"], model["cache_read_tokens"], model["cache_write_tokens"]) == (2, 3, 15, 5, 7)
+    assert errors["classes"] == [{"error_type": "Busy", "count": 2}]
+
+
 @row("caps-series-keys")
 async def _series_keys(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     home = root / "keys"
@@ -488,7 +583,6 @@ async def _prune(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     before = await read_all()
     await _write(home, [], clock_ns=time.time_ns)  # the receiver's startup maintenance prunes the 15-day-old spans
     after = await read_all()
-    import sqlite3
     connection = sqlite3.connect(path)
     try:
         assert connection.execute("SELECT COUNT(*) FROM spans").fetchone()[0] == 0

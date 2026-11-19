@@ -249,8 +249,8 @@ def test_receiver_start_migrates_a_schema_1_database_and_keeps_its_rows(tmp_path
     assert _sessions(database)["items"][0]["span_count"] == 2
     connection = sqlite3.connect(database)
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
-        assert connection.execute("SELECT schema_version, committed_sequence FROM viewer_meta").fetchone() == (4, 2)
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("SELECT schema_version, committed_sequence FROM viewer_meta").fetchone() == (5, 2)
     finally:
         connection.close()
 

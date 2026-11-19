@@ -143,13 +143,13 @@ CASES = (
          seed=(span(1, NOW - 15 * DAY, session=A), span(3, NOW - DAY, session=B)), chunk=1, steps=1,
          expect={"spans": 1, "traces": 1, "sessions": 1}),
     Case("schema 1 migrates to incremental vacuum", schema=1, seed=(span(1, NOW - DAY),),
-         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 4, "spans": 1, "hourly_series": 3}),
+         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 5, "spans": 1, "hourly_series": 3}),
     Case("schema 2 migrates to incremental vacuum", schema=2, seed=(span(1, NOW - DAY),),
-         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 4, "spans": 1, "hourly_series": 3}),
+         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 5, "spans": 1, "hourly_series": 3}),
     Case("a file over the vacuum bound migrates without vacuum", schema=2, seed=(span(1, NOW - DAY),), vacuum_max=0,
-         expect={"PRAGMA auto_vacuum": 0, "PRAGMA user_version": 4, "spans": 1, "hourly_series": 3}),
+         expect={"PRAGMA auto_vacuum": 0, "PRAGMA user_version": 5, "spans": 1, "hourly_series": 3}),
     Case("schema 3 migrates to an indexed span range", schema=3, seed=(span(1, NOW - DAY),),
-         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 4, "SELECT schema_version FROM viewer_meta": 4,
+         expect={"PRAGMA auto_vacuum": 2, "PRAGMA user_version": 5, "SELECT schema_version FROM viewer_meta": 5,
                  "SELECT start_ns FROM spans": NOW - DAY, "SELECT sum(spans) FROM hourly_series": 3}),
     Case("late duplicate after a migrated prune is not recounted", schema=2, seed=(span(1, NOW - 30 * DAY),), start_at_now=True,
          late=(span(1, NOW - 30 * DAY),),
@@ -163,25 +163,27 @@ def _old_database(path: Path, schema: int, rows: tuple[dict, ...]) -> None:
     """Create a database from the DDL of an older receiver."""
     db = sqlite3.connect(path)
     try:
-        if schema == 3:
+        if schema >= 3:
             db.execute("PRAGMA auto_vacuum = INCREMENTAL")
         db.executescript(store.SCHEMA)
         if schema >= 2:
             for statement in store.MIGRATIONS_2:
                 db.execute(statement)
-        if schema == 3:
+        if schema >= 3:
             for statement in store.V3_SCHEMA:
                 if statement.strip():
                     db.execute(statement)
             for row in rows:
                 store._project_rollup(db, row)
+        if schema >= 4:
+            db.execute("CREATE INDEX spans_start ON spans(start_ns)")
         columns = [column[1] for column in db.execute("PRAGMA table_info(spans)")]
         db.executemany(f"INSERT INTO spans ({','.join(columns)}) VALUES ({','.join('?' * len(columns))})",
                        [[row.get(column) for column in columns] for row in rows])
         db.execute("INSERT INTO viewer_meta (singleton, schema_version) VALUES (1, ?)", (schema,))
         db.execute(f"PRAGMA user_version = {schema}")
         db.commit()
-        assert db.execute("PRAGMA auto_vacuum").fetchone()[0] == (2 if schema == 3 else 0)
+        assert db.execute("PRAGMA auto_vacuum").fetchone()[0] == (2 if schema >= 3 else 0)
     finally:
         db.close()
 
