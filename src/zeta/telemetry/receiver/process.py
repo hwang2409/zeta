@@ -30,6 +30,18 @@ def run_receiver(home: Path, idle_exit: bool = False) -> int:
     With ``idle_exit`` (auto-started receivers), it exits cleanly after ``IDLE_EXIT_SECONDS``
     without an ingest or ``/health`` request; every supervisor checks health every 10 seconds.
     """
+    from ...config.settings import SettingsError, load_settings
+
+    enable = "Set the endpoint in ~/.zeta/settings.toml (or $ZETA_HOME/settings.toml) to turn telemetry on."
+    try:
+        endpoint = load_settings(home=home).settings.otel_endpoint
+    except SettingsError as exc:
+        print(f"zeta otel receiver: {exc}. {enable}", file=sys.stderr)
+        return 1
+    if not endpoint:
+        print(f"zeta otel receiver: telemetry is off. {enable}", file=sys.stderr)
+        return 1
+
     try:
         import uvicorn  # noqa: F401 - fail before taking the lock when the extra is missing
 
