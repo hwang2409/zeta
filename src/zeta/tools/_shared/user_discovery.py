@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -267,7 +267,11 @@ def _load_module_file(
             return None
         snapshots.setdefault(name, registry._tools.get(name))
         added.append(name)
-        return original_register(name, *args, **kwargs)
+        result = original_register(name, *args, **kwargs)
+        from ..registry import ToolOrigin
+
+        registry._tools[name] = replace(registry._tools[name], origin=ToolOrigin.USER)
+        return replace(result, origin=ToolOrigin.USER)
 
     registry.register = spy  # type: ignore[method-assign]
     registry.register_tool = spy  # type: ignore[method-assign]
