@@ -42,9 +42,8 @@ def authority_snapshot(registry: ToolRegistry, schemas: Sequence[ToolSchema]) ->
 
 
 def describe_code(registry: ToolRegistry, schemas: Sequence[ToolSchema]) -> None:
-    code = next((schema for schema in schemas if schema["name"] == "code"), None)
-    definition = registry.definition_reference("code")
-    if code is None or definition is None or definition.origin is not ToolOrigin.PACKAGED_BUILTIN:
+    code = next((schema for schema in schemas if registry.is_code_mode_call(schema["name"])), None)
+    if code is None:
         return
     exposed = CODE_MODE_ALLOWED_NAMES.intersection(authority_snapshot(registry, schemas))
     names = ", ".join(sorted(exposed)) or "none"

@@ -88,6 +88,8 @@ class _ToolRegistry(Protocol):
 
     def is_mcp_tool(self, name: str) -> bool: ...
 
+    def is_code_mode_call(self, name: str) -> bool: ...
+
 
 class _AgentLoop(Protocol):
     tool_registry: _ToolRegistry | None
@@ -274,20 +276,23 @@ async def dispatch_tool_calls(
                 call_index += 1
                 continue
             parallel_calls: list[ToolCall] = []
-            if loop.tool_registry is not None:
-                definition = loop.tool_registry.definitions_by_name.get(
-                    calls[call_index].name
-                )
-                if definition is not None and definition.parallel_safe and tool_call.name != "code":
+            registry = loop.tool_registry
+            if registry is not None:
+                definition = registry.definitions_by_name.get(tool_call.name)
+                if (
+                    definition is not None and definition.parallel_safe
+                    and not registry.is_code_mode_call(tool_call.name)
+                ):
                     parallel_calls.append(calls[call_index])
                     while call_index + len(parallel_calls) < len(calls):
                         next_call = calls[call_index + len(parallel_calls)]
                         if not loop.plan_mode_allows(next_call):
                             break
-                        next_definition = loop.tool_registry.definitions_by_name.get(
-                            next_call.name
-                        )
-                        if next_definition is None or not next_definition.parallel_safe or next_call.name == "code":
+                        next_definition = registry.definitions_by_name.get(next_call.name)
+                        if (
+                            next_definition is None or not next_definition.parallel_safe
+                            or registry.is_code_mode_call(next_call.name)
+                        ):
                             break
                         parallel_calls.append(next_call)
             if len(parallel_calls) > 1:
@@ -358,12 +363,16 @@ async def dispatch_tool_calls(
             tool_call = calls[call_index]
             async def run_single(tool_call: ToolCall) -> ToolResult:
                 async with coordinator.slot(parallel_safe=False):
+                    registry = loop.tool_registry
                     nested_factory = getattr(loop, "_nested_executor_for", None)
                     nested = (
                         # The outer slot stays held until its own inner scope has drained.
                         nested_factory(tool_call, abort_signal, enqueue_tool_update, host_environment,
                                        ToolDispatchCoordinator(max_parallel=8))
-                        if nested_factory is not None and tool_call.name == "code"
+                        if (
+                            nested_factory is not None and registry is not None
+                            and registry.is_code_mode_call(tool_call.name)
+                        )
                         else None
                     )
                     return await execute_owned_tool(
