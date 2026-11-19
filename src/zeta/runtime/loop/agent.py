@@ -13,6 +13,7 @@ from collections.abc import (
     Sequence,
 )
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -79,6 +80,7 @@ from ...providers.completion import (
     ProviderAccountSwitched,
     ResetPolicy,
 )
+from ...providers.must_complete_close import DeadlineClock, MonotonicDeadlineClock
 from ...runtime.tool_setup import select_tool_registry
 from ...skills import SkillCatalog
 from ...skills.agent_catalog import AgentCatalog
@@ -117,6 +119,7 @@ from .empty_turn import (
 from .live_config import LiveConfigMixin
 from .mcp_session import MCPSession
 from .plan_mode_runtime import PlanModeRuntimeMixin
+from .pre_dispatch import PreDispatchTimeout, PreDispatchWatchdog
 from .project_context_recovery import ProjectContextRecoveryMixin
 from .project_inbox import ProjectInboxNotificationMixin
 from .tool_schema import canonical_tool_schemas
@@ -173,6 +176,7 @@ class AgentLoop(
         freeze_live_config: bool = False,
         child_turn_control: ChildTurnControl | None = None,
         telemetry: Telemetry | None = None,
+        pre_dispatch_clock: DeadlineClock | None = None,
     ) -> None:
         if type(max_agent_depth) is not int or not (
             0 <= max_agent_depth <= HARD_MAX_AGENT_DEPTH
@@ -185,6 +189,9 @@ class AgentLoop(
                 f"agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
         self.backend = backend
+        self._pre_dispatch_clock = pre_dispatch_clock or MonotonicDeadlineClock()
+        self._set_pre_dispatch_step: Callable[[str], None] = lambda _step: None
+        self._report_pre_dispatch_stall: Callable[[str, str], None] = lambda _step, _error: None
         # the process owner's telemetry (TUI app or zeta serve); disabled is a no-op
         self.telemetry = telemetry or Telemetry.disabled()
         # span identity: the child runner sets the profile name and background flag
@@ -845,6 +852,9 @@ class AgentLoop(
                 self._turn_stop_reason = None
                 self._turn_output_tokens = None
                 self.tool_registry.start_batch()
+            watchdog = PreDispatchWatchdog(self._pre_dispatch_clock, self._report_pre_dispatch_stall)
+            self._set_pre_dispatch_step("preparing context")
+            if not retrying_context:
                 yield StreamEvent(
                     StreamEventType.TURN_START, data={"turn": turn_number}
                 )
@@ -867,29 +877,49 @@ class AgentLoop(
                         account_context is not None
                         and account_context.account_state_unknown
                     ):
+                        self._set_pre_dispatch_step("recovering account state")
                         yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
-                        await account_context.ensure_account_state(self)
+                        await watchdog.wait(
+                            "account recovery", "recovering account state",
+                            partial(account_context.ensure_account_state, self),
+                        )
+                        self._set_pre_dispatch_step("preparing context")
                     try:
-                        should_compact = await self.context_assembler.prepare_context(
-                            force=retrying_context,
-                            system_append=host_instruction,
+                        should_compact = await watchdog.wait(
+                            "context preparation", "preparing context",
+                            partial(
+                                self.context_assembler.prepare_context,
+                                force=retrying_context,
+                                system_append=host_instruction,
+                            ),
                         )
                         if should_compact:
+                            self._set_pre_dispatch_step("compacting context")
                             yield StreamEvent(StreamEventType.COMPACTION_START, data={"turn": turn_number})
-                        context_messages = await self.context_assembler.assemble(
-                            backend=self.backend,
-                            force=retrying_context,
-                            emergency=retrying_context,
-                            system_append=host_instruction,
+                        context_messages = await watchdog.wait(
+                            "eviction" if should_compact else "context assembly",
+                            "compacting context" if should_compact else "assembling context",
+                            partial(
+                                self.context_assembler.assemble,
+                                backend=self.backend,
+                                force=retrying_context,
+                                emergency=retrying_context,
+                                system_append=host_instruction,
+                            ),
                         )
                     except BudgetExceeded:
                         if not notification_turn:
                             raise
-                        context_messages = await self.context_assembler.assemble(
-                            backend=self.backend,
-                            force=True,
-                            emergency=True,
-                            system_append=host_instruction,
+                        self._set_pre_dispatch_step("compacting context")
+                        context_messages = await watchdog.wait(
+                            "eviction", "compacting context",
+                            partial(
+                                self.context_assembler.assemble,
+                                backend=self.backend,
+                                force=True,
+                                emergency=True,
+                                system_append=host_instruction,
+                            ),
                         )
                     finally:
                         # cancellation must not retain the prepared message graph.
@@ -912,12 +942,14 @@ class AgentLoop(
                     active_tools = self._active_tool_schemas()
                     steering = self.store.pending_client_steering()
                     notification_context = system_message if notification_turn else None
-                    prepared_delivery = await step_delivery.prepare_request(
-                        "after_tools",
-                        context_messages,
-                        steering,
-                        active_tools,
-                        notification_context=notification_context,
+                    self._set_pre_dispatch_step("admitting request")
+                    prepared_delivery = await watchdog.wait(
+                        "request admission", "admitting request",
+                        partial(
+                            step_delivery.prepare_request,
+                            "after_tools", context_messages, steering, active_tools,
+                            notification_context=notification_context,
+                        ),
                     )
                     system_message, on_persisted = complete_notification_context_staging(
                         prepared_delivery, system_message, notification_turn, on_persisted
@@ -955,6 +987,7 @@ class AgentLoop(
                         self._turn_provider_retry_records = provider_retry_budget.records
                     admitted_request = prepared_delivery.admitted_request
                     assert admitted_request is not None
+                    await watchdog.close()
                     if self._abort_admitted:
                         return
                     # one span per logical call: provider retries inside the run are events on it
@@ -980,6 +1013,7 @@ class AgentLoop(
                             account_limit=getattr(getattr(self, "account_context", None), "subscription_limit_event", None),
                         ),
                     )
+                    self._set_pre_dispatch_step("thinking")
                     has_active_delivery = prepared_delivery.has_active_delivery
                     provider_stream = observed_completion(
                         completion,
@@ -1069,6 +1103,8 @@ class AgentLoop(
                     provider_error = error
                     provider_error_source = exc
                     completion = None
+                finally:
+                    await watchdog.close()
                 cleanup_error: BaseException | None = None
                 if completion is not None:
                     try:
@@ -1100,11 +1136,12 @@ class AgentLoop(
                 continue
             if provider_error is not None:
                 source = provider_error_source or provider_error
-                provider_error, limit_event = await subscription_limit_failure(
-                    getattr(self, "account_context", None), provider_error, source
-                )
-                if limit_event is not None:
-                    yield limit_event
+                if not isinstance(source, PreDispatchTimeout):
+                    provider_error, limit_event = await subscription_limit_failure(
+                        getattr(self, "account_context", None), provider_error, source
+                    )
+                    if limit_event is not None:
+                        yield limit_event
                 retry_usage = getattr(source, "retry_usage", None)
                 if provider_retry_usage is None and isinstance(retry_usage, Mapping):
                     provider_retry_usage = dict(retry_usage)
