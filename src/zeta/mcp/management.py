@@ -213,28 +213,33 @@ class MCPManagementService:
     @classmethod
     def redact(cls, value: dict[str, object], *, wire: bool = False) -> dict[str, object]:
         if wire:
-            # Wire clients never receive arbitrary config values, even indirect secrets.
-            public: dict[str, object] = {}
-            for key in ("env", "headers"):
-                fields = value.get(key)
-                if isinstance(fields, dict):
-                    public[key] = {name: "<redacted>" for name in fields}
-            if "url" in value:
-                public["url"] = "<redacted-url>"
-            if "command" in value:
-                public["command"] = "<redacted>"
-            if isinstance(value.get("args"), list):
-                public["args"] = ["<redacted>"] * len(value["args"])
-            auth = value.get("auth")
-            if isinstance(auth, dict) and auth.get("type") == "oauth":
-                public["auth"] = {
-                    "type": "oauth", **({"client_secret": "<redacted>"} if "client_secret" in auth else {}),
-                }
-            transport = value.get("transport")
-            if transport in ("stdio", "streamable-http"):
-                public["transport"] = transport
-            return public
+            return cls._redact_wire(value)
         return cls._safe(copy.deepcopy(value))  # type: ignore[return-value]
+
+    @staticmethod
+    def _redact_wire(value: dict[str, object]) -> dict[str, object]:
+        # Wire clients never receive arbitrary config values, even indirect secrets.
+        public: dict[str, object] = {}
+        for key in ("env", "headers"):
+            fields = value.get(key)
+            if isinstance(fields, dict):
+                public[key] = {name: "<redacted>" for name in fields}
+        if "url" in value:
+            public["url"] = "<redacted-url>"
+        if "command" in value:
+            public["command"] = "<redacted>"
+        args = value.get("args")
+        if isinstance(args, list):
+            public["args"] = ["<redacted>"] * len(args)
+        auth = value.get("auth")
+        if isinstance(auth, dict) and auth.get("type") == "oauth":
+            public["auth"] = {
+                "type": "oauth", **({"client_secret": "<redacted>"} if "client_secret" in auth else {}),
+            }
+        transport = value.get("transport")
+        if transport in ("stdio", "streamable-http"):
+            public["transport"] = transport
+        return public
 
     @staticmethod
     def trust_fingerprint(raw: dict[str, object]) -> str:

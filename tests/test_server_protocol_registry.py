@@ -3,21 +3,25 @@ from __future__ import annotations
 import ast
 import json
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
+from zeta.server.handlers.resources import mcp_management
 from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
     FrameCodec,
     MethodDescriptor,
+    ProtocolError,
     SlashErrorCodeDescriptor,
     SlashResultKindDescriptor,
     served_methods,
 )
+from zeta.server.resource_protocol import collect_families
 from zeta.skills import SkillCatalog
 
 ROOT = Path(__file__).parents[1]
@@ -85,6 +89,28 @@ def test_method_registry_matches_documented_table() -> None:
     expected = [(item.wire, item.since or "1.0", item.feature or "none", item.access.value) for item in served_methods()]
     assert legacy == expected[:len(legacy)]
     assert sorted(legacy + families) == sorted(expected), "document each resource method in its own family section"
+
+
+@pytest.mark.asyncio
+async def test_collected_resource_handler_closes_unexpected_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail(client, request_id, params):
+        raise RuntimeError("unexpected test exception at /private/test-config with test-secret-canary")
+
+    monkeypatch.setattr(mcp_management, "METHODS", tuple(
+        replace(method, handler=fail) for method in mcp_management.METHODS
+    ))
+    descriptors = {descriptor.wire: descriptor for descriptor in collect_families()}
+    for method in mcp_management.METHODS:
+        with pytest.raises(Exception) as caught:
+            await descriptors[method.wire].handler(None, 7, {})
+        error = caught.value
+        assert isinstance(error, ProtocolError), "collected handlers must not let unexpected exceptions escape"
+        assert error.descriptor is ErrorDescriptor.INTERNAL_ERROR
+        assert json.loads(FrameCodec().error_response(7, error.descriptor, error.message, error.data)) == {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "error": {"code": -32000, "message": "unexpected server or storage failure"},
+        }
 
 
 @pytest.mark.asyncio
