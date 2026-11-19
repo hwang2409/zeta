@@ -18,12 +18,10 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .paths import MAX_BYTES, RAW_DAYS, ROLLUP_DAYS
 from .projector import EVENT_COLUMNS, SPAN_COLUMNS, root_session_id
 
 SCHEMA_VERSION = 4
-RAW_DAYS = 14
-ROLLUP_DAYS = 90
-MAX_BYTES = 1 << 30
 PRUNE_CHUNK = 1_000
 VACUUM_MAX_BYTES = 64 << 20  # the one-time VACUUM of a larger pre-v3 file could outlast the auto-start deadline
 INGEST_QUEUE_CAPACITY = 64

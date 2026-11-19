@@ -34,7 +34,7 @@ from ..core.session_files import (
     write_session_file,
 )
 from ..telemetry.receiver.process import OTLP_URL
-from .settings import SETTINGS_FILENAME, validate_home_settings
+from .settings import SETTINGS_FILENAME, Settings, validate_home_settings
 
 LOCK_NAME = f"{SETTINGS_FILENAME}.lock"
 LOCK_SECONDS = 0.25
@@ -59,11 +59,7 @@ class HomeSettingsError(Exception):
 
 def get(home: Path) -> dict[str, Any]:
     """The safe projection of ``home``'s settings and their revision."""
-    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        raw = _read(home_fd)
-    finally:
-        os.close(home_fd)
+    raw = _read_home(home)
     try:
         settings = _project(raw, home)
     except HomeSettingsError:
@@ -156,18 +152,35 @@ def _lock(fd: int) -> None:
             time.sleep(LOCK_POLL_SECONDS)
 
 
+def _read_home(home: Path) -> bytes:
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return _read(home_fd)
+    finally:
+        os.close(home_fd)
+
+
+def read_settings(home: Path) -> Settings:
+    """Read validated home settings without taking a write lock."""
+    return validate_home_settings(_read_home(home), home)
+
+
 def _project(raw: bytes, home: Path) -> dict[str, Any]:
     try:
-        endpoint = validate_home_settings(raw, home).otel_endpoint
+        return {"telemetry": telemetry_projection(validate_home_settings(raw, home))}
     except (ValueError, TypeError):
         raise HomeSettingsError("settings_malformed") from None
+
+
+def telemetry_projection(settings: Settings) -> dict[str, Any]:
+    endpoint = settings.otel_endpoint
     if endpoint is None:
         telemetry = {"enabled": False, "source": "off", "editable": True}
     elif endpoint == OTLP_URL:
         telemetry = {"enabled": True, "source": "builtin", "editable": True}
     else:
         telemetry = {"enabled": True, "source": "custom", "editable": False}
-    return {"telemetry": telemetry}
+    return telemetry
 
 
 def _with_telemetry(raw: bytes, enabled: bool) -> bytes:

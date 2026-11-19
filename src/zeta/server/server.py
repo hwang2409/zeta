@@ -45,6 +45,7 @@ from .handlers.projects import (
     project_request_error,
 )
 from .handlers.registry import dispatch as _dispatch_request
+from .handlers.registry import state_read_available
 from .parking import ParkedPairs
 from .protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,
@@ -1029,6 +1030,8 @@ class _Client:
         accepted = (
             [item for item in FEATURES if item in (requested or ())] if extended else []
         )
+        if "state_read_v1" in accepted and not state_read_available():
+            accepted.remove("state_read_v1")
         accepted = self.server.runtime.available_project_features(accepted)
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")

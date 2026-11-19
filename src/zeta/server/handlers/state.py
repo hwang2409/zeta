@@ -2,6 +2,12 @@
 
 from ...read_page import InvalidParams, TooLarge
 from ..protocol import ErrorDescriptor, MethodDescriptor, ProtocolError
+from ..read_home_state import (
+    accounts_page,
+    retention_result,
+    settings_page,
+    storage_page,
+)
 from ..read_sessions import read_session_page
 
 
@@ -74,3 +80,23 @@ async def state_agents(client, request_id, params):
 
 async def state_background_tasks(client, request_id, params):
     return await _session_read(client, request_id, params, MethodDescriptor.STATE_BACKGROUND_TASKS, collection="background_tasks")
+
+
+def _home_state_handler(owner_read):
+    async def read(client, request_id, params):
+        try:
+            return await client.connections.run_blocking(lambda: owner_read(
+                client.server.home, params, lambda result: client.codec.response_fits(request_id, result),
+            ))
+        except InvalidParams:
+            raise ProtocolError(ErrorDescriptor.INVALID_STATE_PARAMS, "invalid params") from None
+        except TooLarge:
+            raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit") from None
+
+    return read
+
+
+state_settings = _home_state_handler(settings_page)
+state_accounts = _home_state_handler(accounts_page)
+state_storage = _home_state_handler(storage_page)
+state_retention = _home_state_handler(retention_result)

@@ -19,14 +19,12 @@ from typing import Any
 from ...read_page import InvalidParams, Key, resume
 from ..runtime import _SESSION_ID
 from .page import keyset_page
+from .paths import MAX_BYTES, RAW_DAYS, ROLLUP_DAYS, database_path, used_bytes
 from .process import OTLP_URL, receiver_ready
 from .store import (
     BUSY_TIMEOUT_MS,
     DAY_NS,
     HOUR_NS,
-    MAX_BYTES,
-    RAW_DAYS,
-    ROLLUP_DAYS,
     SCHEMA_VERSION,
 )
 
@@ -96,10 +94,6 @@ class SchemaMismatch(Exception):
 
 
 Fits = Callable[[dict[str, Any]], bool]
-
-
-def database_path(home: Path) -> Path:
-    return home / "telemetry" / "telemetry.sqlite3"
 
 
 def status(home: Path, endpoint: str | None, live: dict[str, Any]) -> dict[str, Any]:
@@ -501,7 +495,7 @@ def _oldest(connection: sqlite3.Connection) -> tuple[int | None, int | None]:
 
 def _status(home: Path, endpoint: str | None, live: dict[str, Any], oldest: tuple[int | None, int | None] | None) -> dict[str, Any]:
     """``oldest`` is ``(oldest_raw_ns, oldest_rollup_ns)``, or None when there is no database."""
-    used = _used_bytes(database_path(home))
+    used = used_bytes(home)
     return {
         "enabled": oldest is not None and endpoint is not None,
         "receiver": live["receiver"] or ("ready" if receiver_ready(home) else "stopped"),
@@ -544,16 +538,6 @@ def _snapshot[T](home: Path, read: Callable[[sqlite3.Connection], T]) -> T:
             connection.rollback()
     finally:
         connection.close()
-
-
-def _used_bytes(path: Path) -> int:
-    total = 0
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            total += path.with_name(path.name + suffix).stat().st_size
-        except FileNotFoundError:
-            pass
-    return total
 
 
 def _only(params: dict[str, Any], allowed: set[str]) -> None:

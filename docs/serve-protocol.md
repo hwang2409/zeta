@@ -210,6 +210,10 @@ feature. Observer connections receive only methods with `read` access.
 | `state_inbox` | `1.0` | `state_read_v1` | `read` |
 | `state_inbox_detail` | `1.0` | `state_read_v1` | `controller_read` |
 | `state_attention` | `1.0` | `state_read_v1` | `read` |
+| `state_settings` | `1.0` | `state_read_v1` | `read` |
+| `state_accounts` | `1.0` | `state_read_v1` | `read` |
+| `state_storage` | `1.0` | `state_read_v1` | `read` |
+| `state_retention` | `1.0` | `state_read_v1` | `read` |
 | `telemetry_status` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_sessions` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_trace` | `1.0` | `telemetry_read_v1` | `read` |
@@ -1035,6 +1039,46 @@ nanoseconds; missing times are null.
 
 Session state uses the same state read errors as the catalog. A missing
 `state_session` target returns `-32602` with `data.code` `session_not_found`.
+
+### Home state reads
+
+`state_read_v1` exposes these methods to authenticated controllers and observers
+without an attached session. It is advertised only with the full state method set.
+
+| method | params | result |
+|---|---|---|
+| `state_settings` | `{"collection":"mcp\|redacted_keys","limit"?:200,"cursor"?:null}` | `{"model":string\|null,"provider":string\|null,"approval_mode":string\|null,"max_depth":integer,"otel":{"enabled":boolean,"endpoint":"builtin\|external"\|null},"collection":string,"items":[{"name":string,"transport":string,"configured":boolean}\|string],"next_cursor":string\|null}` |
+| `state_accounts` | `{"collection":"accounts\|warnings","limit"?:200,"cursor"?:null}` | `{"collection":string,"items":[{"provider":string,"account_id":string,"status":"available\|selected\|exhausted\|error","selected":boolean,"refreshable":boolean,"last_checked_ns":integer\|null}\|string],"next_cursor":string\|null}` |
+| `state_storage` | `{"limit"?:200,"cursor"?:null}` | `{"writer_epoch":integer,"sessions":{"count":integer,"bytes":integer},"projects":{"count":integer,"bytes":integer},"accounts":{"count":integer,"bytes":integer},"telemetry":{"bytes":integer},"warnings":[string],"next_cursor":string\|null}` |
+| `state_retention` | `{}` | `{"session_days":integer\|null,"telemetry_raw_days":14,"telemetry_rollup_days":90,"telemetry_max_bytes":1073741824,"last_telemetry_prune_ns":integer\|null}` |
+
+- Settings are allowlisted. `approval_mode` is `allow` or `ask` if explicitly
+  configured, otherwise null. `configured` marks a valid and enabled MCP
+  declaration, not a live connection or an authentication check. MCP rows sort
+  by name then transport. `redacted_keys` lists recognized secret field names
+  in lexical order, not their values. Credentials are not exposed.
+- Accounts sort by provider then account id. `selected` identifies the stored
+  provider default, even when credentials have expired or usage is exhausted.
+  Status is `error` for missing, invalid or expired credentials, then `exhausted`
+  for a stored active usage limit, then `selected` or `available`. Unrecognized
+  usage metadata is ignored with a warning, never returned as a status or raw
+  text. `refreshable` is based only on stored credential metadata. Reads do not
+  refresh, contact providers, return email, or change selection.
+- Storage counts top-level session and project directories and provider/account
+  directories; bytes are regular-file sizes. Symlinks are not counted. The
+  traversal examines at most 4,096 entries across those trees and descends to
+  at most 16 levels. A partial area returns a warning; its totals are lower
+  bounds. Telemetry bytes include the database, WAL and shared-memory file.
+- Retention reports the effective session setting and the receiver policy. The
+  receiver does not store a last prune time, so `last_telemetry_prune_ns` is null.
+
+Warnings sort lexically with an ordinal tie-breaker. Limits are 1–200, and the
+cursor is bound to its method and collection. Each response returns the
+largest fitting prefix. Errors are `-32601` without negotiation, `-32602` /
+`invalid_params` for invalid params or cursors, `-32005` / `state_unavailable`
+for unavailable state, `-32000` / `corrupt_state` for invalid stored format or
+settings, `-32009` / `stale_state_snapshot` after a failed snapshot retry, and
+`-32007` / `result_too_large` when a complete item does not fit.
 
 ### home settings (`home_settings_v1` feature)
 
@@ -2715,7 +2759,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `tool_approval_origin` | adds `approval_origin: "automatic" | "user"` to live `tool_start` calls and replayed history `tool_use` calls |
 | `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, `telemetry_trace`, `telemetry_overview`, `telemetry_models`, `telemetry_tools`, `telemetry_errors`, `telemetry_series`, and `telemetry_agent_tree` methods |
-| `state_read_v1` | enables `state_catalog`, `state_projects`, `state_memory`, `state_memory_detail`, `state_inbox`, `state_inbox_detail`, `state_attention`, `state_sessions`, `state_session`, `state_agents`, and `state_background_tasks` |
+| `state_read_v1` | enables `state_catalog`, `state_projects`, `state_memory`, `state_memory_detail`, `state_inbox`, `state_inbox_detail`, `state_attention`, `state_sessions`, `state_session`, `state_agents`, `state_background_tasks`, `state_settings`, `state_accounts`, `state_storage`, and `state_retention` |
 | `home_settings_v1` | enables `home_settings_get` and controller-only `home_settings_update` for the home `settings.toml` (`telemetry.enabled` only) |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
