@@ -24,28 +24,35 @@ def _string(params: dict[str, Any], key: str, max_bytes: int) -> str:
     return value
 
 
-def _error(reason: str):
-    from ...protocol import ErrorDescriptor, ProtocolError
+def _owner_error(code: str):
+    from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
 
-    descriptor = ErrorDescriptor[reason.upper()]
-    return ProtocolError(descriptor, descriptor.meaning, {"code": reason, "reason": reason})
+    if code == "invalid_params":
+        return invalid_resource_params()
+    return resource_error({
+        "child_run_not_found": ErrorDescriptor.CHILD_RUN_NOT_FOUND,
+        "operation_busy": ErrorDescriptor.OPERATION_BUSY,
+        "state_unavailable": ErrorDescriptor.STATE_UNAVAILABLE,
+    }[code])
 
 
 def _active(client, params):
+    from ...protocol import ErrorDescriptor, resource_error
+
     session_id = _string(params, "session_id", 256)
     runtime = client.server.runtime
     if runtime.opened is None:
-        raise _error("no_active_session")
+        raise resource_error(ErrorDescriptor.NO_ACTIVE_SESSION)
     if runtime.session_id != session_id:
-        raise _error("session_mismatch")
+        raise resource_error(ErrorDescriptor.SESSION_MISMATCH)
     if runtime.loop is None:
-        raise _error("no_active_session")
+        raise resource_error(ErrorDescriptor.NO_ACTIVE_SESSION)
     return runtime.loop
 
 
 async def child_run_spawn(client, request_id, params):
     from ....agent.runner import ChildControlError, spawn_child
-    from ...protocol import invalid_resource_params
+    from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
 
     require_params(params, "session_id", "agent_type", "task", optional=("cwd", "background"))
     loop = _active(client, params)
@@ -57,24 +64,22 @@ async def child_run_spawn(client, request_id, params):
     control = client.server.control
     control._reject_if_unhealthy()
     if control.client_turn_detached():
-        raise _error("no_active_session")
+        raise resource_error(ErrorDescriptor.NO_ACTIVE_SESSION)
     if control.state_change_busy():
-        raise _error("operation_busy")
+        raise resource_error(ErrorDescriptor.OPERATION_BUSY)
     try:
         with control.hold_wake_start():
             run_id = await spawn_child(loop, agent_type=agent_type, task=task, cwd=cwd)
     except ChildControlError as exc:
-        if exc.code == "invalid_params":
-            raise invalid_resource_params() from None
-        raise _error(exc.code) from None
+        raise _owner_error(exc.code) from None
     except Exception:  # noqa: BLE001 - do not expose owner paths or exception details
-        raise _error("state_unavailable") from None
+        raise resource_error(ErrorDescriptor.STATE_UNAVAILABLE) from None
     return {"data": {"accepted": True, "run_id": run_id}}
 
 
 async def child_run_cancel(client, request_id, params):
     from ....agent.runner import ChildControlError, cancel_child_run
-    from ...protocol import invalid_resource_params
+    from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
 
     require_params(params, "session_id", "run_id", optional=("reason",))
     loop = _active(client, params)
@@ -84,9 +89,9 @@ async def child_run_cancel(client, request_id, params):
     try:
         state = await cancel_child_run(loop, run_id)
     except ChildControlError as exc:
-        raise _error(exc.code) from None
+        raise _owner_error(exc.code) from None
     except Exception:  # noqa: BLE001 - do not expose owner paths or exception details
-        raise _error("state_unavailable") from None
+        raise resource_error(ErrorDescriptor.STATE_UNAVAILABLE) from None
     return {"data": {"accepted": True, "run_id": run_id, "state": state}}
 
 
