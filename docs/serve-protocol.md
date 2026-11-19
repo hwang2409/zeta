@@ -806,8 +806,8 @@ boundary after both now minus 14 days and the oldest stored span. Hours that
 start before the cutoff come whole from the rollups, so a range start inside
 such an hour includes that whole hour. Spans that start at or after the cutoff
 come from raw spans. The cutoff is an hour boundary, so each span counts once
-when a range crosses it. `telemetry_errors` reads raw spans only and returns
-nothing older than 14 days.
+when a range crosses it. `telemetry_errors.classes` uses this same split;
+`telemetry_errors.items` still lists only individual raw spans.
 
 Model and tool keys: a model is `[provider, model]` with the response model,
 else the request model, of a `chat` span; a tool is `[tool_name, tool_type]`
@@ -848,7 +848,7 @@ is 1 to 200. Each returns a page ordered by `calls` descending, then the
 canonical key ascending:
 
 ```json
-{"items":[{"provider":"openai","model":"gpt-5","calls":0,"errors":0,"duration_ns":0,"p50_ns":0,"p95_ns":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"last_ns":0}],"next_cursor":null,"as_of_ns":0}
+{"items":[{"provider":"openai","model":"gpt-5","calls":0,"errors":0,"duration_ns":0,"p50_ns":0,"p95_ns":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"last_ns":0,"ttft_p50_ns":null,"ttft_p95_ns":null}],"next_cursor":null,"as_of_ns":0}
 {"items":[{"tool_name":"bash","tool_type":"function","calls":0,"errors":0,"duration_ns":0,"p50_ns":0,"p95_ns":0,"argument_bytes":0,"result_bytes":0,"last_ns":0}],"next_cursor":null,"as_of_ns":0}
 ```
 
@@ -860,6 +860,14 @@ holds `2^(b-1)` to `2^b - 1` ns. The nearest-rank quantile returns its
 bucket's upper edge, so a positive value is never below the true quantile and
 is less than twice it.
 
+Like `p50_ns` and `p95_ns`, `ttft_p50_ns` and `ttft_p95_ns` come from hourly
+histograms over every hour the range touches, with the same buckets,
+nearest-rank rule, and error bound. They measure time to first token for model
+calls. Calls without `ttft_ns` do not contribute; both fields are `null` if
+there are no samples. `cache_read_tokens` and `cache_write_tokens` sum their
+respective counts from hourly model rollups over the same hours; each is `0`
+when no count is available. No dollar cost is reported.
+
 #### `telemetry_errors`
 
 Params: `{"start_ns":null,"end_ns":null,"operation":null,"limit":50,"cursor":null}`.
@@ -868,12 +876,24 @@ failed spans newest first (`time_ns` descending, then `trace_id` and
 `span_id` descending):
 
 ```json
-{"items":[{"trace_id":"00112233445566778899aabbccddeeff","span_id":"0011223344556677","session_id":null,"time_ns":0,"operation":"mcp","error_type":null,"duration_ns":0,"model":null,"tool_name":null,"agent_name":null,"mcp_server":null,"mcp_method":null,"mcp_tool":null}],"next_cursor":null,"as_of_ns":0}
+{"items":[{"trace_id":"00112233445566778899aabbccddeeff","span_id":"0011223344556677","session_id":null,"time_ns":0,"operation":"mcp","error_type":null,"duration_ns":0,"model":null,"tool_name":null,"agent_name":null,"mcp_server":null,"mcp_method":null,"mcp_tool":null}],"next_cursor":null,"as_of_ns":0,"classes":[{"error_type":null,"count":1}]}
 ```
 
 `time_ns` is the span start; `model` is the response, else request, model;
 `agent_name`, `mcp_server`, `mcp_method`, and `mcp_tool` name the failing
 operation's target. No error message is ever returned.
+
+`classes` counts failed spans by `error_type` over the entire requested range
+and `operation` filter, not just the current page. It combines raw spans
+and hourly rollups at the cutoff and is returned on each page, even when
+there are no raw `items`. Classes sort by descending count, then ascending
+`error_type` (`null` sorts first for a tie). At most 50 classes are returned;
+when more exist, a final `{"error_type":"other","count":n}` entry sums
+all omitted counts.
+
+A schema-v4 store backfills TTFT, cache tokens, and error classes from raw
+spans still within retention on receiver restart. Older v4 rollups lacked
+these measures, so already-pruned spans cannot contribute to the new fields.
 
 #### `telemetry_series`
 
