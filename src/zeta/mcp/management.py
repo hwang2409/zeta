@@ -11,9 +11,10 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal
@@ -28,10 +29,12 @@ from .config import (
     load_mcp_config_overlay,
     project_config_path,
 )
+from .envelope import MCPCallLimits
 from .fs import ensure_directory_below_existing_root
 from .oauth_store import (
     MCPCredentialStore,
     MCPCredentialStoreError,
+    MCPOAuthToken,
     PublicCredentialStoreError,
     SaveDisposition,
     public_credential_store_error,
@@ -1013,9 +1016,11 @@ class MCPManagementService:
             home=str(self.home) if self.home else None,
             capture_stderr=not wire,
         )
+        limits = (registry.mcp_limits if registry is not None else None) or MCPCallLimits()
         try:
-            await client.connect()
-            tools = await client.list_tools()
+            async with asyncio.timeout(limits.deadline_seconds):
+                await client.connect()
+                tools = await client.list_tools()
             if wire:
                 return {"status": "ok", "tool_count": len(tools)}
             summaries = []
@@ -1025,6 +1030,8 @@ class MCPManagementService:
                     description = description[:117] + "..."
                 summaries.append({"name": tool.name, "description": description})
             return {"name": name, "tools": summaries, "status": "ok"}
+        except TimeoutError:
+            return {"name": name, "tools": [], "status": "failed", "detail": "MCP probe timed out"}
         finally:
             await client.close()
 
@@ -1042,9 +1049,8 @@ class MCPManagementService:
             raise MCPManagementError("skipped by tool policy")
         if config is None or item.config.get("transport") != "streamable-http":
             raise MCPManagementError("OAuth requires an HTTP MCP server", code="invalid_params")
-        initial = await self._credential_store.load(name)
-        headless = authorization_ready is not None
-        candidate = await authorize(
+        flow = partial(
+            authorize,
             server_name=name,
             server_url=config.url or "",
             client_id=config.client_id,
@@ -1053,24 +1059,35 @@ class MCPManagementService:
             scopes=config.scopes,
             authorization_server_url=config.authorization_server_url,
             resource_metadata_url=config.resource_metadata_url,
-            authorization_params=None if headless else config.authorization_params,
-            no_browser=no_browser,
-            **({"authorization_ready": authorization_ready} if headless else {}),
         )
-        if before_commit is not None:
-            before_commit()
-        if headless:
-            saved = await self._credential_store.save_if_current(
-                name, initial.generation, candidate, allow_new_login=True,
+        if authorization_ready is not None:
+            token = await self._login_headless(
+                name, partial(flow, authorization_ready=authorization_ready), before_commit,
             )
-            if saved.disposition is not SaveDisposition.COMMITTED:
-                raise MCPManagementError("credentials changed during login")
-            credential = saved.snapshot
         else:
-            credential = await self._credential_store.save_login(name, candidate)
-        self._credential_status[name] = token_state(credential.token)
+            await self._credential_store.load(name)
+            candidate = await flow(authorization_params=config.authorization_params, no_browser=no_browser)
+            if before_commit is not None:
+                before_commit()
+            token = (await self._credential_store.save_login(name, candidate)).token
+        self._credential_status[name] = token_state(token)
         self.credential_store_error = None
         await self.refresh()
+
+    async def _login_headless(
+        self, name: str, flow: Callable[[], Awaitable[MCPOAuthToken]],
+        before_commit: Callable[[], None] | None,
+    ) -> MCPOAuthToken | None:
+        initial = await self._credential_store.load(name)
+        candidate = await flow()
+        if before_commit is not None:
+            before_commit()
+        saved = await self._credential_store.save_if_current(
+            name, initial.generation, candidate, allow_new_login=True,
+        )
+        if saved.disposition is not SaveDisposition.COMMITTED:
+            raise MCPManagementError("credentials changed during login")
+        return saved.snapshot.token
 
     async def logout(self, name: str, *, scope: Scope = "effective") -> None:
         await asyncio.to_thread(self._command_target, name, scope)

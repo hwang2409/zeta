@@ -220,6 +220,7 @@ async def discover_protected_resource(
     *,
     http_client: httpx.AsyncClient,
     resource_metadata_url: str | None = None,
+    require_metadata: bool = False,
 ) -> ProtectedResourceMetadata:
     """Probe the MCP server for RFC 9728 protected-resource metadata."""
 
@@ -238,6 +239,8 @@ async def discover_protected_resource(
     for metadata_url in metadata_urls:
         result = await _fetch_resource_metadata(metadata_url, http_client)
         if isinstance(result, _UnavailableResourceMetadata):
+            if require_metadata:
+                continue
             if resource_metadata_url is not None:
                 if result.cause is not None:
                     raise result.error from result.cause
@@ -245,6 +248,8 @@ async def discover_protected_resource(
             logger.debug("MCP OAuth: protected-resource probe failed: %s", result.error)
             continue
         return _parse_resource_metadata(result, server_url)
+    if require_metadata:
+        raise MCPOAuthError("MCP OAuth: headless authorization requires protected-resource metadata")
     return ProtectedResourceMetadata(server_url, None)
 
 
@@ -743,6 +748,28 @@ def token_from_response(
     )
 
 
+async def _discover_headless(
+    server_url: str, authorization_server_url: str | None,
+    resource_metadata_url: str | None, http_client: httpx.AsyncClient,
+) -> tuple[ProtectedResourceMetadata, AuthServerMetadata]:
+    _validate_oauth_url(server_url, "server URL")
+    if "?" in server_url:
+        raise MCPOAuthError("MCP OAuth: headless authorization requires a query-free server URL")
+    resource = await discover_protected_resource(
+        server_url, http_client=http_client, resource_metadata_url=resource_metadata_url,
+        require_metadata=True,
+    )
+    # Metadata can echo the configured URL; no configured path segment is public.
+    parsed = urlparse(resource.resource)
+    if parsed.path not in ("", "/") or parsed.params:
+        raise MCPOAuthError("MCP OAuth: headless authorization requires an origin-only resource")
+    auth_server = authorization_server_url or resource.authorization_server or resource.resource
+    metadata = await discover_auth_server(auth_server, http_client=http_client)
+    if "?" in metadata.authorization_endpoint:
+        raise MCPOAuthError("MCP OAuth: headless authorization requires a query-free authorization endpoint")
+    return resource, metadata
+
+
 async def authorize(
     *,
     server_name: str,
@@ -768,18 +795,17 @@ async def authorize(
     listener: asyncio.base_events.Server | None = None
     try:
         if authorization_ready is not None:
-            _validate_oauth_url(server_url, "server URL")
-            if urlparse(server_url).query:
-                raise MCPOAuthError("MCP OAuth: headless authorization requires a query-free server URL")
-        resource_meta = await discover_protected_resource(
-            server_url,
-            http_client=http_client,
-            resource_metadata_url=resource_metadata_url,
-        )
-        auth_server = (
-            authorization_server_url or resource_meta.authorization_server or server_url
-        )
-        metadata = await discover_auth_server(auth_server, http_client=http_client)
+            resource_meta, metadata = await _discover_headless(
+                server_url, authorization_server_url, resource_metadata_url, http_client,
+            )
+        else:
+            resource_meta = await discover_protected_resource(
+                server_url,
+                http_client=http_client,
+                resource_metadata_url=resource_metadata_url,
+            )
+            auth_server = authorization_server_url or resource_meta.authorization_server or server_url
+            metadata = await discover_auth_server(auth_server, http_client=http_client)
         (
             listener,
             redirect_uri,
@@ -806,15 +832,7 @@ async def authorize(
             scope=scope,
             authorization_params=authorization_params,
         )
-        if authorization_ready is not None:
-            _validate_oauth_url(resource_meta.resource, "resource")
-            if urlparse(resource_meta.resource).query or urlparse(metadata.authorization_endpoint).query:
-                raise MCPOAuthError("MCP OAuth: headless authorization requires query-free endpoints")
-            authorization_ready(url)
-            outcome = await wait_for_redirect(listener, payload, signal, timeout=listen_timeout)
-            listener = None
-            callback_url = outcome.callback_url or ""
-        elif no_browser:
+        if no_browser and authorization_ready is None:
             print(f"Open this URL to authorize {server_name}:\n{url}", file=sys.stderr)
             callback_url = await asyncio.to_thread(
                 input, "Paste the full callback URL: "
@@ -823,13 +841,16 @@ async def authorize(
             await listener.wait_closed()
             listener = None
         else:
-            opener = browser_opener or _default_browser_opener
-            try:
-                await asyncio.to_thread(opener, url)
-            except Exception as exc:  # noqa: BLE001 - defensive: report but keep waiting
-                logger.warning(
-                    "MCP OAuth: browser opener failed for %s: %s", server_name, exc
-                )
+            if authorization_ready is not None:
+                authorization_ready(url)
+            else:
+                opener = browser_opener or _default_browser_opener
+                try:
+                    await asyncio.to_thread(opener, url)
+                except Exception as exc:  # noqa: BLE001 - defensive: report but keep waiting
+                    logger.warning(
+                        "MCP OAuth: browser opener failed for %s: %s", server_name, exc
+                    )
             outcome = await wait_for_redirect(
                 listener, payload, signal, timeout=listen_timeout
             )
