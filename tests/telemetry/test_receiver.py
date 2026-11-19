@@ -447,9 +447,44 @@ def test_projection_is_identical_in_both_orders(tmp_path):
     assert session["model"] == "m-high"
 
 
+def _enable_receiver(home: Path) -> None:
+    home.mkdir(exist_ok=True)
+    (home / "settings.toml").write_text('[otel]\nendpoint = "http://127.0.0.1:4323/v1/traces"\n')
+
+
 def _receiver_command(home: Path) -> tuple[list[str], dict[str, str]]:
+    _enable_receiver(home)
     command = [sys.executable, "-c", "import sys; from zeta.cli.main import main; sys.exit(main())", "otel", "receiver"]
     return command, {**os.environ, "ZETA_HOME": str(home)}
+
+
+@pytest.mark.parametrize("settings", [None, '[otel]\nendpoint = ""\n'], ids=["unset", "empty"])
+def test_receiver_cli_refuses_to_start_with_telemetry_off(tmp_path, monkeypatch, capsys, settings):
+    from zeta.cli.main import main
+    from zeta.telemetry.receiver import process
+
+    if settings is not None:
+        (tmp_path / "settings.toml").write_text(settings)
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    bound = []
+    create_server = process.socket.create_server
+
+    def listen(address):
+        listener = create_server((address[0], 0))
+        bound.append(listener.getsockname())
+        return listener
+
+    monkeypatch.setattr(process.socket, "create_server", listen)  # use a free port if the guard is missing
+    # test-contract: seam stop just after listen() so a broken receiver command cannot hang the test
+    monkeypatch.setattr(process, "_serve", lambda *args: 0)
+
+    assert main(["otel", "receiver"]) != 0, "receiver started with telemetry off"
+    assert not (tmp_path / "telemetry").exists()
+    assert not bound
+    out, err = capsys.readouterr()
+    assert not out
+    assert len(err.splitlines()) == 1
+    assert "Set the endpoint in ~/.zeta/settings.toml (or $ZETA_HOME/settings.toml)" in err
 
 
 def test_second_process_exits_and_bind_failure_releases_lock(tmp_path, builtin_port):
@@ -566,6 +601,7 @@ def test_only_the_auto_started_receiver_idle_exits(tmp_path, monkeypatch, argume
     from zeta.telemetry.receiver.app import IdleTimer
 
     served: list[float] = []
+    _enable_receiver(tmp_path)
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
     create_server = socket.create_server
     monkeypatch.setattr(process.socket, "create_server", lambda address: create_server(("127.0.0.1", 0)))  # not the fixed port

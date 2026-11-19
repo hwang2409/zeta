@@ -85,6 +85,8 @@ class Launches:
 
 def test_concurrent_starters_produce_one_receiver(tmp_path: Path, builtin_port: None, monkeypatch: pytest.MonkeyPatch) -> None:
     home = tmp_path / "home"
+    home.mkdir()
+    (home / "settings.toml").write_text(f'[otel]\nendpoint = "{OTLP_URL}"\n')
     launches = Launches(tmp_path, threading.Barrier(2))
     monkeypatch.setattr(autostart.subprocess, "Popen", launches)
     checks = Checks(monkeypatch)
@@ -111,6 +113,8 @@ def test_concurrent_starters_produce_one_receiver(tmp_path: Path, builtin_port: 
 
 def test_stale_lock_after_a_crash_is_recovered(tmp_path: Path, builtin_port: None, monkeypatch: pytest.MonkeyPatch) -> None:
     home = tmp_path / "home"
+    home.mkdir()
+    (home / "settings.toml").write_text(f'[otel]\nendpoint = "{OTLP_URL}"\n')
     launches = Launches(tmp_path)
     monkeypatch.setattr(autostart.subprocess, "Popen", launches)
     checks = Checks(monkeypatch)
