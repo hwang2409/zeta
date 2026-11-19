@@ -57,8 +57,8 @@ def collect_families() -> tuple[ResourceDescriptor, ...]:
             raise RuntimeError("duplicate or empty serve resource family")
         flags.add(family.FEATURE)
         for method in family.METHODS:
-            if method.access not in {Access.READ, Access.CONTROLLER_WRITE}:
-                raise RuntimeError("serve resource methods must declare read or controller write access")
+            if method.access not in {Access.READ, Access.CONTROLLER_READ, Access.CONTROLLER_WRITE}:
+                raise RuntimeError("serve resource methods must declare read, controller read, or controller write access")
             descriptors.append(ResourceDescriptor(
                 method.wire, method.since, family.FEATURE, method.access, method.handler,
             ))
