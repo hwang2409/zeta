@@ -3556,6 +3556,50 @@ async def test_eviction_can_replace_a_prior_summary(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("persist_result", [False, True], ids=["interrupted", "persisted"])
+async def test_eviction_keeps_tool_calls_and_results_paired(
+    tmp_path: Path, persist_result: bool,
+) -> None:
+    store = ConversationStore(tmp_path)
+    try:
+        store.append_message(text(MessageRole.USER, "request"))
+        call, result = tool_pair("read", "read-1", "large output\n" * 1500)
+        store.append_message(call)
+        store.append_message(result)
+        store.append_message(Message(
+            MessageRole.ASSISTANT,
+            [ToolUseContent(ToolCall("launch", "agent", {
+                "agent_type": "worker", "description": "job", "model": "sol", "prompt": "do job",
+            }))],
+            metadata={"response_state": "completed", "stop_reason": "tool_use"},
+        ))
+        launch_result = ToolResult("launch", "agent started")
+        if persist_result:
+            store.append_message(Message(MessageRole.TOOL_RESULT, tool_result=launch_result))
+        store.append_message(text(MessageRole.USER, "next request"))
+        context = await ContextAssembler(store, token_budget=700).assemble_context(
+            force=True, bypass_eviction_hysteresis=True,
+        )
+
+        assert store.latest_compaction_marker().data["kind"] == "evict"
+        results = [message.tool_result for message in context.messages if message.tool_result is not None]
+        assert sorted(
+            block.tool_call.id
+            for message in context.messages
+            for block in message.content
+            if isinstance(block, ToolUseContent)
+        ) == sorted(result.tool_call_id for result in results)
+        kept = next(result for result in results if result.tool_call_id == "launch")
+        if persist_result:
+            assert kept == launch_result
+        else:
+            assert kept.is_error and "interrupted" in kept.content
+        assert_payload_pairing(context.messages)
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_forced_eviction_uses_evict_mode(tmp_path: Path) -> None:
     store = ConversationStore(tmp_path)
     store.append_message(with_message_origin(text(MessageRole.USER, "request"), MessageOrigin.USER))
