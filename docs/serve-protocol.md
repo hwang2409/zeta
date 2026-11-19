@@ -1970,6 +1970,38 @@ keys, and bad values; `-32009 stale_settings_revision` (both `data.code` and
 `settings_malformed` or `settings_unsafe` for malformed or unsafe files.
 Unexpected failures return only the generic `-32000` error.
 
+### agent run catalog (`agent_run_catalog_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `agent_run_catalog` | `1.0` | `agent_run_catalog_v1` | `read` |
+
+`agent_run_catalog` works without an attached session. All fields are optional:
+`limit` (integer 1–100, default 50), `state` (`running`, `idle`, `finishing`,
+`completed`, `failed`, or `canceled`), `root_session_id` (exact top-level session
+id), and `cursor` (the opaque `next_cursor` from the previous response with
+identical filters). There is no offset or update event.
+
+The result is `{revision,data:{items,next_cursor?}}`. `revision` is a lowercase
+SHA-256 of the returned page data, not a snapshot or a write token. `items`
+uses the `child_run_list` row shape, including `run_id`, `session_id` (root),
+`parent_run_id` (null for direct children), `description`, `agent_type`,
+`status`, `accepts_follow_ups`, `turns_used`, `tool_count`, `current_step`,
+`started_at`, `finished_at`, and `elapsed_seconds`. The read uses durable
+lifecycle metadata, never transcripts, and omits final results.
+
+Roots sort by session directory mtime descending, then id ascending. Within
+one root, runs sort depth first by lexicographic slot name. Unreadable or
+invalid child records are skipped independently. Metadata processing stops
+after 128 candidate roots/runs or a full page. A short or empty page with a
+`next_cursor` is not the end; follow it until it is absent. This is a live
+view: ordering and contents can change between pages if sessions change.
+
+Invalid params or mismatched cursors return `-32602` (`invalid_params`). An
+unavailable store returns `-32005` (`state_unavailable`). If not even one row
+fits the frame, the method returns `-32007` (`result_too_large`). An
+unnegotiated method returns `-32601`.
+
 ## errors
 
 Error responses use standard JSON-RPC codes where applicable. Each emitted variant selects one registered descriptor.
