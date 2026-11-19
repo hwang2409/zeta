@@ -23324,3 +23324,57 @@ async def test_idle_child_wake_tool_count_is_cumulative(
         backend.release_children.set()
         await loop.close()
         parent_store.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_timeout_delivers_queued_follow_up(tmp_path, monkeypatch):
+    from tests.support.completion import ManualDeadlineClock
+
+    clock = ManualDeadlineClock()
+    monkeypatch.setattr(agent_loop_module, "MonotonicDeadlineClock", lambda: clock, raising=False)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    backend = RunBackend()
+    backend.release_child.set()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    prepare = ContextAssembler.prepare_context
+    child_store = None
+
+    async def block_first_child_prepare(assembler, **kwargs):
+        nonlocal child_store
+        if assembler.store is not store and not entered.is_set():
+            child_store = assembler.store
+            entered.set()
+            await await_or_fail(release.wait(), what="release context preparation")
+        return await prepare(assembler, **kwargs)
+
+    monkeypatch.setattr(ContextAssembler, "prepare_context", block_first_child_prepare)
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await await_or_fail(entered.wait(), what="child context preparation entered")
+        assert await send_to_run(
+            store, _run_handle_from_receipt(store), "also check the tests",
+            owner=loop._background_owner,
+            channel=loop._background_owner.conversation_channel,
+        ) is None
+        clock.advance(15 * 60)
+        # The old code has no timer. Let it finish so it fails at the outcome,
+        # not at the test's safety deadline. At the exact boundary expiry wins.
+        release.set()
+        await wait_background_owner(loop)
+        assert child_store is not None
+        failures = [
+            message.metadata[FAILED_TURN_ERROR]
+            for message in branch_messages(child_store)
+            if FAILED_TURN_ERROR in message.metadata
+        ]
+        assert failures == [{
+            "code": "pre_dispatch_timeout",
+            "message": "turn stalled for 15 min while preparing context (stage: context preparation)",
+        }]
+        assert backend.child_prompts == ["also check the tests"]
+    finally:
+        release.set()
+        await loop.close()
+        store.close()

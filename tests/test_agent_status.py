@@ -158,24 +158,28 @@ async def test_agent_status_round_trip_and_live_snapshot(tmp_path: Path) -> None
     )
     assert durable_lifecycle["current_step"] == "starting"
 
-    live_status = await _status(loop, background_handle)
-    live_child = live_status["structuredContent"]["children"][0]
-    assert live_child["state"] == "running"
-    assert live_child["finished_at"] is None
-    assert live_child["current_step"] == "turn 1: thinking"
+    try:
+        await await_or_fail(
+            backend.child_started["inspect"].wait(), what="background child model call"
+        )
+        live_status = await _status(loop, background_handle)
+        live_child = live_status["structuredContent"]["children"][0]
+        assert live_child["state"] == "running"
+        assert live_child["finished_at"] is None
+        assert live_child["current_step"] == "turn 1: thinking"
 
-    live_list_status = await _status(loop)
-    live_list_child = live_list_status["structuredContent"]["children"][0]
-    assert live_list_child["handle"] == background_handle
-    assert live_list_child["state"] == "running"
-    assert live_list_child["finished_at"] is None
-    assert live_list_status["structuredContent"]["finished_omitted"] == 1
-    assert (
-        "1 finished children omitted (query by handle for results)"
-        in live_list_status["content"][0]["text"]
-    )
-
-    backend.release_children.set()
+        live_list_status = await _status(loop)
+        live_list_child = live_list_status["structuredContent"]["children"][0]
+        assert live_list_child["handle"] == background_handle
+        assert live_list_child["state"] == "running"
+        assert live_list_child["finished_at"] is None
+        assert live_list_status["structuredContent"]["finished_omitted"] == 1
+        assert (
+            "1 finished children omitted (query by handle for results)"
+            in live_list_status["content"][0]["text"]
+        )
+    finally:
+        backend.release_children.set()
     await await_or_fail(loop._background_owner.wait(), what="loop._background_owner.wait()")
     all_status = await _status(loop)
     children = all_status["structuredContent"]["children"]
