@@ -24,8 +24,7 @@
     if (bytes.length > max) throw new Err('request frame too large');
     if (write(1, bytes) !== bytes.length) throw new Err('short bridge write');
   }
-  function receive() {
-    const buffer = new Bytes(max);
+  function receive(buffer) {
     function fill(length) {
       for (let i = 0; i < length;) {
         const n = read(0, buffer.subarray(i, length));
@@ -46,7 +45,8 @@
     queue = [];
     try {
       send({op: 'call', calls: batch.map(item => item.request)});
-      const replies = receive();
+      const buffer = new Bytes(max), replies = [];
+      for (let i = 0; i < batch.length; i++) replies[i] = receive(buffer);
       for (let i = 0; i < batch.length; i++) {
         const item = batch[i], reply = replies[i];
         if (reply.ok) item.resolve(reply.value);
