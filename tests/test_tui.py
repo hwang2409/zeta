@@ -882,7 +882,9 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         )
         if type(command).__name__ == "_AcknowledgeStagedDeliveryCommand":
             loop.call_soon_threadsafe(ack_committed.set)
-            release_ack.wait()
+            assert release_ack.wait(timeout=30), (
+                "test did not release the acknowledgement worker"
+            )
         return result
 
     # test-contract: seam pauses after durable acknowledgement commit
