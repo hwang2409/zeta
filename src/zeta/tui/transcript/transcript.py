@@ -216,6 +216,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._history_entry_id: str | None = None
         self._history_unit_ordinal = 0
         self._follow_tail = True
+        self.on_mouse_scroll: Callable[[], None] | None = None
         self._scroll_offset = 0
         self._viewport_height = 1
         self._content_width = 80
@@ -1285,6 +1286,10 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def mouse_handler(self, mouse_event: MouseEvent):
         """Scroll on the wheel and leave other mouse events to the terminal."""
 
+        if self.on_mouse_scroll is not None and mouse_event.event_type in (
+            MouseEventType.SCROLL_UP, MouseEventType.SCROLL_DOWN
+        ):
+            self.on_mouse_scroll()
         if mouse_event.event_type is MouseEventType.SCROLL_UP:
             self.scroll_up()
             return None
