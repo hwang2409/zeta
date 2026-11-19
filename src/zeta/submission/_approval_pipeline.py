@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 
 from ..core.approval import ApprovalDecision, ApprovalRequest
+from ..core.context_parts.code_audit import nested_call_data
 from .messages import _ApprovalAction, _ApprovalLifecycle, _DurableToolDone
 from .model import SubmissionState, _Entry
 
@@ -53,7 +54,13 @@ class ApprovalPipelineMixin:
         )
         if message.decision is ApprovalDecision.ALLOW:
             if message.always:
-                if request.child_instance_id is not None:
+                parent = request.request_id.rpartition(":code:")[0]
+                if (
+                    self._host.loop.tool_registry.code_mode_enabled
+                    and request.child_instance_id is not None
+                    and parent
+                    and nested_call_data(request.request_id, parent)
+                ):
                     self._host._print_system("approval · cannot always allow delegated approvals")
                     self._ack_action(message)
                     return
