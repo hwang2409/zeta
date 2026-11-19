@@ -10,7 +10,14 @@ from __future__ import annotations
 import asyncio
 import errno
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Self
@@ -24,7 +31,9 @@ from ...protocol.types import (
     RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
+    TextContent,
     ThinkingContent,
+    ToolUseContent,
 )
 
 if TYPE_CHECKING:
@@ -222,6 +231,24 @@ def _add_usage(left: _Usage, right: _Usage) -> _Usage:
     return left[0] + right[0], left[1] + right[1], cache(left[2], right[2]), cache(left[3], right[3])
 
 
+def _carries_model_output(event: StreamEvent) -> bool:
+    blocks: Sequence[ContentBlock | None]
+    if event.type is StreamEventType.MESSAGE_UPDATE:
+        if event.delta or event.tool_call is not None:
+            return True
+        blocks = (event.content,)
+    elif event.type is StreamEventType.MESSAGE_END and event.message is not None:
+        blocks = event.message.content
+    else:
+        return False
+    return any(
+        (isinstance(block, (TextContent, ThinkingContent)) and block.text)
+        or (isinstance(block, RedactedThinkingContent) and block.data)
+        or isinstance(block, ToolUseContent)
+        for block in blocks
+    )
+
+
 class InferenceObservation:
     """The one owner of a logical model call's span.
 
@@ -229,7 +256,7 @@ class InferenceObservation:
     every exit (return, continue, any ``BaseException``). An exception in flight
     is the span's error; otherwise ``error`` (an exception or an ERROR event's
     ``ErrorInfo``) is. Usage sums every attempt, because retries are one call.
-    Time to first token is the span start to the call's first decoded model progress.
+    Time to first token is the span start to the call's first decoded model output.
     """
 
     def __init__(self) -> None:
@@ -254,7 +281,7 @@ class InferenceObservation:
     def observe(self, event: StreamEvent) -> None:
         if self._span is None:
             return
-        if self._ttft_ns is None and event.type in _MODEL_PROGRESS:
+        if self._ttft_ns is None and _carries_model_output(event):
             self._ttft_ns = time.monotonic_ns() - self._started_ns
         if event.type is StreamEventType.MESSAGE_START:
             model = event.data.get("model")

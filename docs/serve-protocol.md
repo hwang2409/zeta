@@ -777,7 +777,7 @@ Errors:
 - no database file, data methods only:
   `{"code":-32005,"message":"state unavailable","data":{"code":"telemetry_off","retryable":true}}`
 - a database file whose `user_version` or `viewer_meta.schema_version` is not
-  4, the one this zeta reads (including a schema-1, schema-2, or schema-3 file
+  5, the one this zeta reads (including a schema-1, schema-2, schema-3, or schema-4 file
   the receiver has not migrated yet, or a missing `viewer_meta` table), any method:
   `{"code":-32000,"message":"telemetry schema is unsupported","data":{"code":"telemetry_schema_mismatch"}}`
 - one span alone larger than the frame: `{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}`

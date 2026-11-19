@@ -84,7 +84,7 @@ class SpanHandle:
         self, *, finish_reason: str | None = None, model: str | None = None,
         ttft_ns: int | None = None, retry_count: int | None = None,
     ) -> None:
-        """``ttft_ns`` is the span start to the first decoded model progress; ``None`` when none came."""
+        """``ttft_ns`` is the span start to the first model output; ``None`` when none came."""
         if self._implementation is not None:
             self._implementation.set_response(finish_reason=finish_reason, model=model, ttft_ns=ttft_ns, retry_count=retry_count)
 
