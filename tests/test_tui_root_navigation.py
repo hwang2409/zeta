@@ -27,7 +27,7 @@ from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.output.vt100 import Vt100_Output
 from rich.console import Console
 
-from tests.support.fake_backend import FakeBackend
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from zeta.accounts.availability import AccountDisplay
 from zeta.accounts.registry import AccountId
@@ -1038,22 +1038,41 @@ async def test_a_prompt_queued_before_a_panel_command_is_still_sent(
     # The panel opens from its Enter during startup; the prompt typed before it
     # still waits for startup and is sent, and only it.
     copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
-    backend = FakeBackend([])
+    received = asyncio.Event()
+
+    def record_request(_messages, _tools) -> bytes:
+        received.set()
+        return b"request"
+
+    backend = FakeBackend(
+        [ScriptedTurn(content=[TextContent("hi")])], request_serializer=record_request
+    )
     async with running_tui(copy, backend) as driver:
         app = driver.app
-        assert app._startup_replay_active, "startup finished before the keys"
-        await driver.send("hello" + ENTER + "/tasks" + ENTER + "zz" + ENTER)
-        await driver.settle("settled screen before startup ends")
-        startup.set()
-        await driver.until(
-            lambda: bool(backend.calls)
-            and (app._active_task is None or app._active_task.done()),
-            what="the queued prompt was not sent after startup",
-        )
-        await driver.settle("settled screen after startup")
-        sent = [str(messages[-1].content) for messages, _tools in backend.calls]
-        assert sent == [str([TextContent("hello")])], f"sent {sent}, expected only 'hello'"
-        assert _window_drawn(driver, app._tasks_panel_window), "the panel closed"
+        panel_drawn = asyncio.Event()
+
+        def after_render(_application: object) -> None:
+            if _window_drawn(driver, app._tasks_panel_window):
+                panel_drawn.set()
+
+        driver.session.app.after_render += after_render
+        try:
+            assert app._startup_replay_active, "startup finished before the keys"
+            driver.pipe.send_bytes(("hello" + ENTER + "/tasks" + ENTER + "zz" + ENTER).encode())
+            await await_or_fail(panel_drawn.wait(), what="draw the tasks panel during startup")
+            assert app._startup_submissions == [("hello", False)]
+            assert not backend.calls, "the prompt reached the provider before startup ended"
+            startup.set()
+            # Delivery is observable before the provider turn finishes.
+            await await_or_fail(received.wait(), what="deliver the queued prompt to the provider")
+            sent = [messages[-1].content for messages, _tools in backend.calls]
+            assert sent == [[TextContent("hello")]], f"sent {sent}, expected only 'hello'"
+            assert app.tasks_panel_active and _window_drawn(driver, app._tasks_panel_window), (
+                "the panel closed"
+            )
+        finally:
+            startup.set()
+            driver.session.app.after_render -= after_render
 
 
 @pytest.mark.asyncio
