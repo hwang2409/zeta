@@ -1880,6 +1880,8 @@ Controllers can write; observers can only read. A resource write from an
 observer returns `-32008` with `data.code` and `data.reason` both set to
 `observer_read_only` and `data.method` set to the method name. Resource
 calls run off the event loop and never return storage paths or exception text.
+Every family returns `-32000` with the fixed message
+`"unexpected server or storage failure"` and no `data` for unexpected failures.
 
 ### child run control (`child_run_control_v1` feature)
 
@@ -1906,7 +1908,8 @@ for either command.
 Unknown fields or invalid input (including an unknown preset or invalid `cwd`)
 return `-32602` with `data.code: "invalid_params"`. Other command errors include
 `-32003 no_active_session` or `session_mismatch`, `-32004 operation_busy`,
-`-32005 state_unavailable`, and `-32012 child_run_not_found`; these errors set
+`-32005 state_unavailable` when the child-run owner reports unavailable state,
+and `-32012 child_run_not_found`; these errors set
 both `data.code` and `data.reason` to the named reason. A detached controller
 cannot spawn. Without `child_run_control_v1`, the methods return `-32601`.
 
@@ -1968,7 +1971,6 @@ keys, and bad values; `-32009 stale_settings_revision` (both `data.code` and
 `data.reason`) when the revision is stale, without the current revision;
 `-32004 operation_busy` for a lock held longer than 250 ms; and `-32000`
 `settings_malformed` or `settings_unsafe` for malformed or unsafe files.
-Unexpected failures return only the generic `-32000` error.
 
 ### agent run catalog (`agent_run_catalog_v1` feature)
 
@@ -2047,8 +2049,8 @@ configuration without restarting serve.
 Errors: `-32602 invalid_params` (including unknown or duplicate names),
 `-32009 stale_mcp_revision` (`data.code` and `data.reason`; re-list),
 `-32004 operation_busy` (lock timeout), `-32005 state_unavailable` (such as
-missing project or unreadable configuration), and generic `-32000` for
-unexpected failures. Observers attempting a write receive `-32008` with code
+missing project or unreadable configuration). Observers attempting a write
+receive `-32008` with code
 and reason `observer_read_only`, plus the method, before parameter validation.
 Unnegotiated methods return `-32601`.
 
