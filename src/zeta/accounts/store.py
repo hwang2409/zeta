@@ -6,6 +6,7 @@ import asyncio
 import fcntl
 import json
 import logging
+import math
 import os
 import stat
 import threading
@@ -61,6 +62,7 @@ from .registry import (
     _UNSAFE_REGISTRY_WARNINGS,
     AccountError,
     AccountId,
+    AccountRegistryBrokenError,
     _account_label,
     _AccountRegistry,
     _publication_record,
@@ -168,12 +170,14 @@ class AccountStore(_AccountRegistry):
             yield
 
     def _read_usage_bytes(self, account: AccountId) -> bytes | None:
-        with self._home() as home_fd:
-            try:
-                with _open_account_directory(home_fd, account) as account_fd:
-                    return _read_optional_bytes(account_fd, "usage.json")
-            except FileNotFoundError:
-                return None
+        try:
+            with (
+                _owned_fd(os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)) as home_fd,
+                _open_account_directory(home_fd, account) as account_fd,
+            ):
+                return _read_optional_bytes(account_fd, "usage.json")
+        except FileNotFoundError:
+            return None
 
     def _write_usage_bytes(self, account: AccountId, data: bytes) -> None:
         with (
@@ -212,6 +216,43 @@ class AccountStore(_AccountRegistry):
         with self._home() as home_fd:
             value = self._read_registry(home_fd)
         return availability.catalog_display(value)
+
+    def state_rows(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """Project stored account status without a writer lease, refresh, or selection change."""
+        from .usage import read_usage
+
+        rows: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        now = time.time()
+        with _owned_fd(os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)) as home_fd:
+            try:
+                registry = self._read_registry(home_fd)
+            except AccountRegistryBrokenError:
+                return [], ["account registry is invalid"]
+            for item in availability.catalog_display(registry):
+                account = item.account
+                selected = registry["defaults"].get(account.provider) == str(account)
+                usage = read_usage(self, account)
+                try:
+                    tokens = _read_account_tokens(home_fd, account)
+                except AccountError:
+                    tokens = None
+                if tokens is None or not math.isfinite(tokens.expires_at) or tokens.expires_at <= now:
+                    status = "error"
+                    warnings.append(f"{account}: credentials unavailable or expired")
+                elif usage.known_exhausted():
+                    status = "exhausted"
+                else:
+                    status = "selected" if selected else "available"
+                if usage.error:
+                    warnings.append(f"{account}: usage could not be checked")
+                checked = usage.snapshot.captured_at if usage.snapshot else None
+                rows.append({
+                    "provider": account.provider, "account_id": str(account), "status": status,
+                    "selected": selected, "refreshable": bool(tokens and tokens.refresh_token),
+                    "last_checked_ns": int(checked.timestamp() * 1_000_000_000) if checked else None,
+                })
+        return rows, warnings
 
     def list_display(self) -> list[availability.AccountDisplay]:
         return availability.list_display(self)

@@ -1133,6 +1133,95 @@ STRUCTURED_ERROR_FIXTURES = (
         {"home_epoch": 2, "required_epoch": 4},
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32013,"message":"transcript repair needs the stored-format upgrade (home epoch 2, needs 4)","data":{"code":"transcript_repair_requires_upgrade","home_epoch":2,"required_epoch":4}}}\n',
     ),
+    (
+        ErrorDescriptor.INVALID_TELEMETRY_PARAMS,
+        "invalid params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
+    ),
+    (
+        ErrorDescriptor.INVALID_STATE_PARAMS,
+        "invalid params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
+    ),
+    (
+        ErrorDescriptor.STATE_READ_UNAVAILABLE,
+        "state unavailable",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32005,"message":"state unavailable","data":{"code":"state_unavailable","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.CORRUPT_STATE,
+        "stored state is invalid",
+        {"resource": "storage-format.json"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"stored state is invalid","data":{"code":"corrupt_state","resource":"storage-format.json"}}}\n',
+    ),
+    (
+        ErrorDescriptor.STALE_STATE_SNAPSHOT,
+        "snapshot changed; retry",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"snapshot changed; retry","data":{"code":"stale_state_snapshot","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.TRACE_NOT_FOUND,
+        "resource not found",
+        {"id": "00112233445566778899aabbccddeeff"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"resource not found","data":{"code":"trace_not_found","id":"00112233445566778899aabbccddeeff"}}}\n',
+    ),
+    (
+        ErrorDescriptor.TELEMETRY_OFF,
+        "state unavailable",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32005,"message":"state unavailable","data":{"code":"telemetry_off","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.TELEMETRY_SCHEMA_MISMATCH,
+        "telemetry schema is unsupported",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"telemetry schema is unsupported","data":{"code":"telemetry_schema_mismatch"}}}\n',
+    ),
+    (
+        ErrorDescriptor.RESULT_TOO_LARGE,
+        "result exceeds frame limit",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}}\n',
+    ),    (
+        ErrorDescriptor.INVALID_HOME_SETTINGS_PARAMS,
+        "invalid params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
+    ),
+    (
+        ErrorDescriptor.CUSTOM_HOME_SETTING,
+        "the setting has a custom value that serve does not change",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}}\n',
+    ),
+    (
+        ErrorDescriptor.STALE_REVISION,
+        "settings.toml changed since the given revision",
+        {"current_revision": "sha256:" + "0" * 64},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}}}\n',
+    ),
+    (
+        ErrorDescriptor.SETTINGS_BUSY,
+        "another zeta process is writing settings.toml",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"another zeta process is writing settings.toml","data":{"code":"settings_busy","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.SETTINGS_MALFORMED,
+        "settings.toml does not parse or validate",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"settings.toml does not parse or validate","data":{"code":"settings_malformed"}}}\n',
+    ),
+    (
+        ErrorDescriptor.SETTINGS_UNSAFE,
+        "settings.toml is a link or not a regular, unshared file",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"settings.toml is a link or not a regular, unshared file","data":{"code":"settings_unsafe"}}}\n',
+    ),
 )
 
 
