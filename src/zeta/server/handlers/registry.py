@@ -18,8 +18,44 @@ from ..protocol import (
     protocol_error,
 )
 from ..session_replay import join_history_and_subscribe
-from . import child_runs, lifecycle, path_completion, session, settings, validation
+from . import (
+    child_runs,
+    lifecycle,
+    path_completion,
+    session,
+    settings,
+    validation,
+)
 from .run_work import cancel_background_task, list_run_work
+from .settings import home_settings_get, home_settings_update
+from .state import (
+    state_accounts,
+    state_agents,
+    state_attention,
+    state_background_tasks,
+    state_catalog,
+    state_inbox,
+    state_inbox_detail,
+    state_memory,
+    state_memory_detail,
+    state_projects,
+    state_retention,
+    state_session,
+    state_sessions,
+    state_settings,
+    state_storage,
+)
+from .telemetry import (
+    telemetry_agent_tree,
+    telemetry_errors,
+    telemetry_models,
+    telemetry_overview,
+    telemetry_series,
+    telemetry_sessions,
+    telemetry_status,
+    telemetry_tools,
+    telemetry_trace,
+)
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
 
@@ -465,9 +501,47 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.CHILD_RUN_LIST: child_run_list,
     MethodDescriptor.CHILD_RUN_SEND: child_run_send,
     MethodDescriptor.MCP_REFRESH_TOOLS: mcp_refresh_tools,
+    MethodDescriptor.STATE_SESSIONS: state_sessions,
+    MethodDescriptor.STATE_SESSION: state_session,
+    MethodDescriptor.STATE_AGENTS: state_agents,
+    MethodDescriptor.STATE_BACKGROUND_TASKS: state_background_tasks,
+    MethodDescriptor.STATE_CATALOG: state_catalog,
+    MethodDescriptor.STATE_PROJECTS: state_projects,
+    MethodDescriptor.STATE_MEMORY: state_memory,
+    MethodDescriptor.STATE_MEMORY_DETAIL: state_memory_detail,
+    MethodDescriptor.STATE_INBOX: state_inbox,
+    MethodDescriptor.STATE_INBOX_DETAIL: state_inbox_detail,
+    MethodDescriptor.STATE_ATTENTION: state_attention,
+    MethodDescriptor.STATE_SETTINGS: state_settings,
+    MethodDescriptor.STATE_ACCOUNTS: state_accounts,
+    MethodDescriptor.STATE_STORAGE: state_storage,
+    MethodDescriptor.STATE_RETENTION: state_retention,
+    MethodDescriptor.TELEMETRY_STATUS: telemetry_status,
+    MethodDescriptor.TELEMETRY_SESSIONS: telemetry_sessions,
+    MethodDescriptor.TELEMETRY_TRACE: telemetry_trace,
+    MethodDescriptor.TELEMETRY_OVERVIEW: telemetry_overview,
+    MethodDescriptor.TELEMETRY_MODELS: telemetry_models,
+    MethodDescriptor.TELEMETRY_TOOLS: telemetry_tools,
+    MethodDescriptor.TELEMETRY_ERRORS: telemetry_errors,
+    MethodDescriptor.TELEMETRY_SERIES: telemetry_series,
+    MethodDescriptor.TELEMETRY_AGENT_TREE: telemetry_agent_tree,
+    MethodDescriptor.HOME_SETTINGS_GET: home_settings_get,
+    MethodDescriptor.HOME_SETTINGS_UPDATE: home_settings_update,
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
+
+
+# Keep the complete v1 contract explicit: missing descriptors or handlers must not negotiate.
+STATE_READ_V1 = frozenset({
+    "state_projects", "state_memory", "state_memory_detail", "state_inbox", "state_inbox_detail",
+    "state_sessions", "state_session", "state_agents", "state_background_tasks", "state_attention",
+    "state_catalog", "state_settings", "state_accounts", "state_storage", "state_retention",
+})
+
+
+def state_read_available() -> bool:
+    return STATE_READ_V1 == {method.wire for method in HANDLERS if method.feature == "state_read_v1"}
 
 
 def _require_attached_session(runtime: Any, params: dict[str, Any]) -> None:

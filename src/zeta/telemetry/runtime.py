@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections import deque
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -14,9 +15,10 @@ from urllib.parse import urlsplit
 
 from . import SpanHandle, TelemetryError, TelemetryStatus
 from .attributes import GEN_AI_PROVIDER_NAMES, RESERVED_CONTENT_ATTRIBUTES
+from .errors import ERROR_CODES, error_code
 
 _OPERATION_ATTRIBUTE_KEYS = {
-    "agent": frozenset({"gen_ai.operation.name", "zeta.agent.name", "gen_ai.conversation.id", "gen_ai.request.model", "zeta.agent.depth", "zeta.background"}),
+    "agent": frozenset({"gen_ai.operation.name", "zeta.agent.name", "gen_ai.conversation.id", "gen_ai.request.model", "zeta.agent.depth", "zeta.background", "zeta.agent.run_id", "zeta.agent.parent_run_id"}),
     "turn": frozenset({"gen_ai.conversation.id", "zeta.turn.number", "zeta.notification"}),
     "inference": frozenset({"gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.conversation.id", "zeta.stream"}),
     "tool": frozenset({"gen_ai.operation.name", "zeta.tool.name", "zeta.tool.type", "zeta.tool.call.id", "zeta.agent.name", "gen_ai.conversation.id"}),
@@ -25,7 +27,7 @@ _OPERATION_ATTRIBUTE_KEYS = {
     "mcp": frozenset({"mcp.method.name", "zeta.mcp.server.name", "gen_ai.tool.name", "gen_ai.prompt.name", "mcp.protocol.version", "jsonrpc.request.id"}),
 }
 _EVENT_ATTRIBUTE_KEYS = {"gen_ai.client.retry": frozenset({"gen_ai.retry.attempt", "gen_ai.retry.reason", "gen_ai.retry.delay", "gen_ai.retry.after"}), "zeta.approval.requested": frozenset({"decision", "scope"}), "zeta.approval.resolved": frozenset({"decision", "scope", "duration"}), "zeta.serve.invalid_propagation": frozenset()}
-_ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.tool.count"})
+_ALLOWED_ATTRIBUTE_KEYS = frozenset().union(*_OPERATION_ATTRIBUTE_KEYS.values(), {"error.type", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "gen_ai.response.model", "gen_ai.response.finish_reasons", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.tool.count", "zeta.error.code", "zeta.outcome", "gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_creation.input_tokens", "zeta.response.time_to_first_token", "zeta.retry.count"})
 # Closed sets mirror repository values; tests/telemetry/test_telemetry.py checks each mirror against its source.
 # provider names are the GenAI values; the facade maps every catalog provider onto them.
 _PROVIDERS = frozenset(GEN_AI_PROVIDER_NAMES.values())
@@ -40,6 +42,9 @@ _RETRY_REASONS = frozenset({
     "subscription_limit", "stream_error", "stream_stall", "stream_inconsistent", "overloaded_error",
     "rate_limit_error", "server_error", "http_error", "transport_error", "backend_error", "account_lock_timeout",
 })
+# how an invoke_agent run or a turn ended: the loop's own ends (agent/notifications.py), plus
+# "redispatched" for a turn the loop restarted without TURN_END.
+_OUTCOMES = frozenset({"finished", "failed", "cancelled", "interrupted", "turn_limit", "redispatched"})
 # core.approval.ApprovalDecision values plus server.protocol.ApprovalDecision values.
 _APPROVAL_DECISIONS = frozenset({"allow", "deny", "ask", "approve"})
 # server.protocol.APPROVAL_SCOPES.
@@ -62,6 +67,7 @@ _REQUEST_ID = re.compile(r"[0-9]{1,19}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 # a session id, or a child agent instance id: the root session id plus ":<n>" per nesting level.
 _SESSION_ID = re.compile(r"[0-9a-f]{32}(?::[1-9][0-9]{0,8}){0,5}\Z")
+_RUN_ID = re.compile(r"[0-9a-f]{32}(?::[1-9][0-9]{0,8}){1,5}\Z")
 _TOOL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}(?:__[A-Za-z0-9][A-Za-z0-9_-]{0,127})?\Z")
 _CALL_ID = re.compile(r"(?=.{1,128}\Z)(?:toolu_[A-Za-z0-9_-]+|call_[A-Za-z0-9_-]+|fc_[A-Za-z0-9_-]+|ollama-[0-9a-f-]+|inline-[0-9a-f-]+)\Z")
 # catalog ids and ollama names: [host/][namespace/]model[:tag], e.g. locally-created-model, qwen3:4b, hf.co/user/model:Q4_K_M.
@@ -72,12 +78,13 @@ _STRING_RULES = {
     "gen_ai.request.model": _MODEL, "gen_ai.response.model": _MODEL, "zeta.agent.name": _IDENTIFIER,
     "zeta.tool.name": _TOOL_NAME, "zeta.tool.type": _TOOL_TYPES, "zeta.tool.call.id": _CALL_ID,
     "gen_ai.response.finish_reasons": _FINISH_REASONS, "gen_ai.retry.reason": _RETRY_REASONS,
-    "decision": _APPROVAL_DECISIONS, "scope": _APPROVAL_SCOPES, "error.type": _PYTHON_NAME,
+    "zeta.agent.run_id": _RUN_ID, "zeta.agent.parent_run_id": _RUN_ID,
+    "zeta.error.code": ERROR_CODES, "zeta.outcome": _OUTCOMES, "decision": _APPROVAL_DECISIONS, "scope": _APPROVAL_SCOPES, "error.type": _PYTHON_NAME,
     "rpc.system": frozenset({"jsonrpc"}), "rpc.method": _SERVE_METHODS,
     "mcp.method.name": _MCP_METHODS, "zeta.mcp.server.name": _IDENTIFIER, "gen_ai.tool.name": _IDENTIFIER,
     "gen_ai.prompt.name": _IDENTIFIER, "mcp.protocol.version": _MCP_PROTOCOL, "jsonrpc.request.id": _REQUEST_ID,
 }
-_INT_KEYS = frozenset({"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.agent.depth", "zeta.turn.number", "zeta.tool.count", "zeta.tokens.before", "zeta.tokens.after", "gen_ai.retry.attempt", "gen_ai.retry.delay", "duration"})
+_INT_KEYS = frozenset({"gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.total_tokens", "zeta.tool.call.arguments.size", "zeta.tool.call.result.size", "zeta.agent.depth", "zeta.turn.number", "zeta.tool.count", "zeta.tokens.before", "zeta.tokens.after", "gen_ai.retry.attempt", "gen_ai.retry.delay", "duration", "gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_creation.input_tokens", "zeta.response.time_to_first_token", "zeta.retry.count"})
 _BOOL_KEYS = frozenset({"zeta.background", "zeta.notification", "zeta.stream", "zeta.emergency", "gen_ai.retry.after"})
 
 
@@ -126,12 +133,13 @@ class StatusCell:
     """A one-slot handoff from the exporter thread to the event-loop owner."""
 
     def __init__(self) -> None:
-        self._values: deque[str] = deque(maxlen=1)
+        self._values: deque[tuple[str, int]] = deque(maxlen=1)
 
     def publish(self, state: str) -> None:
-        self._values.append(state)
+        self._values.append((state, time.time_ns()))
 
-    def read(self) -> str | None:
+    def read(self) -> tuple[str, int] | None:
+        """The latest export state and when it was published, or None when nothing is new."""
         return self._values.pop() if self._values else None
 
 
@@ -160,16 +168,28 @@ class _SpanHandle(SpanHandle):
             return
         self._span.set_attribute(name, _field_value(name, value))
 
-    def set_usage(self, *, input_tokens: int, output_tokens: int, total_tokens: int) -> None:
+    def set_usage(self, *, input_tokens: int, output_tokens: int, total_tokens: int, cache_read_tokens: int | None = None, cache_write_tokens: int | None = None) -> None:
         self._set("gen_ai.usage.input_tokens", input_tokens)
         self._set("gen_ai.usage.output_tokens", output_tokens)
         self._set("gen_ai.usage.total_tokens", total_tokens)
+        # unreported cache counts stay absent: 0 would claim the provider reported no cache use
+        if cache_read_tokens is not None:
+            self._set("gen_ai.usage.cache_read.input_tokens", cache_read_tokens)
+        if cache_write_tokens is not None:
+            self._set("gen_ai.usage.cache_creation.input_tokens", cache_write_tokens)
 
-    def set_response(self, *, finish_reason: str | None = None, model: str | None = None) -> None:
+    def set_response(self, *, finish_reason: str | None = None, model: str | None = None, ttft_ns: int | None = None, retry_count: int | None = None) -> None:
         if model is not None:
             self._set("gen_ai.response.model", model)
         if finish_reason is not None:
             self._set("gen_ai.response.finish_reasons", finish_reason)
+        if ttft_ns is not None:
+            self._set("zeta.response.time_to_first_token", ttft_ns)
+        if retry_count is not None:
+            self._set("zeta.retry.count", retry_count)
+
+    def set_outcome(self, outcome: str) -> None:
+        self._set("zeta.outcome", outcome)
 
     def set_tool_count(self, *, tool_count: int) -> None:
         self._set("zeta.tool.count", tool_count)
@@ -204,24 +224,32 @@ class _SpanHandle(SpanHandle):
     def invalid_propagation(self) -> None:
         self._span.add_event("zeta.serve.invalid_propagation", attributes=_safe_attributes({}, _EVENT_ATTRIBUTE_KEYS["zeta.serve.invalid_propagation"]))
 
-    def fail(self, exc: BaseException | type[BaseException] | None) -> None:
+    def fail(self, error: object | None, *, code: str | None = None) -> None:
         # _OTHER is the semconv fallback when no exception class names the failure
-        error_type = "_OTHER" if exc is None else exc.__qualname__ if isinstance(exc, type) else type(exc).__qualname__
-        self._set("error.type", _field_value("error.type", error_type))
+        if isinstance(error, type) and issubclass(error, BaseException):
+            error_type = error.__qualname__
+        else:
+            error_type = type(error).__qualname__ if isinstance(error, BaseException) else "_OTHER"
+        self._set("error.type", error_type)
+        self._set("zeta.error.code", code if code is not None else error_code(error))
         from opentelemetry.trace import Status, StatusCode
 
         self._span.set_status(Status(StatusCode.ERROR))
 
 
 class _Exporter:
-    def __init__(self, delegate: object, cell: StatusCell, session: object) -> None:
+    def __init__(self, delegate: object, cell: StatusCell, session: object, receiver: object | None) -> None:
         self._delegate = delegate
         self._cell = cell
         self._session = session
+        self._receiver = receiver
 
     def export(self, spans: object) -> object:
         from opentelemetry.sdk.trace.export import SpanExportResult
 
+        if self._receiver is not None and not self._receiver.may_export(len(spans)):
+            self._cell.publish("export_unavailable")  # this home's receiver is not confirmed: send nothing
+            return SpanExportResult.FAILURE
         try:
             result = self._delegate.export(spans)
         except Exception:  # noqa: BLE001 - exporter failures must never escape the SDK worker
@@ -250,9 +278,11 @@ class _Runtime:
         self._lock = threading.Lock()
 
     def status(self) -> TelemetryStatus:
-        state = self._cell.read()
-        if state is not None:
-            self._status = TelemetryStatus(True, "degraded" if state == "export_unavailable" else "healthy", "export_unavailable" if state == "export_unavailable" else None)
+        published = self._cell.read()
+        if published is not None:
+            state, at_ns = published
+            failed = state == "export_unavailable"
+            self._status = TelemetryStatus(True, "degraded" if failed else "healthy", "export_unavailable" if failed else None, at_ns)
         return self._status
 
     def shutdown(self) -> None:
@@ -323,7 +353,9 @@ class _Runtime:
             context.detach(token)
 
 
-def configure(endpoint: str) -> _Runtime:
+def configure(endpoint: str, receiver: object | None = None) -> _Runtime:
+    """``receiver`` is the built-in receiver's supervisor: spans carry its ``home_id``, and
+    export sends only while its ``may_export()`` is true."""
     endpoint = validate_loopback_endpoint(endpoint)
     for name, value in os.environ.items():
         if name.startswith(("OTEL_EXPORTER_OTLP", "OTEL_PYTHON_EXPORTER_OTLP")) and value:
@@ -349,7 +381,7 @@ def configure(endpoint: str) -> _Runtime:
     session.trust_env = False
     cell = StatusCell()
     delegate = OTLPSpanExporter(endpoint=endpoint, headers={}, timeout=5, session=session)
-    exporter = _Exporter(delegate, cell, session)
+    exporter = _Exporter(delegate, cell, session, receiver)
     limits = SpanLimits(
         max_attributes=128,
         max_events=128,
@@ -363,7 +395,10 @@ def configure(endpoint: str) -> _Runtime:
     from importlib.metadata import version
 
     provider = TracerProvider(
-        resource=Resource({"service.name": "zeta", "service.version": version("zeta")}),
+        resource=Resource({
+            "service.name": "zeta", "service.version": version("zeta"),
+            **({} if receiver is None else {"zeta.home.id": receiver.home_id}),
+        }),
         sampler=ParentBased(ALWAYS_ON),
         span_limits=limits,
     )

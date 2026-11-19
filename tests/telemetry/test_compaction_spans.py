@@ -165,7 +165,7 @@ def test_manual_compact_is_one_root_span_with_the_summary_as_child(tmp_path, tra
 @pytest.mark.parametrize(
     ("attempts", "raised", "summary_errors", "compact_error", "turn_error"),
     [
-        ([ErrorInfo("invalid_request_error", PROMPT)], None, ["_OTHER"], "SummaryCompletionError", None),
+        ([ErrorInfo("invalid_request_error", PROMPT)], None, ["_OTHER"], "SummaryCompletionError", "_OTHER"),
         (["stall"], asyncio.CancelledError, ["CancelledError"], "CancelledError", "CancelledError"),
         ([Escape()], Escape, ["Escape"], "Escape", "Escape"),
     ],

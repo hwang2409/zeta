@@ -232,7 +232,7 @@ async def test_context_is_ignored_without_negotiation(tmp_path, traced, monkeypa
         assert (span.parent, span.events) == (None, ())
     (invalid_method,) = _serve_spans(memory, "_invalid")
     assert invalid_method.parent is None
-    assert dict(invalid_method.attributes) == {"rpc.system": "jsonrpc", "rpc.method": "_invalid", "error.type": "ProtocolError"}
+    assert dict(invalid_method.attributes) == {"rpc.system": "jsonrpc", "rpc.method": "_invalid", "error.type": "ProtocolError", "zeta.error.code": "unknown"}
     assert not [text for text in _texts(memory.get_finished_spans()) if "secret" in text]
 
 

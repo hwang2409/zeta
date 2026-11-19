@@ -199,6 +199,32 @@ feature. Observer connections receive only methods with `read` access.
 | `child_run_list` | `1.0` | `child_runs` | `read` |
 | `child_run_send` | `1.0` | `child_runs` | `controller_write` |
 | `mcp_refresh_tools` | `1.0` | `mcp_refresh_tools` | `session_mutation` |
+| `state_sessions` | `1.0` | `state_read_v1` | `read` |
+| `state_session` | `1.0` | `state_read_v1` | `read` |
+| `state_agents` | `1.0` | `state_read_v1` | `read` |
+| `state_background_tasks` | `1.0` | `state_read_v1` | `read` |
+| `state_catalog` | `1.0` | `state_read_v1` | `read` |
+| `state_projects` | `1.0` | `state_read_v1` | `read` |
+| `state_memory` | `1.0` | `state_read_v1` | `read` |
+| `state_memory_detail` | `1.0` | `state_read_v1` | `controller_read` |
+| `state_inbox` | `1.0` | `state_read_v1` | `read` |
+| `state_inbox_detail` | `1.0` | `state_read_v1` | `controller_read` |
+| `state_attention` | `1.0` | `state_read_v1` | `read` |
+| `state_settings` | `1.0` | `state_read_v1` | `read` |
+| `state_accounts` | `1.0` | `state_read_v1` | `read` |
+| `state_storage` | `1.0` | `state_read_v1` | `read` |
+| `state_retention` | `1.0` | `state_read_v1` | `read` |
+| `telemetry_status` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_sessions` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_trace` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_overview` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_models` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_tools` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_errors` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_series` | `1.0` | `telemetry_read_v1` | `read` |
+| `telemetry_agent_tree` | `1.0` | `telemetry_read_v1` | `read` |
+| `home_settings_get` | `1.0` | `home_settings_v1` | `read` |
+| `home_settings_update` | `1.0` | `home_settings_v1` | `controller_write` |
 
 ## common JSON-RPC shapes
 
@@ -638,6 +664,529 @@ surface.
 {"jsonrpc":"2.0","id":5,"result":{"session_id":"abc123","servers":["page"]}}
 ```
 
+### telemetry reads (`telemetry_read_v1` feature)
+
+These methods read the built-in OTLP receiver's database,
+`$ZETA_HOME/telemetry/telemetry.sqlite3`. Controllers and observers may call
+them after `hello` negotiated `telemetry_read_v1`; otherwise they return
+`-32601`. They need no session, take no lock, and change nothing: serve opens
+the database read-only (SQLite `mode=ro`), never creates or migrates it, and
+runs each read in its bounded read executor, off the event loop. Each read is
+one SQLite read transaction that first checks `PRAGMA user_version` and
+`viewer_meta.schema_version`. The receiver
+(`zeta otel receiver`) is the only writer, and it migrates an older database
+forward when it starts. Serve sends no telemetry
+notifications; a client polls (for example every 5 seconds while a view is
+visible).
+
+Values carry metadata only: never prompts, reasoning, model output, tool
+arguments or results, request bodies, environment values, attachments,
+exception messages, status descriptions, or links. Timestamps and durations are
+integer Unix nanoseconds; ids are lowercase hex strings; absent values are
+`null`. Results contain exactly the keys below.
+
+`telemetry_status` takes `{}` and returns:
+
+```json
+{"enabled":true,"receiver":"ready","endpoint":"builtin","last_export":null,"last_export_ns":null,"raw_days":14,"rollup_days":90,"max_bytes":1073741824,"used_bytes":0,"oldest_raw_ns":null,"oldest_rollup_ns":null,"over_cap":false}
+```
+
+- `enabled`: `[otel].endpoint` is configured and the database exists.
+- `receiver`: when this serve process uses the built-in endpoint, its
+  supervisor's latest state: `starting` while it launches a receiver, `ready`
+  when the receiver on `127.0.0.1:4323` reports this home's id, `stopped`
+  between failed launches, `error` after five failed launches in a row or
+  while another zeta home's receiver holds the port.
+  Otherwise `ready` when that receiver reports this home's id, else `stopped`.
+- `endpoint`: `builtin` for exactly `http://127.0.0.1:4323/v1/traces`,
+  `external` for another configured endpoint, or `null`.
+- `last_export`: `ok` or `error` for this serve process's latest export
+  batch, and `last_export_ns` when it finished; both `null` before the first.
+- `used_bytes`: the database file plus its `-wal` and `-shm` files.
+- `oldest_raw_ns`: the earliest stored span start, or `null`.
+- `oldest_rollup_ns`: the start of the earliest stored rollup hour, or `null`.
+- `over_cap`: `used_bytes` is above `max_bytes`. The receiver still accepts
+  spans; its retention deletes the oldest raw spans first, then rollups.
+
+A missing database is not an error here: a home without telemetry returns
+`enabled:false`, `receiver:"stopped"`, and `used_bytes:0`.
+
+`telemetry_sessions` params are all optional:
+`{"limit":50,"cursor":null,"start_ns":null,"end_ns":null,"status":"all","profile":null,"model":null,"session_id":"<32 lowercase hex>"}`.
+`limit` is 1 to 200. With `session_id`, the result is a normal page with the
+matching root session or no rows and `next_cursor:null`. This lookup ignores
+`start_ns`, `end_ns`, `status`, `profile`, and `model`. An invalid ID or a
+non-null `cursor` with `session_id` returns `invalid_params` (`-32602`).
+Without `session_id`, the range defaults to the 24 hours before `end_ns`, and
+`end_ns` defaults to now; `start_ns` must be less than `end_ns`. A session is
+in range when `last_ns >= start_ns` and `first_ns < end_ns`. `status` is `all`
+or `error` (sessions with `error_count > 0`). `profile` and `model` match
+exactly (1 to 256 bytes). The result is a page ordered by `last_ns` descending,
+then `session_id` descending:
+
+```json
+{"items":[{"session_id":"0123456789abcdef0123456789abcdef","first_ns":0,"last_ns":0,"last_trace_id":"00112233445566778899aabbccddeeff","profile":null,"model":null,"span_count":0,"turn_count":0,"model_count":0,"tool_count":0,"error_count":0,"input_tokens":0,"output_tokens":0,"total_tokens":0}],"next_cursor":null,"as_of_ns":0}
+```
+
+`session_id` is the 32-hex root conversation id; child agents count toward
+their root. Token totals sum `chat` spans only. `profile` and `model` are the
+latest `invoke_agent` agent name and `chat` model.
+
+`telemetry_trace` params are `{"trace_id":"<32 hex>","cursor":null,"limit":500}`
+(`limit` 1 to 500). It returns the trace summary on every page and one page of
+spans ordered by `start_ns`, then `span_id`. A page holds the largest prefix of
+up to `limit` spans whose response fits the 1 MiB frame, and `next_cursor`
+continues after its last span, so a page can be shorter than `limit` while
+`next_cursor` is not `null`:
+
+```json
+{"trace":{"trace_id":"00112233445566778899aabbccddeeff","first_ns":0,"last_ns":0,"root_span_id":null,"root_session_id":null,"status":"ok","span_count":0,"error_count":0},"spans":[{"span_id":"0011223344556677","parent_span_id":null,"operation":"turn","start_ns":0,"end_ns":0,"duration_ns":0,"status":"unset","error_type":null,"error_code":null,"session_id":null,"agent_name":null,"agent_depth":null,"background":null,"run_id":null,"parent_run_id":null,"turn_number":null,"notification":null,"outcome":null,"provider":null,"request_model":null,"response_model":null,"stream":null,"input_tokens":null,"output_tokens":null,"total_tokens":null,"cache_read_tokens":null,"cache_write_tokens":null,"finish_reason":null,"ttft_ns":null,"retry_count":null,"tool_name":null,"tool_type":null,"tool_call_id":null,"tool_argument_bytes":null,"tool_result_bytes":null,"tool_count":null,"emergency":null,"tokens_before":null,"tokens_after":null,"rpc_method":null,"mcp_method":null,"mcp_server":null,"mcp_tool":null,"mcp_prompt":null,"mcp_protocol":null,"request_id":null,"events":[{"name":"gen_ai.client.retry","time_ns":0,"retry_attempt":null,"retry_reason":null,"retry_delay":null,"retry_after":null,"decision":null,"scope":null,"duration_ns":null}]}],"next_cursor":null}
+```
+
+`operation` is one of `invoke_agent`, `turn`, `chat`, `execute_tool`,
+`context_compact`, `serve`, or `mcp`; `status` is `unset`, `ok`, or `error`.
+`background`, `notification`, `stream`, `emergency`, and `retry_after` are
+booleans. Events are ordered by `time_ns`.
+
+- `error_code` (failed spans): `invalid_request`, `rate_limit`, `overloaded`,
+  `timeout`, `auth`, `context_length`, `server_error`, `network`,
+  `stream_error`, `model_not_found`, `max_tokens`, `refusal`, `turn_limit`,
+  `cancelled`, `tool_error`, or `unknown`. It comes from zeta's error classes
+  and the provider's machine error code, never from an error message.
+  `error_type` stays the exception class name.
+- `run_id` and `parent_run_id` (`invoke_agent`): a child agent's public run
+  id (`child_instance_id`) and its parent run's id; `null` for the top-level
+  agent and for a direct child's parent. They join spans to the agent tree.
+- `outcome` (`invoke_agent` and `turn`): `finished`, `failed`, `cancelled`,
+  `interrupted`, `turn_limit`, or, for a turn the loop restarted,
+  `redispatched`.
+- `chat` only: `cache_read_tokens` and `cache_write_tokens` are counted inside
+  `input_tokens` and are `null` when the provider did not report them;
+  `ttft_ns` is the time from the span start to the first decoded model output
+  (`null` when none arrived); `retry_count` is the number of provider retries
+  inside the call. The trace, spans, and events of one
+page come from one database snapshot; later pages may see spans that arrived
+since.
+
+Cursors follow the page rules below.
+
+Errors:
+
+- invalid params or cursor: `{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}`
+- unknown trace: `{"code":-32602,"message":"resource not found","data":{"code":"trace_not_found","id":"<trace_id>"}}`
+- no database file, data methods only:
+  `{"code":-32005,"message":"state unavailable","data":{"code":"telemetry_off","retryable":true}}`
+- a database file whose `user_version` or `viewer_meta.schema_version` is not
+  5, the one this zeta reads (including a schema-1, schema-2, schema-3, or schema-4 file
+  the receiver has not migrated yet, or a missing `viewer_meta` table), any method:
+  `{"code":-32000,"message":"telemetry schema is unsupported","data":{"code":"telemetry_schema_mismatch"}}`
+- one span alone larger than the frame: `{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}`
+
+#### pages, ranges, and retention
+
+Every list below is a keyset page. `limit` is the most items a page holds.
+A page is the largest ordered prefix of up to `limit` items whose whole
+response fits the 1 MiB frame. When more items exist, or the frame cut the
+page short, `next_cursor` continues right after the page's last item;
+otherwise it is `null`. Walking every cursor returns each item once, in the
+stated order (the last key in each order is a unique tie-breaker). A cursor
+belongs to the method and to every filter, selector, and sort param that made
+it, and pins the first page's resolved time range; a malformed cursor, one
+used with other params, or a `limit` outside its range returns `-32602`.
+`-32007` means one item alone does not fit. Each page is one database
+snapshot; later pages may see newer spans. Every method returns the errors listed
+above.
+
+`start_ns` and `end_ns` select spans with `start_ns <= span start < end_ns`.
+They are optional unless stated, `end_ns` defaults to now and `start_ns` to
+24 hours before `end_ns`, and `start_ns` must be less than `end_ns`. Raw spans
+are kept 14 days and hourly rollups 90 days. Aggregate reads (`overview`,
+`models`, `tools`, `series`) split a range at the raw cutoff: the first hour
+boundary after both now minus 14 days and the oldest stored span. Hours that
+start before the cutoff come whole from the rollups, so a range start inside
+such an hour includes that whole hour. Spans that start at or after the cutoff
+come from raw spans. The cutoff is an hour boundary, so each span counts once
+when a range crosses it. `telemetry_errors.classes` uses this same split;
+`telemetry_errors.items` still lists only individual raw spans.
+
+Model and tool keys: a model is `[provider, model]` with the response model,
+else the request model, of a `chat` span; a tool is `[tool_name, tool_type]`
+of an `execute_tool` span. Their canonical key is that array as compact JSON
+(for example `["openai","gpt-5"]`). Other spans never make model or tool rows.
+`sessions` counts distinct root sessions; `traces` counts distinct traces;
+both are exact over the bucket or range, never sums of hourly counts. Token
+totals sum model (`chat`) spans only. There is no cost field.
+
+A `SeriesPoint` is:
+
+```json
+{"start_ns":0,"end_ns":0,"sessions":0,"traces":0,"spans":0,"errors":0,"model_calls":0,"tool_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"duration_ns":0}
+```
+
+Bucketed points cover `[start_ns, end_ns)` of one UTC hour or day; only
+buckets with spans appear.
+
+#### `telemetry_overview`
+
+Params: `{"start_ns":null,"end_ns":null,"bucket":"hour","limit":200,"cursor":null}`.
+`bucket` is `hour` or `day`; `limit` is 1 to 200. Result:
+
+```json
+{"status":{"enabled":true,"receiver":"ready","endpoint":"builtin","last_export":null,"last_export_ns":null,"raw_days":14,"rollup_days":90,"max_bytes":1073741824,"used_bytes":0,"oldest_raw_ns":null,"oldest_rollup_ns":null,"over_cap":false},"totals":{"start_ns":0,"end_ns":0,"sessions":0,"traces":0,"spans":0,"errors":0,"model_calls":0,"tool_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"duration_ns":0},"series":[{"start_ns":0,"end_ns":0,"sessions":0,"traces":0,"spans":0,"errors":0,"model_calls":0,"tool_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"duration_ns":0}],"active_models":0,"active_tools":0,"next_cursor":null}
+```
+
+`status` is `telemetry_status`. `totals` is one point for the whole range
+(`start_ns`/`end_ns` are the resolved range). `series` pages the range's
+buckets ordered by `start_ns`; every page repeats `status`, `totals`, and the
+counts. At most 2,208 points come back over all pages. `active_models` and
+`active_tools` count distinct model and tool keys with calls in the range.
+
+#### `telemetry_models` and `telemetry_tools`
+
+Params: `{"start_ns":null,"end_ns":null,"limit":50,"cursor":null}`; `limit`
+is 1 to 200. Each returns a page ordered by `calls` descending, then the
+canonical key ascending:
+
+```json
+{"items":[{"provider":"openai","model":"gpt-5","calls":0,"errors":0,"duration_ns":0,"p50_ns":0,"p95_ns":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"last_ns":0,"ttft_p50_ns":null,"ttft_p95_ns":null}],"next_cursor":null,"as_of_ns":0}
+{"items":[{"tool_name":"bash","tool_type":"function","calls":0,"errors":0,"duration_ns":0,"p50_ns":0,"p95_ns":0,"argument_bytes":0,"result_bytes":0,"last_ns":0}],"next_cursor":null,"as_of_ns":0}
+```
+
+`provider` and `tool_type` may be `null`. `duration_ns` is the sum over calls;
+`last_ns` is the latest call end. `argument_bytes` and `result_bytes` are byte
+counts only. `p50_ns` and `p95_ns` come from hourly latency histograms over
+every hour the range touches: bucket 0 holds exactly 0 ns, and bucket `b`
+holds `2^(b-1)` to `2^b - 1` ns. The nearest-rank quantile returns its
+bucket's upper edge, so a positive value is never below the true quantile and
+is less than twice it.
+
+Like `p50_ns` and `p95_ns`, `ttft_p50_ns` and `ttft_p95_ns` come from hourly
+histograms over every hour the range touches, with the same buckets,
+nearest-rank rule, and error bound. They measure time to first token for model
+calls. Calls without `ttft_ns` do not contribute; both fields are `null` if
+there are no samples. `cache_read_tokens` and `cache_write_tokens` sum their
+respective counts from hourly model rollups over the same hours; each is `0`
+when no count is available. No dollar cost is reported.
+
+#### `telemetry_errors`
+
+Params: `{"start_ns":null,"end_ns":null,"operation":null,"limit":50,"cursor":null}`.
+`operation` is `null` or one span operation; `limit` is 1 to 200. Returns
+failed spans newest first (`time_ns` descending, then `trace_id` and
+`span_id` descending):
+
+```json
+{"items":[{"trace_id":"00112233445566778899aabbccddeeff","span_id":"0011223344556677","session_id":null,"time_ns":0,"operation":"mcp","error_type":null,"duration_ns":0,"model":null,"tool_name":null,"agent_name":null,"mcp_server":null,"mcp_method":null,"mcp_tool":null}],"next_cursor":null,"as_of_ns":0,"classes":[{"error_type":null,"count":1}]}
+```
+
+`time_ns` is the span start; `model` is the response, else request, model;
+`agent_name`, `mcp_server`, `mcp_method`, and `mcp_tool` name the failing
+operation's target. No error message is ever returned.
+
+`classes` counts failed spans by `error_type` over the entire requested range
+and `operation` filter, not just the current page. It combines raw spans
+and hourly rollups at the cutoff and is returned on each page, even when
+there are no raw `items`. Classes sort by descending count, then ascending
+`error_type` (`null` sorts first for a tie). At most 50 classes are returned;
+when more exist, a final `{"error_type":"other","count":n}` entry sums
+all omitted counts.
+
+A schema-v4 store backfills TTFT, cache tokens, and error classes from raw
+spans still within retention on receiver restart. Older v4 rollups lacked
+these measures, so already-pruned spans cannot contribute to the new fields.
+
+#### `telemetry_series`
+
+Params: `{"metric":"spans","start_ns":0,"end_ns":0,"bucket":"hour","group_by":"none","limit":200,"cursor":null}`.
+`metric`, `start_ns`, `end_ns`, `bucket`, and `group_by` are required.
+`metric` is a `SeriesPoint` measure (`sessions`, `traces`, `spans`, `errors`,
+`model_calls`, `tool_calls`, `input_tokens`, `output_tokens`, `total_tokens`,
+`duration_ns`); `bucket` is `hour` or `day`; `group_by` is `none`, `model`,
+`tool`, or `operation`; `limit` is 1 to 200. Result:
+
+```json
+{"points":[{"key":null,"point":{"start_ns":0,"end_ns":0,"sessions":0,"traces":0,"spans":0,"errors":0,"model_calls":0,"tool_calls":0,"input_tokens":0,"output_tokens":0,"total_tokens":0,"duration_ns":0}}],"next_cursor":null}
+```
+
+`key` is `null` for `none`, the operation name, or the canonical model or
+tool key. Only the 20 keys with the largest sum of `metric` over the range's
+buckets appear (ties by key). Points are ordered by `key` (`null` first),
+then `start_ns`; at most 2,208 points come back over all pages.
+
+#### `telemetry_agent_tree`
+
+Params: `{"session_id":"<32 hex>","collection":"traces","trace_id":null,"agent_session_id":null,"limit":200,"cursor":null}`.
+`session_id` is a root session id; `limit` is 1 to 200. Each collection takes
+exactly its selectors:
+
+- `traces` (no selector): the session's trace ids, ordered by first span
+  start, then trace id.
+- `agents` (`trace_id`): one agent row per conversation id in that trace,
+  ordered by `first_ns`, then `session_id`; at most 1,000 rows over all pages.
+- `span_ids` (`trace_id` and `agent_session_id`, a conversation id under
+  `session_id`): that agent's span ids in the trace, ordered by `start_ns`,
+  then span id. Read the spans with `telemetry_trace`.
+
+```json
+{"session_id":"0123456789abcdef0123456789abcdef","trace_id":null,"agent_session_id":null,"items":["00112233445566778899aabbccddeeff"],"next_cursor":null}
+{"session_id":"0123456789abcdef0123456789abcdef","trace_id":"00112233445566778899aabbccddeeff","agent_session_id":null,"items":[{"session_id":"0123456789abcdef0123456789abcdef:1","parent_session_id":"0123456789abcdef0123456789abcdef","agent_name":"worker","depth":1,"background":false,"first_ns":0,"last_ns":0,"status":"ok"}],"next_cursor":null}
+{"session_id":"0123456789abcdef0123456789abcdef","trace_id":"00112233445566778899aabbccddeeff","agent_session_id":"0123456789abcdef0123456789abcdef:1","items":["0011223344556677"],"next_cursor":null}
+```
+
+An agent's `parent_session_id` is its conversation id without the last
+`:<n>` segment (`null` for the root). `agent_name` is its `invoke_agent`
+span's name; `depth` is that span's depth, else the number of `:` segments;
+`status` is `error` when any of its spans failed, else `ok` when any span is
+`ok`, else `unset`.
+
+### state catalog (`state_read_v1` feature)
+
+Request `state_read_v1` in a protocol 1.2 `hello` and check that the server
+returns it in `capabilities.features`. `capabilities.requests` lists the
+implemented subset on `feature/otel-viewer`. The feature will only be
+advertised on `main` when the full v1 state read interface is available.
+
+Authenticated controllers and observers can call `state_catalog` without an
+active session or a telemetry receiver. Without negotiation it returns `-32601`.
+
+```json
+{"kind":"profiles","limit":50,"cursor":null}
+```
+
+`kind` is required and is `profiles`, `skills`, or `commands`. `limit` is
+optional (default 50, range 1–200). `cursor` is optional or `null` on the
+first page. Pass `next_cursor` unchanged for the same `kind` to continue.
+
+```json
+{"kind":"profiles","items":[{"name":"example","description":"Example profile","source":"home"}],"next_cursor":null}
+```
+
+Only built-in and home metadata is included. `source` is `built_in` or `home`.
+No profile prompts, skill instructions, command bodies, credentials, or MCP
+headers are returned. Items sort by name, then source, ascending, capped at
+1,000 per kind. Each response returns the largest ordered prefix that fits the
+1 MiB frame. A non-null `next_cursor` means there are more items, even if the
+page has fewer than `limit`. Each page reads a fresh snapshot.
+
+| error | `data.code` | when |
+|---|---|---|
+| `-32602` | `invalid_params` | invalid parameters or a malformed or mismatched cursor |
+| `-32005` | `state_unavailable` | the manifest is missing or the state cannot be read (`retryable: true`) |
+| `-32000` | `corrupt_state` | invalid stored state or a future storage epoch (`resource` identifies the kind or manifest) |
+| `-32009` | `stale_state_snapshot` | state kept changing after one retry (`retryable: true`) |
+| `-32007` | `result_too_large` | even one item cannot fit the response frame |
+
+### project state (`state_read_v1` feature)
+
+These methods need no active session or telemetry receiver. Both roles may
+call the four list methods. An observer calling either detail method receives
+`-32008` with `data.code: "observer_read_only"` and `data.method` set to the
+requested method. Without feature negotiation the methods return `-32601`.
+
+| method | params (optional fields marked `?`) | result | descending order |
+|---|---|---|---|
+| `state_projects` | `limit?`, `cursor?` | Page of Project | `updated_ns`, `project_id` |
+| `state_memory` | `project_id`, `kind?`, `limit?`, `cursor?` | Page of Memory | `updated_ns`, `memory_id` |
+| `state_memory_detail` | `project_id`, `memory_id` | `{memory, body, truncated}` | — |
+| `state_inbox` | `project_id`, `status?`, `limit?`, `cursor?` | Page of Inbox | `created_ns`, `message_id` |
+| `state_inbox_detail` | `project_id`, `message_id` | `{message, body, truncated}` | — |
+| `state_attention` | `project_id?`, `status?`, `limit?`, `cursor?` | Page of Attention | `created_ns`, `attention_id` |
+
+Ids are strings. Use `null` or omit a filter to include all values. Memory
+`kind` is `brief`, `decision`, `state`, `backlog`, `changelog`, or `legacy`; inbox
+`status` is `new`, `claimed`, or `done`; attention `status` is `open` or `done`.
+The page shape is `{items, next_cursor, as_of_ns}`. `limit` defaults to 50
+(range 1–200). Omit `cursor` or use `null` on the first page. Continue with
+`next_cursor` and the same method and filters. Each page reads a fresh
+snapshot and returns the largest prefix that fits the frame.
+
+```text
+Project   {project_id, name, path, session_count, memory_count, inbox: {new, claimed, done}, updated_ns}
+Memory    {memory_id, project_id, kind, automatic, summary, created_ns, updated_ns, source_session_id, has_body}
+Inbox     {message_id, project_id, kind, status, sender, summary, created_ns, updated_ns, trusted_assignment, has_body}
+Attention {attention_id, project_id, session_id, kind, status, title, created_ns, updated_ns}
+```
+
+Project `path` is the canonical integration root, or `null` when there is none.
+`memory_count` counts all listed memory rows, including legacy files whose
+only content is a heading. These rows have `has_body: false`.
+
+Counts and nanosecond timestamps are integers. `source_session_id` and the
+attention project and session ids may be `null`. Inbox kinds are `bug_report`,
+`change_request`, `question`, `info`, and `reply`; attention kinds are
+`answer`, `decided`, `deferred`, and `decision`. Trust comes from the inbox
+owner's origin and delegation rules, not from the message text.
+
+Lists have no body field. Memory and inbox summaries are capped at 512 UTF-8
+bytes. Detail bodies are capped at 64 KiB on a UTF-8 character boundary;
+`truncated` reports whether any bytes were omitted. Detail bodies are not
+cached. These methods share the state catalog's errors and single snapshot
+retry; invalid ids or a missing detail item return `-32602` `invalid_params`.
+
+### session state (`state_read_v1` feature)
+
+Controllers and observers can read this metadata without attaching a session
+or running a telemetry receiver. No transcript, child output, tool arguments,
+or task command is returned.
+
+| request | params | order (descending) |
+|---|---|---|
+| `state_sessions` | optional `project_id`, `status` | `updated_ns`, `session_id` |
+| `state_session` | required `session_id`, `collection` (`agents`, `background_tasks`, or `attention`) | `attention`: `updated_ns`, `attention_id`; otherwise same as the selected list |
+| `state_agents` | optional `session_id`, `status` | `started_ns` (null last), `run_id` |
+| `state_background_tasks` | optional `session_id`, `status` | `started_ns` (null last), `task_id` |
+
+Each request also accepts `limit` (1–200, default 50, or 200 for
+`state_session`) and a nullable `cursor`. Keep the filters and collection
+unchanged when passing `next_cursor`. Each response returns the largest
+prefix that fits the 1 MiB frame. Lists return `items`, `next_cursor`, and
+`as_of_ns`; `state_session` returns `session`, `collection`, `items`, and
+`next_cursor`, with at most 1,000 items per collection. Timestamps are Unix
+nanoseconds; missing times are null.
+
+- Session rows contain `session_id`, `project_id`, `title`, `profile`, `model`,
+  `created_ns`, `updated_ns`, `status` (`idle`, `running`, `approval`, `failed`,
+  or `unknown`), `child_count` (direct child slots), `background_count` (session
+  tasks), `attention_count` (stored attention records), and `bytes` (top-level transcript size, read from file metadata).
+- Agent rows contain `run_id`, `session_id`, `parent_run_id`, `profile`, `status`
+  (`running`, `idle`, `waiting`, `finished`, `failed`, `cancelled`, or `unknown`),
+  `background` (`true` or `false` or `null`), `started_ns`, and `ended_ns`.
+  `background` is null after the run finished; zeta does not store the flag durably.
+  The owning `session_id` joins to
+  trace `zeta.session.id`. `run_id` is the existing `child_instance_id` and joins
+  to span `zeta.agent.run_id`; direct children have null `parent_run_id`.
+- Task rows contain `task_id`, `session_id`, `kind`, `status` (`running`,
+  `finished`, `failed`, `cancelled`, or `unknown`), `started_ns`, `ended_ns`,
+  and `summary`. Durable task clocks are monotonic, so Unix times are null.
+- Attention rows use the `Attention` shape in project state above, scoped
+  to the selected session.
+
+Session state uses the same state read errors as the catalog. A missing
+`state_session` target returns `-32602` with `data.code` `session_not_found`.
+
+### Home state reads
+
+`state_read_v1` exposes these methods to authenticated controllers and observers
+without an attached session. It is advertised only with the full state method set.
+
+| method | params | result |
+|---|---|---|
+| `state_settings` | `{"collection":"mcp\|redacted_keys","limit"?:200,"cursor"?:null}` | `{"model":string\|null,"provider":string\|null,"approval_mode":string\|null,"max_depth":integer,"otel":{"enabled":boolean,"endpoint":"builtin\|external"\|null},"collection":string,"items":[{"name":string,"transport":string,"configured":boolean}\|string],"next_cursor":string\|null}` |
+| `state_accounts` | `{"collection":"accounts\|warnings","limit"?:200,"cursor"?:null}` | `{"collection":string,"items":[{"provider":string,"account_id":string,"status":"available\|selected\|exhausted\|error","selected":boolean,"refreshable":boolean,"last_checked_ns":integer\|null}\|string],"next_cursor":string\|null}` |
+| `state_storage` | `{"limit"?:200,"cursor"?:null}` | `{"writer_epoch":integer,"sessions":{"count":integer,"bytes":integer,"complete":boolean},"projects":{"count":integer,"bytes":integer,"complete":boolean},"accounts":{"count":integer,"bytes":integer,"complete":boolean},"telemetry":{"bytes":integer},"warnings":[string],"next_cursor":string\|null}` |
+| `state_retention` | `{}` | `{"session_days":integer\|null,"telemetry_raw_days":14,"telemetry_rollup_days":90,"telemetry_max_bytes":1073741824,"last_telemetry_prune_ns":integer\|null}` |
+
+- Settings are allowlisted. `approval_mode` is `allow` or `ask` if explicitly
+  configured, otherwise null. `configured` marks a valid and enabled MCP
+  declaration, not a live connection or an authentication check. MCP rows sort
+  by name then transport. `redacted_keys` lists recognized secret field names
+  in lexical order, not their values. Credentials are not exposed.
+- Accounts sort by provider then account id. `selected` identifies the stored
+  provider default, even when credentials have expired or usage is exhausted.
+  Status is `error` for missing, invalid or expired credentials, then `exhausted`
+  for a stored active usage limit, then `selected` or `available`. Unrecognized
+  usage metadata is ignored with a warning, never returned as a status or raw
+  text. `refreshable` is based only on stored credential metadata. Reads do not
+  refresh, contact providers, return email, or change selection.
+- Storage counts top-level session and project directories and provider/account
+  directories; bytes are regular-file sizes. Symlinks are not counted. The
+  traversal has a separate budget of 4,096 entry stats per tree (at most
+  12,288 across the three trees) and descends to at most 16 levels. If an
+  area's scan stops early, `complete` is `false` and that area returns a
+  warning. Its totals are lower bounds: clients can show "at least N".
+  Telemetry bytes include the database, WAL and shared-memory file.
+- Retention reports the effective session setting and the receiver policy. The
+  receiver does not store a last prune time, so `last_telemetry_prune_ns` is null.
+
+Warnings sort lexically with an ordinal tie-breaker. Limits are 1–200, and the
+cursor is bound to its method and collection. Each response returns the
+largest fitting prefix. Errors are `-32601` without negotiation, `-32602` /
+`invalid_params` for invalid params or cursors, `-32005` / `state_unavailable`
+for unavailable state, `-32000` / `corrupt_state` for invalid stored format or
+settings, `-32009` / `stale_state_snapshot` after a failed snapshot retry, and
+`-32007` / `result_too_large` when a complete item does not fit.
+
+### home settings (`home_settings_v1` feature)
+
+`home_settings_get` and `home_settings_update` read and change the home
+`$ZETA_HOME/settings.toml`. Only an allowlisted projection crosses the wire;
+endpoints, paths, environment values, and other keys are never returned or
+accepted. The only key in v1 is `telemetry.enabled`. Controllers and observers
+may call `home_settings_get`; `home_settings_update` is controller-only, and an
+observer receives `-32008` `observer_read_only`. Both run off the event loop.
+Serve sends no event and the TUI shows nothing for these methods; a client
+reads the result.
+
+`revision` is `sha256:` plus the SHA-256 of the exact file bytes; a missing
+file hashes as empty bytes and projects defaults. `telemetry.source` is
+`builtin` (endpoint `http://127.0.0.1:4323/v1/traces`, `enabled: true`),
+`off` (no `[otel].endpoint`, `enabled: false`), or `custom` (any other valid
+endpoint, `enabled: true`, `editable: false`).
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"home_settings_get","params":{}}
+{"jsonrpc":"2.0","id":1,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"settings_malformed":false}}
+```
+
+A file that does not parse or that zeta would refuse at startup projects as
+`{"telemetry":{"source":"unknown","editable":false}}` with
+`settings_malformed: true`.
+
+`home_settings_update` params are exactly `expected_revision` and `changes`,
+a list with one `{"key":"telemetry.enabled","value":true|false}`. The update
+changes only the built-in endpoint line and never adds or removes an `[otel]`
+header. If the file has an `[otel]` table, `true` inserts
+`endpoint = "http://127.0.0.1:4323/v1/traces"` under its header and `false`
+removes that line. If it has none, `true` inserts the top-level line
+`otel.endpoint = "http://127.0.0.1:4323/v1/traces"` before the first table (or
+at the end) and `false` removes it. Every other byte is kept, with the file's
+line endings (LF or CRLF) and its trailing-newline state, so on then off
+returns the exact original bytes. An update that must edit a layout neither
+form can express (an `otel` inline table, a line inside a multiline string)
+is refused as `custom_home_setting`; an update that changes nothing succeeds
+without a write. Under the sibling lock
+`settings.toml.lock` the server rereads the file, compares its revision,
+validates the changed file as zeta's startup does, and only then replaces the
+file atomically (mode `0600`, file and directory fsync). The lock serializes
+zeta writers only; an editor that writes after that reread is not detected.
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"home_settings_update","params":{"expected_revision":"sha256:<64 hex>","changes":[{"key":"telemetry.enabled","value":true}]}}
+{"jsonrpc":"2.0","id":2,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"restart":{"serve":true,"sessions":["<session id>"],"complete":true}}}
+```
+
+The result has the settings read back from the file after the write. A
+process reads `[otel]` once at startup, so `restart` lists what must restart
+to use the change: `serve` is always `true` (this process), and `sessions` are
+the sorted ids of every top-level session a live process owns, found through
+the kernel lock on each session's `runtime.lease` (never a stored pid).
+Child agents restart with their top-level session. The scan has no row cap
+and a 1 second deadline; `complete` is `false` when the deadline or an
+unreadable directory stopped it, and `sessions` then has the owners found so
+far.
+
+Errors:
+
+- unknown, duplicate, or extra keys, a non-boolean value, or a malformed
+  revision: `{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}`
+- a custom endpoint or custom dotted `otel` value is set; the file is not
+  changed:
+  `{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}`
+  The built-in dotted `otel.endpoint` is an on no-op and is removed when
+  disabling telemetry. An `otel` inline table remains custom.
+- the file changed since `expected_revision`:
+  `{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:<64 hex>"}}`
+- another zeta writer held the lock for 250 ms:
+  `{"code":-32009,"message":"another zeta process is writing settings.toml","data":{"code":"settings_busy","retryable":true}}`
+- the file does not parse or validate (update only; nothing is written):
+  `{"code":-32000,"message":"settings.toml does not parse or validate","data":{"code":"settings_malformed"}}`
+- `settings.toml` is a symbolic link or not a regular, unshared file (get and
+  update; it is never followed or replaced):
+  `{"code":-32000,"message":"settings.toml is a link or not a regular, unshared file","data":{"code":"settings_unsafe"}}`
+- any other failure, such as a missing or moved home directory (get and
+  update): `{"code":-32000,"message":"unexpected server or storage failure"}`;
+  the reply never carries a path or the underlying error text
+
 ### `send`
 
 Params: exactly one of `text` or `input_id`. `text` is a non-empty direct user
@@ -1069,6 +1618,15 @@ first. `state` uses the same values as the top-level `state`, and
 `pending_approvals` is the number of its pending approvals. A closing session
 is not listed. Without the feature, the key is omitted.
 
+With `telemetry_read_v1`, the result also has `telemetry`:
+`{"receiver": "ready" | "starting" | "stopped" | "error" | null, "last_export": "ok" | "error" | null, "last_export_ns": integer | null}`.
+`receiver` is this serve process's latest view of the built-in receiver, or
+`null` when its `[otel].endpoint` is not the built-in one. `last_export` is the
+result of this process's latest export batch and `last_export_ns` when it
+finished; both are `null` before the first batch. `telemetry_status` returns
+the same values. Reading them does no I/O. Without the feature, the key is
+omitted.
+
 With the negotiated `approval_reconnect` feature, `pending_approvals` is the live
 projection merged with the durable store projection by `request_id` (a live row
 wins on overlap, keeping its `resolution_pending`), limited to 64 entries. The
@@ -1443,6 +2001,21 @@ Error descriptors are:
 | `session_id_ambiguous` | `-32602` | `session_id_ambiguous` | the session id prefix matches more than one session |
 | `session_mismatch` | `-32003` | `session_mismatch` | the requested session is not the attached session |
 | `mcp_tool_refresh_failed` | `-32005` | `mcp_tool_refresh_failed` | an MCP tools/list refresh failed |
+| `invalid_telemetry_params` | `-32602` | `invalid_params` | telemetry read parameters or cursor are invalid |
+| `invalid_state_params` | `-32602` | `invalid_params` | state read parameters or cursor are invalid |
+| `state_read_unavailable` | `-32005` | `state_unavailable` | stored state is not available to read |
+| `corrupt_state` | `-32000` | `corrupt_state` | stored state is invalid or unsupported |
+| `stale_state_snapshot` | `-32009` | `stale_state_snapshot` | the stored state changed during the read |
+| `trace_not_found` | `-32602` | `trace_not_found` | the requested trace does not exist |
+| `telemetry_off` | `-32005` | `telemetry_off` | no telemetry database exists |
+| `telemetry_schema_mismatch` | `-32000` | `telemetry_schema_mismatch` | the telemetry database schema is not the one this zeta reads |
+| `result_too_large` | `-32007` | `result_too_large` | not even one item fits one frame |
+| `invalid_home_settings_params` | `-32602` | `invalid_params` | home settings parameters or changes are invalid |
+| `custom_home_setting` | `-32602` | `custom_home_setting` | the setting has a custom value that serve does not change |
+| `stale_revision` | `-32009` | `stale_revision` | settings.toml changed since the given revision |
+| `settings_busy` | `-32009` | `settings_busy` | another zeta process is writing settings.toml |
+| `settings_malformed` | `-32000` | `settings_malformed` | settings.toml does not parse or validate |
+| `settings_unsafe` | `-32000` | `settings_unsafe` | settings.toml is a link or not a regular, unshared file |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. With `session_park`, a swap over the park limit returns
@@ -2211,6 +2784,9 @@ negotiate a feature sees the behavior from before the feature existed.
 | `session_mcp_bindings` | allows controllers to bind transient headers for trusted global MCP servers on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `tool_approval_origin` | adds `approval_origin: "automatic" | "user"` to live `tool_start` calls and replayed history `tool_use` calls |
+| `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, `telemetry_trace`, `telemetry_overview`, `telemetry_models`, `telemetry_tools`, `telemetry_errors`, `telemetry_series`, and `telemetry_agent_tree` methods |
+| `state_read_v1` | enables `state_catalog`, `state_projects`, `state_memory`, `state_memory_detail`, `state_inbox`, `state_inbox_detail`, `state_attention`, `state_sessions`, `state_session`, `state_agents`, `state_background_tasks`, `state_settings`, `state_accounts`, `state_storage`, and `state_retention` |
+| `home_settings_v1` | enables `home_settings_get` and controller-only `home_settings_update` for the home `settings.toml` (`telemetry.enabled` only) |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
 | `child_run_events` | enables the atomic newest-page and live child lifecycle join; the server advertises the feature and request only when the client also requests `session_replay_seq`, `child_run_history`, and `child_runs` |
@@ -2245,7 +2821,7 @@ filtering and response-size limits apply before the response is sent.
 
 protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
 
-observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `child_run_history`, `child_run_events`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated, `content_read` when both `serve_observers` and `content_read` are negotiated, and `child_run_list` when `child_runs` is negotiated. `child_run_history` and `child_run_events` are available only when their respective features are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
+observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `child_run_history`, `child_run_events`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated, `content_read` when both `serve_observers` and `content_read` are negotiated, `child_run_list` when `child_runs` is negotiated, and `telemetry_*` and read-only `state_*` methods when their respective read features are negotiated. `child_run_history` and `child_run_events` are available only when their respective features are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 
 observer `list_sessions` returns the same catalog rows, fields, bounded `first_message_preview` values, frame-size handling, and `list_sessions_paging` `offset`/`limit`/`next_offset` behavior as a controller. Both roles use one shared catalog projection. The observer remains read-only; project-filtered catalog requests remain unavailable.
 
