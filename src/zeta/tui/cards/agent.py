@@ -193,7 +193,7 @@ class AgentCard:
         self._elapsed_seconds = 0.0
         self._turns = 0
         self._child_session_path = ""
-        self._expanded = True
+        self._expanded = call.name.casefold() != "code"
         self._receipt: RenderableType | None = None
         self._depth = 1
         self._tail: tuple[_TailLine, ...] = ()

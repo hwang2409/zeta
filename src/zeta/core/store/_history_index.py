@@ -82,6 +82,7 @@ class IndexedHistoryPage:
     approval_calls: Mapping[str, object]
     endpoint: str | None
     repair_generation: str | None
+    nested_anchors: frozenset[str] = frozenset()
 
 
 class HistoryIndex:
@@ -865,8 +866,8 @@ class HistoryIndex:
             start,
             total,
             self._approval_calls(connection, request_ids),
-            endpoint_row[0] if endpoint_row else None,
-            stored_generation if isinstance(stored_generation, str) else None,
+            endpoint_row[0] if endpoint_row else None, stored_generation if isinstance(stored_generation, str) else None,
+            _row_history.nested_anchors(connection, groups),
         )
 
     def page(self, request: object, g0: object) -> IndexedHistoryPage:
