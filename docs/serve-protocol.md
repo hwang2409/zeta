@@ -1966,8 +1966,13 @@ The same feature extends the controller-only `login_start` request to
 account's short name, label, or qualified ID (for example `anthropic:work` for
 `claude`). Omit `account` to keep the legacy login target. Without the feature,
 `account` is ignored as before. The pending, failure, status and cancel shapes
-are unchanged; at most one login per provider can be pending. A malformed or
-unknown account, unsupported provider or unknown param returns `-32602` with
+are unchanged. With the feature, a pending login on this connection or a
+provider lock held by another connection or TUI returns `-32005` with
+`data.code: "login_in_progress"`. An already pending local login takes
+precedence over account lookup. Without the feature, shared provider lock
+contention still returns `state: "failed"` with `error.code: "login_failed"`.
+A malformed or unknown account, unsupported provider or unknown param returns
+`-32602` with
 `data.code: "invalid_params"`. An unavailable account registry returns `-32005`
 with `data.code: "state_unavailable"`. An observer receives `-32008` with
 `data.code` and `data.reason` set to `observer_read_only` and
