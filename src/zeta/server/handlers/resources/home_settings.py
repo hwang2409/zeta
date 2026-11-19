@@ -9,13 +9,14 @@ from ...resource_protocol import (
     ResourceMethod,
     require_params,
     require_revision,
+    restart_report,
     run_owner,
 )
 
 FEATURE = "home_settings_v1"
 
 
-def _public(result: dict[str, Any]) -> dict[str, Any]:
+def _public(result: dict[str, Any], *, home) -> dict[str, Any]:
     settings = result["settings"]
     view = {
         "revision": result["revision"],
@@ -30,8 +31,8 @@ def _public(result: dict[str, Any]) -> dict[str, Any]:
         public["model"] = settings["model"]
     if "settings_malformed" in result:
         view["settings_malformed"] = result["settings_malformed"]
-    if "restart" in result:
-        view["restart"] = {key: result["restart"][key] for key in ("serve", "sessions", "complete")}
+    if "changed" in result:
+        view["restart"] = restart_report(home, serve=result["restart_serve"], changed=result["changed"])
     return view
 
 
@@ -39,7 +40,7 @@ async def _run(client, call):
     from ....config.home_settings import HomeSettingsError
     from ...protocol import ErrorDescriptor
 
-    return await run_owner(client, call, family="settings", project=_public, owner_error=HomeSettingsError, errors={
+    return await run_owner(client, call, family="settings", project=lambda result: _public(result, home=client.server.home), owner_error=HomeSettingsError, errors={
         "settings_busy": ErrorDescriptor.RESOURCE_BUSY,
         "settings_malformed": ErrorDescriptor.SETTINGS_MALFORMED,
         "settings_unsafe": ErrorDescriptor.SETTINGS_UNSAFE,

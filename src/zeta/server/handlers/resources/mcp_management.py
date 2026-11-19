@@ -9,6 +9,7 @@ from ...resource_protocol import (
     owner_errors,
     require_params,
     require_revision,
+    restart_report,
     run_owner,
 )
 
@@ -114,10 +115,10 @@ def _write(action: str, *keys: str, optional: tuple[str, ...] = ()):
         with owner_errors(**_error_rules()):
             try:
                 view = await getattr(owner, action)(**mutation, revision=params["revision"])
-                return {
-                    "revision": view.revision, "data": _data(view.entries, scope),
-                    "restart_required": ["running_sessions"],
-                }
+                restart = await client.connections.run_blocking(lambda: restart_report(
+                    client.server.home, serve=False, changed=view.revision != params["revision"],
+                ))
+                return {"revision": view.revision, "data": _data(view.entries, scope), "restart": restart}
             finally:
                 # Join the worker before unwinding a cancelled request.
                 await owner.aclose()

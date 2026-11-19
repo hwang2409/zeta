@@ -26,6 +26,7 @@ async def test_mcp_secret_canaries_are_absent_from_wire_logs_and_spans(tmp_path,
     await wire.open()
     try:
         await wire.rpc("hello", "hello", {"protocol_version": "1.2", "features": ["otel", "mcp_management_v1"]})
+        created = json.loads(await wire.rpc("session", "new_session", {"provider": "codex"}))["result"]
         before = json.loads(await wire.rpc("before", "mcp_server_list"))["result"]
         mutation = {
             "scope": "user", "name": "example", "url": f"https://{user}:{password}@example.test/{path}?key={query}",
@@ -36,6 +37,9 @@ async def test_mcp_secret_canaries_are_absent_from_wire_logs_and_spans(tmp_path,
         assert updated["result"]["data"]["items"][0]["config"] == {
             "transport": "streamable-http", "url": "<redacted-url>", "env": {"transport": "<redacted>"},
             "headers": {"Authorization": "<redacted>"}, "auth": {"type": "oauth", "client_secret": "<redacted>"},
+        }
+        assert updated["result"]["restart"] == {
+            "serve": False, "sessions": [created["session"]["session_id"]], "complete": True,
         }
         revision = updated["result"]["revision"]
         listed = json.loads(await wire.rpc("after", "mcp_server_list"))["result"]

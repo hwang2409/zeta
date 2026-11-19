@@ -1,4 +1,4 @@
-"""The one writer of the home ``settings.toml``: safe reads, compare-and-set updates, restart discovery.
+"""The one writer of the home ``settings.toml``: safe reads and compare-and-set updates.
 
 A client sees an allowlisted projection plus ``revision``, the SHA-256 of the exact file bytes
 (an absent file hashes as empty bytes). An update names that revision; it takes the sibling
@@ -6,7 +6,7 @@ A client sees an allowlisted projection plus ``revision``, the SHA-256 of the ex
 finished before the reread is never lost. The lock serializes zeta writers only; an editor that writes after the reread is not stopped.
 Edits preserve bytes outside the changed setting and are validated by the startup parser.
 
-Every function blocks (file locks, fsync, a directory scan); call it off the event loop.
+Every function blocks (file locks and fsync); call it off the event loop.
 """
 
 from __future__ import annotations
@@ -27,10 +27,8 @@ import tomlkit
 from tomlkit.exceptions import TOMLKitError
 
 from ..agent.budget import HARD_MAX_AGENT_DEPTH
-from ..core.session_execution import execution_owner_state
 from ..core.session_files import (
     SessionError,
-    child_directory,
     open_session_file,
     require_off_loop_lock,
     write_session_file,
@@ -41,7 +39,6 @@ from .settings import SETTINGS_FILENAME, Settings, validate_home_settings
 LOCK_NAME = f"{SETTINGS_FILENAME}.lock"
 LOCK_SECONDS = 0.25
 LOCK_POLL_SECONDS = 0.01
-RESTART_SCAN_SECONDS = 1.0
 _REVISION = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _HEADER = re.compile(rb"[ \t]*\[")  # a table or array-of-tables header line
 _OTEL_HEADER = re.compile(rb"""[ \t]*\[[ \t]*(?:otel|"otel"|'otel')[ \t]*\][ \t]*(?:#[^\r\n]*)?\r?\n?\Z""")
@@ -87,11 +84,12 @@ def update(home: Path, expected_revision: object, changes: object) -> dict[str, 
             settings = _project(candidate, home)  # validate before publication
             write_session_file(home_fd, SETTINGS_FILENAME, candidate)
             revision = _revision(candidate)
-        restart = (
-            _restart(home_fd, serve=key == "telemetry.enabled")
-            if changed else {"serve": False, "sessions": [], "complete": True}
-        )
-    return {"revision": revision, "settings": settings, "restart": restart}
+    return {
+        "revision": revision,
+        "settings": settings,
+        "changed": changed,
+        "restart_serve": changed and key == "telemetry.enabled",
+    }
 
 
 @contextmanager
@@ -335,35 +333,3 @@ def _document(raw: bytes, enabled: bool | None = None) -> dict[str, Any]:
     if document.get("otel") == {}:
         del document["otel"]
     return document
-
-
-def _restart(home_fd: int, *, serve: bool) -> dict[str, Any]:
-    """Every top-level session a live process owns, by the kernel lease lock; never by a pid hint.
-
-    No row cap and no recency filter; a scan that hits its deadline or an unreadable directory
-    reports ``complete: false`` with the owners it confirmed. Serve itself only needs to restart for
-    telemetry, because its receiver is configured once at startup.
-    """
-    deadline = time.monotonic() + RESTART_SCAN_SECONDS
-    sessions: list[str] = []
-    complete = True
-    try:
-        with child_directory(home_fd, "sessions") as root_fd:
-            for name in os.listdir(root_fd):
-                if time.monotonic() >= deadline:
-                    complete = False
-                    break
-                try:
-                    with child_directory(root_fd, name) as session_fd:
-                        if execution_owner_state(session_fd) is not None:
-                            sessions.append(name)
-                except OSError as exc:
-                    if exc.errno not in (errno.ENOTDIR, errno.ELOOP, errno.ENOENT):
-                        complete = False
-                except SessionError:
-                    complete = False
-    except FileNotFoundError:
-        pass
-    except OSError:
-        complete = False
-    return {"serve": serve, "sessions": sorted(sessions), "complete": complete}

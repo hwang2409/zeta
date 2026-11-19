@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import errno
+import os
 import re
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib import import_module
+from pathlib import Path
 from pkgutil import iter_modules
 from typing import Any
 
+from ..core.session_execution import execution_owner_state
+from ..core.session_files import SessionError, child_directory
 from .handlers import resources
+
+RESTART_SCAN_SECONDS = 1.0
 
 
 class Access(StrEnum):
@@ -124,3 +132,49 @@ def owner_errors(*, family: str, owner_error: type[Exception], errors: Mapping[s
         raise closed_error(errors.get(code, ErrorDescriptor.INTERNAL_ERROR)) from None
     except Exception:  # noqa: BLE001 - owner paths and request values must not cross the wire
         raise closed_error(ErrorDescriptor.INTERNAL_ERROR) from None
+
+
+def restart_report(home: Path, *, serve: bool, changed: bool) -> dict[str, Any]:
+    """Find every affected top-level session by its execution lease, off-loop."""
+    if not changed:
+        return {"serve": False, "sessions": [], "complete": True}
+    try:
+        home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return {"serve": serve, "sessions": [], "complete": False}
+    try:
+        return _restart_report(home_fd, serve=serve)
+    finally:
+        os.close(home_fd)
+
+
+def _restart_report(home_fd: int, *, serve: bool) -> dict[str, Any]:
+    """Every top-level session a live process owns, by the kernel lease lock; never by a pid hint.
+
+    No row cap and no recency filter; a scan that hits its deadline or an unreadable directory
+    reports ``complete: false`` with the owners it confirmed. Serve itself only needs to restart for
+    telemetry, because its receiver is configured once at startup.
+    """
+    deadline = time.monotonic() + RESTART_SCAN_SECONDS
+    sessions: list[str] = []
+    complete = True
+    try:
+        with child_directory(home_fd, "sessions") as root_fd:
+            for name in os.listdir(root_fd):
+                if time.monotonic() >= deadline:
+                    complete = False
+                    break
+                try:
+                    with child_directory(root_fd, name) as session_fd:
+                        if execution_owner_state(session_fd) is not None:
+                            sessions.append(name)
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOTDIR, errno.ELOOP, errno.ENOENT):
+                        complete = False
+                except SessionError:
+                    complete = False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        complete = False
+    return {"serve": serve, "sessions": sorted(sessions), "complete": complete}
