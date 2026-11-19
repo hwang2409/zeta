@@ -72,14 +72,12 @@ async def child_run_spawn(client, request_id, params):
             run_id = await spawn_child(loop, agent_type=agent_type, task=task, cwd=cwd)
     except ChildControlError as exc:
         raise _owner_error(exc.code) from None
-    except Exception:  # noqa: BLE001 - do not expose owner paths or exception details
-        raise resource_error(ErrorDescriptor.STATE_UNAVAILABLE) from None
     return {"data": {"accepted": True, "run_id": run_id}}
 
 
 async def child_run_cancel(client, request_id, params):
     from ....agent.runner import ChildControlError, cancel_child_run
-    from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
+    from ...protocol import invalid_resource_params
 
     require_params(params, "session_id", "run_id", optional=("reason",))
     loop = _active(client, params)
@@ -90,8 +88,6 @@ async def child_run_cancel(client, request_id, params):
         state = await cancel_child_run(loop, run_id)
     except ChildControlError as exc:
         raise _owner_error(exc.code) from None
-    except Exception:  # noqa: BLE001 - do not expose owner paths or exception details
-        raise resource_error(ErrorDescriptor.STATE_UNAVAILABLE) from None
     return {"data": {"accepted": True, "run_id": run_id, "state": state}}
 
 

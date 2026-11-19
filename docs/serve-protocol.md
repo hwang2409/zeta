@@ -1880,6 +1880,8 @@ Controllers can write; observers can only read. A resource write from an
 observer returns `-32008` with `data.code` and `data.reason` both set to
 `observer_read_only` and `data.method` set to the method name. Resource
 calls run off the event loop and never return storage paths or exception text.
+Every family returns `-32000` with the fixed message
+`"unexpected server or storage failure"` and no `data` for unexpected failures.
 
 ### child run control (`child_run_control_v1` feature)
 
@@ -1906,7 +1908,8 @@ for either command.
 Unknown fields or invalid input (including an unknown preset or invalid `cwd`)
 return `-32602` with `data.code: "invalid_params"`. Other command errors include
 `-32003 no_active_session` or `session_mismatch`, `-32004 operation_busy`,
-`-32005 state_unavailable`, and `-32012 child_run_not_found`; these errors set
+`-32005 state_unavailable` when the child-run owner reports unavailable state,
+and `-32012 child_run_not_found`; these errors set
 both `data.code` and `data.reason` to the named reason. A detached controller
 cannot spawn. Without `child_run_control_v1`, the methods return `-32601`.
 
@@ -1968,7 +1971,6 @@ keys, and bad values; `-32009 stale_settings_revision` (both `data.code` and
 `data.reason`) when the revision is stale, without the current revision;
 `-32004 operation_busy` for a lock held longer than 250 ms; and `-32000`
 `settings_malformed` or `settings_unsafe` for malformed or unsafe files.
-Unexpected failures return only the generic `-32000` error.
 
 ### agent run catalog (`agent_run_catalog_v1` feature)
 
@@ -2001,6 +2003,56 @@ Invalid params or mismatched cursors return `-32602` (`invalid_params`). An
 unavailable store returns `-32005` (`state_unavailable`). If not even one row
 fits the frame, the method returns `-32007` (`result_too_large`). An
 unnegotiated method returns `-32601`.
+
+### MCP management (`mcp_management_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `mcp_server_list` | `1.0` | `mcp_management_v1` | `read` |
+| `mcp_server_add` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_server_remove` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_server_set_enabled` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_server_set_trusted` | `1.0` | `mcp_management_v1` | `controller_write` |
+
+`mcp_server_list` accepts `{scope?}` and returns `{revision,data:{items}}`.
+Scope is `user`, `project`, or `effective` (default). The active session's
+project is used when attached, otherwise the serve working directory. In the
+effective view a project definition shadows a user definition with the same
+name. Items are sorted by name and contain `name`, `scope`, `enabled`,
+`trusted`, `status`, `auth`, `tool_count`, and a redacted `config`. This is a
+disk view, not a live connection or credential probe. Command/argument, URL,
+environment/header values, and OAuth client secrets are not returned.
+
+Each write accepts `{revision,mutation}`. Use the opaque 64-character hex
+revision from a list or successful write in the same project context. It covers
+both config files and the trust file, regardless of list scope, and is compared
+under the same locks used by the CLI/TUI owner. Mutation fields:
+
+- Add: `{name,scope,command?,args?,url?,env?,headers?,oauth?,enabled?,client_id?,client_secret?}`.
+  Scope is `user` or `project`. Supply exactly one of `command` and `url`.
+  `args` is an array of strings (stdio only); `env` and `headers` are maps of
+  strings (`headers` is HTTP only). `enabled` defaults to true and `oauth`
+  defaults to false. Client credentials require HTTP OAuth; a client secret
+  requires a client ID.
+- Remove: `{name,scope}`.
+- Set enabled: `{name,scope,enabled}` with boolean `enabled`.
+- Set trusted: `{name,trusted}` with boolean `trusted`; selects the project definition.
+
+Writes return `{revision,data:{items},restart:{serve,sessions,complete}}`,
+with rows from the changed scope. `restart.serve` is false; `restart.sessions`
+contains the sorted top-level session IDs whose leases are held at the time
+of the scan (a conservative set of potential consumers). A partial scan sets
+`restart.complete` to false. A no-op returns an empty restart list. A write
+does not connect or reconcile an existing mount. New sessions read the new
+configuration without restarting serve.
+
+Errors: `-32602 invalid_params` (including unknown or duplicate names),
+`-32009 stale_mcp_revision` (`data.code` and `data.reason`; re-list),
+`-32004 operation_busy` (lock timeout), `-32005 state_unavailable` (such as
+missing project or unreadable configuration). Observers attempting a write
+receive `-32008` with code
+and reason `observer_read_only`, plus the method, before parameter validation.
+Unnegotiated methods return `-32601`.
 
 ## errors
 

@@ -3,21 +3,27 @@ from __future__ import annotations
 import ast
 import json
 import re
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
+from zeta.server.handlers.resources import FAMILIES
 from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
     FrameCodec,
     MethodDescriptor,
+    ProtocolError,
     SlashErrorCodeDescriptor,
     SlashResultKindDescriptor,
     served_methods,
 )
+from zeta.server.resource_protocol import collect_families
 from zeta.skills import SkillCatalog
 
 ROOT = Path(__file__).parents[1]
@@ -85,6 +91,77 @@ def test_method_registry_matches_documented_table() -> None:
     expected = [(item.wire, item.since or "1.0", item.feature or "none", item.access.value) for item in served_methods()]
     assert legacy == expected[:len(legacy)]
     assert sorted(legacy + families) == sorted(expected), "document each resource method in its own family section"
+
+
+_REVISION = "0" * 64
+_MCP_OWNER = "zeta.mcp.management.MCPManagementService"
+# Valid inputs and the owner entry point each registered method must reach.
+_OWNER_FAILURE_CASES = {
+    "home_settings_get": ("zeta.config.home_settings.get", {}),
+    "home_settings_update": ("zeta.config.home_settings.update", {
+        "expected_revision": f"sha256:{_REVISION}", "changes": {"telemetry": {"enabled": True}},
+    }),
+    "agent_run_catalog": ("zeta.server.handlers.resources._agent_run_catalog.read_page", {}),
+    "child_run_spawn": ("zeta.agent.runner.spawn_child", {
+        "session_id": "test-session", "agent_type": "worker", "task": "test task",
+    }),
+    "child_run_cancel": ("zeta.agent.runner.cancel_child_run", {
+        "session_id": "test-session", "run_id": "test-run",
+    }),
+    "mcp_server_list": (f"{_MCP_OWNER}.read_disk", {}),
+    "mcp_server_add": (f"{_MCP_OWNER}.add", {
+        "revision": _REVISION, "mutation": {"name": "test", "scope": "user", "command": "test"},
+    }),
+    "mcp_server_remove": (f"{_MCP_OWNER}.remove", {
+        "revision": _REVISION, "mutation": {"name": "test", "scope": "user"},
+    }),
+    "mcp_server_set_enabled": (f"{_MCP_OWNER}.set_enabled", {
+        "revision": _REVISION, "mutation": {"name": "test", "scope": "user", "enabled": False},
+    }),
+    "mcp_server_set_trusted": (f"{_MCP_OWNER}.set_trusted", {
+        "revision": _REVISION, "mutation": {"name": "test", "trusted": True},
+    }),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", [method.wire for family in FAMILIES for method in family.METHODS])
+async def test_collected_resource_handler_closes_unexpected_errors(method: str, tmp_path: Path) -> None:
+    assert method in _OWNER_FAILURE_CASES, f"add an owner failure case for {method}"
+    target, params = _OWNER_FAILURE_CASES[method]
+    handler = next(descriptor.handler for descriptor in collect_families() if descriptor.wire == method)
+
+    async def run_blocking(call):
+        return call()
+
+    client = SimpleNamespace(
+        connections=SimpleNamespace(run_blocking=run_blocking),
+        server=SimpleNamespace(
+            home=tmp_path,
+            runtime=SimpleNamespace(
+                opened=object(), session_id="test-session", loop=SimpleNamespace(_mcp_project_dir_value=tmp_path),
+            ),
+            control=SimpleNamespace(
+                _reject_if_unhealthy=lambda: None,
+                client_turn_detached=lambda: False,
+                state_change_busy=lambda: False,
+                hold_wake_start=nullcontext,
+            ),
+        ),
+    )
+    failure = RuntimeError("unexpected test exception at /private/test-config with test-secret-canary")
+    with patch(target, side_effect=failure) as owner:
+        with pytest.raises(ProtocolError) as caught:
+            await handler(client, 7, params)
+        # test-contract: seam prove the injected failure came from the owner, not adapter setup
+        assert owner.call_count == 1, f"{method} did not reach its owner"
+
+    error = caught.value
+    assert json.loads(FrameCodec().error_response(7, error.descriptor, error.message, error.data)) == {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "error": {"code": -32000, "message": "unexpected server or storage failure"},
+    }, f"{method} must return the fixed internal error for unexpected owner failures"
 
 
 @pytest.mark.asyncio
