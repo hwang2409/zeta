@@ -14,6 +14,7 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
+from zeta.config.settings import load_settings
 from zeta.core.approval import (
     ApprovalDecision,
     ApprovalPolicy,
@@ -118,6 +119,18 @@ async def test_uncaught_tool_rejection_reaches_model_without_wasm_backtrace(tmp_
     assert widget.toggle_latest_agent()
     rendered = widget.render(100)
     assert "Error: could not open path:" in rendered and "wasm backtrace" not in rendered, rendered
+
+
+async def test_code_mode_is_off_by_default(tmp_path):
+    (tmp_path / "settings.toml").write_text("[memory]\nenabled = false\n")
+    assert load_settings(home=tmp_path).settings.code_mode_enabled is False
+
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        tools = build_responses_payload([], registry.schemas, model="gpt")["tools"]
+        assert "code" not in {tool["name"] for tool in tools}
+    finally:
+        await registry.close()
 
 
 async def test_code_responses_tool_size_and_exposure(tmp_path):
