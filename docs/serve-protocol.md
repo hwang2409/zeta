@@ -1941,6 +1941,26 @@ keys, and bad values; `-32009 stale_settings_revision` (both `data.code` and
 `settings_malformed` or `settings_unsafe` for malformed or unsafe files.
 Unexpected failures return only the generic `-32000` error.
 
+### account catalog (`account_list_idle_v1` feature)
+
+With protocol 1.1 or later and `account_list_idle_v1`, the controller can call
+`account_list` with `{}` even before a session is active. The result is
+`{"revision":"<64 lowercase hex digits>","data":{"accounts":[...]}}`. Rows have
+`account`, `label`, `detail`, `available`, `current`, `default`, and `usage`.
+`detail` is always null on this version: credential metadata is not projected.
+`current` is false without an active session; otherwise it reflects the active
+session's selection. `default` reflects the stored provider default. The revision
+identifies stored public catalog content, not the active session's selection or
+wall-clock usage freshness.
+
+An empty catalog returns an empty array. Bad or missing credentials make only
+that account unavailable. The read uses the account registry lock and does not
+migrate, recover credentials, or call a provider. An unavailable catalog returns
+`-32005` with `data.code: "state_unavailable"`. Unknown params return `-32602`
+with `data.code: "invalid_params"`. This read remains controller-only; observers
+receive `-32008` with `data.code` and `data.reason` set to `observer_read_only`
+and `data.method: "account_list"`.
+
 ## errors
 
 Error responses use standard JSON-RPC codes where applicable. Each emitted variant selects one registered descriptor.
@@ -2520,7 +2540,7 @@ error code and message. Provider status and origin remain internal.
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
 - `session_settings`: returns `model`, `approval_mode`, and `plan_mode`. with the negotiated `otel` feature it also returns `telemetry` (`enabled`, `state`, and `reason`); endpoint and exporter details are never returned.
-- `account_list`: takes `session_id` and returns every named subscription
+- `account_list` without `account_list_idle_v1`: takes `session_id` and returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and
   `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
   null `snapshot` or the normalized `version`, `captured_at`, `source`, and
