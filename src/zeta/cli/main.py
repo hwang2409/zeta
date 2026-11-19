@@ -336,6 +336,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_project_subcommand(commands)
     _add_inbox_subcommand(commands)
 
+    otel = commands.add_parser("otel", help="OpenTelemetry tools")
+    otel_commands = otel.add_subparsers(dest="otel_action", required=True)
+    otel_receiver = otel_commands.add_parser("receiver", help="run the built-in OTLP receiver at http://127.0.0.1:4323/v1/traces")
+    otel_receiver.add_argument(
+        "--idle-exit",
+        action="store_true",
+        help="exit after 15 minutes with no OTLP ingest and no /health request (zeta passes this when it starts the receiver; without it, the receiver runs until stopped)",
+    )
+
     mcp = commands.add_parser("mcp", help="manage MCP servers")
     mcp_commands = mcp.add_subparsers(dest="mcp_action", required=True)
     add = mcp_commands.add_parser("add")
@@ -1181,6 +1190,9 @@ def _main(argv: list[str] | None = None) -> int:
         except (MCPManagementError, OSError, ValueError, KeyError) as exc:
             print(f"mcp error: {exc}", file=sys.stderr)
             return 2
+    if args.command == "otel" and args.otel_action == "receiver":
+        from ..telemetry.receiver import run_receiver
+        return run_receiver(env_home(), idle_exit=args.idle_exit)
     if args.command == "session":
         from .session import run as _run_session
 
