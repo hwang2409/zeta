@@ -383,9 +383,13 @@ class BackgroundAgentOwner:
     def parent_store(self, instance_id: str, default: ConversationStore) -> ConversationStore:
         return self.parent_edge(instance_id, default)[0]
 
-    def cancel_all(self, *, closing: bool = False) -> None:
-        if closing:
-            self._setup_closed = True
+    async def close_children(self) -> None:
+        """Stop admission and cancel and join the whole child tree."""
+        self._setup_closed = True
+        self.cancel_all()
+        await self.wait()
+
+    def cancel_all(self) -> None:
         if self._canceling:
             return
         self._canceling = True
@@ -444,16 +448,17 @@ class BackgroundAgentOwner:
         current = asyncio.current_task()
         while True:
             setups = self._setup_tasks - {current}
-            if setups:
-                await asyncio.wait(setups)
-                continue
             for instance_id, watcher in tuple(self._watchers.items()):
                 if watcher.done():
                     self.unregister(instance_id)
             watchers = tuple(
                 watcher for watcher in self._watchers.values() if watcher is not current
             )
-            if not watchers:
+            # Snapshot watchers before setup drains: they can unregister during cleanup.
+            if setups:
+                await asyncio.wait(setups)
+            if watchers:
+                await asyncio.gather(*watchers, return_exceptions=True)
+            elif not setups:
                 await self.wait_for_store_closes()
                 return
-            await asyncio.gather(*watchers, return_exceptions=True)
