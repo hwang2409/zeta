@@ -16,6 +16,7 @@ from io import StringIO
 from itertools import pairwise
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
 from rich.console import Console
@@ -3745,12 +3746,12 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
         notification = await original_publish(**kwargs)
         if kwargs["child_instance_id"].count(":") == 1:
             completion_published.set()
-            await release_child_watcher.wait()
+            await await_or_fail(release_child_watcher.wait(), what="release child watcher")
         return notification
 
     async def hold_child_loop_cancellation(coroutine):
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="child close owns cancellation task")
         finally:
             coroutine.close()
 
@@ -3764,7 +3765,7 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
             )
         return original_create_task(loop_self, coroutine)
 
-    def cancel_all() -> None:
+    def signal_cancellation() -> None:
         original_cancel_all()
         cancellation_requested.set()
 
@@ -3772,23 +3773,29 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
         owner.conversation_channel, "publish_completion", pause_after_publication
     )
     monkeypatch.setattr(AgentLoop, "_create_task", create_task)
-    monkeypatch.setattr(owner, "cancel_all", cancel_all)
+    monkeypatch.setattr(
+        owner, "cancel_all", create_autospec(original_cancel_all, side_effect=signal_cancellation)
+    )
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(completion_published.wait(), timeout=10)
-    closing = asyncio.create_task(loop.close())
+    closing = None
     try:
-        await asyncio.wait_for(cancellation_requested.wait(), timeout=10)
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await await_or_fail(completion_published.wait(), what="child publishes completion")
+        closing = asyncio.create_task(loop.close())
+        await await_or_fail(cancellation_requested.wait(), what="close requests cancellation")
         release_child_watcher.set()
-        await asyncio.wait_for(closing, timeout=10)
+        await await_or_fail(closing, what="root close joins adopted grandchild")
         assert not owner.running
     finally:
         release_child_watcher.set()
         backend.release_grandchild.set()
-        if not closing.done():
-            closing.cancel()
-        await asyncio.gather(closing, return_exceptions=True)
-        await asyncio.wait_for(owner.wait(), timeout=10)
+        if closing is not None:
+            await await_or_fail(
+                asyncio.gather(closing, return_exceptions=True), what="drain root close task"
+            )
+        else:
+            await await_or_fail(loop.close(), what="close after failed setup")
+        await await_or_fail(owner.wait(), what="drain background owner")
         store.close()
 
 

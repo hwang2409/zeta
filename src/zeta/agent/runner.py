@@ -462,7 +462,7 @@ async def _build_child_loop(
                 {**usage, "_zeta_model": usage.get("_zeta_model", child_model)}
             )
 
-        child_context = await asyncio.to_thread(
+        child_context = await await_joined_offload(
             _child_base_system_prompt, loop, cwd_override, child_registry
         )
         child_scope = getattr(loop, "_live_config_scope", None)
@@ -547,6 +547,24 @@ async def _build_child_loop(
 
 
 async def run_agent_tool(
+    loop: AgentLoop,
+    tool_call: ToolCall,
+    arguments: dict[str, Any],
+    abort_signal: ToolAbortSignal,
+    publisher: ToolStreamPublisher | None,
+    validate_result: Callable[[object, str], ToolResult],
+    error_message: Callable[[BaseException], str],
+    execution_context: ToolExecutionContext | None = None,
+) -> dict[str, object]:
+    return await loop._background_owner.start_child_setup(
+        lambda: _run_agent_tool(
+            loop, tool_call, arguments, abort_signal, publisher,
+            validate_result, error_message, execution_context,
+        )
+    )
+
+
+async def _run_agent_tool(
     loop: AgentLoop,
     tool_call: ToolCall,
     arguments: dict[str, Any],
@@ -757,19 +775,57 @@ async def run_agent_tool(
             background=background,
         ),
     )
-    if loop._child_lineage_publisher is not None:
-        link = {
-            "project_id": loop.root_project_id,
-            "session_id": child_instance_id,
-            "role": "worker",
-            "parent_session_id": parent_identity,
-            "transcript_path": child_path,
-        }
+    account_context = getattr(loop, "account_context", None)
+    lifecycle_started = False
+
+    def start_lifecycle(selected_accounts: dict[str, object]) -> None:
+        nonlocal lifecycle_started
+        make_publish_child_lifecycle(
+            account_context=account_context,
+            selected_accounts=selected_accounts,
+            child_store=child_store,
+            child_instance_id=child_instance_id,
+            child_depth=child_depth,
+            preset=preset,
+            description=description,
+            child_cwd=child_cwd,
+        )()
+        lifecycle_started = True
+
+    async def release_setup_store() -> None:
+        loop._agent_child_stores.pop(tool_call.id, None)
+        loop._agent_child_turns.pop(tool_call.id, None)
+        loop._agent_child_types.pop(tool_call.id, None)
+        loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
+        loop._background_owner.finish_store(child_instance_id, child_store)
+        await loop._background_owner.wait_for_store_closes()
+
+    async def cancel_setup() -> None:
         try:
-            await await_joined_offload(loop._child_lineage_publisher.publish, link)
-        except (ProjectRegistryError, OSError, ValueError) as exc:
-            logger.warning("could not record child project lineage: %s", exc)
+            if not lifecycle_started:
+                # The parent marker is already durable, even before account pinning.
+                await await_joined_offload(start_lifecycle, {})
+            if not store_bound:
+                child_store.bind_owner_thread()
+            await persist_confirmed_cancel(None, child_store, tool_call.id)
+        finally:
+            await release_setup_store()
+
+    child_policy: ChildApprovalPolicy | None = None
+    store_bound = False
     try:
+        if loop._child_lineage_publisher is not None:
+            link = {
+                "project_id": loop.root_project_id,
+                "session_id": child_instance_id,
+                "role": "worker",
+                "parent_session_id": parent_identity,
+                "transcript_path": child_path,
+            }
+            try:
+                await await_joined_offload(loop._child_lineage_publisher.publish, link)
+            except (ProjectRegistryError, OSError, ValueError) as exc:
+                logger.warning("could not record child project lineage: %s", exc)
         await append_child_start(
             loop.store,
             child_instance_id,
@@ -778,46 +834,20 @@ async def run_agent_tool(
             description,
             accepts_follow_ups=follow_up_loop,
         )
-    except BaseException:
-        loop._background_owner.mark_store_finished(child_store)
-        loop._background_owner.release_unused_stores()
-        await loop._background_owner.wait_for_store_closes()
-        raise
-    account_context = getattr(loop, "account_context", None)
-    child_account_pins = (
-        await asyncio.to_thread(
-            account_context.child_snapshot, getattr(child_backend, "provider", None)
+        child_account_pins = (
+            await await_joined_offload(
+                account_context.child_snapshot, getattr(child_backend, "provider", None)
+            )
+            if account_context is not None
+            else None
         )
-        if account_context is not None
-        else None
-    )
-    selected_accounts = (
-        child_account_pins.snapshot() if child_account_pins is not None else {}
-    )
-
-    child_turn_control = turn_control_for(requested_max_turns, child_path)
-
-    publish_child_lifecycle = make_publish_child_lifecycle(
-        account_context=account_context,
-        selected_accounts=selected_accounts,
-        child_store=child_store,
-        child_instance_id=child_instance_id,
-        child_depth=child_depth,
-        preset=preset,
-        description=description,
-        child_cwd=child_cwd,
-    )
-
-    try:
-        await asyncio.to_thread(publish_child_lifecycle)
-    except BaseException:
-        loop._background_owner.mark_store_finished(child_store)
-        loop._background_owner.release_unused_stores()
-        await loop._background_owner.wait_for_store_closes()
-        raise
-    child_store.bind_owner_thread()
-    child_policy: ChildApprovalPolicy | None = None
-    try:
+        selected_accounts = (
+            child_account_pins.snapshot() if child_account_pins is not None else {}
+        )
+        child_turn_control = turn_control_for(requested_max_turns, child_path)
+        await await_joined_offload(start_lifecycle, selected_accounts)
+        child_store.bind_owner_thread()
+        store_bound = True
         loop._agent_child_stores[tool_call.id] = child_store
         loop._agent_child_turns[tool_call.id] = 0
         loop._agent_child_types[tool_call.id] = preset.name
@@ -846,8 +876,15 @@ async def run_agent_tool(
         child_loop.agent_profile = preset.name
         child_loop.agent_background = background
     except asyncio.CancelledError:
+        cleanup = asyncio.create_task(cancel_setup())
+        await _complete_despite_cancellation(cleanup)
         raise
-    except Exception as exc:  # noqa: BLE001 - setup failures become receipts
+    except Exception as exc:
+        if not store_bound:
+            cleanup = asyncio.create_task(release_setup_store())
+            if await _complete_despite_cancellation(cleanup):
+                raise asyncio.CancelledError
+            raise
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         failure_text = f"agent error: {error_message(exc)}"
         child_store.finish_agent_lifecycle(
@@ -1241,6 +1278,7 @@ async def run_agent_tool(
             active_store=child_store,
             parent_instance_id=loop.agent_instance_id,
         )
+        loop._background_owner.finish_child_setup()
         # The tree owner now keeps this task pair alive after this loop closes.
         loop._tracked_tasks.discard(child_task)
         loop._tracked_tasks.discard(watcher)
@@ -1275,6 +1313,7 @@ async def run_agent_tool(
         active_store=child_store,
         parent_instance_id=loop.agent_instance_id,
     )
+    loop._background_owner.finish_child_setup()
     abort_task = loop._create_task(abort_signal.wait())
     try:
         done, _ = await asyncio.wait(
