@@ -1881,6 +1881,35 @@ observer returns `-32008` with `data.code` and `data.reason` both set to
 `observer_read_only` and `data.method` set to the method name. Resource
 calls run off the event loop and never return storage paths or exception text.
 
+### child run control (`child_run_control_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `child_run_spawn` | `1.0` | `child_run_control_v1` | `controller_write` |
+| `child_run_cancel` | `1.0` | `child_run_control_v1` | `controller_write` |
+
+`child_run_spawn {session_id, agent_type, task, cwd?, background?}` starts a
+background child in the attached session when its parent is idle. `agent_type`
+is a session preset name (up to 256 UTF-8 bytes). `task` is nonblank and at most
+64 KiB of UTF-8. If supplied, `cwd` is an existing absolute directory (up to
+4096 UTF-8 bytes) and `background` must be `true`. No model or tool overrides
+are accepted. The response is `{data: {accepted: true, run_id}}`. `run_id` is
+the same handle as in `child_run_list`; the existing `child_started`,
+`child_progress`, and `child_ended` events describe the run when negotiated.
+
+`child_run_cancel {session_id, run_id, reason?}` accepts only `"user_cancelled"`
+for `reason`. It returns `{data: {accepted: true, run_id, state}}`, with
+`state: "cancelling"` when cancellation is admitted. A terminal run is unchanged
+and returns `"completed"`, `"failed"`, or `"canceled"`. No revision is required
+for either command.
+
+Unknown fields or invalid input (including an unknown preset or invalid `cwd`)
+return `-32602` with `data.code: "invalid_params"`. Other command errors include
+`-32003 no_active_session` or `session_mismatch`, `-32004 operation_busy`,
+`-32005 state_unavailable`, and `-32012 child_run_not_found`; these errors set
+both `data.code` and `data.reason` to the named reason. A detached controller
+cannot spawn. Without `child_run_control_v1`, the methods return `-32601`.
+
 ### home settings (`home_settings_v1` feature)
 
 | method | version | feature | access |
