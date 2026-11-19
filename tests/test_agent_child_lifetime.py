@@ -79,6 +79,7 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, point):
         if point == "append_child_start":
             monkeypatch.setattr(runner, "append_child_start", pause)
         if point in {"build_child_loop", "runtime_shutdown", "cleanup_cancel"}:
+            # test-contract: seam pause loop construction while setup owns the child store.
             monkeypatch.setattr(runner, "_build_child_loop", pause)
         if point == "cleanup_cancel":
             original_persist = runner.persist_confirmed_cancel
@@ -92,8 +93,10 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, point):
         if point == "refresh_live_config":
             monkeypatch.setattr(AgentLoop, "refresh_live_config", pause)
         if point == "step_delivery":
+            # test-contract: seam pause step delivery before setup releases ownership.
             monkeypatch.setattr(AgentLoop, "_ensure_step_delivery", pause)
         if point == "serve_receipt":
+            # test-contract: seam hold the receipt write so shutdown must join it.
             monkeypatch.setattr(store, "_commit_address_async", pause)
 
         async def spawn():
