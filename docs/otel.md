@@ -25,6 +25,14 @@ or tool text is put in spans.
 3. Restart zeta. Telemetry is read once at startup; the serve
    `set_settings` request does not change it.
 
+   A serve client with the `home_settings_v1` feature can turn the built-in
+   endpoint on or off instead. That update changes only the endpoint line
+   (under an existing `[otel]` header, else a top-level `otel.endpoint` line;
+   it never adds or removes the header), so on then off restores the file's
+   exact bytes. It publishes `settings.toml` with mode `0600` (an existing
+   `0644` file becomes `0600` on its first write); a no-op update does not
+   rewrite it.
+
 Rules for `[otel]`:
 
 - `endpoint` is the only key. Without it, telemetry is off: no OpenTelemetry
@@ -104,6 +112,61 @@ tool name, request id, protocol version) to its `execute_tool` span; a prompt
 or resource call with no tool span gets its own `CLIENT` span. Server startup,
 refresh, and notifications carry no context.
 
+## built-in receiver
+
+Zeta has its own receiver, which stores traces for `zeta serve`'s
+`telemetry_*` reads. To use it, set the endpoint to exactly:
+
+```toml
+[otel]
+endpoint = "http://127.0.0.1:4323/v1/traces"
+```
+
+Every zeta process with this exact endpoint (the TUI, `zeta -p`, and
+`zeta serve`) starts the receiver when none is running for its home. Any
+other endpoint, even another loopback address or path, is an external
+collector, and zeta never starts anything for it.
+
+- The receiver runs as `zeta otel receiver --idle-exit` in its own process
+  session. It outlives the zeta process that started it, because the home's
+  other zeta processes export to it too. It exits by itself, and releases its
+  lock, after 15 minutes with no OTLP ingest and no `/health` request. Every
+  running zeta process with this endpoint checks `/health` every 10 seconds,
+  so the receiver stays up while one runs, and exits about 15 minutes after
+  the last one ends or turns telemetry off. Stop it sooner with `kill <pid>`;
+  the next zeta process starts it again.
+- When several processes start at the same time, the receiver's lock on
+  `$ZETA_HOME/telemetry/receiver.lock` keeps one; the others exit. The lock is
+  released when the process ends, also after a crash, so a new receiver can
+  start.
+- Each zeta process checks the receiver's `/health` every 10 seconds on a
+  background thread. If a launch does not answer within 15 seconds, it tries
+  again after 1, 2, 4, and 8 seconds. After five failed launches in a row it
+  stops trying and shows `error`; run `zeta otel receiver` by hand to see why.
+- If the `otel` extra is not installed, startup stops with
+  `OpenTelemetry support is not installed; install zeta[otel]`.
+- Each home has a random, non-secret id in `$ZETA_HOME/telemetry/home-id`,
+  which `/health` also reports. With the built-in endpoint, spans carry it as
+  the resource attribute `zeta.home.id`. The receiver stores only spans with
+  its own home id; it drops other spans (from another home, or from an older
+  zeta without the id), counts them in `/health` under
+  `dropped.foreign_home`, and reports them as OTLP `rejected_spans`. The id is
+  used only for this check and is not stored with the spans.
+- If the receiver on port 4323 belongs to another zeta home, zeta starts
+  nothing, sends no spans, and `/status` shows
+  `error (port 4323 held by another zeta home)`. It checks again every 10
+  seconds.
+- Zeta sends spans only after a `/health` check confirmed this home's
+  receiver. A flush before that (for example at shutdown) first makes one
+  `/health` check with a 1 second limit; if it does not confirm this home, the
+  spans are dropped, and `/status` shows the last export as an error.
+
+`zeta otel receiver` requires telemetry to be on. Set the endpoint in
+`~/.zeta/settings.toml` (or `$ZETA_HOME/settings.toml`) before you start it.
+You can start it by hand with either the built-in or an external endpoint.
+Without `--idle-exit`, it runs until you stop it. It exits with `already running at
+http://127.0.0.1:4323` when the home's receiver already runs.
+
 ## status
 
 The TUI `/status` card has one line:
@@ -111,6 +174,16 @@ The TUI `/status` card has one line:
 - `otel: off`
 - `otel: healthy (127.0.0.1:4318)`
 - `otel: degraded (export unavailable)`
+
+With the built-in endpoint, a second line shows the receiver URL, its state
+(`starting`, `ready`, `stopped`, or `error`), and this process's latest export:
+
+- `otel receiver: http://127.0.0.1:4323/v1/traces ready, last export ok 3s ago`
+- `otel receiver: http://127.0.0.1:4323/v1/traces starting, no export yet`
+
+Serve `status` and `telemetry_status` show the same values (see
+[serve-protocol.md](serve-protocol.md)). Reading them never waits on the
+receiver.
 
 Export runs on a background thread, batched every 5 seconds. When a batch
 fails, the state becomes `degraded`; the next successful batch makes it

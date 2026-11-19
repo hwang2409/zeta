@@ -14,6 +14,7 @@ dependencies = [
     "pyvips[binary]>=3.2.0",
     "pyyaml>=6.0",
     "rich>=13.9",
+    "tomlkit>=0.15.2",
     "websockets>=15,<16",
 ]
 
@@ -21,6 +22,9 @@ dependencies = [
 otel = [
     "opentelemetry-sdk==1.45.2",
     "opentelemetry-exporter-otlp-proto-http==1.45.2",
+    "opentelemetry-proto==1.45.2",
+    "starlette>=0.40",
+    "uvicorn>=0.32",
 ]
 
 [dependency-groups]

@@ -152,6 +152,25 @@ class ErrorDescriptor(Enum):
         "mcp_tool_refresh_failed",
         "an MCP tools/list refresh failed",
     )
+    INVALID_TELEMETRY_PARAMS = (-32602, "invalid_params", "telemetry read parameters or cursor are invalid")
+    INVALID_STATE_PARAMS = (-32602, "invalid_params", "state read parameters or cursor are invalid")
+    STATE_READ_UNAVAILABLE = (-32005, "state_unavailable", "stored state is not available to read")
+    CORRUPT_STATE = (-32000, "corrupt_state", "stored state is invalid or unsupported")
+    STALE_STATE_SNAPSHOT = (-32009, "stale_state_snapshot", "the stored state changed during the read")
+    TRACE_NOT_FOUND = (-32602, "trace_not_found", "the requested trace does not exist")
+    TELEMETRY_OFF = (-32005, "telemetry_off", "no telemetry database exists")
+    TELEMETRY_SCHEMA_MISMATCH = (
+        -32000,
+        "telemetry_schema_mismatch",
+        "the telemetry database schema is not the one this zeta reads",
+    )
+    RESULT_TOO_LARGE = (-32007, "result_too_large", "not even one item fits one frame")
+    INVALID_HOME_SETTINGS_PARAMS = (-32602, "invalid_params", "home settings parameters or changes are invalid")
+    CUSTOM_HOME_SETTING = (-32602, "custom_home_setting", "the setting has a custom value that serve does not change")
+    STALE_REVISION = (-32009, "stale_revision", "settings.toml changed since the given revision")
+    SETTINGS_BUSY = (-32009, "settings_busy", "another zeta process is writing settings.toml")
+    SETTINGS_MALFORMED = (-32000, "settings_malformed", "settings.toml does not parse or validate")
+    SETTINGS_UNSAFE = (-32000, "settings_unsafe", "settings.toml is a link or not a regular, unshared file")
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
         self.code = code
@@ -290,6 +309,9 @@ FEATURES = (
     "in_flight_replay",
     "session_park",
     "tool_approval_origin",
+    "telemetry_read_v1",
+    "state_read_v1",
+    "home_settings_v1",
 )
 
 
@@ -390,6 +412,32 @@ class MethodDescriptor(Enum):
         "mcp_refresh_tools",
         Access.SESSION_MUTATION,
     )
+    STATE_SESSIONS = ("state_sessions", None, "state_read_v1", Access.READ)
+    STATE_SESSION = ("state_session", None, "state_read_v1", Access.READ)
+    STATE_AGENTS = ("state_agents", None, "state_read_v1", Access.READ)
+    STATE_BACKGROUND_TASKS = ("state_background_tasks", None, "state_read_v1", Access.READ)
+    STATE_CATALOG = ("state_catalog", None, "state_read_v1", Access.READ)
+    STATE_PROJECTS = ("state_projects", None, "state_read_v1", Access.READ)
+    STATE_MEMORY = ("state_memory", None, "state_read_v1", Access.READ)
+    STATE_MEMORY_DETAIL = ("state_memory_detail", None, "state_read_v1", Access.CONTROLLER_READ)
+    STATE_INBOX = ("state_inbox", None, "state_read_v1", Access.READ)
+    STATE_INBOX_DETAIL = ("state_inbox_detail", None, "state_read_v1", Access.CONTROLLER_READ)
+    STATE_ATTENTION = ("state_attention", None, "state_read_v1", Access.READ)
+    STATE_SETTINGS = ("state_settings", None, "state_read_v1", Access.READ)
+    STATE_ACCOUNTS = ("state_accounts", None, "state_read_v1", Access.READ)
+    STATE_STORAGE = ("state_storage", None, "state_read_v1", Access.READ)
+    STATE_RETENTION = ("state_retention", None, "state_read_v1", Access.READ)
+    TELEMETRY_STATUS = ("telemetry_status", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_SESSIONS = ("telemetry_sessions", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_TRACE = ("telemetry_trace", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_OVERVIEW = ("telemetry_overview", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_MODELS = ("telemetry_models", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_TOOLS = ("telemetry_tools", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_ERRORS = ("telemetry_errors", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_SERIES = ("telemetry_series", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_AGENT_TREE = ("telemetry_agent_tree", None, "telemetry_read_v1", Access.READ)
+    HOME_SETTINGS_GET = ("home_settings_get", None, "home_settings_v1", Access.READ)
+    HOME_SETTINGS_UPDATE = ("home_settings_update", None, "home_settings_v1", Access.CONTROLLER_WRITE)
 
     def __init__(
         self, wire: str, since: str | None, feature: str | None, access: Access

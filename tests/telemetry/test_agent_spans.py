@@ -114,7 +114,7 @@ def traced() -> Iterator[tuple[Telemetry, list]]:
         telemetry.shutdown()
 
 
-def _loop(tmp_path: Path, backend: ScriptedBackend, telemetry: Telemetry) -> AgentLoop:
+def _loop(tmp_path: Path, backend: ScriptedBackend, telemetry: Telemetry, **options: object) -> AgentLoop:
     async def noop(arguments: dict[str, object], abort_signal: object, publisher: object) -> str:
         del arguments, abort_signal, publisher
         return "ok"
@@ -126,6 +126,7 @@ def _loop(tmp_path: Path, backend: ScriptedBackend, telemetry: Telemetry) -> Age
         max_turns=4,
         skill_catalog=SkillCatalog.empty(),
         telemetry=telemetry,
+        **options,
     )
 
 
@@ -232,8 +233,8 @@ def test_retry_usage_sums_every_attempt_on_the_one_span(tmp_path, traced) -> Non
     ("attempts", "raised", "chat_error", "turn_error", "agent_error"),
     [
         (["reply"], None, None, None, None),
-        ([ScriptedFailure(PROMPT)], None, "ScriptedFailure", None, None),
-        ([ErrorInfo("invalid_request_error", PROMPT)], None, "_OTHER", None, None),
+        ([ScriptedFailure(PROMPT)], None, "ScriptedFailure", "_OTHER", "_OTHER"),
+        ([ErrorInfo("invalid_request_error", PROMPT)], None, "_OTHER", "_OTHER", "_OTHER"),
         ([Escape()], Escape, "Escape", "Escape", "Escape"),
         (["stall"], asyncio.CancelledError, "CancelledError", "CancelledError", "CancelledError"),
         ([PrematureCompletionError(PROMPT), "reply"], None, None, None, None),
@@ -269,6 +270,23 @@ def test_every_exit_ends_each_span_once_under_its_parent(tmp_path, traced, attem
     assert [span.attributes.get("error.type") for span in (chat, turn, agent)] == [chat_error, turn_error, agent_error]
     assert (chat.status.status_code is StatusCode.ERROR) == (chat_error is not None)
     _assert_no_content(spans)
+
+
+def test_a_stream_error_event_fails_the_turn_and_agent_spans(tmp_path, traced) -> None:
+    from opentelemetry.trace import StatusCode
+
+    telemetry, memory = traced
+    # a pre-send rejection: the queued prompt cannot fit, the loop yields ERROR and returns without an exception
+    loop = _loop(tmp_path, ScriptedBackend("claude", "claude-opus-5-5", []), telemetry, token_budget=2_000)
+    loop.store.pending_prompt_queue.append("p" * 15_000, origin=MessageOrigin.AGENT_SEND)
+    events = asyncio.run(_run(loop))
+    assert [event.error.code for event in events if event.type is StreamEventType.ERROR] == ["context_length_exceeded"]
+    names = _by_name(memory.get_finished_spans())
+    for span in (*names["invoke_agent zeta"], *names["zeta.turn"]):
+        assert span.attributes["zeta.outcome"] == "failed", span.name
+        assert span.status.status_code is StatusCode.ERROR, span.name
+        assert span.attributes["zeta.error.code"] == "context_length", span.name
+    _assert_no_content(memory.get_finished_spans())
 
 
 def test_disabled_turn_creates_no_span(tmp_path, monkeypatch) -> None:

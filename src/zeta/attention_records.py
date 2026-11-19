@@ -7,7 +7,7 @@ import json
 import os
 import stat
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -141,6 +141,16 @@ class AttentionRecord:
         ):
             raise ValueError("invalid attention record")
         return record
+
+    def state_row(self) -> dict[str, Any]:
+        from .state_snapshot import timestamp_ns
+
+        return {
+            "attention_id": self.id, "project_id": self.project_id, "session_id": self.session_id,
+            "kind": self.kind, "status": "open" if self.status == "open" else "done",
+            "title": self.title, "created_ns": timestamp_ns(self.created_at),
+            "updated_ns": timestamp_ns(self.resolved_at or self.created_at),
+        }
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -410,6 +420,83 @@ class AttentionStore:
         )
 
 
+def _state_attention_files(session_dir: Path) -> tuple[Path, ...]:
+    directory = session_dir / "attention"
+    if session_dir.is_symlink() or directory.is_symlink():
+        raise ValueError("unsafe attention directory")
+    return tuple(sorted(directory.glob("*.json")))
+
+
+def state_attention_counts(sessions_dir: Path, session_ids: Iterable[str]) -> dict[str, int]:
+    """Count regular attention slots without opening any record body."""
+    counts = {}
+    for session_id in session_ids:
+        count = 0
+        for path in _state_attention_files(sessions_dir / session_id):
+            try:
+                _check_id(path.stem)
+                if stat.S_ISREG(path.lstat().st_mode):
+                    count += 1
+            except (ValueError, FileNotFoundError):
+                continue
+        counts[session_id] = count
+    return counts
+
+
+def state_attention_rows(session_dir: Path, observed_epoch: int) -> list[dict[str, Any]]:
+    store = AttentionStore(session_dir, writer_epoch=observed_epoch)
+    rows = []
+    for path in _state_attention_files(session_dir):
+        _check_id(path.stem)
+        state = store.record_state(path.stem)
+        if isinstance(state, Missing):
+            continue
+        if isinstance(state, Broken) or state.value.session_id != session_dir.name:
+            raise ValueError("invalid attention record")
+        rows.append(state.value.state_row())
+    return rows
+
+
+def state_attention_page(session_dir, observed_epoch, start, limit, *, fits, shape):
+    """Page one session's attention using its updated time and id."""
+    from .read_page import Key, descending_page
+
+    return descending_page(
+        state_attention_rows(session_dir, observed_epoch),
+        (Key("updated_ns", int, True), Key("attention_id", str, True)),
+        start, limit, fits=fits, shape=shape, total=1000,
+    )
+
+
+def state_attention_generation(session_dir: Path) -> object:
+    from .state_snapshot import stamps
+
+    return stamps((session_dir / "attention", *_state_attention_files(session_dir)))
+
+
+def _attention_sessions(sessions_dir: Path) -> tuple[Path, ...]:
+    if sessions_dir.is_symlink():
+        raise ValueError("unsafe sessions directory")
+    return tuple(path for path in sorted(sessions_dir.glob("*")) if _is_attention_id(path.name))
+
+
+def _is_attention_id(value: str) -> bool:
+    return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
+
+
+def state_attention_home_generation(sessions_dir: Path) -> object:
+    from .state_snapshot import stamps
+
+    return stamps([sessions_dir]), tuple(state_attention_generation(path) for path in _attention_sessions(sessions_dir))
+
+
+def state_attention_home_rows(sessions_dir: Path, epoch: int, project_id: str | None, status: str | None):
+    return [
+        row for path in _attention_sessions(sessions_dir) for row in state_attention_rows(path, epoch)
+        if (project_id is None or row["project_id"] == project_id) and (status is None or row["status"] == status)
+    ]
+
+
 def remove_fork_session_links(
     sessions_root: Path,
     session_ids: tuple[str, ...],
@@ -449,9 +536,7 @@ def _remove_store_fork_links(store, remove_ids, charge) -> None:
 
 
 def _check_id(attention_id: str) -> None:
-    if len(attention_id) != 32 or any(
-        character not in "0123456789abcdef" for character in attention_id
-    ):
+    if not _is_attention_id(attention_id):
         raise ValueError("invalid attention id")
 
 
