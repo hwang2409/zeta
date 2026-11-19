@@ -1941,7 +1941,7 @@ keys, and bad values; `-32009 stale_settings_revision` (both `data.code` and
 `settings_malformed` or `settings_unsafe` for malformed or unsafe files.
 Unexpected failures return only the generic `-32000` error.
 
-### account catalog (`account_list_idle_v1` feature)
+### accounts (`account_list_idle_v1` feature)
 
 With protocol 1.1 or later and `account_list_idle_v1`, the controller can call
 `account_list` with `{}` even before a session is active. The result is
@@ -1960,6 +1960,29 @@ migrate, recover credentials, or call a provider. An unavailable catalog returns
 with `data.code: "invalid_params"`. This read remains controller-only; observers
 receive `-32008` with `data.code` and `data.reason` set to `observer_read_only`
 and `data.method: "account_list"`.
+
+The same feature extends the controller-only `login_start` request to
+`{provider, account?}`. `provider` is `claude` or `codex`. `account` is a named
+account's short name, label, or qualified ID (for example `anthropic:work` for
+`claude`). Omit `account` to keep the legacy login target. Without the feature,
+`account` is ignored as before. The pending, failure, status and cancel shapes
+are unchanged; at most one login per provider can be pending. A malformed or
+unknown account, unsupported provider or unknown param returns `-32602` with
+`data.code: "invalid_params"`. An unavailable account registry returns `-32005`
+with `data.code: "state_unavailable"`. An observer receives `-32008` with
+`data.code` and `data.reason` set to `observer_read_only` and
+`data.method: "login_start"` before params are validated.
+
+When a named subscription account fails authentication, the live `error`
+event adds `params.data.auth_account: {account, label, provider}` for each
+connection that negotiated this feature, including observers subscribed to the
+session's replay stream. `account` is the qualified ID, `label` is the public
+account label, and `provider` uses the login provider spelling (`claude` or
+`codex`). The event uses `params.error: {code: "auth_error", message:
+"Account sign-in required."}` instead of the provider's raw error text. The
+existing `data.login_provider` hint remains when applicable. API-key failures
+have no named account. This is a live-only addition; legacy event and history
+shapes are unchanged.
 
 ## errors
 
