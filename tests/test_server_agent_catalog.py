@@ -95,6 +95,7 @@ def test_catalog_bounds_metadata_reads_across_nonmatches(tmp_path: Path, monkeyp
     sessions = tmp_path / "sessions"
     for name in ("1", "10", "2"):
         _child(sessions, f"root:{name}")
+    # test-contract: complexity exercise the candidate cap with a small fixture
     monkeypatch.setattr(catalog, "_MAX_CANDIDATES", 2)
     original = catalog._metadata
     reads = []
@@ -103,6 +104,7 @@ def test_catalog_bounds_metadata_reads_across_nonmatches(tmp_path: Path, monkeyp
         reads.append(name)
         return original(fd, name)
 
+    # test-contract: complexity count metadata reads without relying on timing
     monkeypatch.setattr(catalog, "_metadata", read)
     after = None
     for expected_path, expected_count in (("1", 1), (None, 2)):
