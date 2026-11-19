@@ -729,6 +729,8 @@ def render_event(
         return _tool_card(event, running=True)
     if event.type is StreamEventType.TOOL_EXECUTION_UPDATE and event.delta is not None:
         stream = event.data.get("stream")
+        if isinstance(event.data.get("step"), str):
+            return _safe_text(f"  ↳ {event.delta}", style=theme.NOTICE)
         label = f"[{stream}] " if stream in {"stdout", "stderr"} else ""
         return _safe_text(f"  ↳ {label}{event.delta}", style=theme.DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:

@@ -197,6 +197,9 @@ def tool_start(
 
 def tool_output(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
     data = dict(event.data)
+    step = data.pop("step", None)
+    if isinstance(step, str):
+        data["step"] = bounded(step)
     if fidelity:
         data, _ = project_tool_value(data)
     tool_call = _tool_call(event)
