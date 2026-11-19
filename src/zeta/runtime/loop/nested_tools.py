@@ -46,12 +46,19 @@ def describe_code(registry: ToolRegistry, schemas: Sequence[ToolSchema]) -> None
     definition = registry.definition_reference("code")
     if code is None or definition is None or definition.origin is not ToolOrigin.PACKAGED_BUILTIN:
         return
-    names = ", ".join(sorted(CODE_MODE_ALLOWED_NAMES.intersection(authority_snapshot(registry, schemas)))) or "none"
+    exposed = CODE_MODE_ALLOWED_NAMES.intersection(authority_snapshot(registry, schemas))
+    names = ", ".join(sorted(exposed)) or "none"
+    readers = " and ".join(
+        hint for name, hint in (
+            ("read", "tools.read for files"), ("project", "tools.project for project records"),
+        ) if name in exposed
+    )
+    preference = f"Prefer {readers}. " if readers else ""
     code["description"] = (
         "Run JavaScript to combine results from several tools. Pass {script: string}. "
         "Use await tools.call(name, args) or await tools[name](args). "
         f"Available tools: {names}. "
-        "Prefer tools.read for files and tools.project for project records. "
+        f"{preference}"
         "Only output(value), called once, sends JSON to the model. "
         "Inner approvals still apply; catch ToolDenied or ToolError. "
         "Use Promise.all for independent calls (up to 8 run at once). "
