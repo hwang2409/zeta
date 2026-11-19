@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 
-from ....core import agent_run_catalog as catalog
 from ....core.store._child_runs import parse_child_run_id
 from ....read_page import Key, TooLarge, page_result, resume
 from ...resource_protocol import Access, ResourceMethod, require_params, run_owner
+from . import _agent_run_catalog as catalog
 
 FEATURE = "agent_run_catalog_v1"
 _METHOD = "agent_run_catalog"

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from tests.support.serve_contract import ServeContract
-from zeta.core import agent_run_catalog as catalog
+from zeta.server.handlers.resources import _agent_run_catalog as catalog
 from zeta.storage_format import open_writer
 
 METHOD = "agent_run_catalog"
