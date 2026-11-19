@@ -973,11 +973,13 @@ class AgentNavigation:
         return self._main_transcript_widget
 
     def show_external_view(self, container: Any, transcript: Any) -> None:
+        self.transcript_control.cancel_finder_return()
         self._external_view_container = container
         self._external_view_transcript = transcript
         self._switch_transcript()
 
     def clear_external_view(self) -> None:
+        self.transcript_control.cancel_finder_return()
         self._external_view_container = None
         self._external_view_transcript = None
         self._switch_transcript()

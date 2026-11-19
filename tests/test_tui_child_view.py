@@ -306,7 +306,7 @@ async def test_finder_return_respects_new_navigation(
         restore_task = asyncio.current_task()
         restore_task.add_done_callback(lambda _: finished.set())
         started.set()
-        await asyncio.wait_for(release.wait(), timeout=90)
+        await asyncio.wait_for(release.wait(), 10)
         await restore(follow_tail, anchor)
 
     with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
@@ -408,12 +408,14 @@ async def test_finder_return_respects_new_navigation(
             assert (await _child_rows(app))[:3] == rows
         finally:
             release.set()
-            if restore_task is not None:
-                await await_or_fail(finished.wait(), what="held finder return stopped")
-                if not restore_task.cancelled():
-                    restore_task.result()
-            app.request_exit()
-            await await_or_fail(run_task, what="real child-view TUI shutdown")
+            try:
+                if restore_task is not None:
+                    await await_or_fail(finished.wait(), what="held finder return stopped")
+                    if not restore_task.cancelled():
+                        restore_task.result()
+            finally:
+                app.request_exit()
+                await await_or_fail(run_task, what="real child-view TUI shutdown")
 
 
 @pytest.mark.skipif(
