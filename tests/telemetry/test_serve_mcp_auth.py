@@ -172,6 +172,7 @@ async def test_mcp_stdio_probe_times_out_and_reaps_child(tmp_path, traced, monke
         mcp_limits=MCPCallLimits(deadline_seconds=1),
     )
     wire = Wire(_server(tmp_path, "unix", telemetry, monkeypatch), "unix")
+    # test-contract: seam idle serve has no session registry; inject limits while driving the real RPC and child.
     monkeypatch.setattr(mcp_management, "_registry", lambda _client: registry)
     processes = []
     spawn = asyncio.create_subprocess_exec
