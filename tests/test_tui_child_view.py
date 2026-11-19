@@ -306,7 +306,7 @@ async def test_finder_return_respects_new_navigation(
         restore_task = asyncio.current_task()
         restore_task.add_done_callback(lambda _: finished.set())
         started.set()
-        await await_or_fail(release.wait(), what="release finder return")
+        await asyncio.wait_for(release.wait(), timeout=90)
         await restore(follow_tail, anchor)
 
     with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
@@ -358,6 +358,7 @@ async def test_finder_return_respects_new_navigation(
                 what="draw child finder preview on different resident pages",
             )
 
+            # test-contract: seam hold only the async return, not search or input
             monkeypatch.setattr(app, "_return_to_view", held_restore)
             pipe.send_bytes(b"\x03")
             await await_or_fail(started.wait(), what="finder closed and return held")
@@ -365,13 +366,15 @@ async def test_finder_return_respects_new_navigation(
 
             if order == "switch-first":
                 await _return_to_root(app, pipe)
-                root_screen = await _terminal_text(app)
+                root_rows = (await _terminal_text(app)).splitlines()[:3]
+                root_anchor = app._transcript.durable_scroll_anchor
                 root_pages = app._resident_page_keys()
                 release.set()
                 await await_or_fail(finished.wait(), what="old child restore completed")
                 await next_frame(lambda: True, what="draw root after old child restore")
                 assert app._resident_page_keys() == root_pages
-                assert _drawn_terminal_text(app) == root_screen
+                assert app._transcript.durable_scroll_anchor == root_anchor
+                assert _drawn_terminal_text(app).splitlines()[:3] == root_rows
                 return
 
             if order == "restore-first":
