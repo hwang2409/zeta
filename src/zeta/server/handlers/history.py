@@ -659,7 +659,8 @@ def _backward_history_request(
         ),
     )
     projection = history_projection_from_groups(
-        page.groups, page.approval_calls, served_turn_end=served_turn_end
+        page.groups, page.approval_calls, served_turn_end=served_turn_end,
+        nested_anchors=page.nested_anchors,
     )
     local_before = len(page.groups)
     result, _expanded = _backward_page_history(
@@ -711,7 +712,8 @@ def _forward_history_request(
             approval_origin=approval_origin,
         )
     projection = history_projection_from_groups(
-        page.groups, page.approval_calls, served_turn_end=served_turn_end
+        page.groups, page.approval_calls, served_turn_end=served_turn_end,
+        nested_anchors=page.nested_anchors,
     )
     result, _expanded = page_history(
         projection,

@@ -82,6 +82,7 @@ _TOP_KEYS = frozenset(
         "ollama_base_url",
         "auto_project",
         "memory",
+        "code_mode",
         "inbox",
         "commands",
         "anthropic",
@@ -138,6 +139,7 @@ class Settings:
     ollama_base_url: str | None = None
     auto_project: bool | None = None
     inbox_enabled: bool | None = None
+    code_mode_enabled: bool = False
     anthropic_oauth_compat: bool | None = None
     agents_explicit_finish: bool | None = None
     agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
@@ -179,6 +181,7 @@ class ResolvedConfig:
     workspace_snapshot_cap: int | None = None
     auto_project: bool = True
     inbox_enabled: bool = True
+    code_mode_enabled: bool = False
     agents_explicit_finish: bool = False
     agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
     tool_allow: tuple[str, ...] | None = None
@@ -385,6 +388,7 @@ def resolve(
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
         auto_project=settings.auto_project is not False,
         inbox_enabled=settings.inbox_enabled is not False,
+        code_mode_enabled=settings.code_mode_enabled,
         agents_explicit_finish=settings.agents_explicit_finish is True,
         agents_max_depth=settings.agents_max_depth,
         tool_allow=settings.tool_allow if cli_allow is None else cli_allow,
@@ -647,6 +651,12 @@ def _validate(
         )
     allow_hooks = _validated_bool(data, "allow_hooks", notices)
     allow_external_tools = _validated_bool(data, "allow_external_tools", notices)
+    code_mode = data.get("code_mode", {})
+    if not isinstance(code_mode, Mapping) or set(code_mode) - {"enabled"}:
+        raise SettingsError("invalid code_mode settings")
+    code_mode_enabled = code_mode.get("enabled", False)
+    if type(code_mode_enabled) is not bool:
+        raise SettingsError("code_mode.enabled must be a boolean")
     memory = data.get("memory", {})
     if not isinstance(memory, Mapping):
         notices.append("settings · ignored key 'memory': expected table")
@@ -717,6 +727,7 @@ def _validate(
         ollama_base_url=ollama_base_url,
         auto_project=auto_project,
         inbox_enabled=inbox_enabled,
+        code_mode_enabled=code_mode_enabled,
         anthropic_oauth_compat=anthropic_oauth_compat,
         agents_explicit_finish=agents_explicit_finish,
         agents_max_depth=agents_max_depth,
