@@ -177,7 +177,7 @@ async def mcp_auth_start(client, request_id, params):
     owner = _owner(client)
     registry = _registry(client)
     return {"data": await client.server._mcp_auth.start(name, lambda ready, commit: owner.login(
-        name, scope=scope, authorization_ready=ready, before_commit=commit, registry=registry,
+        name, scope=scope, launch_ready=ready, before_commit=commit, registry=registry,
     ))}
 
 

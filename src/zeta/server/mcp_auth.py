@@ -1,4 +1,4 @@
-"""Serve-owned headless MCP authorization; only start can return the URL."""
+"""Serve-owned headless MCP authorization; only start returns a loopback launch URL."""
 
 from __future__ import annotations
 
@@ -48,12 +48,12 @@ class MCPAuth:
         if len(self._attempts) >= 32:
             del self._attempts[next(iter(self._attempts))]
         attempt = _Attempt()
-        url = asyncio.get_running_loop().create_future()
+        launch_url = asyncio.get_running_loop().create_future()
 
         async def run() -> str:
             try:
                 with private_management_io():
-                    await login(url.set_result, attempt.commit)
+                    await login(launch_url.set_result, attempt.commit)
             except Exception:  # noqa: BLE001 - never retain or log OAuth errors
                 return "failed"
             return "succeeded"
@@ -62,9 +62,9 @@ class MCPAuth:
         attempt.task = task
         self._attempts[name] = attempt
         try:
-            await asyncio.wait((url, task), return_when=asyncio.FIRST_COMPLETED)
-            if url.done():
-                return {"state": "pending", "authorization_url": url.result()}
+            await asyncio.wait((launch_url, task), return_when=asyncio.FIRST_COMPLETED)
+            if launch_url.done():
+                return {"state": "pending", "authorization_url": launch_url.result()}
             return self.status(name)
         except asyncio.CancelledError:
             await attempt.cancel()

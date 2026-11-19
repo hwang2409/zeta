@@ -1042,7 +1042,7 @@ class MCPManagementService:
 
     async def login(
         self, name: str, *, scope: Scope = "effective", no_browser: bool = False,
-        authorization_ready: Callable[[str], None] | None = None,
+        launch_ready: Callable[[str], None] | None = None,
         before_commit: Callable[[], None] | None = None,
         registry: ToolRegistry | None = None,
     ) -> None:
@@ -1065,9 +1065,9 @@ class MCPManagementService:
             authorization_server_url=config.authorization_server_url,
             resource_metadata_url=config.resource_metadata_url,
         )
-        if authorization_ready is not None:
+        if launch_ready is not None:
             token = await self._login_headless(
-                name, partial(flow, authorization_ready=authorization_ready), before_commit,
+                name, partial(flow, launch_ready=launch_ready), before_commit,
             )
         else:
             await self._credential_store.load(name)

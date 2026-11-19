@@ -4,7 +4,8 @@ import asyncio
 import json
 import logging
 import sys
-from urllib.parse import parse_qs, urlparse
+from functools import partial
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 import pytest
@@ -16,11 +17,18 @@ from tests.telemetry.test_serve_propagation import (
     traced as traced,  # noqa: PLC0414 - pytest fixture
 )
 from tests.test_mcp_oauth import _FakeAuthServer, _fire_redirect
+from zeta.mcp import oauth
 from zeta.mcp.envelope import MCPCallLimits
 from zeta.mcp.oauth_store import MCPCredentialStore
 from zeta.server.handlers.resources import mcp_management
 from zeta.skills.catalog import SkillCatalog
 from zeta.tools.registry import ToolRegistry
+
+
+async def _launch(url):
+    reply = await await_or_fail(_fire_redirect(url), what="OAuth browser launch")
+    assert reply.startswith(b"HTTP/1.1 302 ")
+    return reply.split(b"\r\nLocation: ", 1)[1].split(b"\r\n", 1)[0].decode("ascii")
 
 
 @pytest.mark.asyncio
@@ -66,16 +74,18 @@ async def test_mcp_headless_auth_url_is_start_only_and_logout_wins_races(
         }})
         assert "result" in result
 
-        async def start():
+        async def start(*, open_browser=True):
             pending = await state("mcp_auth_start")
             assert pending["state"] == "pending"
             url = pending["authorization_url"]
             urls.append(url)
             assert await state("mcp_auth_status") == {"state": "pending"}
-            query = parse_qs(urlparse(url).query)
+            if not open_browser:
+                return None
+            query = parse_qs(urlparse(await _launch(url)).query)
             return f"{query['redirect_uri'][0]}?code=test-code&state={query['state'][0]}"
 
-        await start()
+        await start(open_browser=False)
         assert (await call("mcp_auth_start", {"name": "example"}))["error"]["code"] == -32004
         assert await state("mcp_auth_cancel") == {"state": "cancelled"}
         assert (await store.load("example")).token is None
@@ -105,36 +115,51 @@ async def test_mcp_headless_auth_url_is_start_only_and_logout_wins_races(
     )
     for url in urls:
         assert url not in diagnostics
-        assert parse_qs(urlparse(url).query)["state"][0] not in diagnostics
     for secret in (client_secret, "CANARY_mcp_access_2d2", "CANARY_mcp_refresh_2d2", log_secret):
         assert secret not in frames + diagnostics
 
 
-@pytest.mark.parametrize("resource_source", ["fallback", "configured-path", "public-origin"])
+@pytest.mark.parametrize(("resource_source", "outcome"), [
+    ("published-path", "succeeded"),
+    ("configured-path", "failed"),
+    ("fallback", "succeeded"),
+    ("published-path", "cancelled"),
+    ("published-path", "expired"),
+])
 @pytest.mark.asyncio
-async def test_mcp_headless_auth_keeps_configured_url_path_private(
-    tmp_path, monkeypatch, traced, caplog, resource_source,
+async def test_mcp_headless_auth_launch_keeps_provider_url_private(
+    tmp_path, monkeypatch, traced, caplog, capsys, resource_source, outcome,
 ):
     telemetry, memory = traced
     wire = Wire(_server(tmp_path, "unix", telemetry, monkeypatch), "unix")
     secret = "CANARY_mcp_url_path_2d2"
-    server_url = f"https://mcp.test/{secret}"
+    server_url = f"https://mcp.linear.test/mcp/{secret}"
+    resource = "https://mcp.linear.test/mcp" if resource_source == "published-path" else server_url
     provider = _FakeAuthServer(
         server_url=server_url,
-        resource="https://mcp.test" if resource_source == "public-origin" else server_url,
+        resource=resource,
         authorization_server=server_url if resource_source == "fallback" else "https://auth.test",
     )
+    endpoint = "https://auth.test/authorize"
+    if resource_source == "configured-path":
+        endpoint += "?provider=CANARY_mcp_provider_2d2"
+    if outcome == "expired":
+        monkeypatch.setattr(oauth, "authorize", partial(oauth.authorize, listen_timeout=0))
     real_client = httpx.AsyncClient
 
     async def handle(request):
         logging.getLogger("httpx").debug("request: %s", request.url)
         path = request.url.path
-        if resource_source == "fallback" and path.startswith("/.well-known/oauth-protected-resource"):
-            return httpx.Response(404)
-        if path == f"/.well-known/oauth-authorization-server/{secret}":
+        if path.startswith("/.well-known/oauth-protected-resource"):
+            if resource_source == "fallback":
+                return httpx.Response(404)
             return httpx.Response(200, json={
-                "issuer": server_url,
-                "authorization_endpoint": "https://auth.test/authorize",
+                "resource": resource, "authorization_servers": [provider.authorization_server],
+            })
+        if path.startswith("/.well-known/oauth-authorization-server"):
+            return httpx.Response(200, json={
+                "issuer": provider.authorization_server,
+                "authorization_endpoint": endpoint,
                 "token_endpoint": "https://auth.test/token",
             })
         return await provider.handle(request)
@@ -142,25 +167,80 @@ async def test_mcp_headless_auth_keeps_configured_url_path_private(
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handle), **kw))
     caplog.set_level(logging.DEBUG)
     await wire.open()
+    bound = []
+    start_server = asyncio.start_server
+
+    async def capture_listener(*args, **kwargs):
+        listener = await start_server(*args, **kwargs)
+        bound.extend(sock.getsockname() for sock in listener.sockets)
+        return listener
+
+    monkeypatch.setattr(asyncio, "start_server", capture_listener)
+
+    async def rpc(method, params=None):
+        return json.loads(await wire.rpc(method, method, params))["result"]
+
+    async def terminal():
+        while (status := await rpc("mcp_auth_status", {"name": "example"}))["data"]["state"] == "pending":
+            pass
+        return status["data"]
+
+    location = None
+    state = None
     try:
-        await wire.rpc("hello", "hello", {"protocol_version": "1.2", "features": ["otel", "mcp_management_v1"]})
-        listed = json.loads(await wire.rpc("list", "mcp_server_list"))["result"]
-        added = json.loads(await wire.rpc("add", "mcp_server_add", {"revision": listed["revision"], "mutation": {
+        await rpc("hello", {"protocol_version": "1.2", "features": ["otel", "mcp_management_v1"]})
+        listed = await rpc("mcp_server_list")
+        await rpc("mcp_server_add", {"revision": listed["revision"], "mutation": {
             "name": "example", "scope": "user", "url": server_url, "oauth": True, "client_id": "serve-test",
-        }}))
-        assert "result" in added
-        started = json.loads(await wire.rpc("start", "mcp_auth_start", {"name": "example"}))
-        if resource_source == "public-origin":
-            url = started["result"]["data"]["authorization_url"]
-            assert parse_qs(urlparse(url).query)["resource"] == ["https://mcp.test"]
+        }})
+        pending = (await rpc("mcp_auth_start", {"name": "example"}))["data"]
+        assert pending["state"] == "pending"
+        launch_url = pending["authorization_url"]
+        launch = urlparse(launch_url)
+        assert launch.scheme == "http" and launch.hostname == "127.0.0.1"
+        assert launch.path.startswith("/launch/") and not launch.query
+        assert bound == [("127.0.0.1", launch.port)]
+        if outcome == "cancelled":
+            assert (await rpc("mcp_auth_cancel", {"name": "example"}))["data"] == {"state": outcome}
+            with pytest.raises(ConnectionRefusedError):
+                await await_or_fail(_fire_redirect(launch_url), what="cancelled OAuth launch")
+        elif outcome == "expired":
+            assert await await_or_fail(terminal(), what="OAuth launch expiry") == {"state": "failed"}
+            with pytest.raises(ConnectionRefusedError):
+                await await_or_fail(_fire_redirect(launch_url), what="expired OAuth launch")
         else:
-            assert started["result"] == {"data": {"state": "failed"}}
+            location = await _launch(launch_url)
+            assert location.startswith(endpoint + ("&" if "?" in endpoint else "?"))
+            query = parse_qs(urlparse(location).query)
+            assert query["resource"] == [resource]
+            redirect_uri, = query["redirect_uri"]
+            assert urlparse(redirect_uri).netloc == launch.netloc
+            state, = query["state"]
+            replay = await await_or_fail(_fire_redirect(launch_url), what="OAuth launch replay")
+            assert replay.startswith(b"HTTP/1.1 404 ") and b"Location:" not in replay
+
+            # An upstream error can reflect the full URL. Serve returns only the failed state.
+            params = {"state": state}
+            if outcome == "failed":
+                params.update(error="access_denied", error_description=location)
+            else:
+                params["code"] = "test-code"
+            callback_url = f"{redirect_uri}?{urlencode(params)}"
+            await await_or_fail(_fire_redirect(callback_url), what="OAuth loopback callback")
+            assert await await_or_fail(terminal(), what="OAuth terminal state") == {"state": outcome}
+            if outcome == "succeeded":
+                [token_request] = provider.token_requests
+                assert token_request["resource"] == resource
     finally:
         await close_serve(wire.server, wire.writer)
 
-    assert secret not in b"".join(wire.received).decode() + caplog.text + "".join(
+    capture = capsys.readouterr()
+    observed = b"".join(wire.received).decode() + capture.out + capture.err + caplog.text + "".join(
         span.to_json() for span in memory.get_finished_spans()
     )
+    for private in (secret, endpoint, "CANARY_mcp_provider_2d2", location, state):
+        if private is not None:
+            assert private not in observed
 
 
 @pytest.mark.parametrize("hang_on", ["initialize", "tools/list"])
