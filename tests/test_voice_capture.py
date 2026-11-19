@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -172,7 +173,7 @@ def test_owned_process_waits_after_eperm_while_child_is_not_waitable(monkeypatch
 def test_owned_process_reports_child_alive_after_sigkill_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     child = Mock(spec=subprocess.Popen, pid=123)
     child.poll.return_value = None
-    child.stdin = Mock()
+    child.stdin = io.BytesIO()
     child.wait.side_effect = subprocess.TimeoutExpired("voice child", 2)
     deny_signal = Mock(side_effect=PermissionError(errno.EPERM, os.strerror(errno.EPERM)))
     monkeypatch.setattr(os, "killpg", deny_signal)
@@ -180,9 +181,11 @@ def test_owned_process_reports_child_alive_after_sigkill_deadline(monkeypatch: p
     with pytest.raises(RuntimeError, match="voice child pid 123 did not exit by the SIGKILL deadline"):
         OwnedProcess(child, 0, 0).kill_blocking()
 
+    # test-contract: seam verify escalation at the OS signal boundary without signaling a real pid
     assert deny_signal.call_args_list == [call(123, signal.SIGTERM), call(123, signal.SIGKILL)]
+    # test-contract: seam verify both wait deadlines without waiting for real timeouts
     assert child.wait.call_args_list == [call(timeout=TERMINATE_SECONDS), call(timeout=KILL_SECONDS)]
-    child.stdin.close.assert_called_once_with()
+    assert child.stdin.closed
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
