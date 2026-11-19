@@ -390,7 +390,12 @@ async def run_guest(
     finally:
         if timer is not None:
             timer.cancel()
-        cleanup = asyncio.gather(done, *([task] if task is not None else []), return_exceptions=True)
+        async def drain_worker() -> None:
+            await asyncio.gather(done, *([task] if task is not None else []), return_exceptions=True)
+            # done is posted after native resources close, just before exit.
+            await asyncio.to_thread(thread.join)
+
+        cleanup = asyncio.create_task(drain_worker())
         canceled = False
         while not cleanup.done():
             try:
@@ -398,6 +403,6 @@ async def run_guest(
             except asyncio.CancelledError:
                 canceled = True
                 interrupt("code mode stopped")
-        thread.join()  # done is posted after native resources close, just before exit.
+        cleanup.result()
         if canceled:
             raise asyncio.CancelledError

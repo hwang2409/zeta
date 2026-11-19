@@ -14,6 +14,7 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
+from zeta.agent.tool_results import validated_tool_result
 from zeta.config.settings import load_settings
 from zeta.core.approval import (
     ApprovalDecision,
@@ -22,7 +23,7 @@ from zeta.core.approval import (
     ApprovalRule,
 )
 from zeta.core.store import ConversationStore
-from zeta.core.tool_dispatch import ToolDispatchCoordinator
+from zeta.core.tool_dispatch import ToolDispatchCoordinator, dispatch_tool_calls
 from zeta.protocol.types import (
     Message,
     MessageOrigin,
@@ -122,15 +123,25 @@ async def test_uncaught_tool_rejection_reaches_model_without_wasm_backtrace(tmp_
 
 
 async def test_code_mode_is_off_by_default(tmp_path):
+    from tests.support.serve_close import close_serve
+    from tests.test_server import _connect, _request
+    from zeta.server import ZetaServer
+
     (tmp_path / "settings.toml").write_text("[memory]\nenabled = false\n")
     assert load_settings(home=tmp_path).settings.code_mode_enabled is False
 
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    server = ZetaServer(home=tmp_path, port=0, provider="codex",
+                        backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"))
+    reader, writer = await _connect(server)
     try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_cwd"]})
+        await _request(reader, writer, 2, "new_session", {"provider": "codex", "cwd": str(tmp_path)})
+        registry = server.runtime.loop.tool_registry
         tools = build_responses_payload([], registry.schemas, model="gpt")["tools"]
         assert "code" not in {tool["name"] for tool in tools}
     finally:
-        await registry.close()
+        writer.close()
+        await close_serve(server)
 
 
 async def test_code_responses_tool_size_and_exposure(tmp_path):
@@ -385,15 +396,16 @@ async def test_unlisted_tool_has_no_authority(tmp_path, monkeypatch, packaged):
 
 
 @asynccontextmanager
-async def nested_owner(tmp_path, *, delegated=False):
+async def nested_owner(tmp_path, *, delegated=False, code_enabled=True):
     policy = ApprovalPolicy()
     store = ConversationStore(tmp_path / "session", session_id="table", cwd=tmp_path)
     outer = ToolCall("outer", "code", {"script": "output(null)"})
-    store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(outer)]))
+    if code_enabled:
+        store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(outer)]))
     tools_policy = ChildApprovalPolicy(policy, store, "proof", "code-child", child_cwd=tmp_path) if delegated else policy
     skills = SkillCatalog.empty()
     registry = ToolRegistry(tmp_path, session_store=store, skill_catalog=skills,
-                            approval_policy=tools_policy, code_mode_enabled=True)
+                            approval_policy=tools_policy, code_mode_enabled=code_enabled)
     loop = AgentLoop(FakeBackend([]), store, registry=registry, skill_catalog=skills, skip_mcp_mount=True)
     try:
         yield loop, policy, outer
@@ -413,9 +425,10 @@ def assert_settled_once(store, call, decision, *, canceled=False):
     assert len(results) == 1 and results[0].is_canceled is canceled
 
 
-@pytest.mark.parametrize("mode", ["direct-always", "delegated-always", "parent-grant"])
+@pytest.mark.parametrize("mode", ["direct-always", "delegated-always", "ordinary-delegated-always", "parent-grant"])
 async def test_nested_grants(tmp_path, mode):
-    async with nested_owner(tmp_path, delegated=mode != "direct-always") as (loop, policy, outer):
+    ordinary = mode == "ordinary-delegated-always"
+    async with nested_owner(tmp_path, delegated=mode != "direct-always", code_enabled=not ordinary) as (loop, policy, outer):
         ask = asyncio.Event()
         events = []
         messages = []
@@ -433,13 +446,24 @@ async def test_nested_grants(tmp_path, mode):
             policy.remember_allow(ApprovalRequest("prior", ToolCall("prior", "write", {"path": "other"})))
         execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None,
                                                       coordinator=ToolDispatchCoordinator(8))
-        call = ToolCall("outer:code:1", "write", {"path": "first", "content": "written"})
-        task = asyncio.create_task(execute(call, NestedToolParent(outer.id, 1)))
+        call = ToolCall("ordinary-write" if ordinary else "outer:code:1", "write", {"path": "first", "content": "written"})
+
+        async def run_call():
+            if not ordinary:
+                return await execute(call, NestedToolParent(outer.id, 1))
+            loop.store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(call)]))
+            async for event in dispatch_tool_calls(loop, [call], validated_tool_result):
+                publish(event)
+            return loop.store.tool_result(call.id)
+
+        task = asyncio.create_task(run_call())
         try:
             if mode != "parent-grant":
                 await await_or_fail(ask.wait(), what="inner write approval")
                 await await_or_fail(pipeline.approval_command(ApprovalDecision.ALLOW, None, always=True),
                                     what="resolve the /always command")
+                if ordinary:
+                    assert policy.session_allow == {ApprovalRule("write")}, messages
                 if mode == "delegated-always":
                     assert policy.session_allow == frozenset()
                     assert any("cannot always allow delegated approvals" in message for message in messages)
