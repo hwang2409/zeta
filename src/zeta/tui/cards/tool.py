@@ -11,6 +11,7 @@ from rich.console import ConsoleOptions, Group, RenderableType
 from rich.syntax import Syntax
 from rich.text import Text
 
+from ...core.context_parts.code_audit import code_projection
 from ...protocol.types import StreamEvent, ToolCall, flatten_tool_content
 from .. import theme
 from .base import (
@@ -415,6 +416,32 @@ def bash_tool_card(event: StreamEvent, running: bool) -> RenderableType:
         body,
         header=header_with_status(tool_header(call), status_text),
     )
+
+
+@register_tool_card("code")
+def code_tool_card(event: StreamEvent, running: bool) -> RenderableType:
+    call = event.tool_call
+    if call is None:
+        return tool_card(event, running=running)
+    script = call.arguments.get("script", "")
+    if not isinstance(script, str):
+        script = ""
+    result = event.tool_result
+    projection = code_projection(result.structured_content if result else None)
+    calls = projection.get("calls")
+    label = f"{len(script.splitlines())} lines"
+    if isinstance(calls, list) and result is not None:
+        omitted = projection.get("omitted_calls", 0)
+        count = len(calls) + (omitted if type(omitted) is int else 0)
+        label = f"{count} calls · emitted {len(result.content)} chars"
+    if result is not None and result.is_error:
+        label += " · error"
+    header = header_with_status(Text("code", style=theme.COMMAND), Text(f"· {label}", style=theme.DIM))
+    if running:
+        return tool_panel(call, Text("running…", style=theme.DIM), header=header)
+    output = tool_body(event)
+    source = Syntax(strip_terminal_controls(script), "javascript", word_wrap=True)
+    return tool_panel(call, Group(source, output) if output is not None else source, header=header)
 
 
 @register_tool_card("todo")
