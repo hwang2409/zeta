@@ -757,6 +757,7 @@ async def authorize(
     no_browser: bool = False,
     http_client: httpx.AsyncClient | None = None,
     browser_opener: BrowserOpener | None = None,
+    authorization_ready: Callable[[str], None] | None = None,
     listen_timeout: float = OAUTH_LISTEN_TIMEOUT_SECONDS,
 ) -> MCPOAuthToken:
     """Drive the full browser flow and return the resulting token candidate."""
@@ -766,6 +767,10 @@ async def authorize(
         http_client = httpx.AsyncClient(timeout=10.0)
     listener: asyncio.base_events.Server | None = None
     try:
+        if authorization_ready is not None:
+            _validate_oauth_url(server_url, "server URL")
+            if urlparse(server_url).query:
+                raise MCPOAuthError("MCP OAuth: headless authorization requires a query-free server URL")
         resource_meta = await discover_protected_resource(
             server_url,
             http_client=http_client,
@@ -801,7 +806,15 @@ async def authorize(
             scope=scope,
             authorization_params=authorization_params,
         )
-        if no_browser:
+        if authorization_ready is not None:
+            _validate_oauth_url(resource_meta.resource, "resource")
+            if urlparse(resource_meta.resource).query or urlparse(metadata.authorization_endpoint).query:
+                raise MCPOAuthError("MCP OAuth: headless authorization requires query-free endpoints")
+            authorization_ready(url)
+            outcome = await wait_for_redirect(listener, payload, signal, timeout=listen_timeout)
+            listener = None
+            callback_url = outcome.callback_url or ""
+        elif no_browser:
             print(f"Open this URL to authorize {server_name}:\n{url}", file=sys.stderr)
             callback_url = await asyncio.to_thread(
                 input, "Paste the full callback URL: "

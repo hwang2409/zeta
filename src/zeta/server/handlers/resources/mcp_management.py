@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from ....mcp.management import ManagedServer, MCPManagementError, MCPManagementService
+from ....mcp.management_privacy import private_management_io
 from ...resource_protocol import (
     Access,
     ResourceMethod,
@@ -54,8 +57,12 @@ async def mcp_server_list(client, request_id, params):
     if scope not in _SCOPES:
         raise invalid_resource_params()
     owner = _owner(client)
+    def read():
+        with private_management_io():
+            return owner.read_disk(require_project=scope == "project")
+
     return await run_owner(
-        client, lambda: owner.read_disk(require_project=scope == "project"),
+        client, read,
         project=lambda result: {"revision": result[0], "data": _data(result[1], scope)},
         **_error_rules(),
     )
@@ -112,7 +119,7 @@ def _write(action: str, *keys: str, optional: tuple[str, ...] = ()):
             raise invalid_resource_params()
 
         owner = _owner(client)
-        with owner_errors(**_error_rules()):
+        with owner_errors(**_error_rules()), private_management_io():
             try:
                 view = await getattr(owner, action)(**mutation, revision=params["revision"])
                 restart = await client.connections.run_blocking(lambda: restart_report(
@@ -126,10 +133,72 @@ def _write(action: str, *keys: str, optional: tuple[str, ...] = ()):
     return handle
 
 
+def _target(params, *, scoped=True):
+    from ...protocol import invalid_resource_params
+
+    require_params(params, "name", optional=("scope",) if scoped else ())
+    name = params["name"]
+    scope = params.get("scope", "effective")
+    if not _text(name) or len(name) > 256 or scope not in _SCOPES:
+        raise invalid_resource_params()
+    return name, scope
+
+
+def _registry(client):
+    loop = client.server.runtime.loop
+    return loop.tool_registry if loop is not None else None
+
+
+async def mcp_server_test(client, request_id, params):
+    name, scope = _target(params)
+    with owner_errors(**_error_rules()), private_management_io():
+        result = await _owner(client).test(name, scope=scope, wire=True, registry=_registry(client))
+    return {"data": {"status": result["status"], "tool_count": result.get("tool_count", 0)}}
+
+
+async def mcp_auth_start(client, request_id, params):
+    name, scope = _target(params)
+    owner = _owner(client)
+    registry = _registry(client)
+    return {"data": await client.server._mcp_auth.start(name, lambda ready, commit: owner.login(
+        name, scope=scope, authorization_ready=ready, before_commit=commit, registry=registry,
+    ))}
+
+
+async def mcp_auth_status(client, request_id, params):
+    name, _ = _target(params, scoped=False)
+    return {"data": client.server._mcp_auth.status(name)}
+
+
+async def mcp_auth_cancel(client, request_id, params):
+    name, _ = _target(params, scoped=False)
+    return {"data": await client.server._mcp_auth.cancel(name)}
+
+
+async def mcp_auth_logout(client, request_id, params):
+    name, scope = _target(params)
+    auth = client.server._mcp_auth
+    await auth.cancel(name)
+    with owner_errors(**_error_rules()), private_management_io():
+        work = asyncio.create_task(_owner(client).logout(name, scope=scope))
+        try:
+            await asyncio.shield(work)
+        except asyncio.CancelledError:
+            await asyncio.gather(asyncio.shield(work), return_exceptions=True)
+            raise
+    auth.forget(name)
+    return {"data": {"state": "unauthorized"}}
+
+
 METHODS = (
     ResourceMethod("mcp_server_list", Access.READ, mcp_server_list),
     ResourceMethod("mcp_server_add", Access.CONTROLLER_WRITE, _write("add", "scope", optional=_ADD)),
     ResourceMethod("mcp_server_remove", Access.CONTROLLER_WRITE, _write("remove", "scope")),
     ResourceMethod("mcp_server_set_enabled", Access.CONTROLLER_WRITE, _write("set_enabled", "scope", "enabled")),
     ResourceMethod("mcp_server_set_trusted", Access.CONTROLLER_WRITE, _write("set_trusted", "trusted")),
+    ResourceMethod("mcp_server_test", Access.CONTROLLER_WRITE, mcp_server_test),
+    ResourceMethod("mcp_auth_start", Access.CONTROLLER_WRITE, mcp_auth_start),
+    ResourceMethod("mcp_auth_status", Access.READ, mcp_auth_status),
+    ResourceMethod("mcp_auth_cancel", Access.CONTROLLER_WRITE, mcp_auth_cancel),
+    ResourceMethod("mcp_auth_logout", Access.CONTROLLER_WRITE, mcp_auth_logout),
 )
