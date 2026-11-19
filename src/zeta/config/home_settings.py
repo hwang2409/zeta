@@ -18,7 +18,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -109,6 +109,19 @@ def _locked_home(home: Path) -> Iterator[int]:
         os.close(home_fd)
 
 
+def _valid_model(value: object) -> bool:
+    return (type(value) is str and 0 < len(value) <= 256 and value == value.strip()
+            and all(char.isprintable() for char in value))
+
+
+_VALUE_VALIDATORS: dict[str, Callable[[object], bool]] = {
+    "telemetry.enabled": lambda value: type(value) is bool,
+    "agents.explicit_finish": lambda value: type(value) is bool,
+    "agents.max_depth": lambda value: type(value) is int and 0 <= value <= HARD_MAX_AGENT_DEPTH,
+    "model": _valid_model,
+}
+
+
 def _parse_changes(expected_revision: object, changes: object) -> tuple[str, Any]:
     if type(expected_revision) is not str or _REVISION.fullmatch(expected_revision) is None:
         raise HomeSettingsError("invalid_params")
@@ -118,14 +131,10 @@ def _parse_changes(expected_revision: object, changes: object) -> tuple[str, Any
     if type(change) is not dict or change.keys() != {"key", "value"}:
         raise HomeSettingsError("invalid_params")
     key, value = change["key"], change["value"]
-    if key in ("telemetry.enabled", "agents.explicit_finish") and type(value) is bool:
-        return key, value
-    if key == "agents.max_depth" and type(value) is int and 0 <= value <= HARD_MAX_AGENT_DEPTH:
-        return key, value
-    if (key == "model" and type(value) is str and 0 < len(value) <= 256 and value == value.strip()
-            and all(char.isprintable() for char in value)):
-        return key, value
-    raise HomeSettingsError("invalid_params")
+    validate = _VALUE_VALIDATORS.get(key) if type(key) is str else None
+    if validate is None or not validate(value):
+        raise HomeSettingsError("invalid_params")
+    return key, value
 
 
 def _edit(raw: bytes, settings: dict[str, Any], key: str, value: Any) -> bytes:
@@ -277,14 +286,26 @@ def _with_scalar(raw: bytes, table: str, name: str, value: str | int | bool) -> 
     present = name in parent
     parent[name] = value
     encoded = json.dumps(value, ensure_ascii=False).encode()
-    key = name.encode()
-    dotted = (table + "." + name).encode() if table else key
+    # Only accept a byte edit that changes the intended TOML value, not a matching decoy.
+    for candidate in _scalar_edits(lines, newline, table, name, encoded, present=present):
+        if unterminated:
+            candidate = candidate.removesuffix(newline)
+        try:
+            if _document(candidate) == expected:
+                return candidate
+        except HomeSettingsError:
+            pass
+    raise HomeSettingsError("invalid_params")
 
+
+def _scalar_edits(
+    lines: list[bytes], newline: bytes, table: str, name: str, encoded: bytes, *, present: bool,
+) -> Iterator[bytes]:
     def atom(name: bytes) -> bytes:
         return rb"(?:" + name + rb"|'" + name + rb"'|\"" + name + rb"\")"
 
-    # The semantic check rejects decoys inside strings and other tables; each candidate
-    # changes only one byte span, so matching TOML output cannot reformat comments.
+    key = name.encode()
+    dotted = (table + "." + name).encode() if table else key
     scalar = rb'''("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[-+a-zA-Z0-9_]+)'''
     plain = atom(key)
     patterns = [plain]
@@ -296,28 +317,16 @@ def _with_scalar(raw: bytes, table: str, name: str, value: str | int | bool) -> 
     else:
         headers = []
 
-    def edits() -> Iterator[list[bytes]]:
-        if not present:
-            for i, spelling in [(0, dotted), *((i + 1, key) for i in headers)]:
-                yield lines[:i] + [spelling + b" = " + encoded + newline] + lines[i:]
-            return
-        for pattern in patterns:
-            line_pattern = re.compile(rb"[ \t]*" + pattern + rb"[ \t]*=[ \t]*" + scalar + rb"[ \t]*(?:#.*)?\r?\n?\Z")
-            for i, line in enumerate(lines):
-                if match := line_pattern.match(line):
-                    start, end = match.span(1)
-                    yield lines[:i] + [line[:start] + encoded + line[end:]] + lines[i + 1:]
-
-    for edited in edits():
-        candidate = b"".join(edited)
-        if unterminated:
-            candidate = candidate.removesuffix(newline)
-        try:
-            if _document(candidate) == expected:
-                return candidate
-        except HomeSettingsError:
-            pass
-    raise HomeSettingsError("invalid_params")
+    if not present:
+        for i, spelling in [(0, dotted), *((i + 1, key) for i in headers)]:
+            yield b"".join(lines[:i] + [spelling + b" = " + encoded + newline] + lines[i:])
+        return
+    for pattern in patterns:
+        line_pattern = re.compile(rb"[ \t]*" + pattern + rb"[ \t]*=[ \t]*" + scalar + rb"[ \t]*(?:#.*)?\r?\n?\Z")
+        for i, line in enumerate(lines):
+            if match := line_pattern.match(line):
+                start, end = match.span(1)
+                yield b"".join(lines[:i] + [line[:start] + encoded + line[end:]] + lines[i + 1:])
 
 
 def _document(raw: bytes, enabled: bool | None = None) -> dict[str, Any]:
