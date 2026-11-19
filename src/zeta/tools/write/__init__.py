@@ -146,7 +146,8 @@ def register(registry: ToolRegistry) -> None:
         binding="shared",
         approval_subject="path",
         description=(
-            "Write UTF-8 text to a file. Relative paths use the session cwd; "
+            "Write UTF-8 text to a file. Relative paths use the bash session cwd, "
+            "which follows cd; "
             "~ and absolute paths outside the cwd are allowed."
         ),
         parameters={

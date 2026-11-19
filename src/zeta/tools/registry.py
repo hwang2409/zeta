@@ -1291,9 +1291,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             self.abort_signal = self._abort_registry.new_generation()
         return self.abort_signal
 
-    def _path(self, raw_path: object) -> Path:
-        return self.policy.resolve(raw_path).absolute
-
     def verify_cwd_identity(self, *, allow_removed: bool = False) -> None:
         """Fail closed if the pathname names a directory other than the captured cwd."""
 

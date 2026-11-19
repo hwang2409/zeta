@@ -240,7 +240,8 @@ def register(registry: ToolRegistry) -> None:
         approval_subject="path",
         description=(
             "Read a UTF-8 text file or a PNG, JPEG, GIF, or WebP image. "
-            "Image reads return the image bytes. Relative paths use the session cwd; "
+            "Image reads return the image bytes. Relative paths use the bash session cwd, "
+            "which follows cd; "
             "~ and absolute paths outside the cwd are allowed."
         ),
         parallel_safe=True,

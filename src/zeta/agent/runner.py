@@ -40,6 +40,7 @@ from ..providers.rate_limit_hold import (
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
 from ..tools import ToolRegistry, ToolStreamPublisher
+from ..tools._shared.cwd_state import require_bash_cwd
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
@@ -689,7 +690,14 @@ async def run_agent_tool(
             )
         candidate = Path(raw_cwd).expanduser()
         if not candidate.is_absolute():
-            candidate = Path(loop.store.cwd) / candidate
+            try:
+                candidate = await asyncio.to_thread(
+                    require_bash_cwd, loop.tool_registry.bash_cwd
+                ) / candidate
+            except ValueError as exc:
+                return loop._child_result_payload(
+                    tool_call.id, f"agent error: {exc}", state="failed"
+                )
         resolved_cwd = Path(os.path.abspath(candidate))
         if not resolved_cwd.is_dir():
             return loop._child_result_payload(
