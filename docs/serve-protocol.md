@@ -712,8 +712,12 @@ A missing database is not an error here: a home without telemetry returns
 `enabled:false`, `receiver:"stopped"`, and `used_bytes:0`.
 
 `telemetry_sessions` params are all optional:
-`{"limit":50,"cursor":null,"start_ns":null,"end_ns":null,"status":"all","profile":null,"model":null}`.
-`limit` is 1 to 200. The range defaults to the 24 hours before `end_ns`, and
+`{"limit":50,"cursor":null,"start_ns":null,"end_ns":null,"status":"all","profile":null,"model":null,"session_id":"<32 lowercase hex>"}`.
+`limit` is 1 to 200. With `session_id`, the result is a normal page with the
+matching root session or no rows and `next_cursor:null`. This lookup ignores
+`start_ns`, `end_ns`, `status`, `profile`, and `model`. An invalid ID or a
+non-null `cursor` with `session_id` returns `invalid_params` (`-32602`).
+Without `session_id`, the range defaults to the 24 hours before `end_ns`, and
 `end_ns` defaults to now; `start_ns` must be less than `end_ns`. A session is
 in range when `last_ns >= start_ns` and `first_ns < end_ns`. `status` is `all`
 or `error` (sessions with `error_count > 0`). `profile` and `model` match
