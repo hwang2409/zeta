@@ -36,7 +36,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application.current import set_app
+from prompt_toolkit.application.current import create_app_session, set_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
@@ -1717,6 +1717,7 @@ def _tool_contract_events(name: str) -> tuple[StreamEvent, StreamEvent, StreamEv
         {
             "path": "sample.txt",
             "command": "printf sample",
+            "script": "output(\"sample\")",
             "content": "sample",
             "items": [],
             "name": "sample",
@@ -1745,7 +1746,7 @@ def _assert_tool_contract(name: str) -> None:
     assert all(item is not None for item in rendered), name
     plain = [terminal_plain(item).lower() for item in rendered]
     assert name.lower() in plain[0], name
-    assert "sample" in plain[0], name
+    assert ("1 lines" if name == "code" else "sample") in plain[0], name
     assert "contract result" in plain[1] or name.lower() in plain[1], name
     assert "contract error" in plain[2], name
     assert any(marker in plain[2] for marker in ("error", "failed", "denied")), name
@@ -1776,6 +1777,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
     top_level = ToolRegistry(
         tmp_path,
         session_store=stores[0],
+        code_mode_enabled=True,
         skill_catalog=SkillCatalog.empty(),
         project_id="project-1",
         project_registry=SimpleNamespace(),
@@ -1868,7 +1870,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
 async def test_tool_card_registry_only_names_real_or_supported_alias_tools(
     tmp_path: Path,
 ) -> None:
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty(), code_mode_enabled=True)
     try:
         assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {
             "exec",
@@ -6484,6 +6486,80 @@ async def test_mcp_notices_suppressed_while_suspended_for_fork_and_rendered_afte
         assert notices == ["after resume"]
         pipe.send_text("\\x04")
         await asyncio.wait_for(resumed_task, timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["live", "resume"])
+async def test_code_cell_shortcut_reveals_source(tmp_path: Path, resume: bool) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    script = 'const pointer = await tools.read({path: "pointer"});'
+    outer = ToolCall("cell", "code", {"script": script})
+    steps = (
+        (ToolCall("cell:code:1", "read", {"path": "pointer"}), "target-name"),
+        (ToolCall("cell:code:2", "grep", {"pattern": "needle"}), "matching-line"),
+    )
+    output = ToolResult(outer.id, "done", structured_content={"code_mode": {
+        "version": 1,
+        "state": "completed",
+        "calls": [
+            {"id": call.id, "name": call.name, "summary": content, "state": "completed"}
+            for call, content in steps
+        ],
+    }})
+    if resume:
+        # Approval audit rows retain the full read; the other call is in the projection only.
+        inner, content = steps[0]
+        try:
+            store.append_message(with_message_origin(
+                Message(MessageRole.USER, [TextContent("run code cell")]), MessageOrigin.USER,
+            ))
+            store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(outer)]))
+            store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(inner)]))
+            store.append_message(Message(
+                MessageRole.TOOL_RESULT, tool_result=ToolResult(inner.id, content),
+            ))
+            store.append_message(Message(MessageRole.TOOL_RESULT, tool_result=output))
+        finally:
+            store.close()
+        store = ConversationStore(store.root_dir, session_id=store.session_id)
+
+    app = _test_tui_app(store, StringIO())
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
+        session = app._make_session()
+        running = asyncio.create_task(app.run(session))
+        try:
+            await wait_until(lambda: app._input_loop_active and app.interaction_ready())
+            if not resume:
+                app._handle_tool_event(
+                    StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=outer)
+                )
+                for index, (inner, content) in enumerate(steps, start=1):
+                    data = {"code_parent_id": outer.id, "code_call_index": index}
+                    app._handle_tool_event(StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_START, tool_call=inner, data=data,
+                    ))
+                    app._handle_tool_event(StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_END, tool_call=inner, data=data,
+                        tool_result=ToolResult(inner.id, content),
+                    ))
+                app._handle_tool_event(StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END, tool_call=outer, tool_result=output,
+                ))
+            before = Text.from_ansi(app._transcript.render(120)).plain
+            assert "code · 2 calls" in before
+            for label in ("read pointer", "grep", "target-name"):
+                assert label in before
+            assert script not in before, "code cell source must start collapsed"
+            # The following character confirms the key processor consumed the chord.
+            pipe.send_text("\x18\x0fx")
+            await wait_until(lambda: session.default_buffer.text == "x")
+            after = Text.from_ansi(app._transcript.render(120)).plain
+            assert script in after, "Ctrl-X Ctrl-O did not reveal the code cell source"
+            for label in ("read pointer", "grep", "target-name"):
+                assert label in after
+        finally:
+            app.request_exit()
+            await asyncio.wait_for(running, timeout=10)
 
 
 def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
