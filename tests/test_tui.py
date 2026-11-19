@@ -869,7 +869,8 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     original_durable_write = ConversationStore._run_committed_mutation
-    ack_committed = threading.Event()
+    loop = asyncio.get_running_loop()
+    ack_committed = asyncio.Event()
     release_ack = threading.Event()
     apps: list[TUIApp] = []
 
@@ -880,8 +881,10 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
             self, command, expected_generation, cancelled_before_write
         )
         if type(command).__name__ == "_AcknowledgeStagedDeliveryCommand":
-            ack_committed.set()
-            assert release_ack.wait(timeout=5)
+            loop.call_soon_threadsafe(ack_committed.set)
+            assert release_ack.wait(timeout=30), (
+                "test did not release the acknowledgement worker"
+            )
         return result
 
     # test-contract: seam pauses after durable acknowledgement commit
@@ -894,14 +897,19 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
             "background_macro",
             "natural_exit_success",
             app_sink=apps.append,
-        )
+        ),
+        name="background completion transcript",
     )
     try:
-        assert await asyncio.to_thread(ack_committed.wait, 5)
+        await await_or_fail(
+            ack_committed.wait(), what="durable delivery acknowledgement"
+        )
         assert len(apps) == 1
         apps[0].request_exit()
         release_ack.set()
-        count, rendered = await await_or_fail(transcript, what="test await")
+        count, rendered = await await_or_fail(
+            transcript, what="background completion transcript"
+        )
         assert count == 1, rendered
         markers = {ref.type for ref in apps[0].loop.store.branch_refs()}
         assert "notification_tui_presented" in markers
@@ -910,7 +918,8 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         if not transcript.done():
             transcript.cancel()
             await await_or_fail(
-                asyncio.gather(transcript, return_exceptions=True), what="test await"
+                asyncio.gather(transcript, return_exceptions=True),
+                what="drain background completion transcript",
             )
 
 
@@ -9476,11 +9485,12 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
     )
     replay_started = asyncio.Event()
     release_replay = asyncio.Event()
+    terminal_restored = asyncio.Event()
 
     async def delayed_replay(*, batch_size: int = 1) -> bool:
         del batch_size
         replay_started.set()
-        await release_replay.wait()
+        await await_or_fail(release_replay.wait(), what="release startup replay")
         return False
 
     monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
@@ -9493,14 +9503,28 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
         def restore_terminal() -> None:
             restored.append(None)
             original_restore()
+            terminal_restored.set()
 
         monkeypatch.setattr(session, "restore_terminal", restore_terminal)
-        run_task = asyncio.create_task(app.run(session))
-        await replay_started.wait()
-        app.request_exit()
-        release_replay.set()
-        await asyncio.wait_for(run_task, timeout=1)
-        await asyncio.sleep(0)
+        run_task = asyncio.create_task(app.run(session), name="full-screen replay exit")
+        try:
+            await await_or_fail(replay_started.wait(), what="startup replay entry")
+            app.request_exit()
+            release_replay.set()
+            await await_or_fail(
+                terminal_restored.wait(), what="full-screen terminal restore"
+            )
+            await await_or_fail(
+                run_task, what="full-screen session close after terminal restore"
+            )
+            await asyncio.sleep(0)
+        finally:
+            release_replay.set()
+            run_task.cancel()
+            await await_or_fail(
+                asyncio.gather(run_task, return_exceptions=True),
+                what="drain full-screen replay exit task",
+            )
 
     prompt_toolkit_tasks = [
         task
