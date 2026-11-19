@@ -2008,13 +2008,18 @@ Only the controller can run a test. A project stdio definition must be trusted.
 
 `mcp_auth_start` starts one headless HTTP OAuth attempt per serve process.
 It returns `{data:{state:"pending",authorization_url}}` after opening the
-loopback callback listener. Only this method returns the URL. Use a browser
-that can reach the serve host's loopback address; do not log or persist the
-URL. Headless mode rejects userinfo and query parameters in the server URL
-and pre-existing queries in the resource and authorization endpoint URLs;
-it does not forward configured extra authorization parameters. Protected-resource
-metadata must advertise an origin-only resource identifier. Serve does not fall
-back to using the configured MCP URL as the resource.
+loopback callback listener. The `authorization_url` field is an opaque,
+one-use launch URL on that same `127.0.0.1` listener, not the provider's URL.
+Open it with a browser that can reach the serve host's loopback address; do
+not log or persist it. The first GET redirects the browser to the provider
+with HTTP 302. Reuse returns 404 while the listener is open. Cancel and the
+OAuth callback timeout end the listener and invalidate the launch URL.
+Serve does not return the provider URL in any RPC response.
+
+OAuth uses the exact resource identifier advertised by protected-resource
+metadata, including any path. If discovery falls back to the configured MCP
+URL, that URL is used as the resource, not returned over serve. Headless mode
+still does not forward configured extra authorization parameters.
 
 `mcp_auth_status` and `mcp_auth_cancel` accept `{name}` and return
 `{data:{state}}` (`idle`, `pending`, `succeeded`, `failed`, or `cancelled`).
