@@ -1,13 +1,8 @@
-name: CI macOS label
+name: CI macOS PR
 
 on:
   pull_request:
-    types: [labeled, unlabeled]
-
-# Label events cannot cancel the normal CI run or an active macOS label run.
-concurrency:
-  group: ci-macos-label-${{ github.event.pull_request.number }}
-  cancel-in-progress: false
+    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -15,12 +10,36 @@ permissions:
 
 jobs:
   macos:
-    if: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}
-    name: pytest (macos label)
+    if: ${{ contains(github.event.pull_request.labels.*.name, 'macos') && (github.event.action != 'labeled' || github.event.label.name == 'macos') }}
+    name: pytest (macos-latest)
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
+    # Only jobs that request macOS enter this group. Main uses ci-macos-main.
+    concurrency:
+      group: ci-macos-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: ./.github/workflows/pytest
+      - name: Start fresh zeta on old home
+        id: fresh-old-home
+        if: ${{ !cancelled() }}
+        run: python scripts/smoke_old_home.py
+      - name: Compare stored-format predecessor
+        id: storage-format
+        if: ${{ !cancelled() && steps.fresh-old-home.outcome == 'success' }}
+        env:
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: uv run --frozen python scripts/storage_format_compatibility.py --output-dir storage-format-artifacts
+      - name: Archive stored-format selection and probes
+        if: ${{ !cancelled() && steps.storage-format.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-format-macos-latest-${{ github.sha }}
+          path: |
+            storage-format-artifacts/storage-format-predecessor-sha
+            storage-format-artifacts/storage-format-predecessor.json
+            storage-format-artifacts/storage-format-candidate.json
+            storage-format-artifacts/uv.lock
