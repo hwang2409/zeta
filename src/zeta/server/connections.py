@@ -423,6 +423,12 @@ class ConnectionRegistry(ReplayOutput):
         state: _Connection, event: EventDescriptor, fields: dict[str, object]
     ) -> dict[str, object]:
         shaped = dict(fields)
+        # The override values stay internal until the receiving connection is known.
+        feature_fields = shaped.pop("_feature_fields", {})
+        if isinstance(feature_fields, dict):
+            for feature, overrides in feature_fields.items():
+                if feature in state.features:
+                    shaped.update(overrides)
         for (field_event, name), required in OPTIONAL_FIELD_FEATURES.items():
             if field_event is event and name in shaped and not required <= history_features(
                 state.features

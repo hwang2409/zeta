@@ -45,8 +45,8 @@ def isolated_credentials(monkeypatch, tmp_path):
     monkeypatch.setattr(
         server_login,
         "build_login_provider",
-        lambda provider, home: replace(
-            real_build_login_provider(provider, home), callback_port=0
+        lambda provider, home, account="default": replace(
+            real_build_login_provider(provider, home, account), callback_port=0
         ),
     )
     # A missed stub must fail locally, before any HTTP request leaves the test.
@@ -72,10 +72,10 @@ async def callback(url, params):
     return status
 
 
-async def connect(tmp_path, provider="claude", version="1.1"):
+async def connect(tmp_path, provider="claude", version="1.1", *, features=()):
     server = ZetaServer(home=tmp_path / "zeta", port=0, provider=provider)
     reader, writer = await _connect(server)
-    hello = await rpc(reader, writer, "hello", protocol_version=version)
+    hello = await rpc(reader, writer, "hello", protocol_version=version, features=list(features))
     return server, reader, writer, hello["result"]
 
 
@@ -92,8 +92,10 @@ async def test_login_is_hidden_and_rejected_for_legacy_protocol(tmp_path, server
         await close_serve(server, writer)
 
 
-@pytest.mark.parametrize("provider", ["claude", "codex"])
-async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_path, monkeypatch, provider):
+@pytest.mark.parametrize("provider,reference", [("claude", None), ("codex", None), ("codex", "work-label"), ("claude", "anthropic:work")])
+async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_path, monkeypatch, provider, reference):
+    from tests.support.credentials import named_account_credentials
+    from zeta.accounts import AccountId
     expected = OAuthTokens("access", "refresh", 4_000_000_000)
     captured = {}
     def build(state, challenge, redirect):
@@ -109,12 +111,26 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
     monkeypatch.setattr(providers, f"build_{suffix}_authorization_url", build)
     monkeypatch.setattr(providers, f"exchange_{suffix}_authorization_code", exchange)
     monkeypatch.setattr(providers, "extract_account_id", lambda _: "test-account")
-    server, reader, writer, hello = await connect(tmp_path)
+    features = ["account_list_idle_v1"] if reference is not None else []
+    server, reader, writer, hello = await connect(tmp_path, features=features)
     try:
         assert set(LOGIN_REQUESTS) <= set(hello["capabilities"]["requests"])
         rows = (await rpc(reader, writer, "login_providers"))["result"]["providers"]
         assert rows == [{"provider": p, "credentials_present": False} for p in ("claude", "codex")]
-        result = (await rpc(reader, writer, "login_start", provider=provider))["result"]
+        params = {"provider": provider, "account": "missing"}
+        if reference is not None:
+            default = named_account_credentials(server.home, suffix)
+            named = named_account_credentials(server.home, suffix, "work")
+            old = OAuthTokens("old", "old-refresh", 4_000_000_000)
+            await asyncio.to_thread(default.save, old)
+            await asyncio.to_thread(named.save, old)
+            await asyncio.to_thread(named.store.rename, named.account, "work-label")
+            invalid = await rpc(reader, writer, "login_start", **params)
+            assert invalid["error"] == {
+                "code": -32602, "message": "invalid params", "data": {"code": "invalid_params"},
+            }
+            params["account"] = reference
+        result = (await rpc(reader, writer, "login_start", **params))["result"]
         assert result["state"] == "pending"
         expected_path = "/callback" if provider == "claude" else "/auth/callback"
         parsed_redirect = urlsplit(captured["redirect"])
@@ -130,8 +146,13 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert await callback(captured["redirect"], {"code": "synthetic-code", "state": captured["state"]}) == 200
         await asyncio.wait_for(server._client.logins.tasks[provider], 3)
         assert (await rpc(reader, writer, "login_status", provider=provider))["result"] == {"state": "succeeded"}
-        saved = await asyncio.to_thread(credential_store, provider, home=server.home)
+        saved = await asyncio.to_thread(
+            credential_store, provider, home=server.home,
+            account=AccountId(suffix, "work" if reference is not None else "default"),
+        )
         assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) == expected
+        if reference is not None:
+            assert await asyncio.to_thread(default.read) == old
         rows = (await rpc(reader, writer, "login_providers"))["result"]["providers"]
         assert next(row for row in rows if row["provider"] == provider)["credentials_present"]
         assert (await rpc(reader, writer, "status"))["result"]["state"] == "idle"

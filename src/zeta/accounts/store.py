@@ -213,6 +213,16 @@ class AccountStore(_AccountRegistry):
                 for key in self._read_registry(home_fd)["accounts"]
             ]
 
+    def public_identity(self, account: AccountId) -> dict[str, str]:
+        """Name an already selected account without reading its credentials."""
+        with self._home() as home_fd:
+            label = self._read_registry(home_fd)["labels"].get(str(account), account.name)
+        return {
+            "account": str(account),
+            "label": label,
+            "provider": "claude" if account.provider == "anthropic" else account.provider,
+        }
+
     def list_catalog(self) -> list[availability.AccountDisplay]:
         with self._home() as home_fd:
             value = self._read_registry(home_fd)

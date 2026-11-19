@@ -48,6 +48,7 @@ from .approval_lifecycle import (
     Terminate,
 )
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
+from .handlers.resources.account_list import FEATURE as ACCOUNT_FEATURE
 from .host_commands import SessionHostCommands
 from .protocol import (
     ApprovalDecision,
@@ -1273,9 +1274,7 @@ class ServeControl:
             login_provider = None
             if foreground and event.error is not None:
                 failed_provider = self.runtime.metadata.provider
-                offers_login = event.error.provider_error and (
-                    event.error.code == "auth_error" or event.error.status_code == 401
-                )
+                offers_login = event.error.provider_auth_failure
                 recovered = await model_selection.recover_async(
                     self.runtime, event.error
                 )
@@ -1283,14 +1282,22 @@ class ServeControl:
                     error = recovered
                     if offers_login:
                         login_provider = failed_provider
+            login_hint = {"login_provider": login_provider} if login_provider else {}
+            feature_fields = {}
+            if event.auth_account is not None:
+                public_data = {**login_hint, "auth_account": event.auth_account}
+                if "agent_instance_id" in event.data:
+                    public_data["agent_instance_id"] = event.data["agent_instance_id"]
+                feature_fields[ACCOUNT_FEATURE] = {
+                    "error": {"code": "auth_error", "message": "Account sign-in required."},
+                    "data": public_data,
+                }
             await self._notify(
                 wire_event,
                 session_id,
                 error=error,
-                data={
-                    **event.data,
-                    **({"login_provider": login_provider} if login_provider else {}),
-                },
+                data={**event.data, **login_hint},
+                _feature_fields=feature_fields,
             )
             return
         if kind is StreamEventType.COMPACTION_START:

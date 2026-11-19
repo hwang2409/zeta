@@ -9,6 +9,7 @@ import httpx
 
 from ..accounts import (
     AccountCredentialLockTimeoutError,
+    AccountError,
     AccountId,
     AccountRegistryBrokenError,
     AccountRegistryMissingError,
@@ -24,7 +25,12 @@ from ..core.login_flow import (
 from ..core.session import account_home
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
-from .protocol import ErrorDescriptor, ProtocolError
+from .protocol import (
+    ErrorDescriptor,
+    ProtocolError,
+    closed_error,
+    invalid_resource_params,
+)
 
 LOGIN_PUBLICATION_TIMEOUT_SECONDS = 60.0
 
@@ -91,15 +97,20 @@ class Logins:
             )
         return provider, self.tasks.get(provider)
 
-    async def login_start(self, params: dict) -> dict:
+    async def login_start(self, params: dict, *, named_accounts: bool = False) -> dict:
+        if named_accounts and params.get("provider") not in ("claude", "codex"):
+            raise invalid_resource_params()
         provider, task = self._provider_task(params)
+        account = "default"
+        if named_accounts and "account" in params:
+            account = await asyncio.to_thread(self._resolve_account, provider, params["account"])
         if task is not None and not task.done():
             raise ProtocolError(
                 ErrorDescriptor.LOGIN_IN_PROGRESS, "login is already pending"
             )
         url = asyncio.get_running_loop().create_future()
         operation = _LoginOperation()
-        task = asyncio.create_task(self._run(provider, url, operation))
+        task = asyncio.create_task(self._run(provider, url, operation, account=account))
         self.tasks[provider] = task
         self.operations[provider] = operation
         await asyncio.wait((url, task), return_when=asyncio.FIRST_COMPLETED)
@@ -126,21 +137,38 @@ class Logins:
             return {"state": "cancelled"}
         return task.result() if task.done() else {"state": "pending"}
 
-    def _prepare(self, login_provider: str):
+    def _resolve_account(self, provider: str, reference: object) -> str:
+        canonical = "anthropic" if provider == "claude" else provider
+        if not isinstance(reference, str) or not 1 <= len(reference) <= 80:
+            raise invalid_resource_params()
+        if ":" in reference:
+            prefix, reference = reference.split(":", 1)
+            if prefix != canonical:
+                raise invalid_resource_params()
+        store = AccountStore(account_home(self.home))
+        try:
+            return store.resolve_reference(canonical, reference).name
+        except (OSError, AccountRegistryBrokenError) as exc:
+            raise closed_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from exc
+        except (ValueError, AccountError) as exc:
+            raise invalid_resource_params() from exc
+
+    def _prepare(self, login_provider: str, account: str):
         # Refuse before the browser opens; the publish step checks again under lock.
         AccountStore(account_home(self.home)).refuse_orphaning_registration(
-            AccountId(login_provider, "default")
+            AccountId(login_provider, account)
         )
-        return build_login_provider(login_provider, self.home)
+        return build_login_provider(login_provider, self.home, account)
 
     async def _attempt(
         self,
         login_provider: str,
         url: asyncio.Future[str],
         operation: _LoginOperation,
+        account: str,
     ) -> dict:
         try:
-            login = await asyncio.to_thread(self._prepare, login_provider)
+            login = await asyncio.to_thread(self._prepare, login_provider, account)
             async with asyncio.timeout(self.timeout):
                 await run_login(
                     login,
@@ -189,6 +217,8 @@ class Logins:
         provider: str,
         url: asyncio.Future[str],
         operation: _LoginOperation | None = None,
+        *,
+        account: str = "default",
     ) -> dict:
         operation = operation or _LoginOperation()
         login_provider = "anthropic" if provider == "claude" else provider
@@ -202,7 +232,7 @@ class Logins:
             locked = acquisition.exception() is None
             if cancelled:
                 raise asyncio.CancelledError
-            result = await self._attempt(login_provider, url, operation)
+            result = await self._attempt(login_provider, url, operation, account)
         except asyncio.CancelledError:
             cancelled = True
         except (OSError, RuntimeError, ValueError, httpx.HTTPError):

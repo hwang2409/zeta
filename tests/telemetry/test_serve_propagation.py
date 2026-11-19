@@ -391,3 +391,92 @@ async def test_account_list_serializes_with_registry_writer(tmp_path, monkeypatc
         await close_serve(server, wire.writer)
         await await_or_fail(asyncio.gather(*(task for task in (writer, reader) if task), return_exceptions=True),
                             what="account catalog test cleanup")
+
+
+@pytest.mark.asyncio
+async def test_auth_error_names_failed_account_for_negotiated_observer(tmp_path, traced, caplog):
+    from tests.test_tui import renderable_plain
+    from zeta.codex import CodexAuthError
+    from zeta.providers.completion import owned_completion
+    from zeta.tui.render import render_event
+
+    telemetry, memory = traced
+    token = "auth-error-token-canary"
+    credentials = named_account_credentials(tmp_path, "codex", "work")
+    await asyncio.to_thread(credentials.save, OAuthTokens(token, "refresh", 9_999_999_999))
+    await asyncio.to_thread(credentials.store.rename, credentials.account, "night-shift")
+
+    class RejectedBackend:
+        token_store = credentials
+
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            if False:
+                yield
+            raise CodexAuthError(f"rejected {token}")
+
+    server = ZetaServer(
+        home=tmp_path, socket_path=short_socket_path(tmp_path), provider="codex",
+        backend_factory=lambda _provider, model, _home: (RejectedBackend(), model), telemetry=telemetry,
+    )
+    rendered = []
+    publish = server.control._event
+
+    async def capture(event, **kwargs):
+        if event.type.value == "error":
+            rendered.append(renderable_plain(render_event(event)))
+        await publish(event, **kwargs)
+
+    server.control._event = capture
+    controller = Wire(server, "unix")
+    observers = []
+    caplog.set_level(logging.DEBUG)
+    await controller.open()
+    try:
+        await controller.rpc("hello", "hello", {"protocol_version": "1.2"})
+        session = json.loads(await controller.rpc("new", "new_session"))["result"]["session"]
+        for features in (["account_list_idle_v1"], []):
+            observer = Wire(server, "unix")
+            observer.reader, observer.writer = await await_or_fail(
+                asyncio.open_unix_connection(str(server.socket_path)), what="observer connect",
+            )
+            observers.append(observer)
+            await observer.rpc("hello", "hello", {
+                "protocol_version": "1.2", "role": "observer",
+                "features": ["serve_observers", "session_replay_seq", *features],
+            })
+            joined = json.loads(await observer.rpc("join", "session_history_and_subscribe", {
+                "session_id": session["session_id"],
+            }))
+            assert "replay" in joined["result"]
+        refused = json.loads(await observers[0].rpc("login", "login_start", {"account": None}))
+        assert refused["error"]["code"] == -32008
+        assert refused["error"]["data"] == {
+            "code": "observer_read_only", "reason": "observer_read_only", "method": "login_start",
+        }
+        sent = json.loads(await controller.rpc("send", "send", {
+            "session_id": session["session_id"], "text": "trigger auth error",
+        }))
+        assert "result" in sent, sent
+        await observers[0].event("error")
+        await observers[1].event("error")
+        await controller.event("agent_end")
+        error = json.loads(observers[0].received[-1])["params"]
+        assert error["data"] == {
+            "login_provider": "codex",
+            "auth_account": {"account": "codex:work", "label": "night-shift", "provider": "codex"},
+        }
+        assert error["error"] == {"code": "auth_error", "message": "Account sign-in required."}
+        legacy = json.loads(observers[1].received[-1])["params"]
+        assert legacy["data"] == {"login_provider": "codex"}
+        assert legacy["error"] == {"code": "auth_error", "message": f"rejected {token}"}
+        assert "account: night-shift" in rendered[0]
+        assert token not in rendered[0]
+        assert token.encode() not in b"".join(observers[0].received)
+        assert token not in caplog.text
+    finally:
+        for observer in observers:
+            observer.writer.close()
+            await await_or_fail(observer.writer.wait_closed(), what="observer close")
+        await close_serve(server, controller.writer)
+    assert not any(token in text for text in _texts(memory.get_finished_spans()))
