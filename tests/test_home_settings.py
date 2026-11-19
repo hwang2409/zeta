@@ -17,6 +17,7 @@ import pytest
 from zeta.config import home_settings
 from zeta.config.home_settings import HomeSettingsError
 from zeta.config.settings import SettingsError
+from zeta.server import resource_protocol
 
 BUILTIN = "http://127.0.0.1:4323/v1/traces"
 ON = [{"key": "telemetry.enabled", "value": True}]
@@ -452,28 +453,28 @@ def test_restart_lists_every_lease_owner_without_a_cap_or_pid_trust(tmp_path: Pa
     try:
         for fd in held:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        result = home_settings.update(home, _revision(b""), ON)
+        result = resource_protocol.restart_report(home, serve=True, changed=True)
     finally:
         for fd in held:
             os.close(fd)
 
-    assert result["restart"] == {"serve": True, "sessions": owners, "complete": True}
+    assert result == {"serve": True, "sessions": owners, "complete": True}
 
 
 def test_restart_scan_past_its_deadline_is_incomplete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     home = _home(tmp_path)
     _session(home, "a" * 32)
-    monkeypatch.setattr(home_settings, "RESTART_SCAN_SECONDS", 0.0)
+    monkeypatch.setattr(resource_protocol, "RESTART_SCAN_SECONDS", 0.0)
 
-    result = home_settings.update(home, _revision(b""), ON)
+    result = resource_protocol.restart_report(home, serve=True, changed=True)
 
-    assert result["restart"] == {"serve": True, "sessions": [], "complete": False}
+    assert result == {"serve": True, "sessions": [], "complete": False}
 
 
 def test_restart_scan_with_an_unreadable_lease_is_incomplete(tmp_path: Path) -> None:
     home = _home(tmp_path)
     os.mkfifo(_session(home, "a" * 32) / "runtime.lease")
 
-    result = home_settings.update(home, _revision(b""), ON)
+    result = resource_protocol.restart_report(home, serve=True, changed=True)
 
-    assert result["restart"] == {"serve": True, "sessions": [], "complete": False}
+    assert result == {"serve": True, "sessions": [], "complete": False}
