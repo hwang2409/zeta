@@ -275,6 +275,7 @@ def history_projection_from_groups(
     approval_calls: Mapping[str, object],
     *,
     served_turn_end: bool,
+    nested_anchors: frozenset[str],
 ) -> HistoryProjection:
     groups = tuple(
         tuple(
@@ -291,6 +292,7 @@ def history_projection_from_groups(
         MappingProxyType(dict(approval_calls)),
         MappingProxyType(entry_index),
         approval_origins=MappingProxyType(_approval_origins(entry_index.values())),
+        nested_anchors=nested_anchors,
     )
 
 

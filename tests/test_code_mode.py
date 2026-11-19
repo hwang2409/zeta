@@ -682,3 +682,74 @@ async def test_abort_parallel_asks_settles_started_calls_only(tmp_path):
             assert_settled_once(store, call, 'abort', canceled=True)
         assert store.approval_state_now('outer:code:3') is None
     assert not (tmp_path / 'never').exists()
+
+
+@pytest.mark.parametrize('invariant', ['projection', 'history-index'])
+async def test_code_replay_retains_audit_not_projection(tmp_path, invariant):
+    import re
+
+    from tests.support.serve_close import close_serve
+    from tests.test_server import _connect, _request
+    from zeta.server import ZetaServer
+
+    sentinel = 'UNSELECTED_REPLAY_FIXTURE_' + 'x' * 2022
+    (tmp_path / 'unselected').write_text(sentinel)
+    (tmp_path / 'selected').write_text('selected')
+    (tmp_path / 'settings.toml').write_text('[code_mode]\nenabled = true\n')
+    script = '''await tools.read({path: 'unselected'});
+const selected = await tools.read({path: 'selected'});
+output(selected.content);'''
+    backend = FakeBackend([
+        ScriptedTurn(tool_calls=[ToolCall('outer', 'code', {'script': script})]),
+        ScriptedTurn(content=[TextContent('finished')]),
+    ])
+    server = ZetaServer(home=tmp_path, port=0, provider='codex',
+                        backend_factory=lambda provider, model, home: (backend, model or 'offline'))
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, 'hello', {'protocol_version': '1.2', 'features': [
+            'session_history_fidelity', 'session_history_backward', 'session_cwd',
+        ]})
+        session = (await _request(reader, writer, 2, 'new_session', {'provider': 'codex', 'cwd': str(tmp_path)}))[-1]['result']['session']
+        loop = server.runtime.loop
+        store = loop.store
+        policy = loop.tool_registry.approval_policy
+
+        async def run():
+            async for event in loop.run_turn('read both', origin=MessageOrigin.USER):
+                if event.type is StreamEventType.TOOL_APPROVAL_START:
+                    assert policy.resolve(event.tool_call.id, 'allow')
+
+        await await_or_fail(run(), what='complete the scripted code turn with real approvals')
+        outer = store.tool_result('outer')
+        assert not outer.is_error and outer.content == '"selected"'
+        console = Console(file=io.StringIO(), width=100, no_color=True, force_terminal=False)
+        widget = TranscriptWidget()
+        replay = TranscriptPresenter(widget, console, lambda: True, console.print)
+        tool_calls = {}
+        for ref in store.branch_refs():
+            entry = store.entry(ref)
+            if entry.type == 'message':
+                render_replayed_message(Message.from_dict(entry.data['message']), presenter=replay,
+                                        print_unit=console.print, tool_calls=tool_calls)
+        def render():
+            return re.sub(r'\x1b\[[0-9;]*m', '', widget.render(100))
+
+        collapsed = render()
+        assert 'const selected' not in collapsed and '2 calls' in collapsed
+        assert widget.toggle_latest_agent() and 'const selected' in render()
+        assert 'UNSELECTED_REPLAY_FIXTURE_' in collapsed  # durable approved read, not the outer projection
+        page = (await _request(reader, writer, 3, 'session_history', {'session_id': session['session_id'], 'before': None}))[-1]['result']
+        results = {r['tool_result']['tool_call_id']: r for r in page['messages'] if r.get('tool_result')}
+        outer_wire = results['outer']['tool_result']
+        assert outer_wire['content'] == outer.content
+        assert sentinel in results['outer:code:1']['tool_result']['content']
+        if invariant == 'projection':
+            for projection in (outer.structured_content, outer_wire['structured_content']):
+                assert 'UNSELECTED_REPLAY_FIXTURE_' not in json.dumps(projection), 'raw inner output in outer projection'
+        else:
+            indexed = [results['outer:code:1'], results['outer:code:2']]
+            assert [r.get('code_call_index') for r in indexed] == [1, 2], 'serve lost nested call indexes'
+            assert [r.get('code_parent_id') for r in indexed] == ['outer', 'outer']
+    finally:
+        await close_serve(server, writer)

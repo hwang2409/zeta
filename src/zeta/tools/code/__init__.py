@@ -42,17 +42,23 @@ async def _code(arguments, abort_signal, *, execution_context: ToolExecutionCont
         result = await execute(ToolCall(inner_id, name, arguments), NestedToolParent(call.id, index))
         structured = result.structured_content or {}
         error = structured.get("error") or {}
+        state = "canceled" if result.is_canceled else "error" if result.is_error else "completed"
+        error_class = (
+            "AbortError" if result.is_canceled else "ToolDenied"
+            if isinstance(error, dict) and error.get("kind") == "denied" else "ToolError"
+        )
         unexposed = result.content.startswith(f"tool {name!r} is not exposed to code mode")
         if not unexposed:
+            summary = f"{name}: {state} ({len(result.content.encode(errors='surrogatepass'))} bytes)"
+            if state != "completed":
+                summary += f" [{error_class}]"
             summaries.append({
                 "id": inner_id, "name": name, "index": index,
-                "state": "canceled" if result.is_canceled else "error" if result.is_error else "completed",
-                "summary": result.content[:240],
+                "state": state, "summary": summary,
             })
         if result.is_error or result.is_canceled:
             return {"ok": False, "error": {
-                "name": "AbortError" if result.is_canceled else "ToolDenied"
-                if isinstance(error, dict) and error.get("kind") == "denied" else "ToolError",
+                "name": error_class,
                 "tool": name, "callId": index, "content": result.content,
                 "structuredContent": result.structured_content, "canceled": result.is_canceled,
             }}
