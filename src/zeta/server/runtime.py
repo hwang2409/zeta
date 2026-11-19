@@ -895,8 +895,9 @@ class ServerRuntime:
         ollama_base_url: str | None = None,
         token_budget: int | None = None,
         account: AccountId | None = None,
+        use_backend_factory: bool = True,
     ) -> tuple[CompletionBackend, str]:
-        if self.backend_factory is not None:
+        if use_backend_factory and self.backend_factory is not None:
             return self.backend_factory(provider, model, home)
         if self._test_scripted_provider:
             from ..models.catalog import default_model
