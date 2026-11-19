@@ -2001,6 +2001,9 @@ Unnegotiated methods return `-32601`.
 `{name,scope?}`, with the same scopes as list. `mcp_server_test` performs a
 bounded connection and lists tools without calling them or returning tool
 names, descriptions, or stdio stderr. It returns `{data:{status,tool_count}}`.
+One MCP call deadline covers initialization and listing. On timeout, the probe
+closes the transport, reaps any stdio child, and returns
+`{data:{status:"failed",tool_count:0}}`.
 Only the controller can run a test. A project stdio definition must be trusted.
 
 `mcp_auth_start` starts one headless HTTP OAuth attempt per serve process.
@@ -2009,7 +2012,9 @@ loopback callback listener. Only this method returns the URL. Use a browser
 that can reach the serve host's loopback address; do not log or persist the
 URL. Headless mode rejects userinfo and query parameters in the server URL
 and pre-existing queries in the resource and authorization endpoint URLs;
-it does not forward configured extra authorization parameters.
+it does not forward configured extra authorization parameters. Protected-resource
+metadata must advertise an origin-only resource identifier. Serve does not fall
+back to using the configured MCP URL as the resource.
 
 `mcp_auth_status` and `mcp_auth_cancel` accept `{name}` and return
 `{data:{state}}` (`idle`, `pending`, `succeeded`, `failed`, or `cancelled`).
