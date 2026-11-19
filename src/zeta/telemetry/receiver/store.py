@@ -21,7 +21,7 @@ from typing import Any
 from .paths import MAX_BYTES, RAW_DAYS, ROLLUP_DAYS
 from .projector import EVENT_COLUMNS, SPAN_COLUMNS, root_session_id
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 PRUNE_CHUNK = 1_000
 VACUUM_MAX_BYTES = 64 << 20  # the one-time VACUUM of a larger pre-v3 file could outlast the auto-start deadline
 INGEST_QUEUE_CAPACITY = 64
@@ -184,6 +184,19 @@ MIGRATIONS_2 = (
         "ALTER TABLE spans ADD COLUMN retry_count INTEGER CHECK (retry_count IS NULL OR retry_count >= 0)",
 
 )
+_V5_SCHEMA = (
+    "ALTER TABLE viewer_meta ADD COLUMN v5_backfill_key BLOB",
+    "ALTER TABLE hourly_models ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE hourly_models ADD COLUMN cache_write_tokens INTEGER NOT NULL DEFAULT 0",
+    """CREATE TABLE hourly_ttft(hour_ns INTEGER NOT NULL, model_key TEXT NOT NULL,
+        bucket INTEGER NOT NULL CHECK(bucket BETWEEN 0 AND 63), calls INTEGER NOT NULL CHECK(calls>0),
+        PRIMARY KEY(hour_ns,model_key,bucket)) STRICT""",
+    "CREATE INDEX hourly_ttft_range ON hourly_ttft(model_key,hour_ns,bucket,calls)",
+    """CREATE TABLE hourly_errors(hour_ns INTEGER NOT NULL, operation TEXT NOT NULL,
+        class_key TEXT NOT NULL, calls INTEGER NOT NULL CHECK(calls>0),
+        PRIMARY KEY(hour_ns,operation,class_key)) STRICT""",
+)
+
 _TRACE_UPSERT = """
 INSERT INTO traces (
     trace_id, first_ns, last_ns, root_span_id, root_session_id,
@@ -408,14 +421,14 @@ def _insert_distinct(connection: sqlite3.Connection, row: dict[str, Any], hour: 
 
 
 def _project_rollup(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
-    hour = row["start_ns"] // 3_600_000_000_000 * 3_600_000_000_000
+    hour = row["start_ns"] // HOUR_NS * HOUR_NS
     _upsert_series(connection, row, hour, "none", "")
     _upsert_series(connection, row, hour, "operation", row["operation"])
     model = row["operation"] == "chat" and (row.get("response_model") or row.get("request_model")) is not None
     tool = row["operation"] == "execute_tool" and row.get("tool_name") is not None
     if model:
         key = _model_key(row)
-        connection.execute("""INSERT INTO hourly_models VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hour_ns,model_key) DO UPDATE SET calls=calls+1,errors=errors+excluded.errors,duration_ns=duration_ns+excluded.duration_ns,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,total_tokens=total_tokens+excluded.total_tokens,last_ns=MAX(last_ns,excluded.last_ns)""", (hour,key,row.get("provider"),row.get("response_model") or row.get("request_model"),1,int(row["status"]=="error"),row["duration_ns"],row.get("input_tokens") or 0,row.get("output_tokens") or 0,row.get("total_tokens") or 0,row["end_ns"]))
+        connection.execute("""INSERT INTO hourly_models (hour_ns,model_key,provider,model,calls,errors,duration_ns,input_tokens,output_tokens,total_tokens,last_ns) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(hour_ns,model_key) DO UPDATE SET calls=calls+1,errors=errors+excluded.errors,duration_ns=duration_ns+excluded.duration_ns,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,total_tokens=total_tokens+excluded.total_tokens,last_ns=MAX(last_ns,excluded.last_ns)""", (hour,key,row.get("provider"),row.get("response_model") or row.get("request_model"),1,int(row["status"]=="error"),row["duration_ns"],row.get("input_tokens") or 0,row.get("output_tokens") or 0,row.get("total_tokens") or 0,row["end_ns"]))
         bucket = _histogram_bucket(row["duration_ns"])
         connection.execute("INSERT INTO hourly_latency VALUES(?,?,?,?,1) ON CONFLICT(hour_ns,family,family_key,bucket) DO UPDATE SET calls=calls+1", (hour,"model",key,bucket))
         _upsert_series(connection, row, hour, "model", key)
@@ -425,6 +438,31 @@ def _project_rollup(connection: sqlite3.Connection, row: dict[str, Any]) -> None
         bucket = _histogram_bucket(row["duration_ns"])
         connection.execute("INSERT INTO hourly_latency VALUES(?,?,?,?,1) ON CONFLICT(hour_ns,family,family_key,bucket) DO UPDATE SET calls=calls+1", (hour,"tool",key,bucket))
         _upsert_series(connection, row, hour, "tool", key)
+
+
+def _project_v5(connection: sqlite3.Connection, row: dict[str, Any]) -> None:
+    hour = row["start_ns"] // HOUR_NS * HOUR_NS
+    model = row["response_model"] or row["request_model"]
+    if row["operation"] == "chat" and model is not None:
+        if row["cache_read_tokens"] or row["cache_write_tokens"]:
+            connection.execute(
+                "UPDATE hourly_models SET cache_read_tokens=cache_read_tokens+?, cache_write_tokens=cache_write_tokens+? "
+                "WHERE hour_ns=? AND model_key=?",
+                (row["cache_read_tokens"] or 0, row["cache_write_tokens"] or 0, hour, _model_key(row)),
+            )
+        if row["ttft_ns"] is not None:
+            connection.execute(
+                "INSERT INTO hourly_ttft VALUES(?,json_array(?,?),?,1) "
+                "ON CONFLICT(hour_ns,model_key,bucket) DO UPDATE SET calls=calls+1",
+                (hour, row["provider"], model, _histogram_bucket(row["ttft_ns"])),
+            )
+    if row["status"] == "error":
+        # JSON null is a unique rollup key, unlike SQL NULL, and cannot collide with a string.
+        connection.execute(
+            "INSERT INTO hourly_errors VALUES(?,?,json_quote(?),1) "
+            "ON CONFLICT(hour_ns,operation,class_key) DO UPDATE SET calls=calls+1",
+            (hour, row["operation"], row["error_type"]),
+        )
 
 
 def open_database(path: Path) -> None:
@@ -451,8 +489,13 @@ def open_database(path: Path) -> None:
                 _migrate_v3(connection)
             # Slice-4 preview databases can already have this index at v3.
             connection.execute("CREATE INDEX IF NOT EXISTS spans_start ON spans(start_ns)")
-            connection.execute("UPDATE viewer_meta SET schema_version=4 WHERE singleton=1")
-            connection.execute("PRAGMA user_version=4")
+            for statement in _V5_SCHEMA:
+                connection.execute(statement)
+            connection.execute("""UPDATE viewer_meta SET
+                schema_version=CASE WHEN EXISTS(SELECT 1 FROM spans) THEN 4 ELSE 5 END,
+                v5_backfill_key=CASE WHEN EXISTS(SELECT 1 FROM spans) THEN X'' ELSE NULL END
+                WHERE singleton=1""")
+            connection.execute("PRAGMA user_version=5")
             connection.commit()
         except BaseException:
             connection.rollback(); raise
@@ -492,6 +535,7 @@ VACUUM_PAGES = 1_000
 _ROLLUP_TABLES = (
     ("hourly_series", "hour_ns,group_by,group_key"), ("hourly_distinct", "hour_ns,group_by,group_key,identity_kind,identity_key"),
     ("hourly_models", "hour_ns,model_key"), ("hourly_tools", "hour_ns,tool_key"), ("hourly_latency", "hour_ns,family,family_key,bucket"),
+    ("hourly_ttft", "hour_ns,model_key,bucket"), ("hourly_errors", "hour_ns,operation,class_key"),
 )
 # (family, table, age column, oldest-first order); the same order picks age and size victims
 _RETENTION_ORDER = (
@@ -542,6 +586,9 @@ class Writer:
 
     def _catch_up(self) -> None:
         self.committed_sequence = self._connection.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]
+        # Finish before serving so reads never see partial projections and ingest never replays a backfilled span.
+        while not self._backfill_step(self._clock_ns()):
+            pass
         deadline = time.monotonic() + STARTUP_SECONDS
         while time.monotonic() < deadline:  # leftover catch-up continues with each ingest batch
             result = self.maintenance_step(self._clock_ns())
@@ -578,10 +625,42 @@ class Writer:
                 trace, session = project_span(row); c.execute(_TRACE_UPSERT, trace)
                 if session is not None: c.execute(_SESSION_UPSERT, session)
                 _project_rollup(c, row)
+                _project_v5(c, row)
             if inserted: c.execute("UPDATE viewer_meta SET committed_sequence=committed_sequence+1 WHERE singleton=1")
             sequence = c.execute("SELECT committed_sequence FROM viewer_meta").fetchone()[0]; c.commit()
         except BaseException: c.rollback(); raise
         self.committed_sequence = sequence; self.maintenance_step(self._clock_ns()); return sequence
+
+    def _backfill_step(self, now_ns: int) -> bool:
+        """Maintenance at startup: project at most one chunk and commit its resume key with it."""
+        c = self._connection
+        key = c.execute("SELECT v5_backfill_key FROM viewer_meta").fetchone()[0]
+        if key is None:
+            return True
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            c.row_factory = sqlite3.Row
+            rows = c.execute(
+                """SELECT trace_id,span_id,start_ns,operation,status,error_type,provider,response_model,request_model,
+                    ttft_ns,cache_read_tokens,cache_write_tokens FROM spans
+                    WHERE (trace_id,span_id) > (?,?) ORDER BY trace_id,span_id LIMIT ?""",
+                (key[:16], key[16:], PRUNE_CHUNK),
+            ).fetchall()
+            c.row_factory = None
+            for row in rows:
+                if row["start_ns"] >= now_ns - RAW_DAYS * DAY_NS:
+                    _project_v5(c, dict(row))
+            if len(rows) == PRUNE_CHUNK:
+                c.execute("UPDATE viewer_meta SET v5_backfill_key=?", (rows[-1]["trace_id"] + rows[-1]["span_id"],))
+            else:
+                c.execute("UPDATE viewer_meta SET v5_backfill_key=NULL, schema_version=5")
+            c.commit()
+        except BaseException:
+            c.rollback()
+            raise
+        finally:
+            c.row_factory = None
+        return len(rows) < PRUNE_CHUNK
 
     def _reclaim(self) -> int:
         """Fixed checkpoint and vacuum work; returns db+WAL+SHM bytes."""

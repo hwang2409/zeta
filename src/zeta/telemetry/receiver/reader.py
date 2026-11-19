@@ -229,7 +229,7 @@ def tools(home: Path, params: dict[str, Any], fits: Fits) -> dict[str, Any]:
 
 
 def errors(home: Path, params: dict[str, Any], fits: Fits) -> dict[str, Any]:
-    """``Page`` of failed spans, newest first, from raw spans only (14 days)."""
+    """Failed raw spans, newest first, and error classes across raw spans and rollups."""
     _only(params, {"start_ns", "end_ns", "operation", "limit", "cursor"})
     operation = params.get("operation")
     if operation is not None and (not isinstance(operation, str) or operation not in _OPERATIONS):
@@ -248,11 +248,34 @@ def errors(home: Path, params: dict[str, Any], fits: Fits) -> dict[str, Any]:
         query += " AND operation = ?"
         values.append(operation)
     as_of = time.time_ns()
-    return _snapshot(home, lambda connection: keyset_page(
-        connection, query, values, order, start, limit=limit, fits=fits,
-        project=lambda rows: [_project(row, _ERROR_COLUMNS) for row in rows],
-        shape=lambda items, cursor: {"items": items, "next_cursor": cursor, "as_of_ns": as_of},
-    ))
+
+    def read(connection: sqlite3.Connection) -> dict[str, Any]:
+        rows = connection.execute(*_error_classes_query(_split(connection, *start.pinned), operation)).fetchall()
+        classes = [{"error_type": row["error_type"], "count": row["count"]} for row in rows]
+        if rows and (remaining := rows[0]["total"] - sum(item["count"] for item in classes)):
+            classes.append({"error_type": "other", "count": remaining})
+        return keyset_page(
+            connection, query, values, order, start, limit=limit, fits=fits,
+            project=lambda rows: [_project(row, _ERROR_COLUMNS) for row in rows],
+            shape=lambda items, cursor: {"items": items, "next_cursor": cursor, "as_of_ns": as_of, "classes": classes},
+        )
+
+    return _snapshot(home, read)
+
+
+def _error_classes_query(split: tuple[int, int, int, int], operation: str | None) -> tuple[str, tuple[object, ...]]:
+    hour_from, hour_to, raw_from, raw_to = split
+    clause, filter_args = ("", ()) if operation is None else (" AND operation = ?", (operation,))
+    return (
+        f"""SELECT error_type, SUM(calls) AS count, SUM(SUM(calls)) OVER () AS total FROM (
+            SELECT error_type, COUNT(*) AS calls FROM spans
+            WHERE status = 'error' AND start_ns >= ? AND start_ns < ?{clause} GROUP BY error_type
+            UNION ALL
+            SELECT json_extract(class_key, '$') AS error_type, SUM(calls) FROM hourly_errors
+            WHERE hour_ns >= ? AND hour_ns < ?{clause} GROUP BY class_key
+        ) GROUP BY error_type ORDER BY count DESC, error_type LIMIT 50""",
+        (raw_from, raw_to, *filter_args, hour_from, hour_to, *filter_args),
+    )
 
 
 def series(home: Path, params: dict[str, Any], fits: Fits) -> dict[str, Any]:
@@ -411,7 +434,8 @@ def _family(home: Path, params: dict[str, Any], fits: Fits, family: str) -> dict
     order = (Key("calls", int, descending=True), Key("key", str))
     start = resume(params.get("cursor"), [f"telemetry_{family}s", *explicit], _range(*explicit), order)
     if family == "model":
-        names, sums = ("provider", "model"), ("input_tokens", "output_tokens", "total_tokens")
+        names = ("provider", "model")
+        sums = ("input_tokens", "output_tokens", "total_tokens")
         raw = (f"SELECT provider, {_MODEL} AS model, 1 AS calls, status = 'error' AS errors, duration_ns, "
                "COALESCE(input_tokens, 0) AS input_tokens, COALESCE(output_tokens, 0) AS output_tokens, "
                f"COALESCE(total_tokens, 0) AS total_tokens, end_ns AS last_ns FROM spans WHERE {_IS_MODEL}")
@@ -436,14 +460,29 @@ def _family(home: Path, params: dict[str, Any], fits: Fits, family: str) -> dict
         hour_from, hour_to, raw_from, raw_to = _split(connection, *start.pinned)
 
         def rows_with_quantiles(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
-            # every hour the range touches, so a raw span's hour counts whole
-            quantiles = _quantiles(connection, family, [row["key"] for row in rows], hour_from, start.pinned[1])
+            # Histograms and cache totals count every hour the range touches.
+            keys = [row["key"] for row in rows]
+            end = start.pinned[1]
+            quantiles = _latency_quantiles(connection, family, keys, hour_from, end)
+            ttft, cache = {}, {}
+            if family == "model" and keys:
+                ttft = _quantiles(connection.execute(*_ttft_query(keys, hour_from, end)))
+                cache = {key: (reads, writes) for key, reads, writes in connection.execute(
+                    "SELECT model_key, SUM(cache_read_tokens), SUM(cache_write_tokens) FROM hourly_models "
+                    f"WHERE hour_ns >= ? AND hour_ns < ? AND model_key IN ({', '.join('?' * len(keys))}) GROUP BY model_key",
+                    (hour_from, end, *keys),
+                )}
             return [
                 {
                     **{name: row[name] for name in names},
                     "calls": row["calls"], "errors": row["errors"], "duration_ns": row["duration_ns"],
                     "p50_ns": quantiles.get(row["key"], (0, 0))[0], "p95_ns": quantiles.get(row["key"], (0, 0))[1],
-                    **{name: row[name] for name in (*sums, "last_ns")},
+                    **{name: row[name] for name in sums},
+                    **({"cache_read_tokens": cache.get(row["key"], (0, 0))[0],
+                        "cache_write_tokens": cache.get(row["key"], (0, 0))[1]} if family == "model" else {}),
+                    "last_ns": row["last_ns"],
+                    **({"ttft_p50_ns": ttft.get(row["key"], (None, None))[0],
+                        "ttft_p95_ns": ttft.get(row["key"], (None, None))[1]} if family == "model" else {}),
                 }
                 for row in rows
             ]
@@ -457,21 +496,29 @@ def _family(home: Path, params: dict[str, Any], fits: Fits, family: str) -> dict
     return _snapshot(home, read)
 
 
-def _quantiles(connection: sqlite3.Connection, family: str, keys: list[str], hour_from: int, end: int) -> dict[str, tuple[int, int]]:
-    """p50/p95 per key by nearest rank over merged latency buckets; each returns its bucket's upper edge.
-
-    Bucket 0 is exactly 0 ns; bucket ``b`` covers ``[2**(b-1), 2**b - 1]``, so a positive estimate is
-    never below the true quantile and is less than twice it.
-    """
+def _latency_quantiles(connection: sqlite3.Connection, family: str, keys: list[str], hour_from: int, end: int) -> dict[str, tuple[int, int]]:
     if not keys:
         return {}
-    counts: dict[str, list[tuple[int, int]]] = {}
-    for row in connection.execute(
+    return _quantiles(connection.execute(
         f"SELECT family_key, bucket, SUM(calls) FROM hourly_latency WHERE family = ? AND family_key IN ({', '.join('?' * len(keys))}) "
         "AND hour_ns >= ? AND hour_ns < ? GROUP BY family_key, bucket ORDER BY family_key, bucket",
         (family, *keys, hour_from, end),
-    ):
-        counts.setdefault(row[0], []).append((row[1], row[2]))
+    ))
+
+
+def _ttft_query(keys: list[str], hour_from: int, end: int) -> tuple[str, tuple[object, ...]]:
+    sql = (
+        f"SELECT model_key, bucket, SUM(calls) FROM hourly_ttft WHERE model_key IN ({', '.join('?' * len(keys))}) "
+        "AND hour_ns >= ? AND hour_ns < ? GROUP BY model_key, bucket ORDER BY model_key, bucket"
+    )
+    return sql, (*keys, hour_from, end)
+
+
+def _quantiles(rows: sqlite3.Cursor) -> dict[str, tuple[int, int]]:
+    """Nearest rank over merged buckets, ordered by key and bucket; return the bucket upper edge."""
+    counts: dict[str, list[tuple[int, int]]] = {}
+    for key, bucket, calls in rows:
+        counts.setdefault(key, []).append((bucket, calls))
 
     def rank(buckets: list[tuple[int, int]], wanted: int) -> int:
         seen = 0
