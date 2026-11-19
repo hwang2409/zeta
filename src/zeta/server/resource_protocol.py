@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib import import_module
@@ -95,6 +96,16 @@ async def run_owner(
     Owners must compute revisions and compare them inside their own write transaction. For MCP,
     the adapter's projector must use MCPManagementService.redact, not serialize raw owner data.
     """
+    def run():
+        with owner_errors(family=family, owner_error=owner_error, errors=errors):
+            return project(call())
+
+    return await client.connections.run_blocking(run)
+
+
+@contextmanager
+def owner_errors(*, family: str, owner_error: type[Exception], errors: Mapping[str, Any]):
+    """Close the error surface of a blocking or asynchronous owner."""
     from .protocol import (
         ErrorDescriptor,
         closed_error,
@@ -102,17 +113,14 @@ async def run_owner(
         stale_resource_revision,
     )
 
-    def run():
-        try:
-            return project(call())
-        except owner_error as exc:
-            code = getattr(exc, "code", None)
-            if code == "stale_revision":
-                raise stale_resource_revision(family) from None
-            if code == "invalid_params":
-                raise invalid_resource_params() from None
-            raise closed_error(errors.get(code, ErrorDescriptor.INTERNAL_ERROR)) from None
-        except Exception:  # noqa: BLE001 - owner paths and request values must not cross the wire
-            raise closed_error(ErrorDescriptor.INTERNAL_ERROR) from None
-
-    return await client.connections.run_blocking(run)
+    try:
+        yield
+    except owner_error as exc:
+        code = getattr(exc, "code", None)
+        if code == "stale_revision":
+            raise stale_resource_revision(family) from None
+        if code == "invalid_params":
+            raise invalid_resource_params() from None
+        raise closed_error(errors.get(code, ErrorDescriptor.INTERNAL_ERROR)) from None
+    except Exception:  # noqa: BLE001 - owner paths and request values must not cross the wire
+        raise closed_error(ErrorDescriptor.INTERNAL_ERROR) from None
