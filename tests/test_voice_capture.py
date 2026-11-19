@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
@@ -14,6 +15,7 @@ import sys
 import threading
 import wave
 from pathlib import Path
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -26,7 +28,7 @@ from zeta.voice.audio import (
     sweep_stale,
     validate_wav,
 )
-from zeta.voice.process import OwnedProcess
+from zeta.voice.process import KILL_SECONDS, TERMINATE_SECONDS, OwnedProcess
 
 
 def _reaped(pid: int) -> bool:
@@ -132,6 +134,55 @@ def test_owned_process_reaps_child_that_exits_before_group_signal(monkeypatch: p
         monkeypatch.setattr(os, "killpg", kill_after_exit)
         OwnedProcess(child, 0, 0).kill_blocking()
         assert stdin.closed and child.returncode == 0 and _reaped(child.pid)
+
+
+def test_owned_process_waits_after_eperm_while_child_is_not_waitable(monkeypatch: pytest.MonkeyPatch) -> None:
+    with subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE,
+        start_new_session=True,
+    ) as child:
+        stdin = child.stdin
+        assert stdin is not None
+        wait = child.wait
+
+        def deny_signal(pgid: int, sig: int) -> None:
+            assert pgid == child.pid and sig == signal.SIGTERM
+            assert child.poll() is None
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+        def finish_exit(timeout: float | None = None) -> int:
+            if timeout is not None:
+                # Release the child only once cleanup waits instead of polling again.
+                stdin.write(b"x")
+                stdin.flush()
+            return wait(timeout=timeout)
+
+        monkeypatch.setattr(os, "killpg", deny_signal)
+        monkeypatch.setattr(child, "wait", finish_exit)
+        error = None
+        try:
+            OwnedProcess(child, 0, 0).kill_blocking()
+        except PermissionError as exc:
+            error = exc
+        assert error is None, "cleanup must wait after EPERM even when poll() still returns None"
+        assert stdin.closed and child.returncode == 0 and _reaped(child.pid)
+
+
+def test_owned_process_reports_child_alive_after_sigkill_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    child = Mock(spec=subprocess.Popen, pid=123)
+    child.poll.return_value = None
+    child.stdin = Mock()
+    child.wait.side_effect = subprocess.TimeoutExpired("voice child", 2)
+    deny_signal = Mock(side_effect=PermissionError(errno.EPERM, os.strerror(errno.EPERM)))
+    monkeypatch.setattr(os, "killpg", deny_signal)
+
+    with pytest.raises(RuntimeError, match="voice child pid 123 did not exit by the SIGKILL deadline"):
+        OwnedProcess(child, 0, 0).kill_blocking()
+
+    assert deny_signal.call_args_list == [call(123, signal.SIGTERM), call(123, signal.SIGKILL)]
+    assert child.wait.call_args_list == [call(timeout=TERMINATE_SECONDS), call(timeout=KILL_SECONDS)]
+    child.stdin.close.assert_called_once_with()
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
