@@ -523,15 +523,12 @@ class AgentLoop(
                 self.tool_registry.background_tasks.begin_shutdown(
                     background_task_cause
                 )
-                self._background_owner.cancel_all()
+                await self._background_owner.close_children()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
                     cancel()
-            watchers = tuple(self._background_child_watchers.values())
-            if cancel_background and watchers:
+                watchers = tuple(self._background_child_watchers.values())
                 await asyncio.gather(*watchers, return_exceptions=True)
-            if cancel_background and self.agent_depth == 0:
-                await self._background_owner.wait()
             tracked_tasks = tuple(
                 task
                 for task in self._tracked_tasks
