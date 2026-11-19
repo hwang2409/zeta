@@ -59,6 +59,7 @@ _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
 
     ("zeta.server.session_replay.__init__", "join_history_and_subscribe", "rpc params"),
     ("zeta.telemetry.receiver.reader", "_only", "rpc params"),
+    ("zeta.tools.code._guest", "frame", "in-memory value"),
     ("zeta.tools._validation", "_validate_schema", "tool arguments"),
     ("zeta.tools._validation", "_schema_equal", "tool arguments"),
     ("zeta.tools._validation", "_validate_schema_definition", "tool arguments"),
