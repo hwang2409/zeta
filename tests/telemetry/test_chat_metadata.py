@@ -103,19 +103,30 @@ def _observe(monkeypatch: pytest.MonkeyPatch, events: list[tuple[int, StreamEven
     return span.calls
 
 
-def test_ttft_is_set_once_at_the_first_model_progress(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ttft_is_set_once_at_the_first_model_output(monkeypatch: pytest.MonkeyPatch) -> None:
     retry = StreamEvent(StreamEventType.RETRY, data={"reason": "overloaded_error", "attempt": 1, "delay": 0.5})
     calls = _observe(monkeypatch, [
-        (1_100, retry),  # a retry notice is not model progress
+        (1_100, retry),
         (1_250, StreamEvent(StreamEventType.MESSAGE_START, data={"model": "qwen3:4b"})),
-        (1_900, StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="hi")),
-        (2_000, StreamEvent(StreamEventType.MESSAGE_END, data={"usage": {"input_tokens": 7, "output_tokens": 2}})),
+        (100_001_000, StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="hi")),
+        (100_002_000, StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="!")),
+        (100_003_000, StreamEvent(StreamEventType.MESSAGE_END, data={"usage": {"input_tokens": 7, "output_tokens": 2}})),
     ])
 
-    assert calls["response"]["ttft_ns"] == 250
+    assert calls["response"]["ttft_ns"] == 100_000_000
     assert calls["response"]["retry_count"] == 1
     # the provider reported no cache counts: absent, never a guessed 0
     assert calls["usage"] == {"input_tokens": 7, "output_tokens": 2, "total_tokens": 9, "cache_read_tokens": None, "cache_write_tokens": None}
+
+
+def test_empty_reply_leaves_ttft_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _observe(monkeypatch, [
+        (1_250, StreamEvent(StreamEventType.MESSAGE_START)),
+        (1_500, StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="")),
+        (1_750, StreamEvent(StreamEventType.MESSAGE_UPDATE, data={"index": (0, "raw", 0)})),
+        (2_000, StreamEvent(StreamEventType.MESSAGE_END)),
+    ])
+    assert calls["response"]["ttft_ns"] is None
 
 
 def test_no_model_progress_leaves_ttft_unset(monkeypatch: pytest.MonkeyPatch) -> None:

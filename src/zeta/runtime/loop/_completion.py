@@ -24,7 +24,9 @@ from ...protocol.types import (
     RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
+    TextContent,
     ThinkingContent,
+    ToolUseContent,
 )
 
 if TYPE_CHECKING:
@@ -254,8 +256,16 @@ class InferenceObservation:
     def observe(self, event: StreamEvent) -> None:
         if self._span is None:
             return
-        if self._ttft_ns is None and event.type in _MODEL_PROGRESS:
-            self._ttft_ns = time.monotonic_ns() - self._started_ns
+        if self._ttft_ns is None and event.type is StreamEventType.MESSAGE_UPDATE:
+            content = event.content
+            if (
+                event.delta
+                or event.tool_call is not None
+                or (isinstance(content, (TextContent, ThinkingContent)) and content.text)
+                or (isinstance(content, RedactedThinkingContent) and content.data)
+                or isinstance(content, ToolUseContent)
+            ):
+                self._ttft_ns = time.monotonic_ns() - self._started_ns
         if event.type is StreamEventType.MESSAGE_START:
             model = event.data.get("model")
             if type(model) is str:
