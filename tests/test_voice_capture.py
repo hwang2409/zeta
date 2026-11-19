@@ -16,7 +16,7 @@ import sys
 import threading
 import wave
 from pathlib import Path
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 
 import pytest
 
@@ -171,21 +171,32 @@ def test_owned_process_waits_after_eperm_while_child_is_not_waitable(monkeypatch
 
 
 def test_owned_process_reports_child_alive_after_sigkill_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
-    child = Mock(spec=subprocess.Popen, pid=123)
+    events: list[tuple[str, float]] = []
+    stdin = io.BytesIO()
+    child = Mock(spec=subprocess.Popen, pid=123, stdin=stdin)
     child.poll.return_value = None
-    child.stdin = io.BytesIO()
-    child.wait.side_effect = subprocess.TimeoutExpired("voice child", 2)
-    deny_signal = Mock(side_effect=PermissionError(errno.EPERM, os.strerror(errno.EPERM)))
-    monkeypatch.setattr(os, "killpg", deny_signal)
 
+    def deny_signal(pgid: int, sig: int) -> None:
+        assert pgid == child.pid
+        events.append(("signal", sig))
+        raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+    def time_out(timeout: float) -> int:
+        events.append(("wait", timeout))
+        raise subprocess.TimeoutExpired("voice child", timeout)
+
+    monkeypatch.setattr(os, "killpg", deny_signal)
+    child.wait = time_out
     with pytest.raises(RuntimeError, match="voice child pid 123 did not exit by the SIGKILL deadline"):
         OwnedProcess(child, 0, 0).kill_blocking()
 
-    # test-contract: seam verify escalation at the OS signal boundary without signaling a real pid
-    assert deny_signal.call_args_list == [call(123, signal.SIGTERM), call(123, signal.SIGKILL)]
-    # test-contract: seam verify both wait deadlines without waiting for real timeouts
-    assert child.wait.call_args_list == [call(timeout=TERMINATE_SECONDS), call(timeout=KILL_SECONDS)]
-    assert child.stdin.closed
+    assert events == [
+        ("signal", signal.SIGTERM),
+        ("wait", TERMINATE_SECONDS),
+        ("signal", signal.SIGKILL),
+        ("wait", KILL_SECONDS),
+    ]
+    assert stdin.closed
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is not installed")
