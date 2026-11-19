@@ -523,7 +523,7 @@ class AgentLoop(
                 self.tool_registry.background_tasks.begin_shutdown(
                     background_task_cause
                 )
-                self._background_owner.cancel_all()
+                self._background_owner.cancel_all(closing=True)
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
                     cancel()
