@@ -9,7 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import errno
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+import time
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Self
@@ -23,7 +31,9 @@ from ...protocol.types import (
     RedactedThinkingContent,
     StreamEvent,
     StreamEventType,
+    TextContent,
     ThinkingContent,
+    ToolUseContent,
 )
 
 if TYPE_CHECKING:
@@ -196,16 +206,47 @@ def can_retry_context(
     )
 
 
-def _usage_tokens(usage: object) -> tuple[int, int] | None:
-    """Normalized (input, output) tokens; input includes cache reads and writes, as GenAI counts them."""
+# (input, output, cache read, cache write); a cache count is None when the provider did not report it
+type _Usage = tuple[int, int, int | None, int | None]
+# the events the provider-liveness deadline counts as decoded model progress
+_MODEL_PROGRESS = frozenset({StreamEventType.MESSAGE_START, StreamEventType.MESSAGE_UPDATE, StreamEventType.MESSAGE_END})
+
+
+def _usage_tokens(usage: object) -> _Usage | None:
+    """Normalized usage; input includes cache reads and writes, as GenAI counts them."""
 
     if not isinstance(usage, Mapping):
         return None
     counts = [
-        value if type(value := usage.get(key)) is int and value >= 0 else 0
+        value if type(value := usage.get(key)) is int and value >= 0 else None
         for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
     ]
-    return sum(counts[:3]), counts[3]
+    return sum(count or 0 for count in counts[:3]), counts[3] or 0, counts[1], counts[2]
+
+
+def _add_usage(left: _Usage, right: _Usage) -> _Usage:
+    def cache(a: int | None, b: int | None) -> int | None:
+        return None if a is None and b is None else (a or 0) + (b or 0)
+
+    return left[0] + right[0], left[1] + right[1], cache(left[2], right[2]), cache(left[3], right[3])
+
+
+def _carries_model_output(event: StreamEvent) -> bool:
+    blocks: Sequence[ContentBlock | None]
+    if event.type is StreamEventType.MESSAGE_UPDATE:
+        if event.delta or event.tool_call is not None:
+            return True
+        blocks = (event.content,)
+    elif event.type is StreamEventType.MESSAGE_END and event.message is not None:
+        blocks = event.message.content
+    else:
+        return False
+    return any(
+        (isinstance(block, (TextContent, ThinkingContent)) and block.text)
+        or (isinstance(block, RedactedThinkingContent) and block.data)
+        or isinstance(block, ToolUseContent)
+        for block in blocks
+    )
 
 
 class InferenceObservation:
@@ -215,15 +256,19 @@ class InferenceObservation:
     every exit (return, continue, any ``BaseException``). An exception in flight
     is the span's error; otherwise ``error`` (an exception or an ERROR event's
     ``ErrorInfo``) is. Usage sums every attempt, because retries are one call.
+    Time to first token is the span start to the call's first decoded model output.
     """
 
     def __init__(self) -> None:
         self._span: SpanHandle | None = None
         self.error: BaseException | ErrorInfo | None = None
-        self._finished_usage: tuple[int, int] | None = None
-        self._attempt_usage: tuple[int, int] | None = None
+        self._finished_usage: _Usage | None = None
+        self._attempt_usage: _Usage | None = None
         self._model: str | None = None
         self._finish_reason: str | None = None
+        self._started_ns = 0
+        self._ttft_ns: int | None = None
+        self._retries = 0
 
     def __enter__(self) -> Self:
         return self
@@ -231,10 +276,13 @@ class InferenceObservation:
     def start(self, span: SpanHandle) -> None:
         span.__enter__()
         self._span = span
+        self._started_ns = time.monotonic_ns()
 
     def observe(self, event: StreamEvent) -> None:
         if self._span is None:
             return
+        if self._ttft_ns is None and _carries_model_output(event):
+            self._ttft_ns = time.monotonic_ns() - self._started_ns
         if event.type is StreamEventType.MESSAGE_START:
             model = event.data.get("model")
             if type(model) is str:
@@ -245,6 +293,7 @@ class InferenceObservation:
             if type(reason) is str:
                 self._finish_reason = reason
         elif event.type is StreamEventType.RETRY and "reason" in event.data:
+            self._retries += 1
             delay = event.data.get("delay")
             self._span.retry(
                 attempt=event.data.get("attempt", 0),
@@ -255,8 +304,7 @@ class InferenceObservation:
             # the retry notice repeats the failed attempt's usage, so it replaces, never adds to, that attempt's MESSAGE_END
             failed = _usage_tokens(event.data.get("usage")) or self._attempt_usage
             if failed is not None:
-                done = self._finished_usage or (0, 0)
-                self._finished_usage = (done[0] + failed[0], done[1] + failed[1])
+                self._finished_usage = failed if self._finished_usage is None else _add_usage(self._finished_usage, failed)
             self._attempt_usage = None
             self._finish_reason = None
 
@@ -265,14 +313,16 @@ class InferenceObservation:
         if span is None:
             return False
         try:
-            usage = [part for part in (self._finished_usage, self._attempt_usage) if part is not None]
-            if usage:
-                input_tokens = sum(part[0] for part in usage)
-                output_tokens = sum(part[1] for part in usage)
-                span.set_usage(input_tokens=input_tokens, output_tokens=output_tokens, total_tokens=input_tokens + output_tokens)
-            span.set_response(finish_reason=self._finish_reason, model=self._model)
+            parts = [part for part in (self._finished_usage, self._attempt_usage) if part is not None]
+            if parts:
+                usage = parts[0] if len(parts) == 1 else _add_usage(*parts)
+                span.set_usage(
+                    input_tokens=usage[0], output_tokens=usage[1], total_tokens=usage[0] + usage[1],
+                    cache_read_tokens=usage[2], cache_write_tokens=usage[3],
+                )
+            span.set_response(finish_reason=self._finish_reason, model=self._model, ttft_ns=self._ttft_ns, retry_count=self._retries)
             if exc is None and isinstance(self.error, ErrorInfo):
-                span.fail(None)
+                span.fail(self.error)
         finally:
             if exc is None and isinstance(self.error, BaseException):
                 span.__exit__(type(self.error), self.error, None)

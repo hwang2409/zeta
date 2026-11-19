@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 from zeta import telemetry
+from zeta.telemetry.errors import ERROR_CODES
 
 
 def test_disabled_facade_does_not_import_opentelemetry() -> None:
@@ -175,7 +176,8 @@ def test_shutdown_is_synchronous_and_export_failure_is_not_logged(monkeypatch: p
         instance.shutdown()
         instance.shutdown()
         assert stopped.is_set()
-        assert instance.status() == telemetry.TelemetryStatus(True, "degraded", "export_unavailable")
+        status = instance.status()
+        assert (status.enabled, status.state, status.reason, status.last_export) == (True, "degraded", "export_unavailable", "error")
         assert not records
     finally:
         app_logger.removeHandler(handler)
@@ -210,7 +212,7 @@ def test_loopback_and_one_slot() -> None:
     cell = StatusCell()
     for value in ("healthy", "export_unavailable", "healthy"):
         cell.publish(value)
-    assert cell.read() == "healthy"
+    assert cell.read()[0] == "healthy"
     assert cell.read() is None
 
 
@@ -270,7 +272,7 @@ def test_status_cell_is_bounded_with_concurrent_publishers() -> None:
         thread.join(timeout=5)
     assert all(not thread.is_alive() for thread in threads)
     cell.publish("healthy")
-    assert cell.read() == "healthy"
+    assert cell.read()[0] == "healthy"
     assert cell.read() is None
 
 
@@ -285,6 +287,8 @@ _VALID: dict[str, object] = {
     "input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "attempt": 1,
     "reason": "stream_error", "delay": 2, "after": False, "decision": "allow", "scope": "once", "duration": 4,
     "finish_reason": "end_turn", "argument_bytes": 5, "result_bytes": 6,
+    "run_id": f"{_SESSION}:1:2", "parent_run_id": f"{_SESSION}:1", "cache_read_tokens": 1, "cache_write_tokens": 0,
+    "ttft_ns": 8, "retry_count": 1, "outcome": "finished", "code": "rate_limit",
     # serve_span and mcp_span share the "method" parameter; serve_span is only ever called with "method" as the field under test
     "method": "tools/call", "server": "fake", "target": "echo", "request_id": 7, "protocol_version": "2025-06-18",
 }
@@ -307,7 +311,7 @@ _ADVERSARIAL = {
     "unicode": "unicode-\u2603",
 }
 _HELPERS = ("agent_span", "turn_span", "inference_span", "tool_span", "context_span", "serve_span", "mcp_span")
-_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "set_compaction", "invalid_propagation", "set_mcp_request", "fail")
+_HANDLE_METHODS = ("set_usage", "retry", "approval_requested", "approval_resolved", "set_response", "set_tool_count", "set_sizes", "set_compaction", "invalid_propagation", "set_mcp_request", "set_outcome", "fail")
 # where a shape-accepted value may appear: "<name>" is the span name.
 _SHAPE_FIELDS = {
     ("agent_span", "profile"): {"<name>"},
@@ -377,7 +381,9 @@ def _emit(memory_telemetry, route: str, field: str, value: object) -> list:
     else:
         turn = {name: _VALID[name] for name in _params("turn_span")}
         with instance.turn_span(**turn) as span:
-            if route == "fail":
+            if route == "fail" and field == "code":
+                span.fail(None, code=value)
+            elif route == "fail":
                 span.fail(value if isinstance(value, BaseException) else ValueError(value))
             else:
                 # a value-free route (invalid_propagation) takes no field
@@ -500,6 +506,7 @@ def test_every_catalog_provider_maps_to_an_accepted_genai_name() -> None:
 
 def _real_values() -> list:
     from zeta.models.catalog import PROVIDER_MODELS
+    from zeta.telemetry.runtime import _OUTCOMES
 
     location = {
         "reason": ("retry", "gen_ai.client.retry.gen_ai.retry.reason"),
@@ -517,6 +524,10 @@ def _real_values() -> list:
     cases += [("tool_span", "name", name, "zeta.tool.name") for name in ("bash", "web_search", "filesystem__read_file")]
     cases += [("tool_span", "tool_type", kind, "zeta.tool.type") for kind in ("function", "computer", "mcp", "agent")]
     cases += [("agent_span", "agent_name", name, "zeta.agent.name") for name in ("worker", "ux-tester")]
+    cases += [("agent_span", "run_id", run, "zeta.agent.run_id") for run in (f"{_SESSION}:1", f"{_SESSION}:12:3")]
+    cases += [("agent_span", "parent_run_id", f"{_SESSION}:4", "zeta.agent.parent_run_id")]
+    cases += [("set_outcome", "outcome", outcome, "zeta.outcome") for outcome in sorted(_OUTCOMES)]
+    cases += [("fail", "code", code, "zeta.error.code") for code in sorted(ERROR_CODES)]
     cases += [("mcp_span", "server", name, "zeta.mcp.server.name") for name in ("fake", "github-mcp", "docs.internal")]
     cases += [("mcp_span", "target", name, "gen_ai.tool.name") for name in ("echo", "get_issue", "search-docs")]
     cases += [("set_mcp_request", "protocol_version", version, "mcp.protocol.version") for version in ("2025-06-18", "2025-11-25")]
@@ -556,7 +567,7 @@ def test_absent_approval_fields_are_omitted(memory_telemetry) -> None:
 def test_profile_name_and_error_type_are_exported(memory_telemetry) -> None:
     surfaces = dict(_surfaces(_emit(memory_telemetry, "agent_span", "profile", "ux-tester")))
     assert surfaces["<name>"] == "invoke_agent ux-tester"
-    surfaces = dict(_surfaces(_emit(memory_telemetry, "fail", "exc", LookupError("secret detail"))))
+    surfaces = dict(_surfaces(_emit(memory_telemetry, "fail", "error", LookupError("secret detail"))))
     assert surfaces["error.type"] == "LookupError"
     assert "secret detail" not in str(surfaces)
 

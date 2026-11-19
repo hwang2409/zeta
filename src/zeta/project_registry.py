@@ -250,6 +250,8 @@ class ProjectRegistry(
 ):
     """A local registry whose root can be overridden for tests."""
 
+    _read_epoch: int | None = None
+
     def __init__(
         self,
         root: Path | str | None = None,
@@ -271,10 +273,56 @@ class ProjectRegistry(
         else:
             self._storage_lease = _storage_lease
 
+    @classmethod
+    def for_state_read(cls, root: Path, observed_epoch: int) -> ProjectRegistry:
+        """Use the owner decoders without opening a writer lease or any lock."""
+        registry = cls.__new__(cls)
+        registry.root = root
+        registry.memory_transactions = MemoryTransactions(registry)
+        registry._read_epoch = observed_epoch
+        return registry
+
     @property
     def observed_storage_epoch(self) -> int:
         """The stored-format epoch observed when this registry opened its lease."""
+        if self._read_epoch is not None:
+            return self._read_epoch
         return self._storage_lease.observed_epoch
+
+    @contextmanager
+    def state_project_fd(self, project_id: str) -> Iterator[int]:
+        """Open an existing validated project without the identity or domain locks."""
+        root_fd, _ = self._open_root()
+        try:
+            fd = self._validated_project_fd(root_fd, project_id)
+            try:
+                yield fd
+            finally:
+                os.close(fd)
+        finally:
+            os.close(root_fd)
+
+    def state_projects_read_only(self) -> list[tuple[Project, int]]:
+        """Read project records and count links without touching transcripts."""
+        try:
+            root_fd, _ = self._open_root()
+        except ProjectNotFoundError:
+            return []
+        try:
+            rows = []
+            for project in self._list_locked(root_fd):
+                fd = self._project_dir(root_fd, project.project_id)
+                try:
+                    links = self._read_session_records(fd, repair_torn_final=False)
+                    rows.append((project, len(links)))
+                finally:
+                    os.close(fd)
+            return rows
+        finally:
+            os.close(root_fd)
+
+    def state_project_paths(self) -> tuple[Path, ...]:
+        return tuple(path for path in sorted(self.root.glob("p_*")) if _PROJECT_ID.fullmatch(path.name))
 
     def _ensure_root(self) -> None:
         created = False
