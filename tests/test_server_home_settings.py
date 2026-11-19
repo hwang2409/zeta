@@ -5,13 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from tests.support.serve_contract import ServeContract
-from zeta.config import home_settings
-from zeta.server.handlers import settings as settings_handlers
 
 FEATURES = ["home_settings_v1"]
 BUILTIN = "http://127.0.0.1:4323/v1/traces"
@@ -44,7 +41,7 @@ async def test_observers_read_but_never_update_home_settings(tmp_path: Path) -> 
         unnegotiated = await plain.request("get", "home_settings_get")
         got = await observer.request("get", "home_settings_get")
         refused = await observer.request(
-            "update", "home_settings_update", {"expected_revision": got["result"]["revision"], "changes": ON}
+            "update", "home_settings_update", {"changes": "not a change"}
         )
     finally:
         await contract.close()
@@ -55,13 +52,16 @@ async def test_observers_read_but_never_update_home_settings(tmp_path: Path) -> 
     assert "home_settings_update" not in observer_hello["capabilities"]["requests"]
     assert got["result"] == {
         "revision": _revision(b'model = "gpt-5.6-luna"\n'),
-        "settings": {"telemetry": {"enabled": False, "source": "off", "editable": True}},
+        "settings": {
+            "telemetry": {"enabled": False, "source": "off", "editable": True},
+            "model": "gpt-5.6-luna", "agents": {"max_depth": 3, "explicit_finish": False},
+        },
         "settings_malformed": False,
     }
     assert refused["error"] == {
         "code": -32008,
         "message": "method is unavailable to read-only observers",
-        "data": {"code": "observer_read_only", "method": "home_settings_update"},
+        "data": {"code": "observer_read_only", "method": "home_settings_update", "reason": "observer_read_only"},
     }
     assert settings.read_bytes() == b'model = "gpt-5.6-luna"\n'
 
@@ -84,6 +84,10 @@ async def test_controller_update_checks_revision_and_lists_restarts(tmp_path: Pa
                 "expected_revision": got["result"]["revision"],
                 "changes": [{"key": "yolo", "value": True}],
             }),
+            await controller.request("depth-bool", "home_settings_update", {
+                "expected_revision": got["result"]["revision"],
+                "changes": [{"key": "agents.max_depth", "value": True}],
+            }),
         ]
         stale = await controller.request(
             "stale", "home_settings_update", {"expected_revision": _revision(b"other"), "changes": ON}
@@ -96,40 +100,50 @@ async def test_controller_update_checks_revision_and_lists_restarts(tmp_path: Pa
         await contract.close()
 
     assert {"home_settings_get", "home_settings_update"} <= set(hello["capabilities"]["requests"])
-    assert [reply["error"] for reply in invalid] == [INVALID, INVALID, INVALID]
+    assert [reply["error"] for reply in invalid] == [INVALID] * 4
     assert stale["error"] == {
         "code": -32009,
-        "message": "settings.toml changed since the given revision",
-        "data": {"code": "stale_revision", "current_revision": got["result"]["revision"]},
+        "message": "resource revision is stale",
+        "data": {"code": "stale_settings_revision", "reason": "stale_settings_revision"},
     }
     assert unchanged is False
     written = settings.read_bytes()
     assert written == f'otel.endpoint = "{BUILTIN}"\n'.encode()
     assert updated["result"] == {
         "revision": _revision(written),
-        "settings": {"telemetry": {"enabled": True, "source": "builtin", "editable": True}},
+        "settings": {
+            "telemetry": {"enabled": True, "source": "builtin", "editable": True},
+            "model": None, "agents": {"max_depth": 3, "explicit_finish": False},
+        },
         "restart": {"serve": True, "sessions": [session_id], "complete": True},
     }
 
 
 @pytest.mark.asyncio
-async def test_update_handler_writes_only_through_home_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple] = []
-
-    def update(home: Path, expected_revision: object, changes: object) -> dict:
-        calls.append((home, expected_revision, changes))
-        return {"written": "by home_settings"}
-
-    monkeypatch.setattr(home_settings, "update", update)
-    client = SimpleNamespace(server=SimpleNamespace(home=tmp_path))
-
-    result = await settings_handlers.home_settings_update(
-        client, 1, {"expected_revision": _revision(b""), "changes": ON}
-    )
-
-    assert result == {"written": "by home_settings"}
-    assert calls == [(tmp_path, _revision(b""), ON)]
-    assert list(tmp_path.iterdir()) == []
+async def test_new_serve_sessions_read_updated_home_defaults_without_restarting_serve(tmp_path: Path) -> None:
+    contract = await ServeContract.start(tmp_path, "websocket")
+    try:
+        controller, _ = await _client(contract)
+        first = (await controller.request("first", "new_session", {"provider": "codex"}))["result"]["session"]
+        assert first["model"] == "gpt-5.6-luna"
+        revision = (await controller.request("get", "home_settings_get"))["result"]["revision"]
+        for key, value in (("model", "gpt-5.5"), ("agents.max_depth", 2), ("agents.explicit_finish", True)):
+            reply = await controller.request(key, "home_settings_update", {
+                "expected_revision": revision, "changes": [{"key": key, "value": value}],
+            })
+            assert "result" in reply, reply
+            result = reply["result"]
+            assert result["restart"] == {"serve": False, "sessions": [first["session_id"]], "complete": True}
+            revision = result["revision"]
+        before = (await controller.request("before", "status"))["result"]
+        assert before["session"]["model"] == "gpt-5.6-luna"
+        assert (before["max_agent_depth"], before["explicit_finish"]) == (3, False)
+        second = (await controller.request("second", "new_session", {"provider": "codex"}))["result"]["session"]
+        assert second["model"] == "gpt-5.5"
+        after = (await controller.request("after", "status"))["result"]
+        assert (after["max_agent_depth"], after["explicit_finish"]) == (2, True)
+    finally:
+        await contract.close()
 
 
 @pytest.mark.asyncio
