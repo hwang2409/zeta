@@ -114,7 +114,7 @@ async def _traced_execute(
     ) as span:
         result = await registry.execute(tool_call, _span=span, **options)
         if result.get("isError"):
-            span.fail(None)
+            span.fail(None, code="tool_error")
         if loop.telemetry.enabled():
             span.set_sizes(
                 argument_bytes=_json_bytes(tool_call.arguments),
