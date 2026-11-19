@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import replace
 from pathlib import Path
 from time import monotonic as _monotonic
@@ -134,6 +134,8 @@ class AgentTranscriptControl(UIControl):
         self._path: Path | None = None
         self._source: Any = None
         self._load_task: asyncio.Task[None] | None = None
+        self._finder_return_task: asyncio.Task[None] | None = None
+        self.transcript.on_mouse_scroll = self.cancel_finder_return
         self._source_revision: tuple[tuple[int, int, int, int], bool] | None = None
         self._load_tasks: set[asyncio.Task[None]] = set()
         self._closed = False
@@ -205,6 +207,7 @@ class AgentTranscriptControl(UIControl):
         self.view_path = root_path
         self._root_source = root_source
         self._root_transcript = root_transcript
+        root_transcript.on_mouse_scroll = self.cancel_finder_return
         self._prompt_history = prompt_history
         self._current_path = current_path
         self._prepare_path = prepare_path
@@ -390,8 +393,22 @@ class AgentTranscriptControl(UIControl):
                 self._child_view_states.popitem(last=False)
         return True
 
+    def start_finder_return(self, restore: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        self.cancel_finder_return()
+        if self.loading_path is None:
+            self._finder_return_task = asyncio.create_task(restore())
+
+    def cancel_finder_return(self) -> asyncio.Task[None] | None:
+        task, self._finder_return_task = self._finder_return_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            return task
+        return None
+
     def _cancel_transition_work(self) -> tuple[asyncio.Task[Any], ...]:
         tasks: list[asyncio.Task[Any]] = []
+        if restore := self.cancel_finder_return():
+            tasks.append(restore)
         if self._load_task is not None and not self._load_task.done():
             self._load_task.cancel()
             tasks.append(self._load_task)
@@ -738,6 +755,7 @@ class AgentTranscriptControl(UIControl):
                 await asyncio.to_thread(source.close)
 
     def scroll(self, amount: int) -> None:
+        self.cancel_finder_return()
         self.transcript.scroll_lines(amount)
         if amount < 0 and self.transcript.at_resident_top and self.on_history_edge:
             self.on_history_edge("older")
@@ -748,11 +766,13 @@ class AgentTranscriptControl(UIControl):
         self.scroll(amount * max(1, self.transcript._viewport_height // 2))
 
     def top(self) -> None:
+        self.cancel_finder_return()
         self.transcript.scroll_to_top()
         if self.on_history_edge:
             self.on_history_edge("older")
 
     def bottom(self) -> None:
+        self.cancel_finder_return()
         self.transcript.scroll_to_bottom()
         if self.on_history_edge:
             self.on_history_edge("newer")

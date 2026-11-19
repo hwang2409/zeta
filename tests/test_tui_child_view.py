@@ -337,6 +337,7 @@ async def test_finder_return_respects_new_navigation(
             control = navigation.transcript_control
             transcript = control.transcript
             child_path = navigation.current_path
+
             def anchor():
                 return transcript.durable_scroll_anchor
 
@@ -360,7 +361,7 @@ async def test_finder_return_respects_new_navigation(
             monkeypatch.setattr(app, "_return_to_view", held_restore)
             pipe.send_bytes(b"\x03")
             await await_or_fail(started.wait(), what="finder closed and return held")
-            assert not transcript.finder_active
+            await next_frame(lambda: not transcript.finder_active, what="draw closed finder")
 
             if order == "switch-first":
                 await _return_to_root(app, pipe)
@@ -748,7 +749,9 @@ async def test_real_tui_child_view_journey(
                     f"length={len(session.default_buffer.text)}"
                 )
 
-            child_transcript = app._agent_navigation.transcript_control.transcript
+            control = app._agent_navigation.transcript_control
+            child_path = app._agent_navigation.current_path
+            child_transcript = control.transcript
             prior_child_anchor = child_transcript.durable_scroll_anchor
             await _wait_until(
                 lambda: (
@@ -765,11 +768,17 @@ async def test_real_tui_child_view_journey(
                 ),
                 what="child anchor after PageUp",
             )
-            child_anchor = child_transcript.durable_scroll_anchor
-            assert child_anchor is not None
+            scrolled_rows = (await _child_rows(app))[:3]
+            scrolled_anchor = child_transcript.durable_scroll_anchor
+            assert scrolled_anchor is not None and scrolled_anchor != prior_child_anchor
 
             await _return_to_root(app, pipe)
             try:
+                parked = control._saved_view(child_path)
+                assert parked is not None and parked.anchor == scrolled_anchor, (
+                    "child-park: durable anchor changed between drawn PageUp and park; "
+                    f"scrolled={scrolled_anchor!r} parked={parked!r}"
+                )
                 await _wait_until(
                     lambda: bool(app._transcript.units),
                     what="restored root transcript",
@@ -788,16 +797,20 @@ async def test_real_tui_child_view_journey(
                     lambda: not app._agent_navigation.transcript_control.transition_pending(),
                     what="published child re-entry",
                 )
+                restored_rows = (await _child_rows(app))[:3]
                 restored_anchor = child_transcript.durable_scroll_anchor
-                assert restored_anchor == child_anchor, (
+                assert restored_anchor == parked.anchor, (
                     "child-return: durable anchor changed; "
                     f"before_pageup={prior_child_anchor!r} "
-                    f"parked={child_anchor!r} "
+                    f"parked={parked.anchor!r} "
                     f"before_reentry={anchor_before_reentry!r} "
                     f"after_reentry={anchor_after_reentry!r} "
                     f"at_check={restored_anchor!r}; "
                     f"redraws={redraw_events!r}; "
                     f"screen={_drawn_terminal_text(app)!r}"
+                )
+                assert restored_rows == scrolled_rows, (
+                    "child-return: the drawn top rows changed from the parked view"
                 )
                 assert not app._transcript.units, (
                     "child-return: the inactive root widget still holds rendered units"
