@@ -40,6 +40,7 @@ from ..providers.rate_limit_hold import (
 from ..runtime.offload import await_joined_offload
 from ..runtime.prompt import RuntimePrompt
 from ..tools import ToolRegistry, ToolStreamPublisher
+from ..tools._shared.cwd_state import require_bash_cwd
 from ..tools.agent import ChildApprovalPolicy, agent_stats
 from ..tools.ask_parent import register_ask_parent
 from ..tools.finish import register as register_finish
@@ -170,11 +171,7 @@ async def consume_child(
         final_message = None
         async for event in events:
             forward_nested_agent_start(child_loop, event)
-            if event.type is StreamEventType.TURN_START:
-                status = f"turn {child_turns() + 1}: thinking"
-                update_step(status)
-                publish(status)
-            elif await hold_wake.observe(event):
+            if await hold_wake.observe(event):
                 if not background and foreground_hold_abandoned(event.data):
                     raise ForegroundChildHeld(foreground_hold_text(event.data))
                 status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
@@ -343,6 +340,14 @@ async def consume_child(
             "account_lock_timeout",
             "no_progress_loop",
         }:
+            return recoverable_error_result(terminal_result, failure_message, *failure_error)
+        if (
+            failure_error is not None
+            and failure_error[0] == "pre_dispatch_timeout"
+            and background
+            and child_loop.step_delivery is not None
+            and child_loop.step_delivery.has_pending_edge
+        ):
             return recoverable_error_result(terminal_result, failure_message, *failure_error)
         if failure_error is not None and failure_error[0] == "empty_turn":
             return clean_no_output(f"agent error: {failure_message}")
@@ -685,7 +690,14 @@ async def run_agent_tool(
             )
         candidate = Path(raw_cwd).expanduser()
         if not candidate.is_absolute():
-            candidate = Path(loop.store.cwd) / candidate
+            try:
+                candidate = await asyncio.to_thread(
+                    require_bash_cwd, loop.tool_registry.bash_cwd
+                ) / candidate
+            except ValueError as exc:
+                return loop._child_result_payload(
+                    tool_call.id, f"agent error: {exc}", state="failed"
+                )
         resolved_cwd = Path(os.path.abspath(candidate))
         if not resolved_cwd.is_dir():
             return loop._child_result_payload(
@@ -872,9 +884,11 @@ async def run_agent_tool(
         execution_context.lifecycle_sink if execution_context is not None else None
     )
 
-    def publish(status: str) -> None:
+    def publish(status: str, *, step: bool = False) -> None:
         if background:
             event_data: dict[str, object] = {"stream": "stdout"}
+            if step:
+                event_data["step"] = status
             if loop.agent_instance_id is not None:
                 event_data["agent_instance_id"] = loop.agent_instance_id
             loop._publish_background_event(
@@ -893,6 +907,33 @@ async def run_agent_tool(
 
     def update_step(step: str) -> None:
         child_store.update_agent_lifecycle(current_step=step)
+
+    def set_pre_dispatch_step(step: str) -> None:
+        status = f"turn {child_turns() + 1}: {step}"
+        update_step(status)
+        publish(status, step=True)
+
+    def report_pre_dispatch_stall(step: str, error: str) -> None:
+        set_pre_dispatch_step(step)
+
+        async def notify_parent() -> None:
+            try:
+                await loop._background_owner.conversation_channel.publish_idle(
+                    child_instance_id=child_instance_id,
+                    child_session_path=child_path,
+                    description=description,
+                    text=error,
+                )
+            except LookupError:
+                # The progress update is still visible if the parent closed.
+                pass
+            except Exception:
+                logger.exception("could not notify parent of stalled child %s", child_instance_id)
+
+        loop._create_task(notify_parent())
+
+    child_loop._set_pre_dispatch_step = set_pre_dispatch_step
+    child_loop._report_pre_dispatch_stall = report_pre_dispatch_stall
 
     def finish_lifecycle(state: str, text: str) -> dict[str, object]:
         turns_used = child_turns()

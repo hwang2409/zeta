@@ -187,7 +187,8 @@ def register(registry: ToolRegistry) -> None:
             "Replace one unique UTF-8 string, or several non-overlapping unique "
             "strings in one file with edits. Match all edits against the original "
             "file and validate them before one write. "
-            "Relative paths use the session cwd; "
+            "Relative paths use the bash session cwd, "
+            "which follows cd; "
             "~ and absolute paths outside the cwd are allowed."
         ),
         parameters={

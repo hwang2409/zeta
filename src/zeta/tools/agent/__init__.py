@@ -1062,14 +1062,12 @@ def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
             "cwd": {
                 "type": "string",
                 "description": (
-                    "Directory the child works in: its bash session cwd and "
-                    "relative read/edit/write paths resolve here. Absolute, "
-                    "or relative to your own working directory; must be an "
+                    "Starting directory for the child. Absolute, or relative to "
+                    "your bash session cwd, which follows cd; must be an "
                     "existing directory (a symlinked directory is rejected). "
                     "Pass this when delegating work in another directory or "
                     "git worktree so the child does not run in your checkout. "
-                    "Omit to inherit your working directory. Grandchildren "
-                    "default to their parent's cwd."
+                    "Omit to inherit your starting directory."
                 ),
             },
             "background": {

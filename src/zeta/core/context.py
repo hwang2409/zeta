@@ -985,12 +985,19 @@ class ContextAssembler(ContextMarkerMixin):
             pinned_message,
             ([] if floor_plan.message is None else [floor_plan.message]),
         )
-        proposed = floor_plan.proposed_messages(system_messages, view_messages)
         result_seqs = {
             id(m): int(m.metadata["source_seq"])
             for m in view_messages
             if m.tool_result is not None
         }
+        # Interrupted results have no source row. Recreate them in the provider
+        # projection with the same repair used when replaying the marker.
+        repaired = _with_interrupted_results(
+            [_ContextItem(None, message) for message in view_messages], branch
+        )
+        proposed = floor_plan.proposed_messages(
+            system_messages, [item.message for item in repaired]
+        )
         truncated = truncate_tool_results(
             proposed, assembly_budget, result_seqs, self.token_counter
         )
