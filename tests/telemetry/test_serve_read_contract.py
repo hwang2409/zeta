@@ -412,15 +412,19 @@ async def _ttft_and_cache(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         _span(TRACE_A, 1, OLD, operation="chat", request_model="m", ttft_ns=8, cache_read_tokens=3, cache_write_tokens=5),
         _span(TRACE_A, 2, RECENT, operation="chat", request_model="m", ttft_ns=128, cache_read_tokens=7, cache_write_tokens=11),
         _span(TRACE_A, 3, RECENT + 1, operation="chat", request_model="missing"),
-        # The same raw hour, but outside the requested range: neither TTFT nor cache counts it.
-        _span(TRACE_A, 4, RECENT + 2, operation="chat", request_model="m", ttft_ns=0, cache_read_tokens=100),
+        # Outside the exact range but in a touched hour: counts for TTFT and cache, not calls.
+        _span(TRACE_A, 4, RECENT + 2, operation="chat", request_model="m", ttft_ns=0, cache_read_tokens=100, cache_write_tokens=200),
+        _span(TRACE_A, 6, RECENT + HOUR, operation="chat", request_model="m", ttft_ns=512, cache_read_tokens=1000, cache_write_tokens=2000),
     ])
     async with _serve(root) as client:
         result, _ = await _call(client, METHODS["models"], start_ns=OLD - HOUR, end_ns=RECENT + 2)
-        raw, _ = await _call(client, METHODS["models"], start_ns=RECENT, end_ns=RECENT + 2)
-    assert [(m["model"], m["calls"], m["ttft_p50_ns"], m["ttft_p95_ns"], m["cache_read_tokens"], m["cache_write_tokens"])
-            for m in result["items"]] == [("m", 2, 15, 255, 10, 16), ("missing", 1, None, None, 0, 0)]
-    assert raw["items"][0]["ttft_p50_ns"] == 255
+        recent, _ = await _call(client, METHODS["models"], start_ns=RECENT, end_ns=RECENT + 2)
+    fields = ("model", "calls", "ttft_p50_ns", "ttft_p95_ns", "cache_read_tokens", "cache_write_tokens")
+    assert [tuple(m[field] for field in fields) for m in result["items"]] == [
+        ("m", 2, 15, 255, 110, 216), ("missing", 1, None, None, 0, 0),
+    ]
+    model = next(m for m in recent["items"] if m["model"] == "m")
+    assert tuple(model[field] for field in fields) == ("m", 1, 0, 255, 107, 211)
 
 
 @row("error-classes-full-range-and-filter")

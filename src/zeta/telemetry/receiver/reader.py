@@ -26,7 +26,6 @@ from .store import (
     DAY_NS,
     HOUR_NS,
     SCHEMA_VERSION,
-    _histogram_bucket,
 )
 
 DEFAULT_RANGE_NS = 24 * 3600 * 10**9
@@ -427,11 +426,10 @@ def _family(home: Path, params: dict[str, Any], fits: Fits, family: str) -> dict
     start = resume(params.get("cursor"), [f"telemetry_{family}s", *explicit], _range(*explicit), order)
     if family == "model":
         names = ("provider", "model")
-        sums = ("input_tokens", "output_tokens", "total_tokens", "cache_read_tokens", "cache_write_tokens")
+        sums = ("input_tokens", "output_tokens", "total_tokens")
         raw = (f"SELECT provider, {_MODEL} AS model, 1 AS calls, status = 'error' AS errors, duration_ns, "
                "COALESCE(input_tokens, 0) AS input_tokens, COALESCE(output_tokens, 0) AS output_tokens, "
-               "COALESCE(total_tokens, 0) AS total_tokens, COALESCE(cache_read_tokens, 0) AS cache_read_tokens, "
-               f"COALESCE(cache_write_tokens, 0) AS cache_write_tokens, end_ns AS last_ns FROM spans WHERE {_IS_MODEL}")
+               f"COALESCE(total_tokens, 0) AS total_tokens, end_ns AS last_ns FROM spans WHERE {_IS_MODEL}")
         table = "hourly_models"
     else:
         names, sums = ("tool_name", "tool_type"), ("argument_bytes", "result_bytes")
@@ -452,21 +450,28 @@ def _family(home: Path, params: dict[str, Any], fits: Fits, family: str) -> dict
     def read(connection: sqlite3.Connection) -> dict[str, Any]:
         hour_from, hour_to, raw_from, raw_to = _split(connection, *start.pinned)
 
-        if family == "model":
-            connection.create_function("histogram_bucket", 1, _histogram_bucket, deterministic=True)
-
         def rows_with_quantiles(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
-            # every hour the range touches, so a raw span's hour counts whole
+            # Histograms and cache totals count every hour the range touches.
             keys = [row["key"] for row in rows]
-            quantiles = _latency_quantiles(connection, family, keys, hour_from, start.pinned[1])
-            ttft = (_quantiles(connection.execute(*_ttft_query(keys, (hour_from, hour_to, raw_from, raw_to))))
-                    if family == "model" and keys else {})
+            end = start.pinned[1]
+            quantiles = _latency_quantiles(connection, family, keys, hour_from, end)
+            ttft, cache = {}, {}
+            if family == "model" and keys:
+                ttft = _quantiles(connection.execute(*_ttft_query(keys, hour_from, end)))
+                cache = {key: (reads, writes) for key, reads, writes in connection.execute(
+                    "SELECT model_key, SUM(cache_read_tokens), SUM(cache_write_tokens) FROM hourly_models "
+                    f"WHERE hour_ns >= ? AND hour_ns < ? AND model_key IN ({', '.join('?' * len(keys))}) GROUP BY model_key",
+                    (hour_from, end, *keys),
+                )}
             return [
                 {
                     **{name: row[name] for name in names},
                     "calls": row["calls"], "errors": row["errors"], "duration_ns": row["duration_ns"],
                     "p50_ns": quantiles.get(row["key"], (0, 0))[0], "p95_ns": quantiles.get(row["key"], (0, 0))[1],
-                    **{name: row[name] for name in (*sums, "last_ns")},
+                    **{name: row[name] for name in sums},
+                    **({"cache_read_tokens": cache.get(row["key"], (0, 0))[0],
+                        "cache_write_tokens": cache.get(row["key"], (0, 0))[1]} if family == "model" else {}),
+                    "last_ns": row["last_ns"],
                     **({"ttft_p50_ns": ttft.get(row["key"], (None, None))[0],
                         "ttft_p95_ns": ttft.get(row["key"], (None, None))[1]} if family == "model" else {}),
                 }
@@ -492,21 +497,12 @@ def _latency_quantiles(connection: sqlite3.Connection, family: str, keys: list[s
     ))
 
 
-def _ttft_query(keys: list[str], split: tuple[int, int, int, int]) -> tuple[str, tuple[object, ...]]:
-    hour_from, hour_to, raw_from, raw_to = split
-    wanted = ", ".join("?" * len(keys))
-    key = f"json_array(provider, {_MODEL})"
-    return (
-        f"""SELECT model_key, bucket, SUM(calls) FROM (
-            SELECT {key} AS model_key, histogram_bucket(ttft_ns) AS bucket, COUNT(*) AS calls
-            FROM spans WHERE {_IS_MODEL} AND start_ns >= ? AND start_ns < ? AND ttft_ns IS NOT NULL
-                AND {key} IN ({wanted}) GROUP BY model_key, bucket
-            UNION ALL
-            SELECT model_key, bucket, SUM(calls) FROM hourly_ttft
-            WHERE model_key IN ({wanted}) AND hour_ns >= ? AND hour_ns < ? GROUP BY model_key, bucket
-        ) GROUP BY model_key, bucket ORDER BY model_key, bucket""",
-        (raw_from, raw_to, *keys, *keys, hour_from, hour_to),
+def _ttft_query(keys: list[str], hour_from: int, end: int) -> tuple[str, tuple[object, ...]]:
+    sql = (
+        f"SELECT model_key, bucket, SUM(calls) FROM hourly_ttft WHERE model_key IN ({', '.join('?' * len(keys))}) "
+        "AND hour_ns >= ? AND hour_ns < ? GROUP BY model_key, bucket ORDER BY model_key, bucket"
     )
+    return sql, (*keys, hour_from, end)
 
 
 def _quantiles(rows: sqlite3.Cursor) -> dict[str, tuple[int, int]]:
