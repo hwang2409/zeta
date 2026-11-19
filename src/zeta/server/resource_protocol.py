@@ -27,6 +27,7 @@ class ResourceMethod:
     access: Access
     handler: Callable[..., Awaitable[Any]]
     since: str | None = None
+    extends_legacy: bool = False
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class ResourceDescriptor:
     feature: str
     access: Access
     handler: Callable[..., Awaitable[Any]]
+    extends_legacy: bool
 
 
 def collect_families() -> tuple[ResourceDescriptor, ...]:
@@ -52,6 +54,7 @@ def collect_families() -> tuple[ResourceDescriptor, ...]:
                 raise RuntimeError("serve resource methods must declare read or controller write access")
             descriptors.append(ResourceDescriptor(
                 method.wire, method.since, family.FEATURE, method.access, method.handler,
+                method.extends_legacy,
             ))
     return tuple(descriptors)
 
@@ -87,7 +90,7 @@ async def run_owner(
     *,
     family: str,
     project: Callable[[Any], Any],
-    owner_error: type[Exception],
+    owner_error: type[Exception] | tuple[type[Exception], ...],
     errors: Mapping[str, Any],
 ) -> Any:
     """Run the owner and an explicit public projection off-loop. Never relay owner error details.

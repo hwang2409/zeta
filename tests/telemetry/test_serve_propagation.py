@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import threading
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
 
 from tests import test_server_websocket as websocket
+from tests.support.credentials import named_account_credentials
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path
+from zeta.accounts import AccountId, AccountStore
+from zeta.oauth import OAuthTokens
 from zeta.server import ZetaServer
 from zeta.server.runtime import TEST_SCRIPTED_PROVIDER_ENV
 from zeta.telemetry import Telemetry
@@ -249,3 +254,138 @@ async def test_disabled_telemetry_serves_context_fields_unchanged(tmp_path, monk
     finally:
         await close_serve(server, wire.writer)
     assert valid == malformed == plain
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("negotiated", [False, True])
+async def test_account_list_on_empty_serve(tmp_path, monkeypatch, negotiated) -> None:
+    server = _server(tmp_path, "unix", Telemetry.disabled(), monkeypatch)
+    wire = Wire(server, "unix")
+    await wire.open()
+    try:
+        flags = ["account_list_idle_v1"] if negotiated else []
+        hello = json.loads(await wire.rpc("hello", "hello", {"protocol_version": "1.2", "features": flags}))
+        capabilities = hello["result"]["capabilities"]
+        assert capabilities["requests"].count("account_list") == 1
+        assert ("account_list_idle_v1" in capabilities["features"]) is negotiated
+        reply = json.loads(await wire.rpc("list", "account_list"))
+        if negotiated:
+            result = reply["result"]
+            assert result["data"] == {"accounts": []}
+            assert len(result["revision"]) == 64
+            assert int(result["revision"], 16) >= 0
+            observer = Wire(server, "unix")
+            observer.reader, observer.writer = await await_or_fail(
+                asyncio.open_unix_connection(str(server.socket_path)), what="observer connect",
+            )
+            try:
+                hello = json.loads(await observer.rpc("hello", "hello", {
+                    "protocol_version": "1.2", "features": [*flags, "serve_observers"], "role": "observer",
+                }))
+                assert "account_list" not in hello["result"]["capabilities"]["requests"]
+                refused = json.loads(await observer.rpc("list", "account_list", {"unexpected": True}))
+                assert refused["error"]["code"] == -32008
+                assert refused["error"]["data"] == {
+                    "code": "observer_read_only", "reason": "observer_read_only", "method": "account_list",
+                }
+            finally:
+                observer.writer.close()
+                await await_or_fail(observer.writer.wait_closed(), what="observer close")
+        else:
+            assert reply["error"] == {"code": -32602, "message": "session_id must be a nonempty string"}
+            stale = json.loads(await wire.rpc("list", "account_list", {"session_id": "missing"}))
+            assert stale["error"] == {"code": -32003, "message": "session is not active"}
+    finally:
+        await close_serve(server, wire.writer)
+
+
+@pytest.mark.asyncio
+async def test_account_list_isolates_corrupt_accounts_and_redacts_wire_logs_and_spans(
+    tmp_path, traced, monkeypatch, caplog,
+) -> None:
+    telemetry, memory = traced
+    server = _server(tmp_path, "unix", telemetry, monkeypatch)
+    wire = Wire(server, "unix")
+    token, refresh = "access-canary-never-export", "refresh-canary-never-export"
+    path = str(tmp_path / "credential-path-canary")
+    await wire.open()
+    try:
+        caplog.set_level(logging.DEBUG)
+        tokens = OAuthTokens(token, refresh, 9_999_999_999, workspace=path)
+        for name in ("good", "broken"):
+            named_account_credentials(tmp_path, "codex", name).save(tokens)
+        store = AccountStore(tmp_path)
+        store.credential_path(AccountId("codex", "broken")).write_text(f"invalid {token} {path}")
+        legacy = tmp_path / "anthropic-oauth.json"
+        legacy.write_text(json.dumps(tokens.to_dict()))
+        await wire.rpc("hello", "hello", {"protocol_version": "1.2", "features": ["account_list_idle_v1"]})
+        first = await wire.rpc("list", "account_list")
+        rows = {row["account"]: row for row in json.loads(first)["result"]["data"]["accounts"]}
+        assert rows["codex:good"] == {
+            "account": "codex:good", "available": True, "current": False, "default": True,
+            "detail": None, "label": "good", "usage": {"error": None, "freshness": "usage unknown", "snapshot": None},
+        }
+        assert rows["codex:broken"]["available"] is False
+        assert set(rows) == {"codex:good", "codex:broken"}
+        assert json.loads(legacy.read_text()) == tokens.to_dict()
+
+        invalid = await wire.rpc("invalid", "account_list", {"session_id": path, "token": token})
+        assert json.loads(invalid)["error"] == {
+            "code": -32602, "message": "invalid params", "data": {"code": "invalid_params"},
+        }
+        store.registry.write_text(f"invalid {token} {path}")
+        unavailable = await wire.rpc("unavailable", "account_list")
+        assert json.loads(unavailable)["error"]["data"] == {"code": "state_unavailable"}
+        assert json.loads(unavailable)["error"]["code"] == -32005
+        spans = _serve_spans(memory, "account_list")
+        assert len(spans) == 3
+        output = "\n".join([*(reply.decode() for reply in (first, invalid, unavailable)), caplog.text, *_texts(spans)])
+        for canary in (token, refresh, path, str(store.registry)):
+            assert canary not in output
+            assert hashlib.sha256(canary.encode()).hexdigest() not in output
+    finally:
+        await close_serve(server, wire.writer)
+
+
+@pytest.mark.asyncio
+async def test_account_list_serializes_with_registry_writer(tmp_path, monkeypatch) -> None:
+    server = _server(tmp_path, "unix", Telemetry.disabled(), monkeypatch)
+    wire = Wire(server, "unix")
+    await wire.open()
+    writing, reading, release = (threading.Event() for _ in range(3))
+    store = AccountStore(tmp_path)
+    write_registry = store._write_registry
+    registry_guard = AccountStore._registry_guard
+
+    def write(home_fd, value):
+        writing.set()
+        assert release.wait(10), "registry writer was not released"
+        write_registry(home_fd, value)
+
+    def guard(owner, home_fd):
+        if owner is not store:
+            reading.set()
+        return registry_guard(owner, home_fd)
+
+    writer = reader = None
+    try:
+        named_account_credentials(tmp_path, "codex", "work").save(OAuthTokens("access", "refresh", 9_999_999_999))
+        await wire.rpc("hello", "hello", {"protocol_version": "1.2", "features": ["account_list_idle_v1"]})
+        before = json.loads(await wire.rpc("before", "account_list"))["result"]
+        monkeypatch.setattr(store, "_write_registry", write)
+        monkeypatch.setattr(AccountStore, "_registry_guard", guard)
+        writer = asyncio.create_task(asyncio.to_thread(store.rename, AccountId("codex", "work"), "renamed"))
+        assert await asyncio.to_thread(writing.wait, 10), "registry writer never acquired its lock"
+        reader = asyncio.create_task(wire.rpc("after", "account_list"))
+        assert await asyncio.to_thread(reading.wait, 10), "account_list did not take the registry lock"
+        release.set()
+        await await_or_fail(writer, what="registry rename")
+        after = json.loads(await await_or_fail(reader, what="locked account_list"))["result"]
+        assert after["data"]["accounts"][0]["label"] == "renamed"
+        assert before["revision"] != after["revision"]
+        assert json.loads(await wire.rpc("repeat", "account_list"))["result"] == after
+    finally:
+        release.set()
+        await close_serve(server, wire.writer)
+        await await_or_fail(asyncio.gather(*(task for task in (writer, reader) if task), return_exceptions=True),
+                            what="account catalog test cleanup")

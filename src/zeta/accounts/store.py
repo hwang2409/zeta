@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
 import math
@@ -253,6 +254,37 @@ class AccountStore(_AccountRegistry):
                     "last_checked_ns": int(checked.timestamp() * 1_000_000_000) if checked else None,
                 })
         return rows, warnings
+
+    def catalog_snapshot(
+        self,
+    ) -> tuple[str, list[availability.AccountDisplay], dict[str, str]]:
+        """Read a consistent catalog without a writer lease or credential recovery."""
+        from .usage import UsageState, read_usage, usage_json
+
+        displays = []
+        with (
+            _owned_fd(os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)) as home_fd,
+            self._registry_guard(home_fd),
+        ):
+            registry = self._read_registry(home_fd)
+            defaults = registry["defaults"]
+            content = []
+            for item in availability.catalog_display(registry):
+                try:
+                    available = _read_account_tokens(home_fd, item.account) is not None
+                except (AccountError, ValueError, OverflowError, RecursionError):
+                    available = False
+                try:
+                    usage = read_usage(self, item.account)
+                except (OverflowError, RecursionError):
+                    usage = UsageState(None, "usage unknown", "invalid usage response")
+                displays.append(availability.AccountDisplay(
+                    item.account, item.label, usage=usage, available=available,
+                ))
+                # Do not hash tokens or derived freshness, which can change without a file write.
+                content.append((str(item.account), item.label, available, usage_json(usage)["snapshot"]))
+            revision = hashlib.sha256(json.dumps((defaults, content), sort_keys=True).encode()).hexdigest()
+        return revision, displays, defaults
 
     def list_display(self) -> list[availability.AccountDisplay]:
         return availability.list_display(self)

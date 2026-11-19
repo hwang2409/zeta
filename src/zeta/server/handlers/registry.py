@@ -568,7 +568,7 @@ async def dispatch(
     handled, result = await client._route_request(request_id, method, params)  # type: ignore[attr-defined]
     if handled:
         return result
-    descriptor = MethodDescriptor.for_wire(method)
+    descriptor = MethodDescriptor.for_wire(method, client.features)  # type: ignore[attr-defined]
     require_access(
         getattr(client, "role", None), method, descriptor.access if descriptor is not None else None,
         resource=isinstance(descriptor, ResourceDescriptor),
