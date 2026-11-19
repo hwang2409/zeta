@@ -279,6 +279,141 @@ def child_view_fixture(tmp_path_factory: pytest.TempPathFactory) -> ChildViewHom
 
 @pytest.mark.skipif(
     bool(os.environ.get("CI")) and sys.version_info < (3, 14),
+    reason="real-TUI finder regression runs once in the Python 3.14 PR job",
+)
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", ["scroll-first", "restore-first", "switch-first"])
+async def test_finder_return_respects_new_navigation(
+    child_view_fixture: ChildViewHome, monkeypatch: pytest.MonkeyPatch, order: str
+) -> None:
+    fixture = child_view_fixture
+    store = await asyncio.to_thread(
+        ConversationStore, fixture.home / "sessions", session_id=fixture.session_id
+    )
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex", model="offline", resumed=True, zeta_home=fixture.home,
+    )
+    output = Vt100_Output(StringIO(), lambda: Size(rows=42, columns=120), enable_cpr=False)
+    release = asyncio.Event()
+    started = asyncio.Event()
+    finished = asyncio.Event()
+    restore = app._return_to_view
+    restore_task = None
+
+    async def held_restore(follow_tail, anchor):
+        nonlocal restore_task
+        restore_task = asyncio.current_task()
+        restore_task.add_done_callback(lambda _: finished.set())
+        started.set()
+        await await_or_fail(release.wait(), what="release finder return")
+        await restore(follow_tail, anchor)
+
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
+        session = app._make_session()
+        run_task = asyncio.create_task(app.run(session))
+
+        async def next_frame(check, *, what, key=None):
+            drawn = asyncio.Event()
+
+            def after_render(_):
+                if check():
+                    drawn.set()
+
+            session.app.after_render += after_render
+            try:
+                if key is None:
+                    session.app.invalidate()
+                else:
+                    pipe.send_bytes(key)
+                await await_or_fail(drawn.wait(), what=what)
+            finally:
+                session.app.after_render -= after_render
+
+        try:
+            await _wait_until(lambda: bool(app._transcript.units), what="root first paint")
+            await _enter_child(app, pipe)
+            navigation = app._agent_navigation
+            control = navigation.transcript_control
+            transcript = control.transcript
+            child_path = navigation.current_path
+            def anchor():
+                return transcript.durable_scroll_anchor
+
+            await next_frame(anchor, key=b"\x1b[5~", what="draw pre-finder PageUp")
+            saved = anchor()
+            pages = app._resident_page_keys()
+
+            await next_frame(
+                lambda: transcript.finder_active, key=b"\x06", what="draw open child finder"
+            )
+            pipe.send_bytes(b"visible assistant 95")
+            await _wait_until(
+                lambda: control.search_task is not None, what="child finder scan started"
+            )
+            await await_or_fail(control.search_task, timeout=90, what="child finder scan")
+            await next_frame(
+                lambda: app._resident_page_keys() != pages,
+                what="draw child finder preview on different resident pages",
+            )
+
+            monkeypatch.setattr(app, "_return_to_view", held_restore)
+            pipe.send_bytes(b"\x03")
+            await await_or_fail(started.wait(), what="finder closed and return held")
+            assert not transcript.finder_active
+
+            if order == "switch-first":
+                await _return_to_root(app, pipe)
+                root_screen = await _terminal_text(app)
+                root_pages = app._resident_page_keys()
+                release.set()
+                await await_or_fail(finished.wait(), what="old child restore completed")
+                await next_frame(lambda: True, what="draw root after old child restore")
+                assert app._resident_page_keys() == root_pages
+                assert _drawn_terminal_text(app) == root_screen
+                return
+
+            if order == "restore-first":
+                release.set()
+                await await_or_fail(finished.wait(), what="finder return completed before PageUp")
+                await next_frame(lambda: anchor() == saved, what="draw restored bookmark")
+
+            before_scroll = anchor()
+            before_pages = app._resident_page_keys()
+            await next_frame(
+                lambda: anchor() is not None and anchor() != before_scroll,
+                key=b"\x1b[5~", what="draw latest PageUp",
+            )
+            scrolled = anchor()
+            rows = (await _child_rows(app))[:3]
+            assert app._resident_page_keys() == before_pages
+            assert not transcript.at_resident_top
+
+            release.set()
+            await await_or_fail(finished.wait(), what="finder return settled after PageUp")
+            await next_frame(lambda: True, what="draw child after finder return settled")
+            assert anchor() == scrolled, "finder return overwrote a newer drawn PageUp"
+            assert (await _child_rows(app))[:3] == rows
+
+            await _return_to_root(app, pipe)
+            parked = control._saved_view(child_path)
+            assert parked is not None and parked.anchor == scrolled
+            await _enter_child(app, pipe)
+            await next_frame(lambda: True, what="draw re-entered child")
+            assert anchor() == parked.anchor
+            assert (await _child_rows(app))[:3] == rows
+        finally:
+            release.set()
+            if restore_task is not None:
+                await await_or_fail(finished.wait(), what="held finder return stopped")
+                if not restore_task.cancelled():
+                    restore_task.result()
+            app.request_exit()
+            await await_or_fail(run_task, what="real child-view TUI shutdown")
+
+
+@pytest.mark.skipif(
+    bool(os.environ.get("CI")) and sys.version_info < (3, 14),
     reason="real-TUI journey runs once in the Python 3.14 PR job",
 )
 @pytest.mark.asyncio
