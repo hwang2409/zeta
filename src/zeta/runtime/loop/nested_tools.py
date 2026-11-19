@@ -51,6 +51,7 @@ def describe_code(registry: ToolRegistry, schemas: Sequence[ToolSchema]) -> None
         "Run JavaScript to combine results from several tools. Pass {script: string}. "
         "Use await tools.call(name, args) or await tools[name](args). "
         f"Available tools: {names}. "
+        "Prefer tools.read for files and tools.project for project records. "
         "Only output(value), called once, sends JSON to the model. "
         "Inner approvals still apply; catch ToolDenied or ToolError. "
         "Use Promise.all for independent calls (up to 8 run at once). "
