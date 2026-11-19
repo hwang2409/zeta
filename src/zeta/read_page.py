@@ -84,12 +84,14 @@ def page_result(
     total: int | None,
     fits: Callable[[dict[str, Any]], bool],
     shape: Callable[[list[Any], str | None], dict[str, Any]],
+    scan_end: Sequence[object] | None = None,
 ) -> dict[str, Any]:
-    """Return the largest fitting prefix, with a cursor after its last item."""
+    """Return the largest fitting prefix; a full page may resume after a bounded scan."""
     def result(count: int) -> dict[str, Any]:
         cursor = None
         if (more or count < len(items)) and (total is None or start.emitted + count < total):
-            cursor = _encode(start, position(count - 1), start.emitted + count)
+            key = scan_end if scan_end is not None and count == len(items) else position(count - 1)
+            cursor = _encode(start, key, start.emitted + count)
         return shape(items[:count], cursor)
 
     size = len(items)

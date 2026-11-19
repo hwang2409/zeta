@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -461,3 +462,39 @@ def project_history_entries(
         if starts(entry.type, entry_data):
             total += 1
     return projected, total, tui_total
+
+def nested_anchors(
+    connection: sqlite3.Connection, groups: tuple[tuple[ConversationEntry, ...], ...]
+) -> frozenset[str]:
+    from ..checkpoints import ConversationEntry
+    from ..context_parts.code_audit import nested_approval_anchors, nested_call_data
+
+    anchors: set[str] = set()
+    for group in groups:
+        for entry in group:
+            call_id = entry.data.get("request_id") if entry.type == "approval_resolution" else None
+            if entry.type == "message":
+                result = entry.data["message"].get("tool_result")
+                if isinstance(result, dict):
+                    call_id = result.get("tool_call_id")
+            if not isinstance(call_id, str):
+                continue
+            parent = call_id.rpartition(":code:")[0]
+            if not parent or call_id in anchors or not nested_call_data(call_id, parent):
+                continue
+            # The request and outer call can precede this page. Read only their
+            # indexed rows rather than loading the preceding transcript.
+            rows = connection.execute(
+                "SELECT e.seq,e.id,e.parent_id,e.lane,e.type,e.data "
+                "FROM active_approval_requests a JOIN entries e ON e.id=a.request_entry_id "
+                "WHERE a.request_id=? AND e.seq<? "
+                "UNION SELECT e.seq,e.id,e.parent_id,e.lane,e.type,e.data "
+                "FROM message_tool_calls t JOIN entries e ON e.seq=t.entry_seq "
+                "WHERE t.call_id=? AND e.history_group IS NOT NULL AND e.seq<? "
+                "ORDER BY 1", (call_id, entry.seq, parent, entry.seq),
+            )
+            anchors.update(nested_approval_anchors(tuple(
+                ConversationEntry(seq, eid, pid, lane, kind, json.loads(data))
+                for seq, eid, pid, lane, kind, data in rows
+            )))
+    return frozenset(anchors)
