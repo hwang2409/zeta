@@ -9,7 +9,17 @@ from types import SimpleNamespace
 import pytest
 
 from zeta.codex import CodexHTTPError, CodexStreamError
-from zeta.protocol.types import ErrorInfo, StreamEvent, StreamEventType
+from zeta.protocol.types import (
+    ContentBlock,
+    ErrorInfo,
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
 from zeta.providers.anthropic_errors import AnthropicHTTPError, AnthropicStreamError
 from zeta.providers.completion import ProviderStallError
 from zeta.providers.ollama import OllamaError
@@ -103,17 +113,29 @@ def _observe(monkeypatch: pytest.MonkeyPatch, events: list[tuple[int, StreamEven
     return span.calls
 
 
-def test_ttft_is_set_once_at_the_first_model_output(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(("deltas", "content", "expected_ns"), [
+    pytest.param(["hi", "!"], TextContent("hi!"), 100_000_000, id="streamed-text"),
+    pytest.param([], TextContent("done"), 100_002_000, id="end-only-text"),
+    pytest.param([], ToolUseContent(ToolCall("call-1", "read", {})), 100_002_000, id="end-only-tool-call"),
+])
+def test_ttft_is_set_once_at_the_first_model_output(
+    monkeypatch: pytest.MonkeyPatch, deltas: list[str], content: ContentBlock, expected_ns: int,
+) -> None:
     retry = StreamEvent(StreamEventType.RETRY, data={"reason": "overloaded_error", "attempt": 1, "delay": 0.5})
+    end = StreamEvent(
+        StreamEventType.MESSAGE_END,
+        message=Message(MessageRole.ASSISTANT, [content]),
+        data={"usage": {"input_tokens": 7, "output_tokens": 2}},
+    )
     calls = _observe(monkeypatch, [
         (1_100, retry),
         (1_250, StreamEvent(StreamEventType.MESSAGE_START, data={"model": "qwen3:4b"})),
-        (100_001_000, StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="hi")),
-        (100_002_000, StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="!")),
-        (100_003_000, StreamEvent(StreamEventType.MESSAGE_END, data={"usage": {"input_tokens": 7, "output_tokens": 2}})),
+        *((at, StreamEvent(StreamEventType.MESSAGE_UPDATE, delta=delta))
+          for at, delta in enumerate(deltas, start=100_001_000)),
+        (100_003_000, end),
     ])
 
-    assert calls["response"]["ttft_ns"] == 100_000_000
+    assert calls["response"]["ttft_ns"] == expected_ns
     assert calls["response"]["retry_count"] == 1
     # the provider reported no cache counts: absent, never a guessed 0
     assert calls["usage"] == {"input_tokens": 7, "output_tokens": 2, "total_tokens": 9, "cache_read_tokens": None, "cache_write_tokens": None}
