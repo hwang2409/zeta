@@ -52,7 +52,7 @@ pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
 async def run_script(tmp_path, script, *, policy=None, delegated=False, configure=None, on_event=None):
     skills = SkillCatalog.empty()
-    store = ConversationStore(tmp_path / "session", session_id="test")
+    store = ConversationStore(tmp_path / "session", session_id="test", cwd=tmp_path)
     if delegated:
         policy = ChildApprovalPolicy(policy, store, "proof", "code-child", child_cwd=tmp_path)
     registry = ToolRegistry(tmp_path, session_store=store, skill_catalog=skills,
@@ -278,7 +278,7 @@ async def test_unexposed_controls(tmp_path):
 
 async def test_restart_does_not_resume_inner_call(tmp_path):
     root = tmp_path / "session"
-    store = ConversationStore(root, session_id="interrupted")
+    store = ConversationStore(root, session_id="interrupted", cwd=tmp_path)
     outer = ToolCall("outer", "code", {"script": "output(null)"})
     inner = ToolCall("outer:code:1", "write", {"path": "never", "content": "changed"})
     try:
@@ -374,7 +374,7 @@ async def test_unlisted_tool_has_no_authority(tmp_path, monkeypatch, packaged):
 @asynccontextmanager
 async def nested_owner(tmp_path, *, delegated=False):
     policy = ApprovalPolicy()
-    store = ConversationStore(tmp_path / "session", session_id="table")
+    store = ConversationStore(tmp_path / "session", session_id="table", cwd=tmp_path)
     outer = ToolCall("outer", "code", {"script": "output(null)"})
     store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(outer)]))
     tools_policy = ChildApprovalPolicy(policy, store, "proof", "code-child", child_cwd=tmp_path) if delegated else policy
