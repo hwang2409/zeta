@@ -144,6 +144,71 @@ async def test_code_mode_is_off_by_default(tmp_path):
         await close_serve(server)
 
 
+@pytest.mark.parametrize(
+    ("enabled", "name", "builtin"),
+    [(False, "code", False), (True, "code", True), (True, "custom", False)],
+    ids=["off-custom-code", "on-builtin-code", "on-custom"],
+)
+async def test_code_tool_identity(tmp_path, enabled, name, builtin):
+    skills = SkillCatalog.empty()
+    store = ConversationStore(tmp_path / "session", session_id="test", cwd=tmp_path)
+    policy = ApprovalPolicy()
+    registry = ToolRegistry(
+        tmp_path, session_store=store, skill_catalog=skills, approval_policy=policy,
+        code_mode_enabled=enabled, enforce_approvals=True,
+    )
+    subject_ran = asyncio.Event()
+    executors = []
+
+    async def subject(arguments, signal, *, execution_context):
+        executors.append(execution_context.nested_tool_executor)
+        subject_ran.set()
+        return "custom result"
+
+    async def peer(arguments, signal):
+        try:
+            await asyncio.wait_for(subject_ran.wait(), 10)
+        except TimeoutError:
+            return "ran alone"
+        return "ran with subject"
+
+    if builtin:
+        calls = [ToolCall("subject", name, {"script": 'output("builtin result");'})]
+    else:
+        registry.register(name, subject, parallel_safe=True)
+        registry.register("peer", peer, parallel_safe=True)
+        calls = [ToolCall("peer", "peer", {}), ToolCall("subject", name, {})]
+    loop = AgentLoop(
+        FakeBackend([ScriptedTurn(tool_calls=calls), ScriptedTurn(content=[TextContent("done")])]),
+        store, registry=registry, skill_catalog=skills, skip_mcp_mount=True,
+    )
+    asks = []
+
+    async def collect():
+        async for event in loop.run_turn("run the tools", origin=MessageOrigin.USER):
+            if event.type is StreamEventType.TOOL_APPROVAL_START:
+                asks.append(event.tool_call.id)
+                assert policy.approve(event.tool_call.id)
+
+    try:
+        await await_or_fail(collect(), timeout=20, what="identity test turn settles")
+        result = store.tool_result("subject")
+        assert result is not None and not result.is_error
+        if builtin:
+            # The builtin cannot run even this script without its nested executor.
+            assert result.content == '"builtin result"'
+            assert asks == []
+        else:
+            assert result.content == "custom result"
+            assert sorted(asks) == ["peer", "subject"]
+            assert executors == [None]
+            assert store.tool_result("peer").content == "ran with subject"
+    finally:
+        subject_ran.set()
+        await await_or_fail(loop.close(), what="close identity test loop")
+        store.close()
+
+
 async def test_code_responses_tool_size_and_exposure(tmp_path):
     async def wire_tools(enabled, *, allow=None):
         registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty(),

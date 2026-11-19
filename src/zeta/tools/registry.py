@@ -198,10 +198,6 @@ def _copy_definition(
     return replace(
         definition, parameters=copy.deepcopy(definition.parameters), handler=handler
     )
-def name_is_code_builtin(definition: ToolDefinition) -> bool:
-    return definition.name == "code" and definition.origin is ToolOrigin.PACKAGED_BUILTIN
-
-
 def _open_directory_fd(path: Path) -> tuple[int, tuple[int, int]]:
     """Open a directory descriptor for a session cwd, rejecting symlinks."""
     cwd_fd = -1
@@ -419,7 +415,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                     continue
                 schema = filtered
             schemas.append(schema)
-        if "code" in self._tools:
+        if self.is_code_mode_call():
             from ..runtime.loop.nested_tools import describe_code
 
             describe_code(self, schemas)
@@ -471,6 +467,17 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         return frozenset(
             name for name in self._tools if self.tool_is_allowed_by_policy(name)
         )
+
+    def is_code_mode_call(self, name: str = "code") -> bool:
+        """Whether this name resolves to the enabled packaged code tool."""
+        if not self.code_mode_enabled:
+            return False
+        definition = self._tools.get(name)
+        if definition is None or definition.origin is not ToolOrigin.PACKAGED_BUILTIN:
+            return False
+        from .code import _code
+
+        return definition.handler is _code
 
     def _registration_origin(self) -> ToolOrigin:
         frame = inspect.currentframe()
@@ -954,7 +961,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             await self.abort_approval(tool_call)
             return None
         if (not capability.requires_approval and not self.enforce_approvals
-                or name_is_code_builtin(definition)):
+                or self.is_code_mode_call(tool_call.name)):
             return None
         if definition.validate_arguments:
             try:
@@ -1100,7 +1107,9 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             if abort_result is not None:
                 return await finalize(abort_result)
         check_expected()
-        if _nested_tool_executor is None:
+        nested_code = _nested_tool_executor is not None and self.is_code_mode_call(tool_call.name)
+        if not nested_code:
+            _nested_tool_executor = None
             self.remember_approval_definition(
                 tool_call, capability, persist=_persist_approval
             )
@@ -1119,7 +1128,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 _lifecycle_sink,
                 execution_token=execution_token,
                 skip_approval=(
-                    _nested_tool_executor is not None
+                    nested_code
                     or not self.enforce_approvals and (
                         _skip_approval
                         or not capability.requires_approval
@@ -1163,6 +1172,8 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         if isinstance(current, dict):
             return await finalize(current)
         definition, capability, arguments = current
+        if nested_code and not self.is_code_mode_call(tool_call.name):
+            return await finalize(_error_result("code tool definition changed", kind="tool_not_allowed"))
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():

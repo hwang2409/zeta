@@ -463,12 +463,8 @@ class AgentLoop(
         )
 
     def _nested_executor_for(self, call, abort, publish, environment, coordinator):
-        from ...tools.registry import name_is_code_builtin
         from .nested_tools import LoopNestedToolExecutor
 
-        definition = self.tool_registry.definition_reference(call.name)
-        if definition is None or not name_is_code_builtin(definition):
-            return None
         return LoopNestedToolExecutor(
             self, call, abort or self.tool_registry.abort_signal, publish, environment,
             coordinator=coordinator,

@@ -56,7 +56,7 @@ class ApprovalPipelineMixin:
             if message.always:
                 parent = request.request_id.rpartition(":code:")[0]
                 if (
-                    self._host.loop.tool_registry.code_mode_enabled
+                    self._host.loop.tool_registry.is_code_mode_call()
                     and request.child_instance_id is not None
                     and parent
                     and nested_call_data(request.request_id, parent)
