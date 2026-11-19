@@ -94,6 +94,10 @@ class AccountCredentialLockTimeoutError(AccountError):
         super().__init__(message)
 
 
+class AccountLockBusyError(AccountError):
+    """Another holder owns the account lock."""
+
+
 class AccountLoopThreadLockError(AccountError):
     """A blocking account lock was requested on an asyncio loop thread."""
 
@@ -139,7 +143,7 @@ class AccountStore(_AccountRegistry):
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
             except BlockingIOError as exc:
-                raise AccountError(
+                raise AccountLockBusyError(
                     "a login for this provider is already in progress"
                 ) from exc
             yield

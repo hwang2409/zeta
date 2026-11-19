@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -137,7 +138,7 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert parsed_redirect.path == expected_path
         assert parsed_redirect.port is not None and parsed_redirect.port > 0
         assert parse_qs(urlsplit(result["authorization_url"]).query)["state"] == [captured["state"]]
-        duplicate = await rpc(reader, writer, "login_start", provider=provider)
+        duplicate = await rpc(reader, writer, "login_start", provider=provider, account="missing")
         assert duplicate["error"]["data"]["code"] == "login_in_progress"
         # Both providers may wait at once, with independent cancellation.
         other = "codex" if provider == "claude" else "claude"
@@ -158,6 +159,43 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert (await rpc(reader, writer, "status"))["result"]["state"] == "idle"
     finally:
         await close_serve(server, writer)
+
+
+async def test_login_start_reports_shared_provider_lock_contention(tmp_path, monkeypatch):
+    home = tmp_path / "zeta"
+    monkeypatch.setenv("ZETA_ACCOUNT_HOME", str(home))
+    holder = await asyncio.wait_for(asyncio.create_subprocess_exec(
+        sys.executable, "-c",
+        "import sys\n"
+        "from zeta.accounts import AccountStore\n"
+        "with AccountStore(sys.argv[1]).provider_login_lock('anthropic'):\n"
+        "    print('locked', flush=True)\n"
+        "    sys.stdin.read()\n",
+        str(home), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+    ), 10)
+    try:
+        assert await asyncio.wait_for(holder.stdout.readline(), 10) == b"locked\n"
+        for features in ((), ("account_list_idle_v1",)):
+            server, reader, writer, _ = await connect(tmp_path, features=features)
+            try:
+                response = await rpc(reader, writer, "login_start", provider="claude")
+                if features:
+                    assert response.get("error") == {
+                        "code": -32005, "message": "login is already pending",
+                        "data": {"code": "login_in_progress"},
+                    }, response
+                else:
+                    assert response["result"] == {
+                        "state": "failed",
+                        "error": {
+                            "code": "login_failed",
+                            "message": "Could not complete sign-in. Please try again.",
+                        },
+                    }
+            finally:
+                await close_serve(server, writer)
+    finally:
+        await asyncio.wait_for(holder.communicate(), 10)
 
 
 _MISSING_REGISTRY_REFUSAL = (

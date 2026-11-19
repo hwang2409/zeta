@@ -11,6 +11,7 @@ from ..accounts import (
     AccountCredentialLockTimeoutError,
     AccountError,
     AccountId,
+    AccountLockBusyError,
     AccountRegistryBrokenError,
     AccountRegistryMissingError,
     AccountStore,
@@ -101,21 +102,30 @@ class Logins:
         if named_accounts and params.get("provider") not in ("claude", "codex"):
             raise invalid_resource_params()
         provider, task = self._provider_task(params)
-        account = "default"
-        if named_accounts and "account" in params:
-            account = await asyncio.to_thread(self._resolve_account, provider, params["account"])
         if task is not None and not task.done():
             raise ProtocolError(
                 ErrorDescriptor.LOGIN_IN_PROGRESS, "login is already pending"
             )
+        account = "default"
+        if named_accounts and "account" in params:
+            account = await asyncio.to_thread(self._resolve_account, provider, params["account"])
         url = asyncio.get_running_loop().create_future()
         operation = _LoginOperation()
-        task = asyncio.create_task(self._run(provider, url, operation, account=account))
+        task = asyncio.create_task(self._run(
+            provider, url, operation, account=account, named_accounts=named_accounts
+        ))
         self.tasks[provider] = task
         self.operations[provider] = operation
         await asyncio.wait((url, task), return_when=asyncio.FIRST_COMPLETED)
         if task.done():
-            return task.result()
+            try:
+                return task.result()
+            except AccountLockBusyError:
+                del self.tasks[provider]
+                del self.operations[provider]
+                raise ProtocolError(
+                    ErrorDescriptor.LOGIN_IN_PROGRESS, "login is already pending"
+                ) from None
         return {"state": "pending", "authorization_url": url.result()}
 
     async def login_status(self, params: dict) -> dict:
@@ -219,6 +229,7 @@ class Logins:
         operation: _LoginOperation | None = None,
         *,
         account: str = "default",
+        named_accounts: bool = False,
     ) -> dict:
         operation = operation or _LoginOperation()
         login_provider = "anthropic" if provider == "claude" else provider
@@ -235,7 +246,9 @@ class Logins:
             result = await self._attempt(login_provider, url, operation, account)
         except asyncio.CancelledError:
             cancelled = True
-        except (OSError, RuntimeError, ValueError, httpx.HTTPError):
+        except (OSError, RuntimeError, ValueError, httpx.HTTPError) as exc:
+            if named_accounts and isinstance(exc, AccountLockBusyError):
+                raise
             result = failure(
                 "login_failed", "Could not complete sign-in. Please try again."
             )
