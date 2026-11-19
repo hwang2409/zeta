@@ -425,9 +425,18 @@ def assert_settled_once(store, call, decision, *, canceled=False):
     assert len(results) == 1 and results[0].is_canceled is canceled
 
 
-@pytest.mark.parametrize("mode", ["direct-always", "delegated-always", "ordinary-delegated-always", "parent-grant"])
-async def test_nested_grants(tmp_path, mode):
-    ordinary = mode == "ordinary-delegated-always"
+@pytest.mark.parametrize(
+    ("mode", "ordinary_id"),
+    [
+        ("direct-always", None),
+        ("delegated-always", None),
+        ("ordinary-delegated-always", "ordinary-write"),
+        ("ordinary-delegated-always", "ordinary:code:1"),
+        ("parent-grant", None),
+    ],
+)
+async def test_nested_grants(tmp_path, mode, ordinary_id):
+    ordinary = ordinary_id is not None
     async with nested_owner(tmp_path, delegated=mode != "direct-always", code_enabled=not ordinary) as (loop, policy, outer):
         ask = asyncio.Event()
         events = []
@@ -446,7 +455,7 @@ async def test_nested_grants(tmp_path, mode):
             policy.remember_allow(ApprovalRequest("prior", ToolCall("prior", "write", {"path": "other"})))
         execute = nested_tools.LoopNestedToolExecutor(loop, outer, registry.abort_signal, publish, None,
                                                       coordinator=ToolDispatchCoordinator(8))
-        call = ToolCall("ordinary-write" if ordinary else "outer:code:1", "write", {"path": "first", "content": "written"})
+        call = ToolCall(ordinary_id or "outer:code:1", "write", {"path": "first", "content": "written"})
 
         async def run_call():
             if not ordinary:

@@ -55,7 +55,12 @@ class ApprovalPipelineMixin:
         if message.decision is ApprovalDecision.ALLOW:
             if message.always:
                 parent = request.request_id.rpartition(":code:")[0]
-                if request.child_instance_id is not None and parent and nested_call_data(request.request_id, parent):
+                if (
+                    self._host.loop.tool_registry.code_mode_enabled
+                    and request.child_instance_id is not None
+                    and parent
+                    and nested_call_data(request.request_id, parent)
+                ):
                     self._host._print_system("approval · cannot always allow delegated approvals")
                     self._ack_action(message)
                     return
