@@ -14,6 +14,7 @@ from ...protocol.types import StreamEvent, StreamEventType
 from .. import theme
 from ..cards.agent_message import AgentIdentityIndex
 from ..cards.agent_sync import refresh_agent_cards
+from ..cards.base import compact_tool_card
 from ..layout import CONTENT_MARGIN
 from ..render import render_event
 from .transcript import (
@@ -472,7 +473,7 @@ class TranscriptPresenter:
                 unit.finish(
                     rendered,
                     event,
-                    compact=False,
+                    compact=event.tool_call.name == "code",
                     on_final_tail=lambda: self._tool_region.update(
                         self._tool_region_renderable()
                     ) if self._tool_region is not None else None,
@@ -501,7 +502,10 @@ class TranscriptPresenter:
 
         call = event.tool_call
         if not self._full_screen_active():
-            self.print_unit(self.render_event(event))
+            rendered = self.render_event(event)
+            if rendered is not None and call is not None and call.name == "code":
+                rendered = compact_tool_card(rendered)
+            self.print_unit(rendered)
             return
         if call is None:
             self.print_unit(self.render_event(event))
