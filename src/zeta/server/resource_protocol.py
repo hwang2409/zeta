@@ -47,6 +47,14 @@ class ResourceDescriptor:
     handler: Callable[..., Awaitable[Any]]
 
 
+def _close_handler_errors(handler: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+    async def handle(client: Any, request_id: Any, params: Any) -> Any:
+        with owner_errors():
+            return await handler(client, request_id, params)
+
+    return handle
+
+
 def collect_families() -> tuple[ResourceDescriptor, ...]:
     """Only collect modules from the packaged resource-family directory, never user plugins."""
     descriptors = []
@@ -60,7 +68,7 @@ def collect_families() -> tuple[ResourceDescriptor, ...]:
             if method.access not in {Access.READ, Access.CONTROLLER_READ, Access.CONTROLLER_WRITE}:
                 raise RuntimeError("serve resource methods must declare read, controller read, or controller write access")
             descriptors.append(ResourceDescriptor(
-                method.wire, method.since, family.FEATURE, method.access, method.handler,
+                method.wire, method.since, family.FEATURE, method.access, _close_handler_errors(method.handler),
             ))
     return tuple(descriptors)
 
@@ -112,10 +120,16 @@ async def run_owner(
 
 
 @contextmanager
-def owner_errors(*, family: str, owner_error: type[Exception], errors: Mapping[str, Any]):
-    """Close the error surface of a blocking or asynchronous owner."""
+def owner_errors(
+    *,
+    family: str = "",
+    owner_error: type[Exception] | tuple[type[Exception], ...] = (),
+    errors: Mapping[str, Any] | None = None,
+):
+    """Close unexpected failures and optionally map an owner's known errors."""
     from .protocol import (
         ErrorDescriptor,
+        ProtocolError,
         closed_error,
         invalid_resource_params,
         stale_resource_revision,
@@ -123,15 +137,19 @@ def owner_errors(*, family: str, owner_error: type[Exception], errors: Mapping[s
 
     try:
         yield
-    except owner_error as exc:
-        code = getattr(exc, "code", None)
-        if code == "stale_revision":
-            raise stale_resource_revision(family) from None
-        if code == "invalid_params":
-            raise invalid_resource_params() from None
-        raise closed_error(errors.get(code, ErrorDescriptor.INTERNAL_ERROR)) from None
-    except Exception:  # noqa: BLE001 - owner paths and request values must not cross the wire
-        raise closed_error(ErrorDescriptor.INTERNAL_ERROR) from None
+    except ProtocolError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - owner paths and request values must not cross the wire
+        descriptor = ErrorDescriptor.INTERNAL_ERROR
+        if isinstance(exc, owner_error):
+            code = getattr(exc, "code", None)
+            if code == "stale_revision":
+                raise stale_resource_revision(family) from None
+            if code == "invalid_params":
+                raise invalid_resource_params() from None
+            if errors is not None:
+                descriptor = errors.get(code, descriptor)
+        raise closed_error(descriptor) from None
 
 
 def restart_report(home: Path, *, serve: bool, changed: bool) -> dict[str, Any]:

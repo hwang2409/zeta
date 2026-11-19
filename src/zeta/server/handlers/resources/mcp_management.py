@@ -18,7 +18,6 @@ from ...resource_protocol import (
 
 FEATURE = "mcp_management_v1"
 _SCOPES = ("user", "project", "effective")
-_ADD = ("command", "args", "url", "env", "headers", "oauth", "enabled", "client_id", "client_secret")
 
 
 def _owner(client) -> MCPManagementService:
@@ -68,29 +67,46 @@ async def mcp_server_list(client, request_id, params):
     )
 
 
+def _string(value: object) -> bool:
+    return isinstance(value, str) and len(value) <= 8192 and "\0" not in value
+
+
 def _text(value: object) -> bool:
-    return isinstance(value, str) and 0 < len(value) <= 8192 and "\0" not in value
+    return _string(value) and value != ""
+
+
+def _string_map(value: object) -> bool:
+    return isinstance(value, dict) and len(value) <= 128 and all(
+        _text(key) and _string(item) for key, item in value.items()
+    )
+
+
+def _args(value: object) -> bool:
+    return isinstance(value, list) and len(value) <= 128 and all(map(_string, value))
+
+
+def _boolean(value: object) -> bool:
+    return type(value) is bool
+
+
+_ADD_FIELDS = {
+    "command": _text,
+    "args": _args,
+    "url": _text,
+    "env": _string_map,
+    "headers": _string_map,
+    "oauth": _boolean,
+    "enabled": _boolean,
+    "client_id": _text,
+    "client_secret": _text,
+}
 
 
 def _add_params(mutation: dict) -> None:
     from ...protocol import invalid_resource_params
 
-    for key, value in mutation.items():
-        if key in ("env", "headers"):
-            valid = isinstance(value, dict) and len(value) <= 128 and all(
-                _text(k) and isinstance(v, str) and len(v) <= 8192 and "\0" not in v
-                for k, v in value.items()
-            )
-        elif key == "args":
-            valid = isinstance(value, list) and len(value) <= 128 and all(
-                isinstance(arg, str) and len(arg) <= 8192 and "\0" not in arg for arg in value
-            )
-        elif key in ("oauth", "enabled"):
-            valid = type(value) is bool
-        else:
-            valid = _text(value)
-        if not valid:
-            raise invalid_resource_params()
+    if any(key in mutation and not validate(mutation[key]) for key, validate in _ADD_FIELDS.items()):
+        raise invalid_resource_params()
     if (
         ("command" in mutation) == ("url" in mutation)
         or ("command" in mutation and ("headers" in mutation or mutation.get("oauth")))
@@ -115,7 +131,7 @@ def _write(action: str, *keys: str, optional: tuple[str, ...] = ()):
             raise invalid_resource_params()
         if action == "add":
             _add_params(mutation)
-        if any(key in mutation and type(mutation[key]) is not bool for key in ("enabled", "trusted")):
+        elif any(key in mutation and not _boolean(mutation[key]) for key in ("enabled", "trusted")):
             raise invalid_resource_params()
 
         owner = _owner(client)
@@ -192,7 +208,7 @@ async def mcp_auth_logout(client, request_id, params):
 
 METHODS = (
     ResourceMethod("mcp_server_list", Access.READ, mcp_server_list),
-    ResourceMethod("mcp_server_add", Access.CONTROLLER_WRITE, _write("add", "scope", optional=_ADD)),
+    ResourceMethod("mcp_server_add", Access.CONTROLLER_WRITE, _write("add", "scope", optional=tuple(_ADD_FIELDS))),
     ResourceMethod("mcp_server_remove", Access.CONTROLLER_WRITE, _write("remove", "scope")),
     ResourceMethod("mcp_server_set_enabled", Access.CONTROLLER_WRITE, _write("set_enabled", "scope", "enabled")),
     ResourceMethod("mcp_server_set_trusted", Access.CONTROLLER_WRITE, _write("set_trusted", "trusted")),
