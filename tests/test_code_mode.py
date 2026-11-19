@@ -8,6 +8,7 @@ import sys
 from contextlib import asynccontextmanager
 from types import ModuleType, SimpleNamespace
 
+import httpx
 import pytest
 from rich.console import Console
 
@@ -81,6 +82,27 @@ async def run_script(tmp_path, script, *, policy=None, delegated=False, configur
     finally:
         await await_or_fail(loop.close(), what="close code mode loop")
         store.close()
+
+
+async def test_code_responses_tool_size_and_exposure(tmp_path):
+    async def wire_tools(enabled, *, allow=None):
+        registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty(),
+                                code_mode_enabled=enabled, tool_allow=allow)
+        try:
+            return build_responses_payload([], registry.schemas, model="gpt")["tools"]
+        finally:
+            await registry.close()
+
+    off, on = await wire_tools(False), await wire_tools(True)
+    assert off == [tool for tool in on if tool["name"] != "code"]
+    # Budget the actual HTTP JSON bytes, with no tokenizer asset download in CI.
+    url = "https://example.invalid"
+    delta = len(httpx.Request("POST", url, json=on).content) - len(httpx.Request("POST", url, json=off).content)
+    assert 0 < delta <= 460, f"code adds {delta} bytes to the Responses tool list"
+
+    limited = await wire_tools(True, allow=["code", "read", "todo"])
+    restricted, = (tool for tool in limited if tool["name"] == "code")
+    assert "`await tools.<name>(args)` with read;" in restricted["description"]
 
 
 @pytest.mark.parametrize("inject_snapshot", [False, True], ids=["production", "executor"])
@@ -684,7 +706,7 @@ async def test_abort_parallel_asks_settles_started_calls_only(tmp_path):
     assert not (tmp_path / 'never').exists()
 
 
-@pytest.mark.parametrize('invariant', ['projection', 'history-index'])
+@pytest.mark.parametrize('invariant', ['projection', 'history-index', 'usage-error'])
 async def test_code_replay_retains_audit_not_projection(tmp_path, invariant):
     import re
 
@@ -697,8 +719,9 @@ async def test_code_replay_retains_audit_not_projection(tmp_path, invariant):
     (tmp_path / 'selected').write_text('selected')
     (tmp_path / 'settings.toml').write_text('[code_mode]\nenabled = true\n')
     script = '''await tools.read({path: 'unselected'});
-const selected = await tools.read({path: 'selected'});
-output(selected.content);'''
+const selected = await tools.read({path: 'selected'});'''
+    if invariant != 'usage-error':
+        script += '\noutput(selected.content);'
     backend = FakeBackend([
         ScriptedTurn(tool_calls=[ToolCall('outer', 'code', {'script': script})]),
         ScriptedTurn(content=[TextContent('finished')]),
@@ -722,7 +745,10 @@ output(selected.content);'''
 
         await await_or_fail(run(), what='complete the scripted code turn with real approvals')
         outer = store.tool_result('outer')
-        assert not outer.is_error and outer.content == '"selected"'
+        if invariant == 'usage-error':
+            assert outer.is_error and 'catch ToolDenied or ToolError' in outer.content
+        else:
+            assert not outer.is_error and outer.content == '"selected"'
         console = Console(file=io.StringIO(), width=100, no_color=True, force_terminal=False)
         widget = TranscriptWidget()
         replay = TranscriptPresenter(widget, console, lambda: True, console.print)
@@ -738,6 +764,8 @@ output(selected.content);'''
         collapsed = render()
         assert 'const selected' not in collapsed and '2 calls' in collapsed
         assert widget.toggle_latest_agent() and 'const selected' in render()
+        if invariant == 'usage-error':
+            assert 'catch ToolDenied or ToolError' in render()
         assert 'UNSELECTED_REPLAY_FIXTURE_' in collapsed  # durable approved read, not the outer projection
         page = (await _request(reader, writer, 3, 'session_history', {'session_id': session['session_id'], 'before': None}))[-1]['result']
         results = {r['tool_result']['tool_call_id']: r for r in page['messages'] if r.get('tool_result')}

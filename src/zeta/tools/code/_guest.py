@@ -208,7 +208,13 @@ def _invoke(wasm: Any, engine: Any, module: Any, source: bytes, bridge: _Bridge,
             if bridge.error is not None:
                 raise GuestError(str(bridge.error)) from bridge.error
         if bridge.frames or bridge.incoming or not bridge.emitted:
-            raise GuestError("script must finish with one output(value) and no pending frame")
+            raise GuestError(
+                "script must finish with one output(value) and no pending frame.\n"
+                "Use direct calls for one tool or when the shell already filters results.\n"
+                "No filesystem, network, clocks, timers or persistent state in the sandbox.\n"
+                "Nested approvals still apply; catch ToolDenied or ToolError.\n"
+                "Use Promise.all for independent calls; up to 8 run at once."
+            )
         _json_loads(bridge.output)
         return bytes(bridge.output)
 
@@ -229,6 +235,7 @@ async def run_guest(
     pending = None
     timer = None
     started = loop.time()
+    active_timeout = f"code mode exceeded {active:g} seconds of active JavaScript"
 
     def interrupt(message: str) -> None:
         if stop.is_set():
@@ -249,7 +256,7 @@ async def run_guest(
     def resume_timer() -> None:
         nonlocal started, timer
         started = loop.time()
-        timer = loop.call_later(active, interrupt, "code mode active guest deadline exceeded")
+        timer = loop.call_later(active, interrupt, active_timeout)
 
     async def run_batch(batch: list[GuestCall]) -> bytes:
         tasks = [loop.create_task(dispatch(*call)) for call in batch]
@@ -288,7 +295,7 @@ async def run_guest(
             timer.cancel()
         active -= loop.time() - started
         if active <= 0:
-            interrupt("code mode active guest deadline exceeded")
+            interrupt(active_timeout)
             return
         task = loop.create_task(run_batch(batch))
 

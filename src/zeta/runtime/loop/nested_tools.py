@@ -48,23 +48,9 @@ def describe_code(registry: ToolRegistry, schemas: Sequence[ToolSchema]) -> None
         return
     exposed = CODE_MODE_ALLOWED_NAMES.intersection(authority_snapshot(registry, schemas))
     names = ", ".join(sorted(exposed)) or "none"
-    readers = " and ".join(
-        hint for name, hint in (
-            ("read", "tools.read for files"), ("project", "tools.project for project records"),
-        ) if name in exposed
-    )
-    preference = f"Prefer {readers}. " if readers else ""
     code["description"] = (
-        "Run JavaScript to combine results from several tools. Pass {script: string}. "
-        "Use await tools.call(name, args) or await tools[name](args). "
-        f"Available tools: {names}. "
-        f"{preference}"
-        "Only output(value), called once, sends JSON to the model. "
-        "Inner approvals still apply; catch ToolDenied or ToolError. "
-        "Use Promise.all for independent calls (up to 8 run at once). "
-        "Use at most 50 calls, 64 KiB of script and 60 seconds of active JavaScript. "
-        "No filesystem, network, clocks, timers or persistent state except through tools. "
-        "Use ordinary calls for one tool or shell commands that already return selective output."
+        "Combine or filter several tool results in JavaScript so only the selection reaches the model. "
+        f"Use `await tools.<name>(args)` with {names}; call `output(value)` once."
     )
 
 
