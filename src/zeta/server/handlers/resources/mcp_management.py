@@ -54,7 +54,7 @@ async def mcp_server_list(client, request_id, params):
         raise invalid_resource_params()
     owner = _owner(client)
     return await run_owner(
-        client, lambda: owner.snapshot(require_project=scope == "project"),
+        client, lambda: owner.read_disk(require_project=scope == "project"),
         project=lambda result: {"revision": result[0], "data": _data(result[1], scope)},
         **_error_rules(),
     )

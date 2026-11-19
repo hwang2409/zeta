@@ -617,7 +617,7 @@ class MCPManagementService:
                 digest.update(data)
         return digest.hexdigest()
 
-    def snapshot(self, *, require_project: bool = False) -> tuple[str, tuple[ManagedServer, ...]]:
+    def read_disk(self, *, require_project: bool = False) -> tuple[str, tuple[ManagedServer, ...]]:
         """Read disk state under the writer locks, without reconciling any mount."""
         candidate = self._transaction(snapshot=True, require_project=require_project)
         assert candidate.revision is not None
