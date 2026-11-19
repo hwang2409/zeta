@@ -161,9 +161,10 @@ collector, and zeta never starts anything for it.
   `/health` check with a 1 second limit; if it does not confirm this home, the
   spans are dropped, and `/status` shows the last export as an error.
 
-`zeta otel receiver` still works by hand, for example with an external
-endpoint or to see its errors. Started by hand without `--idle-exit`, it
-never exits when idle; it runs until you stop it. It exits with `already running at
+`zeta otel receiver` requires telemetry to be on. Set the endpoint in
+`~/.zeta/settings.toml` (or `$ZETA_HOME/settings.toml`) before you start it.
+You can start it by hand with either the built-in or an external endpoint.
+Without `--idle-exit`, it runs until you stop it. It exits with `already running at
 http://127.0.0.1:4323` when the home's receiver already runs.
 
 ## status
