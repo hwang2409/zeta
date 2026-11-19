@@ -885,41 +885,38 @@ async def _run_agent_tool(
             if await _complete_despite_cancellation(cleanup):
                 raise asyncio.CancelledError
             raise
-        try:
-            failure_text = f"agent error: {error_message(exc)}"
-            child_store.finish_agent_lifecycle(
-                "failed",
-                final_result=failure_text,
-                turns_used=0,
+        loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
+        failure_text = f"agent error: {error_message(exc)}"
+        child_store.finish_agent_lifecycle(
+            "failed",
+            final_result=failure_text,
+            turns_used=0,
+        )
+        terminal_stats = agent_stats(
+            child_store.agent_lifecycle(), status="failed", turns_used=0
+        )
+        loop._background_owner.mark_store_finished(child_store)
+        failure_payload = loop._child_result_payload(
+            tool_call.id,
+            failure_text,
+            state="failed",
+            child_session_path=child_path,
+            agent_type=preset.name,
+            child_instance_id=child_instance_id,
+            depth=child_depth,
+            stats=terminal_stats,
+        )
+        failure_content = failure_payload.get("content")
+        if (
+            isinstance(failure_content, list)
+            and failure_content
+            and isinstance(failure_content[0], dict)
+            and isinstance(failure_content[0].get("text"), str)
+        ):
+            child_store.update_agent_lifecycle_result(
+                failure_content[0]["text"], canonical_receipt=True
             )
-            terminal_stats = agent_stats(
-                child_store.agent_lifecycle(), status="failed", turns_used=0
-            )
-            failure_payload = loop._child_result_payload(
-                tool_call.id,
-                failure_text,
-                state="failed",
-                child_session_path=child_path,
-                agent_type=preset.name,
-                child_instance_id=child_instance_id,
-                depth=child_depth,
-                stats=terminal_stats,
-            )
-            failure_content = failure_payload.get("content")
-            if (
-                isinstance(failure_content, list)
-                and failure_content
-                and isinstance(failure_content[0], dict)
-                and isinstance(failure_content[0].get("text"), str)
-            ):
-                child_store.update_agent_lifecycle_result(
-                    failure_content[0]["text"], canonical_receipt=True
-                )
-            return failure_payload
-        finally:
-            cleanup = asyncio.create_task(release_setup_store())
-            if await _complete_despite_cancellation(cleanup):
-                raise asyncio.CancelledError
+        return failure_payload
     lifecycle_sink = (
         execution_context.lifecycle_sink if execution_context is not None else None
     )
