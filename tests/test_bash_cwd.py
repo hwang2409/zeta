@@ -1,15 +1,111 @@
 import asyncio
+import json
 import shlex
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
+from zeta.agent.tool_results import validated_tool_result
 from zeta.core.approval import ApprovalPolicy
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import ToolCall
+from zeta.protocol.types import StreamEvent, StreamEventType, ToolCall
+from zeta.server.event_contract import tool_end
+from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 from zeta.tools.agent.approval import ChildApprovalPolicy
+from zeta.tui.render import render_event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["edit", "write", "read"])
+async def test_relative_file_tools_follow_bash_cd(
+    tmp_path: Path, tool_name: str
+) -> None:
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    start_file = tmp_path / "data.txt"
+    sub_file = sub / "data.txt"
+    start_file.write_text("original in start cwd")
+    sub_file.write_text("original in sub")
+    arguments = {"path": "data.txt"}
+    if tool_name == "edit":
+        arguments.update(old_string="original", new_string="edited")
+    elif tool_name == "write":
+        arguments["content"] = "written"
+
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        changed = await registry.execute(ToolCall("cd", "bash", {"command": "cd sub"}))
+        assert changed["structuredContent"]["cwd_after"] == str(sub)
+        call = ToolCall("file", tool_name, arguments)
+        result = await registry.execute(call)
+
+        if tool_name == "edit":
+            assert sub_file.read_text() == "edited in sub"
+        elif tool_name == "write":
+            assert sub_file.read_text() == "written"
+        else:
+            assert "original in sub" in result["content"][0]["text"]
+        assert start_file.read_text() == "original in start cwd"
+        assert result["structuredContent"]["path"] == str(sub_file)
+
+        event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=validated_tool_result(result, call.id),
+        )
+        output = StringIO()
+        Console(file=output, width=120, color_system=None).print(render_event(event))
+        assert "data.txt" in output.getvalue()
+        frame = FrameCodec().notification(
+            EventDescriptor.TOOL_END, "session", **tool_end(event, fidelity=True)
+        )
+        payload = json.loads(frame)["params"]
+        assert payload["tool_result"]["structured_content"]["path"] == str(sub_file)
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replace_with_file", [False, True])
+async def test_file_tools_do_not_recover_invalid_bash_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replace_with_file: bool
+) -> None:
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    start_file = tmp_path / "data.txt"
+    start_file.write_text("unchanged")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    try:
+        changed = await registry.execute(ToolCall("cd", "bash", {"command": "cd sub"}))
+        assert changed["structuredContent"]["cwd_after"] == str(sub)
+        sub.rmdir()
+        if replace_with_file:
+            sub.write_text("not a directory")
+
+        for tool_name, arguments in (
+            ("read", {"path": "../data.txt"}),
+            ("edit", {"path": "data.txt", "old_string": "unchanged", "new_string": "wrong"}),
+            ("write", {"path": "nested/data.txt", "content": "wrong", "create_parents": True}),
+        ):
+            result = await registry.execute(ToolCall(tool_name, tool_name, arguments))
+            assert result["isError"]
+            assert f"bash session cwd {str(sub)!r}" in result["content"][0]["text"]
+        assert start_file.read_text() == "unchanged"
+        assert not (tmp_path / "nested").exists()
+        assert sub.exists() == replace_with_file
+        assert registry.bash_cwd == str(sub)
+
+        for path in (str(start_file), "~/data.txt"):
+            result = await registry.execute(ToolCall("absolute", "read", {"path": path}))
+            assert not result["isError"]
+            assert result["structuredContent"]["path"] == str(start_file)
+    finally:
+        await registry.close()
 
 
 @pytest.mark.asyncio
