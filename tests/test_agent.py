@@ -3751,7 +3751,7 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
 
     async def hold_child_loop_cancellation(coroutine):
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(asyncio.Event().wait(), what="child close owns cancellation task")
         finally:
             coroutine.close()
 
