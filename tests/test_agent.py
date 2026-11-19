@@ -7430,9 +7430,11 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
     parent_cwd = tmp_path / "parent"
     child_cwd = tmp_path / "child"
     parent_cwd.mkdir()
-    child_cwd.mkdir()
+    active_cwd = child_cwd / "sub"
+    active_cwd.mkdir(parents=True)
     parent_store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
     child_store = ConversationStore(tmp_path / "children", cwd=child_cwd)
+    child_store.set_bash_cwd(active_cwd)
     policy = ApprovalPolicy(store=parent_store)
     child_policy = ChildApprovalPolicy(
         policy,
@@ -7451,7 +7453,7 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
 
     assert request is not None
     assert request.effective_cwd is None
-    assert request.resolved_path == str(child_cwd / "src/file.py")
+    assert request.resolved_path == str(active_cwd / "src/file.py")
     output = StringIO()
     Console(file=output, force_terminal=False, width=200).print(
         render_approval_card(
@@ -7462,7 +7464,7 @@ def test_child_approval_card_shows_effective_cwd_and_resolved_path(
     )
     card = output.getvalue()
     assert "cwd=" not in card
-    assert f"resolved_path={child_cwd / 'src/file.py'}" in card
+    assert f"resolved_path={active_cwd / 'src/file.py'}" in card
 
 
 def test_child_shell_approval_shows_cwd(tmp_path: Path) -> None:
@@ -15632,9 +15634,10 @@ def _child_store_for(
 
 
 @pytest.mark.asyncio
-async def test_agent_cwd_relative_to_parent_cwd(tmp_path: Path) -> None:
+async def test_agent_cwd_relative_to_parent_bash_cwd(tmp_path: Path) -> None:
     parent_dir = tmp_path / "primary"
     parent_dir.mkdir()
+    (parent_dir / "sub" / "worktree").mkdir(parents=True)
     (parent_dir / "worktree").mkdir()
     store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
     backend = ChildCwdBackend(
@@ -15649,11 +15652,47 @@ async def test_agent_cwd_relative_to_parent_cwd(tmp_path: Path) -> None:
     )
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    try:
+        changed = await loop.tool_registry.execute(
+            ToolCall("cd", "bash", {"command": "cd sub"})
+        )
+        assert changed["structuredContent"]["cwd_after"] == str(parent_dir / "sub")
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
 
-    assert (parent_dir / "worktree" / "relative_marker").exists()
-    assert not (parent_dir / "relative_marker").exists()
-    await loop.close()
+        assert (parent_dir / "sub" / "worktree" / "relative_marker").exists()
+        assert not (parent_dir / "worktree" / "relative_marker").exists()
+    finally:
+        await loop.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_child_without_cwd_edits_after_cd(tmp_path: Path) -> None:
+    parent_dir = tmp_path / "primary"
+    sub = parent_dir / "sub"
+    sub.mkdir(parents=True)
+    (parent_dir / "data.txt").write_text("original in primary")
+    (sub / "data.txt").write_text("original in sub")
+    store = ConversationStore(tmp_path / "sessions", cwd=parent_dir)
+    backend = ChildToolSequenceBackend(
+        child_arguments={"prompt": "child-work", "description": "edit after cd"},
+        child_tool_calls=[
+            ToolCall("cd", "bash", {"command": "cd sub"}),
+            ToolCall(
+                "edit", "edit",
+                {"path": "data.txt", "old_string": "original", "new_string": "edited"},
+            ),
+        ],
+    )
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+
+        assert (sub / "data.txt").read_text() == "edited in sub"
+        assert (parent_dir / "data.txt").read_text() == "original in primary"
+    finally:
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -23324,3 +23363,57 @@ async def test_idle_child_wake_tool_count_is_cumulative(
         backend.release_children.set()
         await loop.close()
         parent_store.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_timeout_delivers_queued_follow_up(tmp_path, monkeypatch):
+    from tests.support.completion import ManualDeadlineClock
+
+    clock = ManualDeadlineClock()
+    monkeypatch.setattr(agent_loop_module, "MonotonicDeadlineClock", lambda: clock, raising=False)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    backend = RunBackend()
+    backend.release_child.set()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    prepare = ContextAssembler.prepare_context
+    child_store = None
+
+    async def block_first_child_prepare(assembler, **kwargs):
+        nonlocal child_store
+        if assembler.store is not store and not entered.is_set():
+            child_store = assembler.store
+            entered.set()
+            await await_or_fail(release.wait(), what="release context preparation")
+        return await prepare(assembler, **kwargs)
+
+    monkeypatch.setattr(ContextAssembler, "prepare_context", block_first_child_prepare)
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await await_or_fail(entered.wait(), what="child context preparation entered")
+        assert await send_to_run(
+            store, _run_handle_from_receipt(store), "also check the tests",
+            owner=loop._background_owner,
+            channel=loop._background_owner.conversation_channel,
+        ) is None
+        clock.advance(15 * 60)
+        # The old code has no timer. Let it finish so it fails at the outcome,
+        # not at the test's safety deadline. At the exact boundary expiry wins.
+        release.set()
+        await wait_background_owner(loop)
+        assert child_store is not None
+        failures = [
+            message.metadata[FAILED_TURN_ERROR]
+            for message in branch_messages(child_store)
+            if FAILED_TURN_ERROR in message.metadata
+        ]
+        assert failures == [{
+            "code": "pre_dispatch_timeout",
+            "message": "turn stalled for 15 min while preparing context (stage: context preparation)",
+        }]
+        assert backend.child_prompts == ["also check the tests"]
+    finally:
+        release.set()
+        await loop.close()
+        store.close()

@@ -55,6 +55,18 @@ def open_verified_directory(path: str | Path, identity: tuple[int, int]) -> int:
     return fd
 
 
+def require_bash_cwd(cwd: str) -> Path:
+    """Return a usable base for relative paths, without shell recovery."""
+
+    path = Path(cwd)
+    try:
+        if path.is_absolute() and path.is_dir():
+            return path
+    except OSError as exc:
+        raise ValueError(f"bash session cwd {cwd!r} is not accessible: {exc}") from exc
+    raise ValueError(f"bash session cwd {cwd!r} is not an existing directory; use an absolute path")
+
+
 def nearest_existing_directory(path: str | os.PathLike[str]) -> str:
     """Return path, or its nearest ancestor that is still a directory."""
 
