@@ -153,7 +153,7 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         )
         assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) == expected
         if reference is not None:
-            assert await asyncio.to_thread(default.read) == old
+            assert await asyncio.wait_for(asyncio.to_thread(default.read), 10) == old
         rows = (await rpc(reader, writer, "login_providers"))["result"]["providers"]
         assert next(row for row in rows if row["provider"] == provider)["credentials_present"]
         assert (await rpc(reader, writer, "status"))["result"]["state"] == "idle"

@@ -10,7 +10,7 @@ import pytest
 
 from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
-from zeta.server.handlers.resources import mcp_management
+from zeta.server.handlers.resources import account_list, mcp_management
 from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -96,11 +96,13 @@ async def test_collected_resource_handler_closes_unexpected_errors(monkeypatch: 
     async def fail(client, request_id, params):
         raise RuntimeError("unexpected test exception at /private/test-config with test-secret-canary")
 
-    monkeypatch.setattr(mcp_management, "METHODS", tuple(
-        replace(method, handler=fail) for method in mcp_management.METHODS
-    ))
+    families = (account_list, mcp_management)
+    for family in families:
+        monkeypatch.setattr(family, "METHODS", tuple(
+            replace(method, handler=fail) for method in family.METHODS
+        ))
     descriptors = {descriptor.wire: descriptor for descriptor in collect_families()}
-    for method in mcp_management.METHODS:
+    for method in (*account_list.METHODS, *mcp_management.METHODS):
         with pytest.raises(Exception) as caught:
             await descriptors[method.wire].handler(None, 7, {})
         error = caught.value
