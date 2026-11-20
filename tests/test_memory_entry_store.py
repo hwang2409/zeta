@@ -554,3 +554,55 @@ def test_sk_lookalikes_are_not_secrets(text: str) -> None:
 
     assert redact_secrets(text) == text
     assert not contains_secret(text)
+
+
+_JWT = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"
+    ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (f"token {_JWT} expired", "token [secret omitted] expired"),
+        (f'{{"access_token_jwt": "{_JWT}"}}', '{"access_token_jwt": "[secret omitted]"}'),
+        (f"Authorization: Bearer {_JWT}", "Authorization: Bearer [secret omitted]"),
+        (
+            "authorization: bearer abcDEF0123456789opaque_tok",
+            "authorization: bearer [secret omitted]",
+        ),
+        (
+            "Bearer dGhpcyBpcyBhIGxvbmcgdG9rZW4=; next",
+            "Bearer [secret omitted]; next",
+        ),
+    ],
+)
+def test_jwt_and_bearer_tokens_are_detected_and_redacted(
+    text: str, expected: str
+) -> None:
+    from zeta.memory.safety import contains_secret, redact_secrets
+
+    assert redact_secrets(text) == expected
+    assert contains_secret(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "version 1.2.3 and 10.20.30",
+        "zeta.server.handlers.session_history",
+        "eyJ",
+        "eyJhbGc.abcd.efgh",
+        "see docs.example-company.com/path",
+        "id 123e4567-e89b-12d3-a456-426614174000",
+        "Bearer short",
+        "the bearer of bad news",
+    ],
+)
+def test_jwt_and_bearer_lookalikes_are_not_secrets(text: str) -> None:
+    from zeta.memory.safety import contains_secret, redact_secrets
+
+    assert redact_secrets(text) == text
+    assert not contains_secret(text)
