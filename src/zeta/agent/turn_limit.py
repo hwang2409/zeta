@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from ..core.agent_progress import publish_child_started
 from ..core.checkpoints import _now
 from ..core.store._async_writes import _EnsureTurnLimitHandoffCommand
+from ..project_inbox_sent.notifications import project_inbox_notification
 from ..protocol.types import Message, StreamEvent, StreamEventType, harness_notice
 from .presets import valid_max_turns
 from .receipt import _without_agent_receipt_suffix, has_agent_receipt_suffix
@@ -156,7 +157,8 @@ def parse_turn_limit_result(
 
 
 def project_notification_data(data: dict[str, Any]) -> dict[str, Any]:
-    """Project a validated stored completion without changing its stored shape."""
+    """Project a validated stored notification without changing its stored shape."""
+    data = project_inbox_notification(data)
     if data.get("status") != "completed":
         return data
     projection = parse_turn_limit_result(

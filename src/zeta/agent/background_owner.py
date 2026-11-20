@@ -349,11 +349,15 @@ class BackgroundAgentOwner:
         self._parent_stores.pop(instance_id, None)
         self._active_stores.pop(instance_id, None)
         self._descriptions.pop(instance_id, None)
-        self._parent_ids.pop(instance_id, None)
+        parent_id = self._parent_ids.pop(instance_id, None)
         self._original_parent_ids.pop(instance_id, None)
         self._cancel_requested.discard(instance_id)
         self._cancel_confirmations.pop(instance_id, None)
         self.causal_episodes.release_member(instance_id)
+        if parent_id is not None:
+            # The completion notice wakes the parent before this unregister, so a
+            # parent waiting for owned work must re-check after the child leaves.
+            self.conversation_channel.wake(parent_id)
 
     def adopt(
         self,

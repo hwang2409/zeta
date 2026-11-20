@@ -842,7 +842,7 @@ class ProjectInbox:
             new_fd, claimed_fd, _done_fd, bodies_fd = dirs[:4]
             try:
                 record = self._read_record(new_fd, name, bodies_fd, resolve_body=False)
-                if delegation_enabled(self.registry) and decorate(self.registry, target.project_id, record, self._delegations(target.project_id))["authority"] != "trusted_assignment":
+                if delegation_enabled(self.registry) and not is_trusted(decorate(self.registry, target.project_id, record, self._delegations(target.project_id))):
                     raise InboxError("inbox message is information, not an authorized assignment")
                 target_session = record.get("to_session")
                 if target_session is not None and target_session != session_id:

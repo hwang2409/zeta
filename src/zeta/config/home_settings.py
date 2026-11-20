@@ -4,7 +4,9 @@ A client sees an allowlisted projection plus ``revision``, the SHA-256 of the ex
 (an absent file hashes as empty bytes). An update names that revision; it takes the sibling
 ``settings.toml.lock``, rereads the bytes under the lock, and refuses a stale revision, so an edit
 finished before the reread is never lost. The lock serializes zeta writers only; an editor that writes after the reread is not stopped.
-Edits preserve bytes outside the changed setting and are validated by the startup parser.
+Edits preserve bytes outside the changed setting and are validated by the startup parser. An
+update that turns telemetry on first runs the telemetry start preflight, so it never writes a
+setting that would stop the next start.
 
 Every function blocks (file locks and fsync); call it off the event loop.
 """
@@ -70,6 +72,8 @@ def get(home: Path) -> dict[str, Any]:
 def update(home: Path, expected_revision: object, changes: object) -> dict[str, Any]:
     """Apply one change if the file still has the expected revision."""
     key, value = _parse_changes(expected_revision, changes)
+    if key == "telemetry.enabled" and value is True:
+        _require_telemetry_can_start()
     with _locked_home(home) as home_fd:
         raw = _read(home_fd)
         revision = _revision(raw)
@@ -88,6 +92,17 @@ def update(home: Path, expected_revision: object, changes: object) -> dict[str, 
         "changed": changed,
         "restart_serve": changed and key == "telemetry.enabled",
     }
+
+
+def _require_telemetry_can_start() -> None:
+    """Refuse an on that would stop zeta's next start: the start runs the same preflight."""
+    from ..telemetry import TelemetryError
+    from ..telemetry.runtime import preflight
+
+    try:
+        preflight()
+    except TelemetryError as exc:
+        raise HomeSettingsError("telemetry_unavailable", detail=str(exc)) from None
 
 
 @contextmanager

@@ -174,6 +174,34 @@ async def test_observer_reads_same_project_session_as_its_session_history(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_legacy_inbox_wake_row_reads_back_neutral(tmp_path: Path) -> None:
+    """A wake row stored before the neutral text reads back neutral and without author or authority."""
+    harness, _ = await start(tmp_path)
+    opened = await asyncio.to_thread(harness.session, harness.project, keep_open=True)
+    try:
+        opened.store._append_row("notification", {
+            "origin": MessageOrigin.NOTIFICATION.value, "kind": "project_inbox",
+            "project_id": "p", "message_ids": ["m"], "description": "project inbox",
+            "status": "new",
+            "text": "Requests are work to do: claim, do, and mark done. You do not need to confirm the sender with the user.",
+            "messages": [{"id": "m", "author": "user", "authority": "trusted_assignment"}],
+        })
+    finally:
+        opened.store.close()
+    try:
+        observer = await harness.client()
+        result = (await read(observer, "r", session_id=opened.metadata.session_id))["result"]
+        row = next(item for item in result["messages"] if item.get("notification"))
+        text = row["content"][0]["text"]
+        assert "Requests are work to do" not in text
+        assert text == row["notification"]["text"]
+        assert "Project inbox wake" in text
+        assert row["notification"]["messages"] == [{"id": "m"}]
+    finally:
+        await close_serve(harness.server, *harness.writers)
+
+
+@pytest.mark.asyncio
 async def test_absent_and_cross_project_sessions_share_one_not_found_and_params_are_bounded(tmp_path: Path) -> None:
     harness, attached = await start(tmp_path)
     foreign = await asyncio.to_thread(harness.session, harness.other_project, 1)
