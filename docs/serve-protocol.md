@@ -2469,6 +2469,7 @@ Error descriptors are:
 | `resource_busy` | `-32004` | `operation_busy` | another process is writing this resource |
 | `settings_malformed` | `-32000` | `settings_malformed` | settings.toml does not parse or validate |
 | `settings_unsafe` | `-32000` | `settings_unsafe` | settings.toml is a link or not a regular, unshared file |
+| `telemetry_unavailable` | `-32602` | `telemetry_unavailable` | telemetry cannot start in this zeta install or environment |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. With `session_park`, a swap over the park limit returns
