@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ....memory.safety import redact_secrets
+from ....memory.safety import REDACTED_SECRET, redact_secrets
 from ...resource_protocol import (
     Access,
     ResourceMethod,
@@ -32,6 +32,9 @@ def _handler(*, profiles, delete):
             mutation = params["mutation"]
             if not isinstance(mutation, dict) or mutation.keys() != {"document"} or not isinstance(mutation["document"], str):
                 raise invalid_resource_params()
+            # A read masks secrets; saving that masked text back would replace the real secret.
+            if REDACTED_SECRET in mutation["document"]:
+                raise invalid_resource_params(reason="contains_redaction_marker")
         name, scope, revision = params["name"], params["scope"], params.get("revision")
         if revision is not None:
             require_revision(revision)

@@ -23,6 +23,8 @@ async def test_observer_library_reads(tmp_path: Path) -> None:
     ).encode()
     (skills / "alpha.md").write_bytes(raw)
     (skills / "beta.md").write_text("---\nname: beta\ndescription: Other notes\n---\n" + "☃" * 50_000)
+    gamma = "---\r\nname: gamma\r\ndescription: Plain\r\n---\r\nPlain body ☃\r\n".encode()
+    (skills / "gamma.md").write_bytes(gamma)
     project = tmp_path / ".zeta" / "skills"
     project.mkdir(parents=True)
     (project / "alpha.md").write_text("---\nname: alpha\ndescription: Project notes\n---\nProject body\n")
@@ -46,15 +48,20 @@ async def test_observer_library_reads(tmp_path: Path) -> None:
         tail = (await observer.request("tail", "skill_catalog", {
             "scope": "home", "offset": page["next_offset"], "limit": 1,
         }))["result"]["data"]
-        assert [row["name"] for row in tail["items"]] == ["beta"] and "next_offset" not in tail
+        assert [row["name"] for row in tail["items"]] == ["beta"] and tail["next_offset"] == 2
         detail = (await observer.request("skill", "skill_read", {"name": "alpha", "scope": "home"}))["result"]
         assert detail["revision"] == hashlib.sha256(raw).hexdigest()
         assert detail["data"]["redacted"] is True
         assert detail["data"]["body"] == f"[secret omitted]\n{directive}"
         assert detail["data"]["frontmatter"]["extra"]["api_key"] == "[secret omitted]"
         assert token not in json.dumps(detail)
+        assert "document" not in detail["data"]
         large = (await observer.request("large", "skill_read", {"name": "beta", "scope": "home"}))["result"]["data"]
         assert large["truncated"] is True and len(large["body"].encode()) == 131_070
+        assert "document" not in large
+        plain = (await observer.request("plain", "skill_read", {"name": "gamma", "scope": "home"}))["result"]
+        assert plain["data"]["document"] == gamma.decode()
+        assert plain["revision"] == hashlib.sha256(gamma).hexdigest()
         missing = await observer.request("missing", "skill_read", {"name": "missing", "scope": "effective"})
         assert missing["error"]["data"]["reason"] == "resource_not_found"
         profiles = (await observer.request("profiles", "agent_profile_catalog"))["result"]["data"]["items"]
