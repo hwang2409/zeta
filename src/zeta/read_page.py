@@ -94,6 +94,26 @@ def page_result(
             cursor = _encode(start, key, start.emitted + count)
         return shape(items[:count], cursor)
 
+    return _fit_prefix(items, result, fits, shape)
+
+
+def offset_page(
+    items: list[Any], offset: int, limit: int, *,
+    project: Callable[[Any], Any],
+    fits: Callable[[dict[str, Any]], bool],
+    shape: Callable[[list[Any], int | None], dict[str, Any]],
+) -> dict[str, Any]:
+    """Fit an offset page of an already ordered collection to the response frame."""
+    page = [project(item) for item in items[offset:offset + limit]]
+
+    def result(count: int) -> dict[str, Any]:
+        end = offset + count
+        return shape(page[:count], end if end < len(items) else None)
+
+    return _fit_prefix(page, result, fits, shape)
+
+
+def _fit_prefix(items, result, fits, shape):
     size = len(items)
     if fits(full := result(size)):
         return full

@@ -436,7 +436,12 @@ class MethodDescriptor(Enum):
         self.wire, self.since, self.feature, self.access = wire, since, feature, access
 
     @classmethod
-    def for_wire(cls, wire: str) -> MethodDescriptor | ResourceDescriptor | None:
+    def for_wire(
+        cls, wire: str, features: frozenset[str] = frozenset(),
+    ) -> MethodDescriptor | ResourceDescriptor | None:
+        extension = _METHOD_EXTENSIONS.get(wire)
+        if extension is not None and extension.feature in features:
+            return extension
         return _METHODS_BY_WIRE.get(wire)
 
     @classmethod
@@ -460,11 +465,25 @@ def served_methods() -> tuple[MethodDescriptor | ResourceDescriptor, ...]:
     return _SERVED_METHODS
 
 
-_SERVED_METHODS = (*MethodDescriptor, *collect_families())
+_RESOURCE_METHODS = collect_families()
+_SERVED_METHODS = (*MethodDescriptor, *(item for item in _RESOURCE_METHODS if not item.extends_legacy))
 _METHODS_BY_WIRE = {item.wire: item for item in served_methods()}
+_METHOD_EXTENSIONS: dict[str, ResourceDescriptor] = {}
 if len(_METHODS_BY_WIRE) != len(served_methods()):
     raise RuntimeError("serve resource methods must have unique names and may not replace legacy methods")
-FEATURES = tuple(dict.fromkeys((*_LEGACY_FEATURES, *(item.feature for item in served_methods() if item.feature))))
+for _extension in _RESOURCE_METHODS:
+    if not _extension.extends_legacy:
+        continue
+    _legacy = _METHODS_BY_WIRE.get(_extension.wire)
+    if (
+        not isinstance(_legacy, MethodDescriptor)
+        or _legacy.feature is not None
+        or (_legacy.since, _legacy.access) != (_extension.since, _extension.access)
+        or _extension.wire in _METHOD_EXTENSIONS
+    ):
+        raise RuntimeError("serve method extensions must preserve the legacy version and access")
+    _METHOD_EXTENSIONS[_extension.wire] = _extension
+FEATURES = tuple(dict.fromkeys((*_LEGACY_FEATURES, *(item.feature for item in _RESOURCE_METHODS))))
 
 
 EVENT_ACCESS = {
@@ -713,8 +732,11 @@ def resource_error(descriptor: ErrorDescriptor) -> ProtocolError:
     return ProtocolError(descriptor, descriptor.meaning, {"code": reason, "reason": reason})
 
 
-def invalid_resource_params() -> ProtocolError:
-    return ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid params", {"code": "invalid_params"})
+def invalid_resource_params(*, reason: str | None = None) -> ProtocolError:
+    data = {"code": "invalid_params"}
+    if reason is not None:
+        data["reason"] = reason
+    return ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid params", data)
 
 
 def stale_resource_revision(family: str) -> ProtocolError:

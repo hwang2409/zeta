@@ -13,6 +13,8 @@ import pytest
 from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
 from zeta.server.handlers.resources import FAMILIES
+from zeta.server.handlers.resources._mcp_auth import MCPAuth
+from zeta.server.login import Logins
 from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -108,6 +110,12 @@ _OWNER_FAILURE_CASES = {
     "child_run_cancel": ("zeta.agent.runner.cancel_child_run", {
         "session_id": "test-session", "run_id": "test-run",
     }),
+    "skill_catalog": ("zeta.skills.catalog.discover_session_skills", {}),
+    "skill_read": ("zeta.skills.catalog.discover_session_skills", {"name": "test", "scope": "effective"}),
+    "agent_profile_catalog": ("zeta.skills.agent_catalog.discover_session_agents", {}),
+    "agent_profile_read": (
+        "zeta.skills.agent_catalog.discover_session_agents", {"name": "test", "scope": "effective"},
+    ),
     "session_history_read": ("zeta.server.handlers.resources.session_read._read", {"session_id": "other-session"}),
     "mcp_server_list": (f"{_MCP_OWNER}.read_disk", {}),
     "mcp_server_add": (f"{_MCP_OWNER}.add", {
@@ -122,6 +130,13 @@ _OWNER_FAILURE_CASES = {
     "mcp_server_set_trusted": (f"{_MCP_OWNER}.set_trusted", {
         "revision": _REVISION, "mutation": {"name": "test", "trusted": True},
     }),
+    "mcp_server_test": (f"{_MCP_OWNER}.test", {"name": "test"}),
+    "mcp_auth_start": ("zeta.server.handlers.resources._mcp_auth.MCPAuth.start", {"name": "test"}),
+    "mcp_auth_status": ("zeta.server.handlers.resources._mcp_auth.MCPAuth.status", {"name": "test"}),
+    "mcp_auth_cancel": ("zeta.server.handlers.resources._mcp_auth.MCPAuth.cancel", {"name": "test"}),
+    "mcp_auth_logout": (f"{_MCP_OWNER}.logout", {"name": "test"}),
+    "account_list": ("zeta.accounts.AccountStore.catalog_snapshot", {}),
+    "login_start": ("zeta.server.login.Logins.login_start", {"provider": "claude"}),
 }
 
 
@@ -138,12 +153,15 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
     client = SimpleNamespace(
         features=frozenset(),
         connections=SimpleNamespace(run_blocking=run_blocking),
+        logins=Logins(tmp_path),
         server=SimpleNamespace(
             home=tmp_path,
             runtime=SimpleNamespace(
-                opened=SimpleNamespace(metadata=SimpleNamespace(project_id="test-project")),
-                session_id="test-session", manager=None, loop=SimpleNamespace(_mcp_project_dir_value=tmp_path),
+                opened=SimpleNamespace(metadata=SimpleNamespace(project_id="test-project", cwd=tmp_path)),
+                session_id="test-session", manager=None,
+                loop=SimpleNamespace(_mcp_project_dir_value=tmp_path, tool_registry=None),
             ),
+            _mcp_auth=MCPAuth(),
             control=SimpleNamespace(
                 _reject_if_unhealthy=lambda: None,
                 client_turn_detached=lambda: False,

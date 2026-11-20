@@ -2013,6 +2013,11 @@ unnegotiated method returns `-32601`.
 | `mcp_server_remove` | `1.0` | `mcp_management_v1` | `controller_write` |
 | `mcp_server_set_enabled` | `1.0` | `mcp_management_v1` | `controller_write` |
 | `mcp_server_set_trusted` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_server_test` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_auth_start` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_auth_status` | `1.0` | `mcp_management_v1` | `read` |
+| `mcp_auth_cancel` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_auth_logout` | `1.0` | `mcp_management_v1` | `controller_write` |
 
 `mcp_server_list` accepts `{scope?}` and returns `{revision,data:{items}}`.
 Scope is `user`, `project`, or `effective` (default). The active session's
@@ -2053,6 +2058,152 @@ missing project or unreadable configuration). Observers attempting a write
 receive `-32008` with code
 and reason `observer_read_only`, plus the method, before parameter validation.
 Unnegotiated methods return `-32601`.
+
+`mcp_server_test`, `mcp_auth_start`, and `mcp_auth_logout` accept
+`{name,scope?}`, with the same scopes as list. `mcp_server_test` performs a
+bounded connection and lists tools without calling them or returning tool
+names, descriptions, or stdio stderr. It returns `{data:{status,tool_count}}`.
+One MCP call deadline covers initialization and listing. On timeout, the probe
+closes the transport, reaps any stdio child, and returns
+`{data:{status:"failed",tool_count:0}}`.
+Only the controller can run a test. A project stdio definition must be trusted.
+
+`mcp_auth_start` starts one headless HTTP OAuth attempt per serve process.
+It returns `{data:{state:"pending",authorization_url}}` after opening the
+loopback callback listener. The `authorization_url` field is an opaque,
+one-use launch URL on that same `127.0.0.1` listener, not the provider's URL.
+Open it with a browser that can reach the serve host's loopback address; do
+not log or persist it. The first GET redirects the browser to the provider
+with HTTP 302. Reuse returns 404 while the listener is open. Cancel and the
+OAuth callback timeout end the listener and invalidate the launch URL.
+Serve does not return the provider URL in any RPC response.
+
+OAuth uses the exact resource identifier advertised by protected-resource
+metadata, including any path. If discovery falls back to the configured MCP
+URL, that URL is used as the resource, not returned over serve. Headless mode
+still does not forward configured extra authorization parameters.
+
+`mcp_auth_status` and `mcp_auth_cancel` accept `{name}` and return
+`{data:{state}}` (`idle`, `pending`, `succeeded`, `failed`, or `cancelled`).
+Start also returns `failed` if discovery fails before the URL is available.
+Cancel waits for cleanup; a credential commit already in progress is allowed
+to finish. Status is safe for observers and performs no I/O. The attempt state
+is local to the current serve process, not a durable credential status.
+`mcp_auth_logout` cancels a local pending attempt and deletes the named
+credential, returning `{data:{state:"unauthorized"}}`. A concurrent logout
+fences earlier OAuth attempts even across serve processes. Only the controller
+can start, cancel, or log out. Another pending start returns `-32004
+operation_busy`.
+
+### accounts
+
+With protocol 1.1 or later and `account_list_idle_v1`, the controller can call
+`account_list` with `{}` even before a session is active. The result is
+`{"revision":"<64 lowercase hex digits>","data":{"accounts":[...]}}`. Rows have
+`account`, `label`, `detail`, `available`, `current`, `default`, and `usage`.
+`detail` is always null on this version: credential metadata is not projected.
+`current` is false without an active session; otherwise it reflects the active
+session's selection. `default` reflects the stored provider default. The revision
+identifies stored public catalog content, not the active session's selection or
+wall-clock usage freshness.
+
+An empty catalog returns an empty array. Bad or missing credentials make only
+that account unavailable. The read uses the account registry lock and does not
+migrate, recover credentials, or call a provider. An unavailable catalog returns
+`-32005` with `data.code: "state_unavailable"`. Unknown params return `-32602`
+with `data.code: "invalid_params"`. This read remains controller-only; observers
+receive `-32008` with `data.code` and `data.reason` set to `observer_read_only`
+and `data.method: "account_list"`.
+
+The same feature extends the controller-only `login_start` request to
+`{provider, account?}`. `provider` is `claude` or `codex`. `account` is a named
+account's short name, label, or qualified ID (for example `anthropic:work` for
+`claude`). Omit `account` to keep the legacy login target. Without the feature,
+`account` is ignored as before. The pending, failure, status and cancel shapes
+are unchanged. With the feature, a pending login on this connection or a
+provider lock held by another connection or TUI returns `-32005` with
+`data.code: "login_in_progress"`. An already pending local login takes
+precedence over account lookup. Without the feature, shared provider lock
+contention still returns `state: "failed"` with `error.code: "login_failed"`.
+A malformed or unknown account, unsupported provider or unknown param returns
+`-32602` with
+`data.code: "invalid_params"`. An unavailable account registry returns `-32005`
+with `data.code: "state_unavailable"`. An observer receives `-32008` with
+`data.code` and `data.reason` set to `observer_read_only` and
+`data.method: "login_start"` before params are validated.
+
+When a named subscription account fails authentication, the live `error`
+event adds `params.data.auth_account: {account, label, provider}` for each
+connection that negotiated this feature, including observers subscribed to the
+session's replay stream. `account` is the qualified ID, `label` is the public
+account label, and `provider` uses the login provider spelling (`claude` or
+`codex`). The event uses `params.error: {code: "auth_error", message:
+"Account sign-in required."}` instead of the provider's raw error text. The
+existing `data.login_provider` hint remains when applicable. API-key failures
+have no named account. This is a live-only addition; legacy event and history
+shapes are unchanged.
+
+Unexpected errors that reach the negotiated resource handler's error boundary
+return `-32000` with the fixed message `unexpected server or storage failure`.
+The unnegotiated methods keep legacy error handling.
+
+### skills and agent profiles (`library_read_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `skill_catalog` | `1.0` | `library_read_v1` | `read` |
+| `skill_read` | `1.0` | `library_read_v1` | `read` |
+| `agent_profile_catalog` | `1.0` | `library_read_v1` | `read` |
+| `agent_profile_read` | `1.0` | `library_read_v1` | `read` |
+
+All four methods are read-only and available to observers who negotiate the
+feature in `hello`. No events are emitted. This is a serve-only surface; the
+TUI already shows skills and agent profiles.
+
+Catalog requests accept `{scope?,offset?,limit?}`. `scope` is `effective`
+(default), `home`, or `project`. `offset` starts at zero; `limit` is an integer
+from 1 through 100 (default 50). Catalogs return
+`{revision,data:{items,next_offset?}}`. Items are sorted by name. Use the
+returned `next_offset` to continue; omission means the end. The revision is a
+SHA-256 of the canonical JSON of the returned page data, not a document
+revision. Catalog pages are live and may change between requests.
+
+- Skill items: `{name,description,keywords,source,scope,filename,editable,diagnostics}`.
+- Agent profile items: `{name,description,tools,model,allow_delegation,accepts_follow_ups,explicit_finish,max_turns,source,scope,filename,editable,diagnostics}`.
+  `tools`, `model`, and `max_turns` can be null.
+
+`source` is `packaged`, `home`, or `project`. The item `scope` is the selector
+for a detail request: `effective` for packaged items, otherwise its source.
+`filename` is relative to the catalog root, or null for a built-in agent
+profile. Packaged items are not editable. `diagnostics` is an empty array;
+owner warnings and their paths are not sent over serve.
+
+Project scope reads `.zeta` under the attached session's working directory.
+Without an attached session, explicit `project` scope is unavailable and
+`effective` reads only home and packaged items. In `effective`, project
+shadows home and home shadows packaged definitions of the same name.
+
+Detail requests accept `{name,scope}` and return
+`{revision,data:{name,frontmatter,body,source,editable,redacted,truncated?}}`.
+For a file, `revision` is the SHA-256 of the exact markdown bytes before
+projection. Built-in agent profiles have no markdown file: they return their
+public preset fields and preset prompt text (or the empty string). The
+built-in revision is a display-only SHA-256 of the returned data object
+encoded as canonical JSON (sorted keys, compact separators, ASCII escapes).
+
+The server applies its shared secret-pattern redactor to text, sets
+`redacted: true` when it replaces content and `false` otherwise, and caps the
+redacted body at 128 KiB of UTF-8 without splitting a code point. If it cuts
+the body, it includes `truncated: true`. This is not a round-trip editable
+copy. `body`, `frontmatter`, and `description` are untrusted user-authored
+content. Render them as text; do not send them to a model as instructions.
+The server does not rewrite instructions in these fields.
+
+Invalid parameters return `-32602` (`data.code: invalid_params`); a name not
+found in the selected scope also sets `data.reason: resource_not_found`.
+Missing project context returns `-32005` (`state_unavailable`). A result that
+cannot fit the response budget returns `-32007` (`result_too_large`). Unexpected
+owner failures return `-32000`. Unnegotiated methods return `-32601`.
 
 ### session history read (`session_history_read_v1` feature)
 
@@ -2672,7 +2823,8 @@ error code and message. Provider status and origin remain internal.
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
 - `session_settings`: returns `model`, `approval_mode`, and `plan_mode`. with the negotiated `otel` feature it also returns `telemetry` (`enabled`, `state`, and `reason`); endpoint and exporter details are never returned.
-- `account_list`: takes `session_id` and returns every named subscription
+- `account_list` without `account_list_idle_v1`: takes `session_id` and
+  returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and
   `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
   null `snapshot` or the normalized `version`, `captured_at`, `source`, and
@@ -2910,6 +3062,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `turn_context` | adds `set_turn_context` for one-shot context on the next server-started turn |
 | `delivery_id` | `send` and `steer` accept durable idempotency IDs; with `send_images_delivery_id`, `send_images` does too; adds `delivery_status` |
 | `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
+| `account_list_idle_v1` | enables controller-only idle `account_list` and named `login_start`; adds public failed-account identity to live auth errors for controllers and observers |
 | `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers"); observers use the same `list_sessions` catalog projection as controllers |
 | `session_grants` | adds `session_grants`, controller-only `revoke_session_grants`, and live `session_grants_changed` events for inspecting and removing session approval grants |
 | `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals, and a failed decision or history write marks approval persistence unhealthy. it changes no output |
