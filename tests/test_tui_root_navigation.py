@@ -1038,18 +1038,24 @@ async def test_a_prompt_queued_before_a_panel_command_is_still_sent(
     # The panel opens from its Enter during startup; the prompt typed before it
     # still waits for startup and is sent, and only it.
     copy, startup = await _own_home_with_held_startup(root_home, tmp_path, monkeypatch)
-    received = asyncio.Event()
-
-    def record_request(_messages, _tools) -> bytes:
-        received.set()
-        return b"request"
-
-    backend = FakeBackend(
-        [ScriptedTurn(content=[TextContent("hi")])], request_serializer=record_request
-    )
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("hi")])])
     async with running_tui(copy, backend) as driver:
         app = driver.app
         panel_drawn = asyncio.Event()
+        persisted = asyncio.Event()
+        prompts: list[object] = []
+        append = app.loop.store.append_message_async
+
+        async def record_append(message: Message, **kwargs: object) -> object:
+            entry = await append(message, **kwargs)
+            if message.role is MessageRole.USER:
+                prompts.append(message.content)
+                persisted.set()
+            return entry
+
+        # The turn stores its prompt before the slow context assembly of this
+        # long session, so delivery is observed here, not at the provider.
+        monkeypatch.setattr(app.loop.store, "append_message_async", record_append)
 
         def after_render(_application: object) -> None:
             if _window_drawn(driver, app._tasks_panel_window):
@@ -1061,12 +1067,13 @@ async def test_a_prompt_queued_before_a_panel_command_is_still_sent(
             driver.pipe.send_bytes(("hello" + ENTER + "/tasks" + ENTER + "zz" + ENTER).encode())
             await await_or_fail(panel_drawn.wait(), what="draw the tasks panel during startup")
             assert app._startup_submissions == [("hello", False)]
-            assert not backend.calls, "the prompt reached the provider before startup ended"
+            assert not prompts, "the prompt was sent before startup ended"
             startup.set()
-            # Delivery is observable before the provider turn finishes.
-            await await_or_fail(received.wait(), what="deliver the queued prompt to the provider")
-            sent = [messages[-1].content for messages, _tools in backend.calls]
-            assert sent == [[TextContent("hello")]], f"sent {sent}, expected only 'hello'"
+            # Startup ends and submits its queued input in one loop step.
+            await driver.until(lambda: not app._startup_replay_active, what="startup end")
+            assert app._active_task is not None, "the queued prompt was not sent after startup"
+            await await_or_fail(persisted.wait(), what="store the sent prompt")
+            assert prompts == [[TextContent("hello")]], f"sent {prompts}, expected only 'hello'"
             assert app.tasks_panel_active and _window_drawn(driver, app._tasks_panel_window), (
                 "the panel closed"
             )
