@@ -398,7 +398,10 @@ async def test_account_list_serializes_with_registry_writer(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_auth_error_names_failed_account_for_negotiated_observer(tmp_path, traced, caplog):
+@pytest.mark.parametrize("controller_negotiated", [False, True])
+async def test_auth_error_names_failed_account_for_negotiated_clients(
+    tmp_path, traced, caplog, controller_negotiated,
+):
     from tests.test_tui import renderable_plain
     from zeta.codex import CodexAuthError
     from zeta.providers.completion import owned_completion
@@ -437,7 +440,10 @@ async def test_auth_error_names_failed_account_for_negotiated_observer(tmp_path,
     caplog.set_level(logging.DEBUG)
     await controller.open()
     try:
-        await controller.rpc("hello", "hello", {"protocol_version": "1.2"})
+        await controller.rpc("hello", "hello", {
+            "protocol_version": "1.2",
+            "features": ["account_list_idle_v1"] if controller_negotiated else [],
+        })
         session = json.loads(await controller.rpc("new", "new_session"))["result"]["session"]
         for features in (["account_list_idle_v1"], []):
             observer = Wire(server, "unix")
@@ -465,6 +471,8 @@ async def test_auth_error_names_failed_account_for_negotiated_observer(tmp_path,
         assert "result" in sent, sent
         await observers[0].event("error")
         await observers[1].event("error")
+        await controller.event("error")
+        controller_error = json.loads(controller.received[-1])["params"]
         await controller.event("agent_end")
         error = json.loads(observers[0].received[-1])["params"]
         assert error["data"] == {
@@ -475,6 +483,9 @@ async def test_auth_error_names_failed_account_for_negotiated_observer(tmp_path,
         legacy = json.loads(observers[1].received[-1])["params"]
         assert legacy["data"] == {"login_provider": "codex"}
         assert legacy["error"] == {"code": "auth_error", "message": f"rejected {token}"}
+        expected = error if controller_negotiated else legacy
+        assert controller_error["data"] == expected["data"]
+        assert controller_error["error"] == expected["error"]
         assert "account: night-shift" in rendered[0]
         assert token not in rendered[0]
         assert token.encode() not in b"".join(observers[0].received)

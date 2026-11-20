@@ -61,9 +61,12 @@ def image_stub(block: Mapping[str, object]) -> dict[str, object]:
     return stub
 
 
+FeatureFields = Mapping[str, Mapping[str, object]]
+
+
 def auth_error_feature_fields(
     event: StreamEvent, login_hint: Mapping[str, str],
-) -> dict[str, dict[str, object]]:
+) -> FeatureFields:
     """Replace legacy provider details only for clients that opted in."""
     if event.auth_account is None:
         return {}
