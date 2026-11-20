@@ -20,7 +20,13 @@ from tests.support.sockets import short_socket_path
 from zeta.core.session_execution import execution_owner_state
 from zeta.core.session_files import child_directory, session_root
 from zeta.project_registry import ProjectRegistry
-from zeta.protocol.types import Message, MessageOrigin, MessageRole, TextContent, with_message_origin
+from zeta.protocol.types import (
+    Message,
+    MessageOrigin,
+    MessageRole,
+    TextContent,
+    with_message_origin,
+)
 from zeta.server import ZetaServer
 from zeta.server.handlers.resources import session_read
 from zeta.storage_format import WRITER_EPOCH
@@ -111,7 +117,7 @@ class GatedRead:
                 raise RuntimeError("injected read failure")
             return real(*args)
 
-        # test-contract: concurrency hold the read inside the worker thread for a forced ordering
+        # test-contract: seam hold the read inside the worker thread for a forced ordering
         monkeypatch.setattr(session_read, "_read", gated)
 
     async def wait_entered(self) -> None:
@@ -371,7 +377,7 @@ async def test_slot_frees_only_after_the_worker_read_ends(
     try:
         first, second = [await harness.client() for _ in range(2)]
         if ending == "deadline":
-            # test-contract: timeout shrink the named deadline; the gate, not the clock, orders the steps
+            # test-contract: complexity shrink the named deadline; the gate, not the clock, orders the steps
             monkeypatch.setattr(session_read, "READ_DEADLINE_SECONDS", 0)
         gate = GatedRead(monkeypatch, fail=ending == "failure")
         pending = asyncio.ensure_future(read(first, "held", session_id=target))
