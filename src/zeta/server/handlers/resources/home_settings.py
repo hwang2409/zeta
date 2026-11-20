@@ -44,6 +44,7 @@ async def _run(client, call):
         "settings_busy": ErrorDescriptor.RESOURCE_BUSY,
         "settings_malformed": ErrorDescriptor.SETTINGS_MALFORMED,
         "settings_unsafe": ErrorDescriptor.SETTINGS_UNSAFE,
+        "telemetry_unavailable": ErrorDescriptor.TELEMETRY_UNAVAILABLE,
     })
 
 

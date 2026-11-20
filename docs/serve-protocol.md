@@ -1972,6 +1972,14 @@ keys, and bad values; `-32009 stale_settings_revision` (both `data.code` and
 `-32004 operation_busy` for a lock held longer than 250 ms; and `-32000`
 `settings_malformed` or `settings_unsafe` for malformed or unsafe files.
 
+Turning telemetry on is refused with nothing written when telemetry could not
+start: `zeta[otel]` is not installed, an `OTEL_EXPORTER_OTLP*` or
+`OTEL_PYTHON_EXPORTER_OTLP*` variable is set, or `OTEL_SDK_DISABLED=true` is
+set in the server's environment. The server runs the same check zeta runs at
+startup, before it takes the lock. `detail` is the fixed startup error text.
+Turning telemetry off is never refused for this reason:
+`{"code":-32602,"message":"telemetry cannot start in this zeta install or environment","data":{"code":"telemetry_unavailable","detail":"OpenTelemetry support is not installed; install zeta[otel]"}}`
+
 ### agent run catalog (`agent_run_catalog_v1` feature)
 
 | method | version | feature | access |
