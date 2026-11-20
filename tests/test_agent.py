@@ -3731,12 +3731,6 @@ async def test_post_cap_question_answer_completion_uses_three_causal_turns(
 async def test_close_cancels_adopted_grandchild_after_child_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    await _assert_close_cancels_adopted_grandchild(tmp_path, monkeypatch)
-
-
-async def _assert_close_cancels_adopted_grandchild(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
     backend = FinishGateBackend("handoff", background_child=True)
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())

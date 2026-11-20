@@ -7,7 +7,6 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
-from tests.test_agent import _assert_close_cancels_adopted_grandchild
 from zeta.agent import runner
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.child_runs import LoadedAgentLifecycle, read_child_lifecycle
@@ -28,21 +27,21 @@ BEFORE_MARKER = ("resolve_cwd", "resolve_child_backend", "ensure_mcp", "open_chi
     *(("cancel", point) for point in SETUP_POINTS),
     *(("close", point) for point in (*BEFORE_MARKER, *SETUP_POINTS, "serve_receipt", "cleanup_cancel")),
     *(("cancel", point) for point in ("cleanup_cancel", "cancel_read", "cancel_confirmation", "cancel_reread", "success")),
-    ("close", "adopted_grandchild"),
+    *(("tool_close", point) for point in SETUP_POINTS),
+    ("tool_repeat_close", "build_child_loop"),
     ("repeat_close", "cleanup_cancel"),
 ])
 async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
-    if point == "adopted_grandchild":
-        await _assert_close_cancels_adopted_grandchild(tmp_path, monkeypatch)
-        return
-
     entered = asyncio.Event()
     release = asyncio.Event()
     running = asyncio.Event()
     cleanup_entered = asyncio.Event()
     tasks = []
     closed = False
-    shutdown = action in {"close", "repeat_close"}
+    tool_entry = action == "cancel" or action.startswith("tool_")
+    shutdown = action != "cancel"
+    repeat_close = action.endswith("repeat_close")
+    gate_cleanup = point == "cleanup_cancel" or repeat_close
     opened = []
 
     async def pause(*args, **kwargs):
@@ -95,7 +94,7 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
         if point in {"build_child_loop", "cleanup_cancel"}:
             # test-contract: seam pause loop construction while setup owns the child store.
             monkeypatch.setattr(runner, "_build_child_loop", pause)
-        if point == "cleanup_cancel":
+        if gate_cleanup:
             original_persist = runner.persist_confirmed_cancel
 
             async def persist(*args, **kwargs):
@@ -139,8 +138,15 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
             # test-contract: seam cancel on the return edge of joined store work.
             monkeypatch.setattr(ConversationStore, "_to_thread_store", store_offload)
 
-        async def spawn():
-            return await runner.spawn_child(loop, agent_type="general", task="test child", cwd=str(tmp_path) if point == "resolve_cwd" else None)
+        async def spawn(*, via_tool=False):
+            if via_tool:
+                return await loop._run_agent_tool(
+                    call, call.arguments, AbortGenerationRegistry().new_generation(), None,
+                )
+            return await runner.spawn_child(
+                loop, agent_type="general", task="test child",
+                cwd=str(tmp_path) if point == "resolve_cwd" else None,
+            )
 
         try:
             if point.startswith("cancel_") or point == "success":
@@ -181,9 +187,7 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
                         release.set()
                 await await_or_fail(owner.wait(), what="settle canceled child")
             else:
-                task = asyncio.create_task(spawn() if shutdown else loop._run_agent_tool(
-                    call, call.arguments, AbortGenerationRegistry().new_generation(), None,
-                ))
+                task = asyncio.create_task(spawn(via_tool=tool_entry))
                 tasks.append(task)
                 await await_or_fail(entered.wait(), what=point)
                 if point not in BEFORE_MARKER:
@@ -193,17 +197,17 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
                 if shutdown:
                     closing = asyncio.create_task(loop.close())
                     tasks.append(closing)
-                    if point == "cleanup_cancel":
+                    if gate_cleanup:
                         await await_or_fail(cleanup_entered.wait(), what="close starts cancellation write")
                         assert not closing.done()
                         assert child_store.directory_fd != -1
                         release.set()
-                    await await_or_fail(closing, what="runtime joins spawn setup")
+                    await await_or_fail(closing, what="close joins setup")
                     closed = True
-                    if action == "repeat_close":
+                    if repeat_close:
                         await await_or_fail(loop.close(), what="repeat close")
                         with pytest.raises(asyncio.CancelledError):
-                            await await_or_fail(spawn(), what="closed owner refuses setup")
+                            await await_or_fail(spawn(via_tool=tool_entry), what="closed owner refuses setup")
                 else:
                     task.cancel()
                     if point == "cleanup_cancel":
@@ -247,6 +251,6 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
             for task in tasks:
                 if not task.done():
                     task.cancel()
-            await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
+            await await_or_fail(asyncio.gather(*tasks, return_exceptions=True), what="drain test tasks")
             if not closed:
-                await loop.close()
+                await await_or_fail(loop.close(), what="close root after test")

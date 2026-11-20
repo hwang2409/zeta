@@ -84,6 +84,7 @@ from zeta.tui.app import TUIApp
 from zeta.tui.render import render_event
 
 _SENTINEL = "token-text-must-not-escape"
+_TURN_LOCK_TEST_REFRESH_TIMEOUT = 0.05
 
 
 def _hold_lifecycle_lock(
@@ -181,12 +182,14 @@ def _access_turn_credentials(
     home: str,
     account: AccountId,
     method: str,
+    ready: multiprocessing.synchronize.Event,
     result: multiprocessing.queues.Queue,
 ) -> None:
-    account_store.OAUTH_REFRESH_TIMEOUT_SECONDS = 0.05
+    account_store.OAUTH_REFRESH_TIMEOUT_SECONDS = _TURN_LOCK_TEST_REFRESH_TIMEOUT
     credential = credential_store(account.provider, home=home, account=account)
     assert credential is not None
     try:
+        ready.set()
         getattr(credential, method)()
     except AccountCredentialLockTimeoutError as exc:
         result.put((exc.code, exc.retryable, str(exc)))
@@ -482,27 +485,33 @@ def _run_virtual_clock_codex_turn(
 
 @pytest.mark.parametrize("method", ["read", "bootstrap"])
 def test_turn_credential_access_times_out_when_another_process_holds_lock(
-    tmp_path: Path, method: str
+    tmp_path: Path, method: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(
+        account_store, "OAUTH_REFRESH_TIMEOUT_SECONDS", _TURN_LOCK_TEST_REFRESH_TIMEOUT
+    )
     account = AccountId("codex", "work")
     named_account_credentials(tmp_path, account.provider, account.name).save(tokens())
     context = multiprocessing.get_context("spawn")
-    ready = context.Event()
+    holder_ready = context.Event()
+    reader_ready = context.Event()
     release = context.Event()
     result = context.Queue()
     holder = context.Process(
         target=_hold_lifecycle_lock,
-        args=(str(tmp_path), account, ready, release),
+        args=(str(tmp_path), account, holder_ready, release),
     )
     reader = context.Process(
         target=_access_turn_credentials,
-        args=(str(tmp_path), account, method, result),
+        args=(str(tmp_path), account, method, reader_ready, result),
     )
     holder.start()
     try:
-        assert ready.wait(timeout=5)
+        assert holder_ready.wait(timeout=30), "account lock holder did not start"
         reader.start()
-        reader.join(timeout=5)
+        assert reader_ready.wait(timeout=30), "credential reader did not start"
+        # Allow time to publish the result and exit, not to spawn and import.
+        reader.join(timeout=account_store.credential_wait_timeout_seconds() + 5)
         assert not reader.is_alive(), "turn credential access ignored the lock timeout"
         assert reader.exitcode == 0
         assert result.get(timeout=1) == (
@@ -511,9 +520,10 @@ def test_turn_credential_access_times_out_when_another_process_holds_lock(
             "cannot access codex:work: another process holds the account lock; retry the turn",
         )
     finally:
-        if reader.is_alive():
-            reader.kill()
-        reader.join(timeout=5)
+        if reader.pid is not None:
+            if reader.is_alive():
+                reader.kill()
+            reader.join(timeout=5)
         release.set()
         holder.join(timeout=5)
         if holder.is_alive():

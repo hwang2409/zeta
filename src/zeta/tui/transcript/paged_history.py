@@ -421,7 +421,9 @@ class PagedTranscriptHistory:
         self._refresh_edges()
         return True
 
-    async def reveal(self, entry_id: str) -> TUIHistoryPage:
+    async def reveal(self, entry_id: str | None) -> TUIHistoryPage:
+        """Replace resident pages around an entry, or at the tail if not specified."""
+
         self._reveal_target = entry_id
         source = self.source
         if source is None:
@@ -430,6 +432,14 @@ class PagedTranscriptHistory:
         # the pages it replaces.
         self.generation += 1
         generation = self.generation
+        if entry_id is None:
+            # Keep the scrolled window live until a tail restore can publish.
+            page = await self._read(("tail",), source.page())
+            if not page.segments or generation != self.generation:
+                return TUIHistoryPage(())
+            self.reset(endpoint_id=self.endpoint_id)
+            self.adopt(page)
+            return page
         page = await self._read(("reveal", entry_id), source.reveal(entry_id))
         # The revealed page ends at the target; rows after it let the view put
         # the target on the top row. One huge row (a compaction) can fill a
