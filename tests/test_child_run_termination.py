@@ -770,6 +770,33 @@ async def _close_running(tmp_path, monkeypatch, mode):
         _expect("grandchild D1", _d1(run.child_dir / "agents" / "1") == "canceled")
 
 
+@row("abort@running-bg-grandchild")
+async def _abort_running_bg_grandchild(tmp_path, monkeypatch, mode):
+    """``loop.abort()`` while the child and its background grandchild are in model calls.
+
+    The CI hang of tests/test_agent.py::test_parent_abort_cancels_background_grandchild
+    (main run 44743141922, job 136311585001, macOS: pytest-timeout killed gw0). Here a
+    hang fails as a named await_or_fail timeout. bg aborts after the parent turn ended,
+    as that test does; fg aborts the running parent turn."""
+    child = Actor([
+        _call("agent", "grandchild", prompt="grandchild prompt", description="gc", background=True),
+        _text("late"),
+    ], gate_call=1)
+    grandchild = Actor([_text("late")], gate_call=0)
+    run = await _open(tmp_path, monkeypatch, mode, child, grandchild=grandchild)
+    async with run.cleanup:
+        run.start()
+        await await_or_fail(run.child.started.wait(), what="child second call")
+        await await_or_fail(run.grandchild.started.wait(), what="grandchild call")
+        if mode == "bg":
+            assert await run.finish_turn() is None
+        run.loop.abort()
+        await run.finish_turn()
+        await run.settle()
+        await _verify(run, "canceled")
+        _expect("grandchild D1", _d1(run.child_dir / "agents" / "1") == "canceled")
+
+
 @row("cancel@finish_gate")
 async def _cancel_finish_gate(tmp_path, monkeypatch, mode):
     """Bug 4: the grandchild's cancel write frees the gate before the child's lands."""
@@ -1058,6 +1085,7 @@ MODES = {
     "explicit-cancel-first": ("explicit",),
     "abort-after-complete": ("fg",),
     "close@running": ("fg", "bg"),
+    "abort@running-bg-grandchild": ("fg", "bg"),
     "fail@D1_cancel_write": ("fg", "bg"),
     "fail@D1_finish_write": ("fg", "bg"),
     "fail@D5_write": ("fg", "bg"),
