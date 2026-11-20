@@ -2147,6 +2147,64 @@ Unexpected errors that reach the negotiated resource handler's error boundary
 return `-32000` with the fixed message `unexpected server or storage failure`.
 The unnegotiated methods keep legacy error handling.
 
+### skills and agent profiles (`library_read_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `skill_catalog` | `1.0` | `library_read_v1` | `read` |
+| `skill_read` | `1.0` | `library_read_v1` | `read` |
+| `agent_profile_catalog` | `1.0` | `library_read_v1` | `read` |
+| `agent_profile_read` | `1.0` | `library_read_v1` | `read` |
+
+All four methods are read-only and available to observers who negotiate the
+feature in `hello`. No events are emitted. This is a serve-only surface; the
+TUI already shows skills and agent profiles.
+
+Catalog requests accept `{scope?,offset?,limit?}`. `scope` is `effective`
+(default), `home`, or `project`. `offset` starts at zero; `limit` is an integer
+from 1 through 100 (default 50). Catalogs return
+`{revision,data:{items,next_offset?}}`. Items are sorted by name. Use the
+returned `next_offset` to continue; omission means the end. The revision is a
+SHA-256 of the canonical JSON of the returned page data, not a document
+revision. Catalog pages are live and may change between requests.
+
+- Skill items: `{name,description,keywords,source,scope,filename,editable,diagnostics}`.
+- Agent profile items: `{name,description,tools,model,allow_delegation,accepts_follow_ups,explicit_finish,max_turns,source,scope,filename,editable,diagnostics}`.
+  `tools`, `model`, and `max_turns` can be null.
+
+`source` is `packaged`, `home`, or `project`. The item `scope` is the selector
+for a detail request: `effective` for packaged items, otherwise its source.
+`filename` is relative to the catalog root, or null for a built-in agent
+profile. Packaged items are not editable. `diagnostics` is an empty array;
+owner warnings and their paths are not sent over serve.
+
+Project scope reads `.zeta` under the attached session's working directory.
+Without an attached session, explicit `project` scope is unavailable and
+`effective` reads only home and packaged items. In `effective`, project
+shadows home and home shadows packaged definitions of the same name.
+
+Detail requests accept `{name,scope}` and return
+`{revision,data:{name,frontmatter,body,source,editable,redacted,truncated?}}`.
+For a file, `revision` is the SHA-256 of the exact markdown bytes before
+projection. Built-in agent profiles have no markdown file: they return their
+public preset fields and preset prompt text (or the empty string). The
+built-in revision is a display-only SHA-256 of the returned data object
+encoded as canonical JSON (sorted keys, compact separators, ASCII escapes).
+
+The server applies its shared secret-pattern redactor to text, sets
+`redacted: true` when it replaces content and `false` otherwise, and caps the
+redacted body at 128 KiB of UTF-8 without splitting a code point. If it cuts
+the body, it includes `truncated: true`. This is not a round-trip editable
+copy. `body`, `frontmatter`, and `description` are untrusted user-authored
+content. Render them as text; do not send them to a model as instructions.
+The server does not rewrite instructions in these fields.
+
+Invalid parameters return `-32602` (`data.code: invalid_params`); a name not
+found in the selected scope also sets `data.reason: resource_not_found`.
+Missing project context returns `-32005` (`state_unavailable`). A result that
+cannot fit the response budget returns `-32007` (`result_too_large`). Unexpected
+owner failures return `-32000`. Unnegotiated methods return `-32601`.
+
 ## errors
 
 Error responses use standard JSON-RPC codes where applicable. Each emitted variant selects one registered descriptor.

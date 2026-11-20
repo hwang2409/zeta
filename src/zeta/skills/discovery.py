@@ -22,6 +22,7 @@ class MarkdownDocument:
     root: Path
     metadata: dict[str, object]
     body: str
+    raw: bytes
 
 
 class NamedItem(Protocol):
@@ -91,7 +92,11 @@ def parse_frontmatter(
 def read_markdown(path: Path, kind: str) -> tuple[dict[str, object], str]:
     """Read common frontmatter and a non-empty markdown body."""
 
-    lines = path.read_text(encoding="utf-8").splitlines()
+    return _parse_markdown(path.read_bytes(), path, kind)
+
+
+def _parse_markdown(raw: bytes, path: Path, kind: str) -> tuple[dict[str, object], str]:
+    lines = raw.decode("utf-8").splitlines()
     if not lines or lines[0].strip() != "---":
         raise ValueError(f"{kind} {path} is missing YAML frontmatter")
     try:
@@ -114,6 +119,7 @@ def discover_markdown[Item](
     build: Callable[[MarkdownDocument], Item],
     notices: list[str] | None = None,
     document_name: str | None = None,
+    capture: Callable[[Item, MarkdownDocument], None] | None = None,
 ) -> list[Item]:
     """Discover one tier of flat markdown or named directory documents."""
 
@@ -146,13 +152,15 @@ def discover_markdown[Item](
             resolved_path = contained_path(document_path, root, kind)
             if entry_path.is_dir() and not resolved_path.is_file():
                 continue
-            metadata, body = read_markdown(resolved_path, kind)
+            raw = resolved_path.read_bytes()
+            metadata, body = _parse_markdown(raw, resolved_path, kind)
             document = MarkdownDocument(
                 entry_path=entry_path,
                 path=resolved_path,
                 root=root,
                 metadata=metadata,
                 body=body,
+                raw=raw,
             )
             item = build(document)
         except (
@@ -175,6 +183,8 @@ def discover_markdown[Item](
             )
         paths_by_name[name] = entry_path
         discovered.append(item)
+        if capture is not None:
+            capture(item, document)
     return discovered
 
 

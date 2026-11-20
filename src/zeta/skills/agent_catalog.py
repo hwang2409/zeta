@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -182,7 +183,7 @@ def _build_agent(
         except ValueError:
             notice = warn_discovery(
                 document.path,
-                f"unknown model {model!r}; agent will inherit the parent model",
+                "unknown model; agent will inherit the parent model",
                 "agent",
             )
             if notices is not None:
@@ -242,6 +243,7 @@ def discover_agents(
     *,
     source: str,
     notices: list[str] | None = None,
+    capture: Callable[[AgentPreset, MarkdownDocument], None] | None = None,
     agents_dir: Path | None = None,
 ) -> list[AgentPreset]:
     """Discover one tier of flat agent definitions."""
@@ -252,11 +254,13 @@ def discover_agents(
         kind="agent",
         build=lambda document: _build_agent(document, source, notices),
         notices=notices,
+        capture=capture,
     )
 
 
 def discover_session_agents(
-    *, home: str | Path | None = None, project_dir: str | Path | None = None
+    *, home: str | Path | None = None, project_dir: str | Path | None = None,
+    capture: Callable[[AgentPreset, MarkdownDocument], None] | None = None,
 ) -> AgentCatalog:
     """Discover packaged, home, and project agents for one session."""
 
@@ -267,7 +271,7 @@ def discover_session_agents(
             replace(preset, source="packaged") for preset in AGENT_PRESETS.values()
         ],
         discover=lambda root, source, notices: discover_agents(
-            root, source=source, notices=notices
+            root, source=source, notices=notices, capture=capture
         ),
         warn_override=lambda agent: warn_discovery(
             agent.path or Path(agent.name),
