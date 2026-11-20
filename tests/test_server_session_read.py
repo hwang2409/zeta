@@ -19,6 +19,7 @@ from tests.support.serve_contract import ServeClient
 from tests.support.sockets import short_socket_path
 from zeta.core.session_execution import execution_owner_state
 from zeta.core.session_files import child_directory, session_root
+from zeta.core.store import ConversationStore
 from zeta.project_registry import ProjectRegistry
 from zeta.protocol.types import (
     Message,
@@ -50,7 +51,7 @@ class Harness:
         self.project = registry.create_project("alpha", "repo").project_id
         self.other_project = registry.create_project("beta", "repo").project_id
 
-    def session(self, project_id: str, turns: int = 0, *, keep_open: bool = False):
+    def session(self, project_id: str | None, turns: int = 0, *, keep_open: bool = False):
         opened = self.server.runtime.manager.create(
             provider="codex", model="offline", cwd=self.server.runtime.cwd, project_id=project_id, auto_project=False,
         )
@@ -81,11 +82,11 @@ def append_turn(store, text: str) -> None:
     store.append_message(Message(MessageRole.ASSISTANT, [TextContent(f"{text} answer")]))
 
 
-async def start(tmp_path: Path, attach: bool = True) -> tuple[Harness, str | None]:
+async def start(tmp_path: Path, attach: bool = True, *, projectless: bool = False) -> tuple[Harness, str | None]:
     harness = await asyncio.to_thread(Harness, tmp_path)
     attached = None
     if attach:
-        attached = await asyncio.to_thread(harness.session, harness.project)
+        attached = await asyncio.to_thread(harness.session, None if projectless else harness.project)
         await harness.server.runtime.resume_session(attached)
     await harness.server.start()
     return harness, attached
@@ -202,6 +203,42 @@ async def test_absent_and_cross_project_sessions_share_one_not_found_and_params_
         for index, params in enumerate(invalid):
             error = (await observer.request(f"invalid-{index}", METHOD, params))["error"]
             assert (error["code"], error["data"]) == (-32602, {"code": "invalid_params"}), params
+    finally:
+        await close_serve(harness.server, *harness.writers)
+
+
+@pytest.mark.asyncio
+async def test_projectless_sessions_read_each_other_and_never_cross_the_project_boundary(tmp_path: Path) -> None:
+    harness, attached = await start(tmp_path, projectless=True)
+    target = await asyncio.to_thread(harness.session, None, 2)
+    in_project = await asyncio.to_thread(harness.session, harness.project, 1)
+    # a child-agent store under the target, at sessions/<target>/agents/1
+    child = ConversationStore(harness.server.home / "sessions" / target / "agents", session_id="1", cwd=str(tmp_path))
+    try:
+        append_turn(child, "child")
+    finally:
+        child.close()
+    not_found = {
+        "code": -32602, "message": "the requested session does not exist",
+        "data": {"code": "session_not_found", "reason": "session_not_found"},
+    }
+    try:
+        observer = await harness.client()
+        reply = await read(observer, "same", session_id=target, direction="forward")
+        assert "result" in reply, reply
+        assert texts(reply["result"]) == [f"turn {n} {kind}" for n in range(2) for kind in ("question", "answer")]
+        assert (await read(observer, "cross", session_id=in_project))["error"] == not_found
+        # child sessions are not reachable by id: by its number, its instance id, or its path
+        assert (await read(observer, "child-number", session_id="1"))["error"] == not_found
+        assert (await read(observer, "child-instance", session_id=f"{target}:1"))["error"] == not_found
+        error = (await read(observer, "child-path", session_id=f"{target}/agents/1"))["error"]
+        assert (error["code"], error["data"]) == (-32602, {"code": "invalid_params"})
+
+        # a project caller does not see project-less sessions either
+        assert "result" in await (await harness.client(role="controller")).request(
+            "attach-project", "resume", {"session_id": in_project},
+        )
+        assert (await read(observer, "reverse", session_id=attached))["error"] == not_found
     finally:
         await close_serve(harness.server, *harness.writers)
 

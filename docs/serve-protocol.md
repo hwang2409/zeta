@@ -2277,8 +2277,10 @@ observer_read_only` for an observer. Unexpected failures return `-32000`.
 
 `session_history_read {session_id, cursor?, direction?, limit?, max_bytes?}`
 returns history rows of another top-level session in the attached session's
-project. It does not attach, subscribe, or take the session's execution lease,
-and it takes no lock the session's owner waits for. `direction` is `backward`
+project; when the attached session has no project, only top-level sessions with
+no project are readable. Child-agent sessions are not readable by id. It does
+not attach, subscribe, or take the session's execution lease, and it takes no
+lock the session's owner waits for. `direction` is `backward`
 (default, newest rows first) or `forward`. `limit` (1–128, default 50) counts
 history groups, not rows; a group is never split. `max_bytes` (1–1048576,
 default and maximum 1048576) bounds the whole response frame.
@@ -2300,9 +2302,10 @@ transcript off the event loop: a 34 MB transcript costs about 0.85 s and about
 Clients must not poll faster than every few seconds.
 
 Errors: `-32602 invalid_params` for bad params or a cursor made for other
-params; `-32602 session_not_found` for an absent session and for a session in
-another project (the same error, so other projects are not disclosed);
-`-32005 state_unavailable` with no attached session or project, for a newer
+params; `-32602 session_not_found` for an absent session and for a session whose
+project differs from the attached session's, including project versus no
+project in either direction (the same error, so other sessions are not
+disclosed); `-32005 state_unavailable` with no attached session, for a newer
 stored format, a corrupt or changing transcript, or a read that passes its
 10 s deadline; `-32007 result_too_large` when one group alone is over
 `max_bytes`. Errors set `data.code` and `data.reason` to the named reason and
