@@ -399,8 +399,14 @@ async def test_account_list_serializes_with_registry_writer(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("controller_negotiated", [False, True])
+@pytest.mark.parametrize(("token", "template"), [
+    pytest.param("sk-auth-error-token-canary-0001", "rejected {}", id="canary"),
+    pytest.param("sk-proj-AbCdEf1234567890abcdEFGH1234abcd", "Incorrect API key provided: {}", id="sk-proj"),
+    pytest.param("sk-proj-AbCdEf12\x1b[0m34567890abcdEFGH", "Incorrect API key provided: {}", id="control-split"),
+    pytest.param("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVlLTAx", "Invalid token: {}", id="jwt"),
+])
 async def test_auth_error_names_failed_account_for_negotiated_clients(
-    tmp_path, traced, caplog, controller_negotiated,
+    tmp_path, traced, caplog, controller_negotiated, token, template,
 ):
     from tests.test_tui import renderable_plain
     from zeta.codex import CodexAuthError
@@ -408,7 +414,6 @@ async def test_auth_error_names_failed_account_for_negotiated_clients(
     from zeta.tui.render import render_event
 
     telemetry, memory = traced
-    token = "auth-error-token-canary"
     credentials = named_account_credentials(tmp_path, "codex", "work")
     await asyncio.to_thread(credentials.save, OAuthTokens(token, "refresh", 9_999_999_999))
     await asyncio.to_thread(credentials.store.rename, credentials.account, "night-shift")
@@ -420,7 +425,7 @@ async def test_auth_error_names_failed_account_for_negotiated_clients(
         async def complete(self, messages, tool_schemas):
             if False:
                 yield
-            raise CodexAuthError(f"rejected {token}")
+            raise CodexAuthError(template.format(token))
 
     server = ZetaServer(
         home=tmp_path, socket_path=short_socket_path(tmp_path), provider="codex",
@@ -482,12 +487,13 @@ async def test_auth_error_names_failed_account_for_negotiated_clients(
         assert error["error"] == {"code": "auth_error", "message": "Account sign-in required."}
         legacy = json.loads(observers[1].received[-1])["params"]
         assert legacy["data"] == {"login_provider": "codex"}
-        assert legacy["error"] == {"code": "auth_error", "message": f"rejected {token}"}
+        assert legacy["error"] == {"code": "auth_error", "message": template.format(token)}
         expected = error if controller_negotiated else legacy
         assert controller_error["data"] == expected["data"]
         assert controller_error["error"] == expected["error"]
         assert "account: night-shift" in rendered[0]
-        assert token not in rendered[0]
+        assert f"provider: {template.format('[secret omitted]')}" in rendered[0]
+        assert token.replace("\x1b[0m", "") not in rendered[0]
         assert token.encode() not in b"".join(observers[0].received)
         assert token not in caplog.text
     finally:
