@@ -40,9 +40,10 @@ def _retain_logs(directory: Path) -> None:
         try:
             fd = os.open(temp, os.O_RDONLY | os.O_NOFOLLOW)
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # never lock a fresh temp: its owner's own non-blocking lock would fail
                 stale = now_ns - os.fstat(fd).st_mtime_ns > _TUI_STDERR_TEMP_MAX_AGE_NS
                 if stale:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     locked = os.fstat(fd)
                     try:
                         current = os.stat(temp, follow_symlinks=False)
