@@ -14,6 +14,15 @@ def delegation_enabled(registry: ProjectRegistry) -> bool:
     )
 
 
+def is_trusted(record: dict[str, Any]) -> bool:
+    """The one trust rule for every inbox surface: only provenance grants work.
+
+    Below the delegation epoch no record carries an authority, so every message
+    is information there: local origin cannot tell a user from another agent.
+    """
+    return record.get("authority") == "trusted_assignment"
+
+
 def decorate(
     registry: ProjectRegistry,
     project_id: str,

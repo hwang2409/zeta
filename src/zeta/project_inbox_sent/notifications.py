@@ -21,10 +21,12 @@ def project_inbox_notification(
 ) -> dict[str, Any]:
     """Project one inbox notification using the held home epoch gate."""
     result = dict(data)
-    if (
-        result.get("kind") != PROJECT_INBOX_NOTIFICATION_KIND
-        or observed_epoch is None
-        or not feature_enabled(observed_epoch, StorageFeature.INBOX_DELEGATION)
+    if result.get("kind") != PROJECT_INBOX_NOTIFICATION_KIND:
+        return result
+    # every epoch: a stored wake text must never call inbox messages work
+    result["text"] = NEUTRAL_INBOX_TEXT
+    if observed_epoch is None or not feature_enabled(
+        observed_epoch, StorageFeature.INBOX_DELEGATION
     ):
         return result
     messages = result.get("messages")
@@ -38,5 +40,4 @@ def project_inbox_notification(
             for message in messages
             if isinstance(message, Mapping)
         ]
-    result["text"] = NEUTRAL_INBOX_TEXT
     return result

@@ -17,9 +17,9 @@ from ...project_errors import (
     UnsupportedMemoryFormatError,
 )
 from ...project_inbox import InboxBusyError, InboxError, ProjectInbox
+from ...project_inbox_provenance import is_trusted
 from ...project_memory_history import PROJECT_MEMORY_FILES
 from ...project_registry import Project, ProjectRegistry
-from ...storage_format import StorageFeature, feature_enabled
 from ..protocol import ErrorDescriptor, FrameCodec
 
 if TYPE_CHECKING:
@@ -295,10 +295,6 @@ class ProjectRequests:
             self.inbox.decorate(project.project_id, item) for item in state[status]
         ]
         messages = [self._bounded_message(request_id, item) for item in projected]
-        provenance_enabled = feature_enabled(
-            self.registry._storage_lease.observed_epoch,
-            StorageFeature.INBOX_DELEGATION,
-        )
         projected_by_id = {item["id"]: item for item in projected}
         invalid = [item for item in state["invalid"] if item["status"] == status]
         return self._page(
@@ -310,14 +306,7 @@ class ProjectRequests:
             extra_for_page=lambda page: {
                 "status": status,
                 "untrusted": any(
-                    (
-                        projected_by_id.get(message.get("id"), {}).get("authority")
-                        != "trusted_assignment"
-                    )
-                    if provenance_enabled
-                    else projected_by_id.get(message.get("id"), {}).get("origin")
-                    != "local"
-                    for message in page
+                    not is_trusted(projected_by_id[message["id"]]) for message in page
                 ),
                 "invalid": invalid,
             },
@@ -360,7 +349,7 @@ class ProjectRequests:
 
         envelope = {
             "status": "claimed",
-            "untrusted": result.get("authority") != "trusted_assignment",
+            "untrusted": not is_trusted(message),
             "messages": [result],
         }
         optional = [
