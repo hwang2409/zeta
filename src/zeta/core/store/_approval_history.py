@@ -233,7 +233,10 @@ class ApprovalHistoryStoreMixin:
         if record is None:
             return "none"
         owner = owner or asyncio.current_task()
-        if definition[0] != "missing" and record.definition != definition:
+        if record.definition[0] == "missing":
+            # Resume after a restart records before MCP mounts: bind on first sight.
+            record.definition = definition
+        elif definition[0] != "missing" and record.definition != definition:
             record.owner = owner
             return "changed"
         if prepared:

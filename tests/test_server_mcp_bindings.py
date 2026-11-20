@@ -25,7 +25,14 @@ from tests.test_server import TIMEOUT, _connect, _request
 from zeta.mcp import MCPMount, MCPServerConfig, StreamableHTTPMCPClient
 from zeta.mcp.call_deadline import MCPCallDeadline
 from zeta.mcp.client import MCPHTTPError
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.core.session import SessionManager
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    TextContent,
+    ToolCall,
+    ToolUseContent,
+)
 from zeta.runtime.loop.mcp_session import MCPSession
 from zeta.server import ZetaServer
 from zeta.server.protocol import EventDescriptor
@@ -2294,3 +2301,69 @@ async def test_session_mcp_binding_rejects_invalid_and_reserved_header_names(
         writer.close()
         await writer.wait_closed()
         await server.close()
+
+
+
+def _seed_pending_approval(home: Path, cwd: Path, call: ToolCall) -> str:
+    # What a serve process that exited mid-approval leaves on disk.
+    opened = SessionManager(home).create(provider="codex", model="offline", cwd=cwd)
+    try:
+        opened.store.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]),
+            [(call.id, call, {"action": None}, {})],
+        )
+        return opened.store.session_id
+    finally:
+        opened.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_kept", [True, False])
+async def test_serve_restart_runs_the_restored_approved_mcp_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, server_kept: bool
+) -> None:
+    allow_local_http(monkeypatch)
+    project = tmp_path / "project"
+    project.mkdir()
+    mcp = LocalMCP()
+    port = await await_or_fail(mcp.start(), timeout=30, what="restart MCP start")
+    # A removed server is a real change: the restored approval must not run.
+    name = "page" if server_kept else "other"
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {name: {
+        "transport": "streamable-http", "url": f"http://127.0.0.1:{port}"
+    }}}))
+    session_id = await asyncio.to_thread(
+        _seed_pending_approval, tmp_path, project,
+        ToolCall("page-call", "page__echo", {}),
+    )
+    backend = FakeBackend([ScriptedTurn(content=[TextContent("done")])])
+    server = ZetaServer(
+        home=tmp_path,
+        cwd=project,
+        port=0,
+        provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {
+            "protocol_version": "1.2", "features": ["approval_reconnect"]
+        })
+        resumed = await _request(reader, writer, 2, "resume", {"session_id": session_id})
+        assert "error" not in resumed[-1]
+        allowed = await _request(reader, writer, 3, "approve", {"request_id": "page-call"})
+        assert "error" not in allowed[-1]
+        assert server.control._turn_task is not None
+        await await_or_fail(
+            asyncio.shield(server.control._turn_task), timeout=30, what="restored tool"
+        )
+
+        result = server.runtime.opened.store.tool_result("page-call")
+        assert result is not None
+        assert result.is_error is not server_kept, result.content
+        assert mcp.methods.count("tools/call") == int(server_kept)
+    finally:
+        writer.close()
+        await await_or_fail(writer.wait_closed(), timeout=30, what="socket close")
+        await await_or_fail(server.close(), timeout=30, what="serve close")
+        await await_or_fail(mcp.close(), timeout=30, what="restart MCP close")
