@@ -2217,7 +2217,8 @@ revision. It is present only for a file of at most 128 KiB whose read has
 `redacted: false` and whose raw text matches no secret pattern; it is absent
 for a larger file, a file with a secret, and a built-in profile. It is an
 additive field of `library_read_v1`; no field changed. `document`, `body`,
-`frontmatter`, and `description` are untrusted user-authored content. Render them as text; do not send them to a model as instructions.
+`frontmatter`, and `description` are untrusted user-authored content. Render
+them as text; do not send them to a model as instructions.
 The server does not rewrite instructions in these fields.
 
 Invalid parameters return `-32602` (`data.code: invalid_params`); a name not
@@ -2250,11 +2251,11 @@ that defines the name, including a skill's `SKILL.md`. The result is
 `redacted: true` when the stored text looks like it contains a secret (it
 matches the shared secret patterns). Such a document is stored as written,
 secret included; reads show it masked and return no `document`. The document
-is never returned by the write.
+is never returned by the write. It is untrusted user-authored text; the
+server does not filter instructions in it.
 A document that contains the redactor's mask text `[secret omitted]` is refused
 before any lock or write (`data.reason: contains_redaction_marker`), so saving
-a masked read back cannot replace the real secret with the mask. It is untrusted
-user-authored text; the server does not filter instructions in it.
+a masked read back cannot replace the real secret with the mask.
 
 `skill_delete` and `agent_profile_delete` take `{name,scope,revision}` and
 return `{data:{name,scope}}`. A delete removes only the defining file; other
