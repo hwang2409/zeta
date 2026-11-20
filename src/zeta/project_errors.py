@@ -33,8 +33,6 @@ class ProjectNotFoundError(ProjectRegistryError):
 class MemoryDigestMismatchError(ProjectRegistryError):
     """Project memory changed since the caller read its digest."""
 
-    code = "stale_revision"
-
     def __init__(self) -> None:
         super().__init__("project memory digest mismatch")
 
