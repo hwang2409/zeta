@@ -14,6 +14,7 @@ from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
 from zeta.server.handlers.resources import FAMILIES
 from zeta.server.login import Logins
+from zeta.server.mcp_auth import MCPAuth
 from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -122,6 +123,11 @@ _OWNER_FAILURE_CASES = {
     "mcp_server_set_trusted": (f"{_MCP_OWNER}.set_trusted", {
         "revision": _REVISION, "mutation": {"name": "test", "trusted": True},
     }),
+    "mcp_server_test": (f"{_MCP_OWNER}.test", {"name": "test"}),
+    "mcp_auth_start": ("zeta.server.mcp_auth.MCPAuth.start", {"name": "test"}),
+    "mcp_auth_status": ("zeta.server.mcp_auth.MCPAuth.status", {"name": "test"}),
+    "mcp_auth_cancel": ("zeta.server.mcp_auth.MCPAuth.cancel", {"name": "test"}),
+    "mcp_auth_logout": (f"{_MCP_OWNER}.logout", {"name": "test"}),
     "account_list": ("zeta.accounts.AccountStore.catalog_snapshot", {}),
     "login_start": ("zeta.server.login.Logins.login_start", {"provider": "claude"}),
 }
@@ -143,8 +149,9 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
         server=SimpleNamespace(
             home=tmp_path,
             runtime=SimpleNamespace(
-                opened=object(), session_id="test-session", loop=SimpleNamespace(_mcp_project_dir_value=tmp_path),
+                opened=object(), session_id="test-session", loop=SimpleNamespace(_mcp_project_dir_value=tmp_path, tool_registry=None),
             ),
+            _mcp_auth=MCPAuth(),
             control=SimpleNamespace(
                 _reject_if_unhealthy=lambda: None,
                 client_turn_detached=lambda: False,
