@@ -116,6 +116,14 @@ _OWNER_FAILURE_CASES = {
     "agent_profile_read": (
         "zeta.skills.agent_catalog.discover_session_agents", {"name": "test", "scope": "effective"},
     ),
+    "skill_write": ("zeta.skills.resource_store.write", {"name": "test", "scope": "home", "mutation": {"document": "x"}}),
+    "skill_delete": ("zeta.skills.resource_store.delete", {"name": "test", "scope": "home", "revision": _REVISION}),
+    "agent_profile_write": (
+        "zeta.skills.resource_store.write", {"name": "test", "scope": "project", "mutation": {"document": "x"}},
+    ),
+    "agent_profile_delete": (
+        "zeta.skills.resource_store.delete", {"name": "test", "scope": "project", "revision": _REVISION},
+    ),
     "session_history_read": ("zeta.server.handlers.resources.session_read._read", {"session_id": "other-session"}),
     "mcp_server_list": (f"{_MCP_OWNER}.read_disk", {}),
     "mcp_server_add": (f"{_MCP_OWNER}.add", {
@@ -158,7 +166,7 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
             home=tmp_path,
             runtime=SimpleNamespace(
                 opened=SimpleNamespace(metadata=SimpleNamespace(project_id="test-project", cwd=tmp_path)),
-                session_id="test-session", manager=None,
+                project_dir=tmp_path, session_id="test-session", manager=None,
                 loop=SimpleNamespace(_mcp_project_dir_value=tmp_path, tool_registry=None),
             ),
             _mcp_auth=MCPAuth(),
