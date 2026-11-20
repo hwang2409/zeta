@@ -3472,6 +3472,7 @@ async def test_foreground_cancel_wins_when_child_finishes_before_cancel_write(
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await loop.close()
+        store.close()
 
 
 async def _finish_gate_before_end_turn(
