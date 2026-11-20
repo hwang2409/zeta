@@ -476,10 +476,7 @@ class AgentLoop(
             return False
         if ":code:" in tool_call.id and tool_call.id in self._nested_approval_ids():
             return False
-        if not self.store.prepare_pending_approval_execution(
-            tool_call.id,
-            self.tool_registry.approval_definition_identity(tool_call.name),
-        ):
+        if not self.store.prepare_pending_approval_execution(tool_call.id):
             return False
         self.tool_registry.start_batch()
         return True
@@ -641,6 +638,10 @@ class AgentLoop(
         if state is None or state[1] is None:
             return None
         tool_call = state[0]
+        # Only now, with MCP mounted, is the identity real after a restart.
+        self.store.bind_pending_approval_definition(
+            tool_call.id, self.tool_registry.approval_definition_identity(tool_call.name)
+        )
         existing = self._existing_tool_result(tool_call.id)
         if existing is not None:
             return existing
