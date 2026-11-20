@@ -27,7 +27,7 @@ from .core.session_files import (
     reference_publication,
 )
 from .project_errors import ProjectNotFoundError, ProjectRegistryBusyError
-from .project_inbox_provenance import decorate, delegation_enabled
+from .project_inbox_provenance import decorate, delegation_enabled, is_trusted
 from .project_inbox_sent import SentLedgerOutcome, SentMessageTracker
 from .project_inbox_sent.delivery import SentDelivery
 from .project_inbox_sent.generation import InboxGeneration
@@ -713,7 +713,7 @@ class ProjectInbox:
                             "sender": record["from"]["project"], "summary": clip(record["title"], 512)[0],
                             "created_ns": timestamp_ns(record["created_at"]),
                             "updated_ns": timestamp_ns(record.get("done_at", record.get("claimed_at", record["created_at"]))),
-                            "trusted_assignment": decorated.get("authority") == "trusted_assignment",
+                            "trusted_assignment": is_trusted(decorated),
                             "has_body": bool(body),
                         }
                         if message_id is not None:
