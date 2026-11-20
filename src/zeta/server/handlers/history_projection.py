@@ -532,7 +532,6 @@ def _history_entry_rows(
     if entry_type == "warning":
         return [_transcript_recovery_history_row(entry)]
     if entry_type == "notification":
-        # no epoch: a closed store's lease cannot report it; the text is epoch-free
         data = project_notification_data(entry.data)
         kind = data.get("kind", "agent_completion")
         if kind == "task_exited":

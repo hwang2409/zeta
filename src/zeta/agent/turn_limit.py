@@ -156,11 +156,9 @@ def parse_turn_limit_result(
     return TurnLimitProjection("turn_limit", handoff_path(child_session_path), readable)
 
 
-def project_notification_data(
-    data: dict[str, Any], *, observed_epoch: int | None = None
-) -> dict[str, Any]:
+def project_notification_data(data: dict[str, Any]) -> dict[str, Any]:
     """Project a validated stored notification without changing its stored shape."""
-    data = project_inbox_notification(data, observed_epoch=observed_epoch)
+    data = project_inbox_notification(data)
     if data.get("status") != "completed":
         return data
     projection = parse_turn_limit_result(

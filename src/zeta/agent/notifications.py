@@ -85,10 +85,7 @@ class AgentNotificationMixin:
                 StreamEventType.AGENT_NOTIFICATION,
                 data={
                     "notification_id": notification.id,
-                    **project_notification_data(
-                        notification.data,
-                        observed_epoch=self.store.observed_storage_epoch,
-                    ),
+                    **project_notification_data(notification.data),
                     "kind": notification.data.get("kind", "agent_completion"),
                     "tui_presented": self.store.is_agent_notification_presented_to_tui(
                         notification.id
