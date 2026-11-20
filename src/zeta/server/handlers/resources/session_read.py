@@ -184,9 +184,9 @@ async def _handle(client, request_id, params):
         raise invalid_resource_params() from None
     runtime = client.server.runtime
     opened = runtime.opened
-    project_id = opened.metadata.project_id if opened is not None else None
-    if project_id is None:
+    if opened is None:
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
+    project_id = opened.metadata.project_id  # None reads only project-less sessions
     if session_id == runtime.session_id:
         raise invalid_resource_params()  # the attached session pages through session_history
     loop = asyncio.get_running_loop()
