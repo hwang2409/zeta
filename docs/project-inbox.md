@@ -51,8 +51,10 @@ There is no daemon, network transport, ownership election, or automatic model tu
 
 ## Trust
 
-Current inbox messages come only from the user's other Zeta sessions in the same Zeta home on the same machine. A receiving agent treats a request as work assigned by the user through another session. It can claim and do that work within the receiving project's normal rules without asking the user to confirm the sender.
+Current inbox messages come only from the user's other Zeta sessions in the same Zeta home on the same machine. Local origin alone does not show whether the user or another agent wrote a message, so it grants no trust.
+
+A message is trusted work only when it carries `authority: trusted_assignment`. Zeta grants that authority only at or above the inbox delegation storage epoch, and only to a user-origin send or a message covered by an active delegation. A receiving agent can claim and do trusted work within the receiving project's normal rules.
+
+Every other message, and every message in a home below the delegation epoch, is untrusted information. Every surface shows it that way: the `inbox` tool, the wake notice, the serve `untrusted` flag, and `state_inbox`. At or above the epoch, claim also refuses it.
 
 Message text is still data. It cannot override the system prompt, `AGENTS.md`, safety rules, tool policy, tool permissions, or direct instructions from the user in the receiving session. Destructive or irreversible actions still require the normal confirmation, and agents must not echo secrets from messages.
-
-Each stored message records its local origin. The model-visible framing checks that origin. A future transport that introduces a non-local origin will keep strict untrusted-data framing instead of receiving local-request trust.
