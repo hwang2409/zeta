@@ -8,6 +8,7 @@ import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
@@ -93,6 +94,26 @@ async def test_login_is_hidden_and_rejected_for_legacy_protocol(tmp_path, server
         await close_serve(server, writer)
 
 
+@pytest.mark.parametrize("negotiated", [False, True])
+async def test_login_start_error_contract(tmp_path, negotiated):
+    features = ["account_list_idle_v1"] if negotiated else []
+    server, reader, writer, _ = await connect(tmp_path, features=features)
+    try:
+        invalid = (await rpc(reader, writer, "login_start", provider="unsupported"))["error"]
+        assert invalid == (
+            {"code": -32602, "message": "invalid params", "data": {"code": "invalid_params"}}
+            if negotiated else {"code": -32602, "message": "unsupported login provider"}
+        )
+        with patch.object(AccountStore, "provider_login_lock") as owner:
+            for failure, legacy_code in ((TypeError, -32000), (ValueError, -32602)):
+                owner.side_effect = failure("owner failure")
+                error = (await rpc(reader, writer, "login_start", provider="claude"))["error"]
+                assert error == ({"code": -32000, "message": "unexpected server or storage failure"}
+                                 if negotiated else {"code": legacy_code, "message": "owner failure"})
+    finally:
+        await close_serve(server, writer)
+
+
 @pytest.mark.parametrize("provider,reference", [("claude", None), ("codex", None), ("codex", "work-label"), ("claude", "anthropic:work")])
 async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_path, monkeypatch, provider, reference):
     from tests.support.credentials import named_account_credentials
@@ -139,6 +160,7 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert parsed_redirect.port is not None and parsed_redirect.port > 0
         assert parse_qs(urlsplit(result["authorization_url"]).query)["state"] == [captured["state"]]
         duplicate = await rpc(reader, writer, "login_start", provider=provider, account="missing")
+        assert duplicate["error"]["code"] == -32005
         assert duplicate["error"]["data"]["code"] == "login_in_progress"
         # Both providers may wait at once, with independent cancellation.
         other = "codex" if provider == "claude" else "claude"

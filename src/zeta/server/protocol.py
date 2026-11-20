@@ -726,6 +726,12 @@ def closed_error(descriptor: ErrorDescriptor) -> ProtocolError:
     return ProtocolError(descriptor, descriptor.meaning)
 
 
+def resource_error(descriptor: ErrorDescriptor) -> ProtocolError:
+    """Opt in to a code and reason without changing the legacy descriptor's data."""
+    reason = descriptor.data_code or descriptor.name.lower()
+    return ProtocolError(descriptor, descriptor.meaning, {"code": reason, "reason": reason})
+
+
 def invalid_resource_params() -> ProtocolError:
     return ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid params", {"code": "invalid_params"})
 

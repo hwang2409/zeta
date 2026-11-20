@@ -470,15 +470,14 @@ def _source_finish_reasons() -> set[str]:
 def _source_closed_sets() -> dict[str, set[str]]:
     from zeta.core.approval import ApprovalDecision as CoreDecision
     from zeta.mcp.client import CALLER_METHODS
-    from zeta.server.handlers.registry import HANDLERS
-    from zeta.server.protocol import APPROVAL_SCOPES
+    from zeta.server.protocol import APPROVAL_SCOPES, served_methods
     from zeta.server.protocol import ApprovalDecision as ServeDecision
 
     return {
         "reason": _source_retry_reasons(), "finish_reason": _source_finish_reasons(),
         "decision": {*CoreDecision, *ServeDecision}, "scope": set(APPROVAL_SCOPES),
-        # the dispatch registry, plus hello, which the connection routes before it
-        "serve_method": {"hello", *(descriptor.wire for descriptor in HANDLERS)},
+        # legacy and resource methods, plus the connection's separate handshake
+        "serve_method": {"hello", *(descriptor.wire for descriptor in served_methods())},
         "mcp_method": set(CALLER_METHODS),
     }
 

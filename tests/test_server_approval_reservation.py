@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import fcntl
 import inspect
 import json
 import os
@@ -1327,7 +1328,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
     old_state = server.runtime.state
     assert old_state is not None
     old_store = old_state.opened.store
-    session_dir = old_store.session_dir
+    session_dir = old_store.session_dir.resolve()
     entered = asyncio.Event()
     release = asyncio.Event()
     completed = asyncio.Event()
@@ -1348,7 +1349,6 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
         )
         await asyncio.wait_for(entered.wait(), TIMEOUT)
         resume.cancel()
-        await asyncio.sleep(0)
         assert server.runtime.state is old_state
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -1368,11 +1368,18 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
             assert reopened.metadata.session_id == old_state.session_id
         finally:
             await asyncio.to_thread(reopened.store.close)
+        # Retention can take its own session locks after the runtime releases them.
+        if server._retention_owner is not None:
+            await server._retention_owner.stop()
         fd_directory = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
         leaked_targets = []
         for name in os.listdir(fd_directory):
             try:
-                target = os.path.realpath(f"{fd_directory}/{name}")
+                if fd_directory == "/proc/self/fd":
+                    target = os.readlink(f"{fd_directory}/{name}")
+                else:
+                    raw = fcntl.fcntl(int(name), fcntl.F_GETPATH, b"\0" * 1024)
+                    target = os.fsdecode(raw.rstrip(b"\0"))
             except OSError:
                 continue
             if target == str(session_dir) or target.startswith(

@@ -10,14 +10,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from importlib import import_module
 from pathlib import Path
-from pkgutil import iter_modules
 from typing import Any
 
 from ..core.session_execution import execution_owner_state
 from ..core.session_files import SessionError, child_directory
-from .handlers import resources
 
 RESTART_SCAN_SECONDS = 1.0
 
@@ -58,11 +55,13 @@ def _close_handler_errors(handler: Callable[..., Awaitable[Any]]) -> Callable[..
 
 
 def collect_families() -> tuple[ResourceDescriptor, ...]:
-    """Only collect modules from the packaged resource-family directory, never user plugins."""
+    """Collect explicitly registered resource families."""
+    # Family modules import the wire rules defined here.
+    from .handlers.resources import FAMILIES
+
     descriptors = []
     flags = set()
-    for entry in sorted(iter_modules(resources.__path__), key=lambda item: item.name):
-        family = import_module(f"{resources.__name__}.{entry.name}")
+    for family in FAMILIES:
         if family.FEATURE in flags or not family.METHODS:
             raise RuntimeError("duplicate or empty serve resource family")
         flags.add(family.FEATURE)

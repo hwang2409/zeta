@@ -982,11 +982,6 @@ async def test_account_switch_never_replays_transcript(
         "build_backend",
         lambda *_args, **_kwargs: (SimpleNamespace(model="offline"), "codex"),
     )
-    monkeypatch.setattr(
-        server_accounts,
-        "build_backend",
-        lambda *_args, **_kwargs: (SimpleNamespace(model="offline"), "codex"),
-    )
     loop = SimpleNamespace(
         account_context=context,
         backend=SimpleNamespace(model="offline"),
@@ -1015,7 +1010,13 @@ async def test_account_switch_never_replays_transcript(
 
     response = await asyncio.wait_for(
         server_accounts.switch(
-            SimpleNamespace(loop=loop, metadata=context.metadata),
+            SimpleNamespace(
+                loop=loop,
+                metadata=context.metadata,
+                _build_backend=lambda *_args, **_kwargs: (
+                    SimpleNamespace(model="offline"), "codex"
+                ),
+            ),
             idle,
             {"account": str(first)},
         ),
