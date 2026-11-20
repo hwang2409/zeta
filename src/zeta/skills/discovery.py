@@ -103,6 +103,15 @@ def read_markdown(path: Path, kind: str) -> tuple[dict[str, object], str]:
     return _parse_markdown(path.read_bytes(), path, kind)
 
 
+def parse_document(raw: bytes, entry_path: Path, path: Path, root: Path, kind: str) -> MarkdownDocument:
+    """Parse one definition's bytes exactly as discovery does; raise ValueError or UnicodeError."""
+
+    metadata, body = _parse_markdown(raw, path, kind)
+    return MarkdownDocument(
+        entry_path=entry_path, path=path, root=root, metadata=metadata, body=body, raw=raw
+    )
+
+
 def _parse_markdown(raw: bytes, path: Path, kind: str) -> tuple[dict[str, object], str]:
     lines = raw.decode("utf-8").splitlines()
     if not lines or lines[0].strip() != "---":
@@ -160,15 +169,8 @@ def discover_markdown[Item](
             resolved_path = contained_path(document_path, root, kind)
             if entry_path.is_dir() and not resolved_path.is_file():
                 continue
-            raw = resolved_path.read_bytes()
-            metadata, body = _parse_markdown(raw, resolved_path, kind)
-            document = MarkdownDocument(
-                entry_path=entry_path,
-                path=resolved_path,
-                root=root,
-                metadata=metadata,
-                body=body,
-                raw=raw,
+            document = parse_document(
+                resolved_path.read_bytes(), entry_path, resolved_path, root, kind
             )
             item = build(document)
         except (
@@ -182,7 +184,7 @@ def discover_markdown[Item](
             if notices is not None:
                 notices.append(notice)
             continue
-        name = metadata["name"]
+        name = document.metadata["name"]
         assert isinstance(name, str)
         previous_path = paths_by_name.get(name)
         if previous_path is not None:
@@ -257,6 +259,7 @@ __all__ = [
     "discover_markdown",
     "discover_session_items",
     "is_slash_safe_name",
+    "parse_document",
     "parse_frontmatter",
     "read_markdown",
     "snapshot_metadata",

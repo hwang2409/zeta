@@ -168,7 +168,7 @@ def _parse_tools(value: object, path: Path) -> frozenset[str] | None:
     return frozenset(_CLAUDE_TOOL_NAMES.get(name, name) for name in names)
 
 
-def _build_agent(
+def build_agent(
     document: MarkdownDocument, source: str, notices: list[str] | None
 ) -> AgentPreset:
     metadata = document.metadata
@@ -252,7 +252,7 @@ def discover_agents(
     return discover_markdown(
         agents_dir,
         kind="agent",
-        build=lambda document: _build_agent(document, source, notices),
+        build=lambda document: build_agent(document, source, notices),
         notices=notices,
         capture=capture,
     )
@@ -289,6 +289,7 @@ def discover_packaged_agents() -> AgentCatalog:
 __all__ = [
     "AgentCatalog",
     "AgentMeta",
+    "build_agent",
     "discover_agents",
     "discover_packaged_agents",
     "discover_session_agents",

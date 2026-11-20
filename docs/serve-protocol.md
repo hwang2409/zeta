@@ -2216,6 +2216,52 @@ Missing project context returns `-32005` (`state_unavailable`). A result that
 cannot fit the response budget returns `-32007` (`result_too_large`). Unexpected
 owner failures return `-32000`. Unnegotiated methods return `-32601`.
 
+### skill and agent profile writes (`library_write_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `skill_write` | `1.0` | `library_write_v1` | `controller_write` |
+| `skill_delete` | `1.0` | `library_write_v1` | `controller_write` |
+| `agent_profile_write` | `1.0` | `library_write_v1` | `controller_write` |
+| `agent_profile_delete` | `1.0` | `library_write_v1` | `controller_write` |
+
+`skill_write` and `agent_profile_write` take
+`{name,scope,revision?,mutation:{document}}`. `scope` is `home` or `project`
+(the `.zeta` directory under the attached session's working directory).
+`document` is the whole markdown file: YAML frontmatter and body, at most
+128 KiB of UTF-8. The server validates it with the same loader as the
+catalogs before it writes anything; its frontmatter `name` must equal `name`.
+Without `revision` the call creates `<name>.md` in the catalog root and fails
+as stale if a file already defines the name. With `revision` (the detail
+read's file revision, the SHA-256 of the exact bytes) it replaces the file
+that defines the name, including a skill's `SKILL.md`. The result is
+`{revision,data:{name,scope,redacted}}`: the new file revision, and
+`redacted: true` when the stored document matches the shared secret patterns.
+The document is stored as written and is never returned. It is untrusted
+user-authored text; the server does not filter instructions in it.
+
+`skill_delete` and `agent_profile_delete` take `{name,scope,revision}` and
+return `{data:{name,scope}}`. A delete removes only the defining file; other
+files in a skill directory stay.
+
+Each write takes one lock per catalog root, rereads the file under it, and
+compares revisions there; it then publishes the file atomically (temporary
+file, fsync, rename), so a cancelled write leaves the old or the new file.
+Written files have mode `0600`. Paths are taken only from `name` and the
+loader: separators, `..`, and links that leave the catalog root are refused.
+Running sessions pick up the change at their next catalog refresh and send the
+existing `config_changed` event; there is no new event.
+
+Errors: `-32602` (`data.code: invalid_params`) for bad parameters, with
+`data.reason` set to `invalid_document` (and a public loader message in
+`data.detail`), `name_mismatch`, `document_too_large`, `unsafe_path`,
+`resource_not_found`, or `packaged_read_only` for a packaged item (the
+catalog's `effective` scope, or a name that only a packaged item defines);
+`-32009 stale_library_revision` (both `data.code` and `data.reason`) for a
+stale revision or a create that lost a race; `-32005 state_unavailable` for
+`project` scope without an attached session; `-32008 observer_read_only` for an
+observer. Unexpected failures return `-32000`.
+
 ### session history read (`session_history_read_v1` feature)
 
 | method | version | feature | access |

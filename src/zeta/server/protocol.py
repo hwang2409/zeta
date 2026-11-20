@@ -732,10 +732,13 @@ def resource_error(descriptor: ErrorDescriptor) -> ProtocolError:
     return ProtocolError(descriptor, descriptor.meaning, {"code": reason, "reason": reason})
 
 
-def invalid_resource_params(*, reason: str | None = None) -> ProtocolError:
+def invalid_resource_params(*, reason: str | None = None, detail: str | None = None) -> ProtocolError:
+    """``detail`` is public owner text the adapter already made safe (relative paths, redacted)."""
     data = {"code": "invalid_params"}
     if reason is not None:
         data["reason"] = reason
+    if detail is not None:
+        data["detail"] = detail
     return ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid params", data)
 
 

@@ -199,6 +199,14 @@ def _detail(item, document, fits):
     return result
 
 
+def valid_name(name):
+    """A name that maps to one file component under a catalog root."""
+    return (
+        isinstance(name, str) and is_slash_safe_name(name)
+        and name not in (".", "..") and "\\" not in name and "\x00" not in name
+    )
+
+
 def _handler(*, profiles, detail):
     async def handle(client, request_id, params):
         from ...protocol import ErrorDescriptor, closed_error, invalid_resource_params
@@ -206,10 +214,7 @@ def _handler(*, profiles, detail):
         if detail:
             require_params(params, "name", "scope")
             name = params["name"]
-            if (
-                not isinstance(name, str) or not is_slash_safe_name(name)
-                or name in (".", "..") or "\\" in name or "\x00" in name
-            ):
+            if not valid_name(name):
                 raise invalid_resource_params()
         else:
             require_params(params, optional=("scope", "offset", "limit"))
