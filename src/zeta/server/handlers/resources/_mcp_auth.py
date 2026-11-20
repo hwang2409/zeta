@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from ..mcp.management_privacy import private_management_io
-from .protocol import ErrorDescriptor, closed_error
+from ....mcp.management_privacy import private_management_io
+from ...protocol import ErrorDescriptor, closed_error
 
 
 @dataclass

@@ -46,7 +46,7 @@ from .handlers.projects import (
 )
 from .handlers.registry import dispatch as _dispatch_request
 from .handlers.registry import state_read_available
-from .mcp_auth import MCPAuth
+from .handlers.resources._mcp_auth import MCPAuth
 from .parking import ParkedPairs
 from .protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,

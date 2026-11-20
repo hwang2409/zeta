@@ -13,8 +13,8 @@ import pytest
 from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
 from zeta.server.handlers.resources import FAMILIES
+from zeta.server.handlers.resources._mcp_auth import MCPAuth
 from zeta.server.login import Logins
-from zeta.server.mcp_auth import MCPAuth
 from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -124,9 +124,9 @@ _OWNER_FAILURE_CASES = {
         "revision": _REVISION, "mutation": {"name": "test", "trusted": True},
     }),
     "mcp_server_test": (f"{_MCP_OWNER}.test", {"name": "test"}),
-    "mcp_auth_start": ("zeta.server.mcp_auth.MCPAuth.start", {"name": "test"}),
-    "mcp_auth_status": ("zeta.server.mcp_auth.MCPAuth.status", {"name": "test"}),
-    "mcp_auth_cancel": ("zeta.server.mcp_auth.MCPAuth.cancel", {"name": "test"}),
+    "mcp_auth_start": ("zeta.server.handlers.resources._mcp_auth.MCPAuth.start", {"name": "test"}),
+    "mcp_auth_status": ("zeta.server.handlers.resources._mcp_auth.MCPAuth.status", {"name": "test"}),
+    "mcp_auth_cancel": ("zeta.server.handlers.resources._mcp_auth.MCPAuth.cancel", {"name": "test"}),
     "mcp_auth_logout": (f"{_MCP_OWNER}.logout", {"name": "test"}),
     "account_list": ("zeta.accounts.AccountStore.catalog_snapshot", {}),
     "login_start": ("zeta.server.login.Logins.login_start", {"provider": "claude"}),
