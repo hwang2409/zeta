@@ -48,7 +48,6 @@ from .approval_lifecycle import (
     Terminate,
 )
 from .delivery import DeliveryRequests, PendingModelInputs, TurnOutcome
-from .handlers.resources.account_list import FEATURE as ACCOUNT_FEATURE
 from .host_commands import SessionHostCommands
 from .protocol import (
     ApprovalDecision,
@@ -1283,21 +1282,12 @@ class ServeControl:
                     if offers_login:
                         login_provider = failed_provider
             login_hint = {"login_provider": login_provider} if login_provider else {}
-            feature_fields = {}
-            if event.auth_account is not None:
-                public_data = {**login_hint, "auth_account": event.auth_account}
-                if "agent_instance_id" in event.data:
-                    public_data["agent_instance_id"] = event.data["agent_instance_id"]
-                feature_fields[ACCOUNT_FEATURE] = {
-                    "error": {"code": "auth_error", "message": "Account sign-in required."},
-                    "data": public_data,
-                }
             await self._notify(
                 wire_event,
                 session_id,
                 error=error,
                 data={**event.data, **login_hint},
-                _feature_fields=feature_fields,
+                _feature_fields=event_contract.auth_error_feature_fields(event, login_hint),
             )
             return
         if kind is StreamEventType.COMPACTION_START:
