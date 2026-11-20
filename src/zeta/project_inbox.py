@@ -571,7 +571,7 @@ class ProjectInbox:
             )
             for key in immutable_fields
         }
-        expected = {key: record[key] for key in immutable_fields}
+        expected = {key: record.get(key, LEGACY_LOCAL_ORIGIN) if key == "origin" else record[key] for key in immutable_fields}
         # Decoding resolves spilled bodies, so compare against the caller body.
         expected["body"] = body
         if comparable != expected:
