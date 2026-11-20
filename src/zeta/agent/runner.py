@@ -1109,31 +1109,46 @@ async def _run_agent_tool(
             "finish_turn_limit": finish_turn_limit,
         }
     )
-    child_task = loop._create_task(
-        consume(
-            child_loop,
-            prompt,
-            **run_kwargs,
-            child_path=child_path,
-            publish=publish,
-            hold_wake=HoldWake(
-                loop._background_owner.conversation_channel,
-                child_instance_id, child_path, description, child_account_pins,
-            ) if background else NO_HOLD_WAKE,
-            child_turns=child_turns,
-            update_turns=update_turns,
-            record_tool_call=record_tool_call,
-            update_step=update_step,
-            finish_lifecycle=finish_lifecycle,
-            publish_lifecycle=publish_lifecycle,
-            child_result=child_result,
-            error_message=error_message,
-        )
-    )
     child_canceled = False
     terminal_fence = getattr(child_loop, "_terminal_transition_fence", None)
     if getattr(child_loop, "explicit_finish", False) and terminal_fence is None:
         terminal_fence = TerminalTransitionFence(child_store)
+    cancellation: asyncio.Task[bool] | None = None
+
+    async def run_child() -> dict[str, object]:
+        try:
+            return await consume(
+                child_loop,
+                prompt,
+                **run_kwargs,
+                child_path=child_path,
+                publish=publish,
+                hold_wake=HoldWake(
+                    loop._background_owner.conversation_channel,
+                    child_instance_id, child_path, description, child_account_pins,
+                ) if background else NO_HOLD_WAKE,
+                child_turns=child_turns,
+                update_turns=update_turns,
+                record_tool_call=record_tool_call,
+                update_step=update_step,
+                finish_lifecycle=finish_lifecycle,
+                publish_lifecycle=publish_lifecycle,
+                child_result=child_result,
+                error_message=error_message,
+            )
+        finally:
+            # Explicit finish has its own fence. For other runs, a cancel started
+            # before the task settled must finish its durable write first, so a
+            # normal finish the cancel itself unblocked cannot win over it.
+            if terminal_fence is None and cancellation is not None:
+                try:
+                    canceled = await asyncio.shield(cancellation)
+                except Exception:  # noqa: BLE001 - the cancel requester reports the failure
+                    canceled = False
+                if canceled:
+                    raise asyncio.CancelledError
+
+    child_task = loop._create_task(run_child())
 
     async def confirm_child_cancel() -> bool:
         nonlocal child_canceled
@@ -1172,9 +1187,12 @@ async def _run_agent_tool(
 
     def request_child_cancel() -> CancellationRequest:
         """Start durable cancellation and tree-owned cleanup."""
+        nonlocal cancellation
         confirmation = loop._background_owner.create_cancellation_task(
             confirm_child_cancel()
         )
+        if cancellation is None or cancellation.done():
+            cancellation = confirmation
         cleanup = loop._background_owner.create_cancellation_task(
             cleanup_canceled_child(confirmation)
         )
