@@ -19,6 +19,7 @@ from tests.support.fake_backend import (
     PerActorFakeBackend,
     ScriptedTurn,
 )
+from tests.support.live_home import files_containing
 from tests.support.owned import await_or_fail
 from tests.support.server_client import event as _event
 from tests.test_server import TIMEOUT, _connect, _request
@@ -506,7 +507,7 @@ async def test_session_mcp_binding_mounts_and_stays_out_of_wire_and_home(tmp_pat
             await asyncio.wait_for(mcp.auth_received.wait(), TIMEOUT)
             assert all(value == f"Bearer {SECRET}" for value in mcp.headers if value is not None)
             assert all(SECRET not in json.dumps(frame) for frame in frames)
-            assert all(SECRET not in path.read_text(errors="ignore") for path in tmp_path.rglob("*") if path.is_file())
+            assert files_containing(tmp_path, SECRET.encode()) == []
             assert session["session_id"]
         finally:
             writer.close(); await writer.wait_closed(); await server.close()
