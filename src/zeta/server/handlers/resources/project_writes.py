@@ -81,7 +81,7 @@ def _project_id(params: dict[str, Any]) -> str:
 def _require_project(registry, project_id: str) -> None:
     """Refuse an unknown project exactly as the project reads do; a busy registry is retryable."""
     from ...protocol import ErrorDescriptor, ProtocolError, resource_error
-    from ..projects import ProjectNotFound, project_request_error
+    from ..projects import ProjectNotFound
 
     try:
         registry.show_project(project_id)
@@ -90,8 +90,8 @@ def _require_project(registry, project_id: str) -> None:
         raise ProtocolError(ErrorDescriptor.PROJECT_NOT_FOUND, message, {"project_id": project_id}) from None
     except ProjectRegistryBusyError:
         raise resource_error(ErrorDescriptor.RESOURCE_BUSY) from None
-    except ProjectRegistryError as exc:
-        raise ProtocolError(*project_request_error(exc)) from None
+    except ProjectRegistryError:
+        raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "project storage is invalid or unavailable") from None
 
 
 def _owner_call(registry, project_id: str, write: Callable[[], Any]) -> Any:
