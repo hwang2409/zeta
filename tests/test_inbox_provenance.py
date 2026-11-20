@@ -385,7 +385,7 @@ async def test_serve_list_and_state_agree_on_agent_message_trust(
     tmp_path: Path, epoch: int
 ) -> None:
     """An agent send is information on every serve surface, below the epoch too."""
-    home, registry, sender, recipient, manager, opened, inbox = await _create_fixtures(
+    _home, registry, sender, recipient, manager, opened, inbox = await _create_fixtures(
         tmp_path, epoch
     )
     message_id = await asyncio.to_thread(
