@@ -2272,7 +2272,8 @@ with a compare-and-set. `revision` is `memory.digest` from `project_show`. The
 owner compares it while it holds the project memory lock; a mismatch returns
 `-32009` with `data.code` and `data.reason` `stale_project_memory_revision`,
 and the client reads again. Each memory format keeps its own operations;
-`mutation.format` must be the project's current format, or the call is stale:
+`mutation.format` must be the project's current format, or the call is stale
+(also when a migration changes the format while the call runs):
 
 - format 1: `{format: 1, op: "set", file, content}` replaces one standard file
   (`brief.md`, `state.md`, `backlog.md`, `changelog.md`, `decisions.md`);
@@ -2299,18 +2300,26 @@ message is a `trusted_assignment`, as it is from the TUI. `kind` is an inbox
 kind, `title` is nonblank, `body` may be empty, and each is at most 1 MiB of
 UTF-8. `delivery_id` (1 to 128 of `A-Z a-z 0-9 _ . : -`) is scoped to the
 attached session and the recipient: a retry with the same payload returns the
-same `{data: {message_id}}` and makes no second message; a different payload
-returns `-32602` with `data.reason` `delivery_id_reused`. The recipient's
-running sessions get the existing `project_inbox` notification.
+same `message_id` and makes no second message; a different payload
+returns `-32602` with `data.reason` `delivery_id_reused`. This holds while the
+recipient keeps the message record; after a done message is pruned, a late
+retry creates a new message. The result is `{data: {message_id, pending}}`.
+`pending: false` means the message is in the recipient inbox, and the
+recipient's running sessions get the existing `project_inbox` notification.
+`pending: true` means the recipient could not be reached now, but the message
+is saved and the attached session delivers it on a later inbox poll; do not
+resend it (a resend with the same `delivery_id` is still one message).
 
 Inbox claim and done are not exposed: they are agent actions taken by the
 session that does the work, and the TUI has no user transition.
 
-Other errors: `-32602 invalid_params` for unknown fields or bad values;
+Other errors: `-32602 invalid_params` for unknown fields or bad values,
+including values the inbox owner rejects;
 `-32003 no_active_session` for a send with no attached session;
 `-32005 state_unavailable` when the attached session has no project or the
 project registry is unavailable; `-32004 operation_busy` when another process
-holds the lock past its deadline. Errors set `data.code` (and `data.reason`
+holds a registry, memory, or inbox lock past its deadline (retry); `-32000`
+when project storage is invalid or unavailable, as for `project_show`. Errors set `data.code` (and `data.reason`
 where named) and never include paths or owner text. An unnegotiated method
 returns `-32601`.
 

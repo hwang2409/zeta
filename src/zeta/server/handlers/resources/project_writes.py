@@ -13,11 +13,14 @@ from ....project_errors import (
     ProjectNotFoundError,
     ProjectRegistryBusyError,
     ProjectRegistryError,
+    UnsupportedMemoryFormatError,
 )
 from ....project_inbox import (
     KINDS,
     InboxBusyError,
     InboxConflictError,
+    InboxDeliveryPendingError,
+    InboxInvalidError,
     ProjectInbox,
     is_message_id,
 )
@@ -76,15 +79,19 @@ def _project_id(params: dict[str, Any]) -> str:
 
 
 def _require_project(registry, project_id: str) -> None:
-    """Refuse an unknown project exactly as the project reads do."""
-    from ...protocol import ErrorDescriptor, ProtocolError
-    from ..projects import ProjectNotFound
+    """Refuse an unknown project exactly as the project reads do; a busy registry is retryable."""
+    from ...protocol import ErrorDescriptor, ProtocolError, resource_error
+    from ..projects import ProjectNotFound, project_request_error
 
     try:
         registry.show_project(project_id)
     except ProjectNotFoundError:
         message = str(ProjectNotFound(project_id))
         raise ProtocolError(ErrorDescriptor.PROJECT_NOT_FOUND, message, {"project_id": project_id}) from None
+    except ProjectRegistryBusyError:
+        raise resource_error(ErrorDescriptor.RESOURCE_BUSY) from None
+    except ProjectRegistryError as exc:
+        raise ProtocolError(*project_request_error(exc)) from None
 
 
 def _owner_call(registry, project_id: str, write: Callable[[], Any]) -> Any:
@@ -104,6 +111,8 @@ def _owner_call(registry, project_id: str, write: Callable[[], Any]) -> Any:
         raise resource_error(ErrorDescriptor.RESOURCE_BUSY) from None
     except InboxConflictError:
         raise invalid_resource_params(reason="delivery_id_reused") from None
+    except InboxInvalidError:
+        raise invalid_resource_params() from None
     except ProjectRegistryError:
         # Owner rejections (unknown entry, empty history, tool subprocess) carry details we must not relay.
         raise invalid_resource_params(reason="operation_rejected") from None
@@ -178,7 +187,11 @@ def _memory_write(registry, project_id: str, revision: str, mutation: object) ->
             # A migration changed the format, so the client's view and revision are stale.
             raise stale_resource_revision("project_memory")
         authorize(action=action, target=target)
-        return call()
+        try:
+            return call()
+        except UnsupportedMemoryFormatError:
+            # The format was checked above, so the owner's guard under the lock saw a migration land since.
+            raise stale_resource_revision("project_memory") from None
 
     return write
 
@@ -232,18 +245,22 @@ async def project_inbox_send(client, request_id, params):
     inbox = ProjectInbox(registry, sessions_root=registry.root.parent / "sessions")
 
     def send() -> dict:
-        sent, _outcome = inbox.send_user_with_outcome(
-            from_project=from_project,
-            from_session=from_session,
-            to_project=to_project,
-            kind=kind,
-            title=title,
-            body=body,
-            message_id=message_id,
-            to_session=to_session,
-        )
+        try:
+            sent, _outcome = inbox.send_user_with_outcome(
+                from_project=from_project,
+                from_session=from_session,
+                to_project=to_project,
+                kind=kind,
+                title=title,
+                body=body,
+                message_id=message_id,
+                to_session=to_session,
+            )
+        except InboxDeliveryPendingError:
+            # Saved as a durable intent: the attached session re-publishes it, so the client must not resend.
+            return {"data": {"message_id": message_id, "pending": True}}
         loop.notify_project_inbox_publication()  # wake the attached poller; others poll as usual
-        return {"data": {"message_id": sent}}
+        return {"data": {"message_id": sent, "pending": False}}
 
     return await client.connections.run_blocking(lambda: _owner_call(registry, to_project, send))
 

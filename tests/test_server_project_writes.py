@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 
 from tests.support.owned import await_or_fail
+from tests.support.serve_close import close_serve
 from tests.support.serve_contract import ServeClient, ServeContract
+from tests.test_server import _connect, _request
+from tests.test_server_projects import _server
+from zeta.project_errors import ProjectRegistryBusyError
+from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
 
 FEATURES = ["projects", "project_writes_v1"]
@@ -207,3 +212,80 @@ async def test_inbox_send_is_the_user_send_and_idempotent(tmp_path: Path) -> Non
         assert rows[message_id]["authority"] == "trusted_assignment"
     finally:
         await contract.close()
+
+
+async def _in_process(server, features: list[str]):
+    reader, writer = await _connect(server)
+    hello = await _request(reader, writer, "hello", "hello", {"protocol_version": "1.2", "features": features})
+    assert "result" in hello[-1], hello
+    return reader, writer
+
+
+@pytest.mark.asyncio
+async def test_busy_registry_and_mid_call_migration_map_to_retryable_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha, _beta = await _off_loop(_projects, tmp_path)
+    server = _server(tmp_path)
+    reader, writer = await _in_process(server, FEATURES)
+    try:
+        show = await _request(reader, writer, "show", "project_show", {"project_id": alpha})
+        revision = show[-1]["result"]["memory"]["digest"]
+        set_brief = {"format": 1, "op": "set", "file": "brief.md", "content": "serve brief\n"}
+        params = {"project_id": alpha, "revision": revision, "mutation": set_brief}
+        real_show, real_cas = ProjectRegistry.show_project, ProjectRegistry.compare_and_swap_memory
+
+        def busy(*_args: object, **_kwargs: object):
+            raise ProjectRegistryBusyError()
+
+        # test-contract: seam another process holds the registry lock past its deadline
+        monkeypatch.setattr(ProjectRegistry, "show_project", busy)
+        blocked = await _request(reader, writer, "busy", "project_memory_update", params)
+        assert blocked[-1]["error"]["code"] == -32004, blocked
+        assert blocked[-1]["error"]["data"]["code"] == "operation_busy"
+        monkeypatch.setattr(ProjectRegistry, "show_project", real_show)
+
+        def migrate_then_write(self, project_id, **kwargs):
+            self.activate_entry_memory(project_id)  # a 1 -> 2 migration lands after the format check
+            return real_cas(self, project_id, **kwargs)
+
+        # test-contract: seam force a migration between the format check and the owner's locked write
+        monkeypatch.setattr(ProjectRegistry, "compare_and_swap_memory", migrate_then_write)
+        raced = await _request(reader, writer, "raced", "project_memory_update", params)
+        assert raced[-1]["error"] == STALE, raced
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_inbox_send_saved_for_retry_tells_the_client_not_to_resend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _alpha, beta = await _off_loop(_projects, tmp_path)
+    server = _server(tmp_path)
+    reader, writer = await _in_process(server, [*FEATURES, "session_cwd"])
+    try:
+        created = await _request(reader, writer, "new", "new_session", {
+            "provider": "codex", "cwd": str((tmp_path / "alpha").resolve()),
+        })
+        assert "result" in created[-1], created
+        message = {"kind": "question", "title": "t", "body": "late", "delivery_id": "web-pending"}
+        params = {"project_id": beta, "mutation": message}
+        real_publish = ProjectInbox._publish_outgoing
+
+        def unreachable(*_args: object, **_kwargs: object):
+            raise OSError("recipient inbox is temporarily unavailable")
+
+        # test-contract: seam the recipient publish fails after the durable intent is saved
+        monkeypatch.setattr(ProjectInbox, "_publish_outgoing", unreachable)
+        saved = await _request(reader, writer, "send", "project_inbox_send", params)
+        assert saved[-1]["result"]["data"]["pending"] is True, saved
+        message_id = saved[-1]["result"]["data"]["message_id"]
+        monkeypatch.setattr(ProjectInbox, "_publish_outgoing", real_publish)
+
+        retry = await _request(reader, writer, "retry", "project_inbox_send", params)
+        assert retry[-1]["result"]["data"] == {"message_id": message_id, "pending": False}
+        inbox = await _request(reader, writer, "inbox", "project_inbox", {"project_id": beta})
+        assert [row["id"] for row in inbox[-1]["result"]["messages"]] == [message_id]
+    finally:
+        await close_serve(server, writer)
