@@ -271,17 +271,16 @@ async def test_inbox_send_saved_for_retry_tells_the_client_not_to_resend(
         assert "result" in created[-1], created
         message = {"kind": "question", "title": "t", "body": "late", "delivery_id": "web-pending"}
         params = {"project_id": beta, "mutation": message}
-        real_publish = ProjectInbox._publish_outgoing
 
         def unreachable(*_args: object, **_kwargs: object):
             raise OSError("recipient inbox is temporarily unavailable")
 
-        # test-contract: seam the recipient publish fails after the durable intent is saved
-        monkeypatch.setattr(ProjectInbox, "_publish_outgoing", unreachable)
-        saved = await _request(reader, writer, "send", "project_inbox_send", params)
+        with monkeypatch.context() as m:
+            # test-contract: seam the recipient publish fails after the durable intent is saved
+            m.setattr(ProjectInbox, "_publish_outgoing", unreachable)
+            saved = await _request(reader, writer, "send", "project_inbox_send", params)
         assert saved[-1]["result"]["data"]["pending"] is True, saved
         message_id = saved[-1]["result"]["data"]["message_id"]
-        monkeypatch.setattr(ProjectInbox, "_publish_outgoing", real_publish)
 
         retry = await _request(reader, writer, "retry", "project_inbox_send", params)
         assert retry[-1]["result"]["data"] == {"message_id": message_id, "pending": False}
