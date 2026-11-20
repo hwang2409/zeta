@@ -17,7 +17,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
-from ...accounts import AccountCredentials, AccountError
+from ...accounts import AccountCredentials
 from ...agent import recovery_lease
 from ...agent.background_owner import BackgroundAgentOwner
 from ...agent.budget import (
@@ -1169,8 +1169,8 @@ class AgentLoop(
                         auth_account = await asyncio.to_thread(
                             attempt_credentials.store.public_identity, attempt_credentials.account
                         )
-                    except (OSError, AccountError):
-                        pass  # Account registry unavailable; the original error still applies.
+                    except Exception:  # noqa: BLE001, S110 - the label is optional; the original auth error still applies
+                        pass
                 yield StreamEvent(
                     StreamEventType.ERROR,
                     error=provider_error,
