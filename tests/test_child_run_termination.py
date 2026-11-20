@@ -5,7 +5,8 @@ durable records: D1 child lifecycle state, D2 cancel marker, D4 parent marker,
 D5 parent receipt, plus no running owner entry, open child store, or pending task.
 Rows that fail today are strict xfails that must fail at a durable-outcome
 check (``TerminalMismatch``: D1, D5, D2, D4, or a cancel reply; each reason
-names which); a hang, leak, or setup error is a real failure.
+names which); a hang, leak, or setup error is a real failure, except rows in
+``XFAIL_HANG``, which fail today by a named await_or_fail timeout.
 """
 
 from __future__ import annotations
@@ -797,6 +798,43 @@ async def _abort_running_bg_grandchild(tmp_path, monkeypatch, mode):
         _expect("grandchild D1", _d1(run.child_dir / "agents" / "1") == "canceled")
 
 
+@row("abort@cancel-write-fails")
+async def _abort_cancel_write_fails(tmp_path, monkeypatch, mode):
+    """R2 (~/.zeta/scratch/lanes/serve_surface-rca-grandchild-abort-hang.md): the
+    child's durable cancel write raises once during ``loop.abort()``.
+
+    Today ``cleanup_canceled_child`` returns before ``child_task.cancel()``, so the
+    child stays in its model call: bg never drains and fails by the await_or_fail
+    timeout "child tree settles" (strict xfail, raises pytest's Failed); fg drains
+    through the parent turn's cancel and fails at the D5 notice. Expected (design §5.3, Q2): the tree drains, D5
+    canceled with "terminal state not saved", D4 kept, restart -> D1 canceled, and
+    the grandchild D1 canceled."""
+    child = Actor([
+        _call("agent", "grandchild", prompt="grandchild prompt", description="gc", background=True),
+        _text("late"),
+    ], gate_call=1)
+    grandchild = Actor([_text("late")], gate_call=0)
+    run = await _open(tmp_path, monkeypatch, mode, child, grandchild=grandchild)
+    async with run.cleanup:
+        failed = _held(monkeypatch, run, "mark_agent_canceled_async", error=OSError("disk full"), once=True)
+        run.start()
+        await await_or_fail(run.child.started.wait(), what="child second call")
+        await await_or_fail(run.grandchild.started.wait(), what="grandchild call")
+        if mode == "bg":
+            assert await run.finish_turn() is None
+        run.loop.abort()
+        await run.finish_turn()
+        await run.settle()
+        await _closed(run)
+        assert failed.calls, "the child's cancel write never ran"
+        status, text = await _d5_after(run)
+        _expect("D5", status == "canceled", status)
+        _expect("D5 notice", "terminal state not saved" in text, text)
+        _expect("D4 kept", bool(await _d4(run)))
+        _expect("grandchild D1", _d1(run.child_dir / "agents" / "1") == "canceled")
+        _expect_terminal(*await _restart(run), "canceled")
+
+
 @row("cancel@finish_gate")
 async def _cancel_finish_gate(tmp_path, monkeypatch, mode):
     """Bug 4: the grandchild's cancel write frees the gate before the child's lands."""
@@ -1057,12 +1095,19 @@ XFAIL: dict[tuple[str, str], str] = {
     ("cancel-vs-explicit-finish", "explicit"):
         "a cancel after the D3 finish row waits 1 s and answers unconfirmed (fails at the reply)",
     ("abort-after-complete", "fg"): "an abort after the child's D1 completed still writes D5 canceled (fails at D5)",
+    ("abort@cancel-write-fails", "fg"): "R2: a failed cancel write gives D5 canceled with no notice (fails at D5)",
     ("fail@D1_cancel_write", "fg"): "a failed cancel write lets the child complete; D5 completed (fails at D5)",
     ("fail@D1_cancel_write", "bg"): "a failed cancel write lets the child complete; D5 completed (fails at D5)",
     ("fail@D1_finish_write", "fg"): "a failed D1 write turns D5 into an error (fails at D5)",
     ("fail@D1_finish_write", "bg"): "a failed finalize write leaves no notification (fails at D5)",
     ("fail@D6_publish", "fg"): "a raising child_ended sink fails the parent turn before D4 is cleared (fails at D4)",
     ("restart@D5_no_D1", "fg"): "recovery leaves D1 running when D5 exists (fails at D1; slice 4)",
+}
+
+# Rows that fail today by a bounded-wait timeout: await_or_fail raises pytest's Failed.
+XFAIL_HANG: dict[tuple[str, str], str] = {
+    ("abort@cancel-write-fails", "bg"):
+        "R2: a failed cancel write skips the child's task cancel; the tree never drains",
 }
 
 MODES = {
@@ -1086,6 +1131,7 @@ MODES = {
     "abort-after-complete": ("fg",),
     "close@running": ("fg", "bg"),
     "abort@running-bg-grandchild": ("fg", "bg"),
+    "abort@cancel-write-fails": ("fg", "bg"),
     "fail@D1_cancel_write": ("fg", "bg"),
     "fail@D1_finish_write": ("fg", "bg"),
     "fail@D5_write": ("fg", "bg"),
@@ -1101,7 +1147,9 @@ MODES = {
 assert set(MODES) == set(ROWS)
 CASES = [
     pytest.param(name, mode, id=f"{name}-{mode}", marks=(
-        [_xfail(XFAIL[name, mode])] if (name, mode) in XFAIL else []
+        [_xfail(XFAIL[name, mode])] if (name, mode) in XFAIL
+        else [pytest.mark.xfail(strict=True, raises=pytest.fail.Exception, reason=XFAIL_HANG[name, mode])]
+        if (name, mode) in XFAIL_HANG else []
     ))
     for name, modes in MODES.items()
     for mode in modes
