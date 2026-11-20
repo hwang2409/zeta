@@ -77,13 +77,14 @@ def _project_id(params: dict[str, Any]) -> str:
 
 def _require_project(registry, project_id: str) -> None:
     """Refuse an unknown project exactly as the project reads do."""
-    from ...protocol import ProtocolError
-    from ..projects import ProjectNotFound, project_request_error
+    from ...protocol import ErrorDescriptor, ProtocolError
+    from ..projects import ProjectNotFound
 
     try:
         registry.show_project(project_id)
     except ProjectNotFoundError:
-        raise ProtocolError(*project_request_error(ProjectNotFound(project_id))) from None
+        message = str(ProjectNotFound(project_id))
+        raise ProtocolError(ErrorDescriptor.PROJECT_NOT_FOUND, message, {"project_id": project_id}) from None
 
 
 def _owner_call(registry, project_id: str, write: Callable[[], Any]) -> Any:
