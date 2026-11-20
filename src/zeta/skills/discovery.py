@@ -50,10 +50,18 @@ def contained_path(path: Path, root: Path, kind: str) -> Path:
     return resolved
 
 
+class DiscoveryNotice(str):
+    """A discovery warning that keeps its path and error for structured readers."""
+
+    path: Path
+    error: str
+
+
 def warn_discovery(path: Path, error: Exception | str, kind: str) -> str:
     """Log and return one tolerant-discovery warning."""
 
-    message = f"ignored {kind} {path}: {error}"
+    message = DiscoveryNotice(f"ignored {kind} {path}: {error}")
+    message.path, message.error = path, str(error)
     _logger.warning(message)
     return message
 
@@ -243,6 +251,7 @@ def snapshot_metadata(
 
 
 __all__ = [
+    "DiscoveryNotice",
     "MarkdownDocument",
     "contained_path",
     "discover_markdown",
