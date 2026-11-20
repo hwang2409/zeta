@@ -22,10 +22,10 @@ from tests.support.fake_backend import (
 from tests.support.owned import await_or_fail
 from tests.support.server_client import event as _event
 from tests.test_server import TIMEOUT, _connect, _request
+from zeta.core.session import SessionManager
 from zeta.mcp import MCPMount, MCPServerConfig, StreamableHTTPMCPClient
 from zeta.mcp.call_deadline import MCPCallDeadline
 from zeta.mcp.client import MCPHTTPError
-from zeta.core.session import SessionManager
 from zeta.protocol.types import (
     Message,
     MessageRole,
