@@ -10,6 +10,7 @@ from typing import Any
 from ....memory.user_authorization import MemoryMutationAuthorization
 from ....project_errors import (
     MemoryDigestMismatchError,
+    MemorySecretError,
     ProjectNotFoundError,
     ProjectRegistryBusyError,
     ProjectRegistryError,
@@ -113,6 +114,8 @@ def _owner_call(registry, project_id: str, write: Callable[[], Any]) -> Any:
         raise invalid_resource_params(reason="delivery_id_reused") from None
     except InboxInvalidError:
         raise invalid_resource_params() from None
+    except MemorySecretError:
+        raise invalid_resource_params(reason="secret_refused") from None
     except ProjectRegistryError:
         # Owner rejections (unknown entry, empty history, tool subprocess) carry details we must not relay.
         raise invalid_resource_params(reason="operation_rejected") from None
