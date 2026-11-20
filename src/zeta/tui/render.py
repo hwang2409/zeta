@@ -186,13 +186,13 @@ def render_error_card(event: StreamEvent) -> Panel:
 
     error = event.error
     code = error.code if error is not None and error.code else "backend_error"
-    raw_reason = error.message if error is not None else "unknown error"
+    reason = _strip_terminal_controls(error.message if error is not None else "unknown error").strip()
     label = "reason"
     if event.auth_account is not None:
         # 401 bodies can echo part of a key; the provider text tells an expired token from a revoked key.
-        raw_reason = redact_secrets(raw_reason)
+        # redact the visible text: the strip keeps SGR codes, which can split a key past redaction.
+        reason = redact_secrets(Text.from_ansi(reason).plain)
         label = "provider"
-    reason = _strip_terminal_controls(raw_reason).strip()
     if event.auth_account is None:
         reason = reason or "unknown error"
     try:

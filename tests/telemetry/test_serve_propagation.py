@@ -402,6 +402,7 @@ async def test_account_list_serializes_with_registry_writer(tmp_path, monkeypatc
 @pytest.mark.parametrize(("token", "template"), [
     pytest.param("sk-auth-error-token-canary-0001", "rejected {}", id="canary"),
     pytest.param("sk-proj-AbCdEf1234567890abcdEFGH1234abcd", "Incorrect API key provided: {}", id="sk-proj"),
+    pytest.param("sk-proj-AbCdEf12\x1b[0m34567890abcdEFGH", "Incorrect API key provided: {}", id="control-split"),
 ])
 async def test_auth_error_names_failed_account_for_negotiated_clients(
     tmp_path, traced, caplog, controller_negotiated, token, template,
@@ -491,7 +492,7 @@ async def test_auth_error_names_failed_account_for_negotiated_clients(
         assert controller_error["error"] == expected["error"]
         assert "account: night-shift" in rendered[0]
         assert f"provider: {template.format('[secret omitted]')}" in rendered[0]
-        assert token not in rendered[0]
+        assert token.replace("\x1b[0m", "") not in rendered[0]
         assert token.encode() not in b"".join(observers[0].received)
         assert token not in caplog.text
     finally:
