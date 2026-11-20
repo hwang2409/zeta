@@ -40,7 +40,11 @@ async def test_account_list_error_contract(tmp_path: Path, monkeypatch, negotiat
             data = {"code": "observer_read_only", "method": method}
             if negotiated:
                 data["reason"] = "observer_read_only"
-            assert (error["code"], error["data"]) == (-32008, data)
+            assert error == {
+                "code": -32008,
+                "message": "method is unavailable to read-only observers",
+                "data": data,
+            }
 
         params = {}
         if not negotiated:
@@ -64,8 +68,9 @@ async def test_account_list_error_contract(tmp_path: Path, monkeypatch, negotiat
             ):
                 read.side_effect = failure("owner failure")
                 error = (await request("account_list", params))["error"]
-                assert (error["code"], error["message"]) == (code, message)
+                expected = {"code": code, "message": message}
                 if code == -32005:
-                    assert error["data"]["code"] == "state_unavailable"
+                    expected["data"] = {"code": "state_unavailable"}
+                assert error == expected
     finally:
         await close_serve(server, *writers)

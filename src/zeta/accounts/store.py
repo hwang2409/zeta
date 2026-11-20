@@ -398,12 +398,13 @@ class AccountStore(_AccountRegistry):
             raise AccountError("account reference must be provider:name") from exc
         return self.resolve_reference(provider, reference)
 
-    def resolve_reference(self, provider: str, name_or_label: str) -> AccountId:
+    def resolve_reference(
+        self, provider: str, name_or_label: str, *, refuse_orphans: bool = False,
+    ) -> AccountId:
         reference = AccountId(provider, name_or_label)
         with self._home() as home_fd, self._registry_guard(home_fd):
-            resolved = _registry_reference_index(self._read_registry(home_fd)).get(
-                (provider, reference.name)
-            )
+            registry = self._read_registry(home_fd, refuse_orphans=refuse_orphans)
+            resolved = _registry_reference_index(registry).get((provider, reference.name))
         if resolved is not None:
             return resolved
         raise AccountError(f"account {reference} does not exist")

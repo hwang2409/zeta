@@ -26,6 +26,7 @@ from ..core.login_flow import (
 from ..core.session import account_home
 from ..providers.factory import credential_store
 from ..providers.login import build_login_provider, pkce_values
+from ..storage_format import StorageFormatError
 from .protocol import (
     ErrorDescriptor,
     ProtocolError,
@@ -157,8 +158,11 @@ class Logins:
                 raise invalid_resource_params()
         store = AccountStore(account_home(self.home))
         try:
-            return store.resolve_reference(canonical, reference).name
-        except (OSError, AccountRegistryBrokenError) as exc:
+            return store.resolve_reference(canonical, reference, refuse_orphans=True).name
+        except (
+            AccountRegistryBrokenError, AccountRegistryMissingError, OSError,
+            RecursionError, StorageFormatError,
+        ) as exc:
             raise closed_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from exc
         except (ValueError, AccountError) as exc:
             raise invalid_resource_params() from exc

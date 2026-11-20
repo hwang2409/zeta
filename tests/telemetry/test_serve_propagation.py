@@ -284,9 +284,10 @@ async def test_account_list_on_empty_serve(tmp_path, monkeypatch, negotiated) ->
                 }))
                 assert "account_list" not in hello["result"]["capabilities"]["requests"]
                 refused = json.loads(await observer.rpc("list", "account_list", {"unexpected": True}))
-                assert refused["error"]["code"] == -32008
-                assert refused["error"]["data"] == {
-                    "code": "observer_read_only", "reason": "observer_read_only", "method": "account_list",
+                assert refused["error"] == {
+                    "code": -32008,
+                    "message": "method is unavailable to read-only observers",
+                    "data": {"code": "observer_read_only", "reason": "observer_read_only", "method": "account_list"},
                 }
             finally:
                 observer.writer.close()
@@ -335,8 +336,11 @@ async def test_account_list_isolates_corrupt_accounts_and_redacts_wire_logs_and_
         }
         store.registry.write_text(f"invalid {token} {path}")
         unavailable = await wire.rpc("unavailable", "account_list")
-        assert json.loads(unavailable)["error"]["data"] == {"code": "state_unavailable"}
-        assert json.loads(unavailable)["error"]["code"] == -32005
+        assert json.loads(unavailable)["error"] == {
+            "code": -32005,
+            "message": "stored state is not available to read",
+            "data": {"code": "state_unavailable"},
+        }
         spans = _serve_spans(memory, "account_list")
         assert len(spans) == 3
         output = "\n".join([*(reply.decode() for reply in (first, invalid, unavailable)), caplog.text, *_texts(spans)])
@@ -450,9 +454,10 @@ async def test_auth_error_names_failed_account_for_negotiated_observer(tmp_path,
             }))
             assert "replay" in joined["result"]
         refused = json.loads(await observers[0].rpc("login", "login_start", {"account": None}))
-        assert refused["error"]["code"] == -32008
-        assert refused["error"]["data"] == {
-            "code": "observer_read_only", "reason": "observer_read_only", "method": "login_start",
+        assert refused["error"] == {
+            "code": -32008,
+            "message": "method is unavailable to read-only observers",
+            "data": {"code": "observer_read_only", "reason": "observer_read_only", "method": "login_start"},
         }
         sent = json.loads(await controller.rpc("send", "send", {
             "session_id": session["session_id"], "text": "trigger auth error",

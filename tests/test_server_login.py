@@ -114,6 +114,27 @@ async def test_login_start_error_contract(tmp_path, negotiated):
         await close_serve(server, writer)
 
 
+async def test_named_login_start_reports_missing_registry_with_orphan(tmp_path):
+    home = tmp_path / "zeta"
+    initialize_storage_home(home)
+    orphan = home / "accounts" / "anthropic" / "work"
+    orphan.mkdir(parents=True)
+    (orphan / "oauth.json").write_bytes(b"kept")
+    feature = "account_list_idle_v1"
+    server, reader, writer, hello = await connect(tmp_path, features=[feature])
+    try:
+        assert feature in hello["capabilities"]["features"]
+        assert not (home / "accounts.json").exists()
+        reply = await rpc(reader, writer, "login_start", provider="claude", account="work")
+        assert reply["error"] == {
+            "code": -32005,
+            "message": "stored state is not available to read",
+            "data": {"code": "state_unavailable"},
+        }
+    finally:
+        await close_serve(server, writer)
+
+
 @pytest.mark.parametrize("provider,reference", [("claude", None), ("codex", None), ("codex", "work-label"), ("claude", "anthropic:work")])
 async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_path, monkeypatch, provider, reference):
     from tests.support.credentials import named_account_credentials
