@@ -25,6 +25,8 @@ async def test_observer_library_reads(tmp_path: Path) -> None:
     (skills / "beta.md").write_text("---\nname: beta\ndescription: Other notes\n---\n" + "☃" * 50_000)
     gamma = "---\r\nname: gamma\r\ndescription: Plain\r\n---\r\nPlain body ☃\r\n".encode()
     (skills / "gamma.md").write_bytes(gamma)
+    comment_token = "sk_library_mask_secret_12345"
+    (skills / "delta.md").write_text(f"---\nname: delta\n# token {comment_token}\ndescription: Hidden\n---\nBody\n")
     project = tmp_path / ".zeta" / "skills"
     project.mkdir(parents=True)
     (project / "alpha.md").write_text("---\nname: alpha\ndescription: Project notes\n---\nProject body\n")
@@ -46,9 +48,9 @@ async def test_observer_library_reads(tmp_path: Path) -> None:
             "scope": "home", "filename": "alpha.md", "editable": True, "diagnostics": [],
         }], "diagnostics": [], "next_offset": 1}
         tail = (await observer.request("tail", "skill_catalog", {
-            "scope": "home", "offset": page["next_offset"], "limit": 1,
+            "scope": "home", "offset": page["next_offset"], "limit": 3,
         }))["result"]["data"]
-        assert [row["name"] for row in tail["items"]] == ["beta"] and tail["next_offset"] == 2
+        assert [row["name"] for row in tail["items"]] == ["beta", "delta", "gamma"] and "next_offset" not in tail
         detail = (await observer.request("skill", "skill_read", {"name": "alpha", "scope": "home"}))["result"]
         assert detail["revision"] == hashlib.sha256(raw).hexdigest()
         assert detail["data"]["redacted"] is True
@@ -62,6 +64,9 @@ async def test_observer_library_reads(tmp_path: Path) -> None:
         plain = (await observer.request("plain", "skill_read", {"name": "gamma", "scope": "home"}))["result"]
         assert plain["data"]["document"] == gamma.decode()
         assert plain["revision"] == hashlib.sha256(gamma).hexdigest()
+        hidden = (await observer.request("hidden", "skill_read", {"name": "delta", "scope": "home"}))["result"]["data"]
+        assert hidden["redacted"] is False and "document" not in hidden
+        assert comment_token not in json.dumps(hidden)
         missing = await observer.request("missing", "skill_read", {"name": "missing", "scope": "effective"})
         assert missing["error"]["data"]["reason"] == "resource_not_found"
         profiles = (await observer.request("profiles", "agent_profile_catalog"))["result"]["data"]["items"]
