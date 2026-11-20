@@ -1,7 +1,7 @@
 """The one writer of skill and agent profile files: compare-and-set create, update, and delete.
 
 A revision is the SHA-256 of the file's exact bytes, the same value ``skill_read`` and
-``agent_profile_read`` return. Every write takes one process-shared lock per catalog root,
+``agent_profile_read`` return. Every write takes one lock file per catalog root (``.library.lock``),
 rereads the target under it, and refuses a stale revision. A document is validated by the catalog
 loader before it is written, and published atomically (temp file, fsync, rename), so a cancelled
 write leaves the old file or the new one. The lock serializes zeta writers only.
@@ -12,12 +12,13 @@ Every function blocks (file locks and fsync); call it off the event loop.
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import os
-from pathlib import Path
-
+import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
+from pathlib import Path
 
 import yaml
 
@@ -26,14 +27,18 @@ from ..core.session_files import (
     SessionError,
     descend_directory,
     open_session_file,
+    require_off_loop_lock,
     unlink_session_file,
     write_session_file,
     write_session_file_if_absent,
 )
-from ..locking import domain_authority
 from ..project_schema import MAX_MEMORY_FILE_SIZE
 from . import agent_catalog, catalog
 from .discovery import MarkdownDocument, NamedItem, parse_document
+
+LOCK_NAME = ".library.lock"
+LOCK_SECONDS = 0.25
+LOCK_POLL_SECONDS = 0.01
 
 
 class LibraryError(Exception):
@@ -45,7 +50,7 @@ class LibraryError(Exception):
         self.detail = detail
 
 
-def write(home: Path, root: Path, *, profiles: bool, name: str, revision: str | None, document: str) -> str:
+def write(root: Path, *, profiles: bool, name: str, revision: str | None, document: str) -> str:
     """Create (no ``revision``) or update one definition named ``name`` under ``root``; return its revision."""
     try:
         raw = document.encode("utf-8")
@@ -69,7 +74,7 @@ def write(home: Path, root: Path, *, profiles: bool, name: str, revision: str | 
         root.mkdir(parents=True, exist_ok=True)
     elif not root.is_dir():
         _check(None, revision, name, profiles=profiles)
-    with _target(home, root, profiles=profiles, name=name) as (directory_fd, target, current):
+    with _target(root, profiles=profiles, name=name) as (directory_fd, target, current):
         _check(current, revision, name, profiles=profiles)
         if current is None:
             if not write_session_file_if_absent(directory_fd, target, raw):
@@ -79,11 +84,11 @@ def write(home: Path, root: Path, *, profiles: bool, name: str, revision: str | 
     return hashlib.sha256(raw).hexdigest()
 
 
-def delete(home: Path, root: Path, *, profiles: bool, name: str, revision: str) -> None:
+def delete(root: Path, *, profiles: bool, name: str, revision: str) -> None:
     """Delete one definition if its file still has ``revision``. A skill directory keeps its other files."""
     if not root.is_dir():
         _check(None, revision, name, profiles=profiles)
-    with _target(home, root, profiles=profiles, name=name) as (directory_fd, target, current):
+    with _target(root, profiles=profiles, name=name) as (directory_fd, target, current):
         _check(current, revision, name, profiles=profiles)
         unlink_session_file(directory_fd, target)
 
@@ -101,28 +106,44 @@ def _check(current: bytes | None, revision: str | None, name: str, *, profiles: 
 
 
 @contextmanager
-def _target(home: Path, root: Path, *, profiles: bool, name: str) -> Iterator[tuple[int, str, bytes | None]]:
+def _target(root: Path, *, profiles: bool, name: str) -> Iterator[tuple[int, str, bytes | None]]:
     """Lock ``root``, find the file that defines ``name``, and pin its directory.
 
     Yields ``(directory_fd, filename, current bytes or None)``. An existing definition is found with
     the catalog loader, which keeps it inside the root; a new one is ``<name>.md`` in the root.
     """
+    require_off_loop_lock("library")
     base = root.resolve(strict=True)
-    with domain_authority(home, hashlib.sha256(str(base).encode()).hexdigest(), "library", exclusive=True):
+    with ExitStack() as stack:
+        base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+        stack.callback(os.close, base_fd)
+        # The lock lives in the root, so writers from every zeta home that shares it serialize.
+        lock_fd = open_session_file(base_fd, LOCK_NAME, os.O_RDWR | os.O_CREAT)
+        stack.callback(os.close, lock_fd)
+        _lock(lock_fd)
         path = _find(base, profiles=profiles, name=name) or base / f"{name}.md"
         if not path.parent.is_relative_to(base):
             raise LibraryError("unsafe_path")
-        with ExitStack() as stack:
-            base_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
-            stack.callback(os.close, base_fd)
-            # Walk from the root without following links, so a parent swapped for one is refused.
-            try:
-                directory_fd = stack.enter_context(descend_directory(base_fd, path.parent.relative_to(base).parts))
-            except OSError as exc:
-                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                    raise LibraryError("unsafe_path") from None
-                raise
-            yield directory_fd, path.name, _read(directory_fd, path.name)
+        # Walk from the root without following links, so a parent swapped for one is refused.
+        try:
+            directory_fd = stack.enter_context(descend_directory(base_fd, path.parent.relative_to(base).parts))
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise LibraryError("unsafe_path") from None
+            raise
+        yield directory_fd, path.name, _read(directory_fd, path.name)
+
+
+def _lock(fd: int) -> None:
+    deadline = time.monotonic() + LOCK_SECONDS
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise LibraryError("busy") from None
+            time.sleep(LOCK_POLL_SECONDS)
 
 
 def _find(base: Path, *, profiles: bool, name: str) -> Path | None:

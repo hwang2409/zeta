@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from ....memory.safety import redact_secrets
-from ...resource_protocol import Access, ResourceMethod, require_params, require_revision
+from ...resource_protocol import (
+    Access,
+    ResourceMethod,
+    require_params,
+    require_revision,
+)
 from .library import valid_name
 
 FEATURE = "library_write_v1"
@@ -18,6 +23,7 @@ def _handler(*, profiles, delete):
             ErrorDescriptor,
             closed_error,
             invalid_resource_params,
+            resource_error,
             stale_resource_revision,
         )
 
@@ -37,9 +43,8 @@ def _handler(*, profiles, delete):
             raise invalid_resource_params(reason="packaged_read_only")
         if scope not in ("home", "project"):
             raise invalid_resource_params()
-        home = client.server.home
         if scope == "home":
-            base = home
+            base = client.server.home
         else:
             opened = client.server.runtime.opened
             if opened is None:
@@ -50,15 +55,17 @@ def _handler(*, profiles, delete):
         def run():
             try:
                 if delete:
-                    resource_store.delete(home, root, profiles=profiles, name=name, revision=revision)
+                    resource_store.delete(root, profiles=profiles, name=name, revision=revision)
                     return {"data": {"name": name, "scope": scope}}
                 document = mutation["document"]
                 written = resource_store.write(
-                    home, root, profiles=profiles, name=name, revision=revision, document=document,
+                    root, profiles=profiles, name=name, revision=revision, document=document,
                 )
             except resource_store.LibraryError as exc:
                 if exc.code == "stale_revision":
                     raise stale_resource_revision("library") from None
+                if exc.code == "busy":
+                    raise resource_error(ErrorDescriptor.RESOURCE_BUSY) from None
                 detail = redact_secrets(exc.detail) if exc.detail is not None else None
                 raise invalid_resource_params(reason=exc.code, detail=detail) from None
             # The body is the user's own file and is stored as written; it never comes back.

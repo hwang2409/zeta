@@ -2244,7 +2244,8 @@ user-authored text; the server does not filter instructions in it.
 return `{data:{name,scope}}`. A delete removes only the defining file; other
 files in a skill directory stay.
 
-Each write takes one lock per catalog root, rereads the file under it, and
+Each write takes one lock per catalog root (the file `.library.lock` in it),
+rereads the file under it, and
 compares revisions there; it then publishes the file atomically (temporary
 file, fsync, rename), so a cancelled write leaves the old or the new file.
 Written files have mode `0600`. Paths are taken only from `name` and the
@@ -2259,8 +2260,9 @@ Errors: `-32602` (`data.code: invalid_params`) for bad parameters, with
 catalog's `effective` scope, or a name that only a packaged item defines);
 `-32009 stale_library_revision` (both `data.code` and `data.reason`) for a
 stale revision or a create that lost a race; `-32005 state_unavailable` for
-`project` scope without an attached session; `-32008 observer_read_only` for an
-observer. Unexpected failures return `-32000`.
+`project` scope without an attached session; `-32004 operation_busy` when
+another writer holds the root's lock longer than 250 ms; `-32008
+observer_read_only` for an observer. Unexpected failures return `-32000`.
 
 ### session history read (`session_history_read_v1` feature)
 
