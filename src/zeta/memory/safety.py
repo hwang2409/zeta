@@ -6,7 +6,10 @@ import re
 from typing import Any
 
 _KEY_PREFIX = r"\b(?:password|passwd|api[_ -]?key|access[_ -]?token|secret)\s*[:=]\s*"
-_SECRET_PATTERNS = (
+# Token patterns cannot hide a match of their own kind inside one match, so a
+# plain scan finds all of them. Key matches can (`a=x;password=y`), so keys
+# are found by prefix and each one covers to the end of its `\S+` run.
+_TOKEN_PATTERNS = (
     re.compile(
         r"-----BEGIN (?P<label>(?:RSA |EC |OPENSSH )?PRIVATE KEY)-----"
         r".*?-----END (?P=label)-----",
@@ -14,12 +17,13 @@ _SECRET_PATTERNS = (
     ),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\b(?:sk[-_]|ghp_|github_pat_)[A-Za-z0-9_-]{16,}\b", re.IGNORECASE),
-    re.compile(_KEY_PREFIX + r"\S+", re.IGNORECASE),
+    # JWT: base64url header (`{"` encodes to `eyJ`), payload, and signature.
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{16,}"),
+    # Only the token after `Bearer ` is masked, so the auth scheme stays readable.
+    # shortcut: exactly one whitespace after Bearer, widen if multi-space headers show up.
+    re.compile(r"(?<=\bBearer\s)[A-Za-z0-9._~+/-]{16,}=*", re.IGNORECASE),
 )
-# Token patterns cannot hide a match of their own kind inside one match, so a
-# plain scan finds all of them. Key matches can (`a=x;password=y`), so keys
-# are found by prefix and each one covers to the end of its `\S+` run.
-_TOKEN_PATTERNS = _SECRET_PATTERNS[:3]
+_SECRET_PATTERNS = (*_TOKEN_PATTERNS, re.compile(_KEY_PREFIX + r"\S+", re.IGNORECASE))
 _KEY_START = re.compile(_KEY_PREFIX + r"(?=\S)", re.IGNORECASE)
 _RUN = re.compile(r"\S+")
 

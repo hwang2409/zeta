@@ -20,6 +20,7 @@ from PIL import Image
 
 from tests.support.branch_reads import branch_messages, resident_entries
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.live_home import files_containing
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.sockets import short_socket_path as _socket_path
@@ -1624,11 +1625,7 @@ async def test_session_host_commands_do_not_persist_or_reach_children(
             ]
         )
         assert token not in json.dumps(captured)
-        assert all(
-            token.encode() not in path.read_bytes()
-            for path in (tmp_path / "home").rglob("*")
-            if path.is_file()
-        )
+        assert files_containing(tmp_path / "home", token.encode()) == []
         from zeta.skills import SkillCatalog
         from zeta.tools import ToolRegistry
 
