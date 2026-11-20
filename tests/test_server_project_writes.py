@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -161,6 +162,33 @@ async def test_format_two_memory_compare_and_set(tmp_path: Path) -> None:
             "project_id": beta, "revision": written["revision"], "mutation": {"format": 2, "op": "undo"},
         })
         assert stale_undo["error"] == STALE
+    finally:
+        await contract.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("memory_format", [1, 2])
+async def test_memory_set_with_a_secret_is_refused_and_writes_nothing(tmp_path: Path, memory_format: int) -> None:
+    alpha, beta = await _off_loop(_projects, tmp_path, entry_memory=True)
+    key = "sk-proj-" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+    project_id, mutation, features = (
+        (alpha, {"format": 1, "op": "set", "file": "brief.md", "content": f"key {key}\n"}, FEATURES)
+        if memory_format == 1
+        else (beta, {"format": 2, "op": "set", "kind": "brief", "content": f"key {key}"}, [*FEATURES, "projects-memory-v2"])
+    )
+    contract = await ServeContract.start(tmp_path, "websocket")
+    try:
+        controller = await _client(contract, features)
+        before = await _memory(controller, project_id)
+        refused = await controller.request("secret", "project_memory_update", {
+            "project_id": project_id, "revision": before["digest"], "mutation": mutation,
+        })
+        assert refused["error"]["code"] == -32602, refused
+        assert refused["error"]["data"] == {"code": "invalid_params", "reason": "secret_refused"}
+        assert key not in json.dumps(refused)
+        shown = await controller.request("show", "project_show", {"project_id": project_id})
+        assert shown["result"]["memory"]["digest"] == before["digest"]
+        assert key not in json.dumps(shown)
     finally:
         await contract.close()
 

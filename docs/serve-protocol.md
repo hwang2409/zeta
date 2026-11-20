@@ -2358,7 +2358,9 @@ and the client reads again. Each memory format keeps its own operations;
 The result is `{revision, data: {format}}` (format 2 adds `version_id`).
 `revision` is the digest of the state this write produced. An owner rejection
 (unknown entry, empty history) returns `-32602` with `data.reason`
-`operation_rejected`. A user write emits no event, the same as a TUI
+`operation_rejected`. Content that holds a secret (the shared memory secret
+check) returns `-32602` with `data.reason` `secret_refused`; nothing is
+written. A user write emits no event, the same as a TUI
 `/memory` write; running sessions read the change at their next prompt.
 
 `project_inbox_send {project_id, mutation: {kind, title, body, delivery_id,
