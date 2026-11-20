@@ -1204,9 +1204,10 @@ async def _run_child(
                 error_message=error_message,
             )
         finally:
-            # Explicit finish has its own fence. For other background runs, a
-            # cancel started before the task settled must finish its durable write first.
-            if background and terminal_fence is None and cancellation is not None:
+            # Explicit finish has its own fence. For other runs, a cancel started
+            # before the task settled must finish its durable write first, so a
+            # normal finish the cancel itself unblocked cannot win over it.
+            if terminal_fence is None and cancellation is not None:
                 try:
                     canceled = await asyncio.shield(cancellation)
                 except Exception:  # noqa: BLE001 - the cancel requester reports the failure
