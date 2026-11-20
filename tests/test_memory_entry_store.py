@@ -497,18 +497,27 @@ def test_memory_source_evidence_rank_is_canonical_and_bounded(
             "key [secret omitted] and [secret omitted]",
             "hunter22",
         ),
+        (
+            "API_KEY=sk_live_abcdefghijklmnopqrst;PASSWORD: hunter2",
+            "[secret omitted]",
+            "hunter2",
+        ),
         ("nothing here", "nothing here", ""),
     ],
 )
 def test_redact_secrets_overlapping_patterns_yield_one_clean_marker(
     text: str, expected: str, secret: str
 ) -> None:
-    from zeta.memory.safety import redact_secrets
+    from zeta.memory.safety import REDACTED_SECRET, redact_secrets
 
     redacted = redact_secrets(text)
     assert redacted == expected
-    fragments = {
-        secret[i : i + 4] for i in range(len(secret) - 3)
-    } - set(expected)
-    leaked = [fragment for fragment in fragments if fragment in redacted]
+    marker_fragments = {
+        REDACTED_SECRET[i : i + 4] for i in range(len(REDACTED_SECRET) - 3)
+    }
+    leaked = [
+        fragment
+        for fragment in (secret[i : i + 4] for i in range(len(secret) - 3))
+        if fragment in redacted and fragment not in marker_fragments
+    ]
     assert leaked == []

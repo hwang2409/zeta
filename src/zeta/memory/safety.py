@@ -19,6 +19,13 @@ _SECRET_PATTERNS = (
     ),
 )
 
+# Lookahead copies match at every start position, so a long match (such as
+# `key=\S+` swallowing a second key) cannot hide a match that starts inside it.
+_OVERLAPPING_SECRET_PATTERNS = tuple(
+    re.compile("(?=(" + pattern.pattern + "))", pattern.flags)
+    for pattern in _SECRET_PATTERNS
+)
+
 REDACTED_SECRET = "[secret omitted]"
 
 
@@ -34,10 +41,10 @@ def redact_secrets(value: str) -> str:
     # Match on the original text and merge overlapping spans, so one pattern
     # never matches inside another pattern's marker or leftover fragment.
     spans = sorted(
-        match.span()
-        for pattern in _SECRET_PATTERNS
+        match.span(1)
+        for pattern in _OVERLAPPING_SECRET_PATTERNS
         for match in pattern.finditer(value)
-        if match.end() > match.start()
+        if match.end(1) > match.start(1)
     )
     merged: list[list[int]] = []
     for start, end in spans:
