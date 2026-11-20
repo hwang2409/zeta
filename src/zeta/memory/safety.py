@@ -13,7 +13,7 @@ _SECRET_PATTERNS = (
         re.IGNORECASE | re.DOTALL,
     ),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{16,}\b", re.IGNORECASE),
+    re.compile(r"\b(?:sk[-_]|ghp_|github_pat_)[A-Za-z0-9_-]{16,}\b", re.IGNORECASE),
     re.compile(_KEY_PREFIX + r"\S+", re.IGNORECASE),
 )
 # Token patterns cannot hide a match of their own kind inside one match, so a

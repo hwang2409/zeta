@@ -22337,7 +22337,7 @@ async def test_completion_recovery_is_durable_for_every_recipient(
         return SimpleNamespace(
             store=store,
             _background_owner=BackgroundAgentOwner(store),
-            _existing_tool_result=lambda _call_id: False,
+            _existing_tool_result=lambda call_id: ToolResult(call_id, "done"),
         )
 
     async def recover(store: ConversationStore) -> None:

@@ -169,6 +169,34 @@ def test_memory_snapshot_releases_domain_lock_after_pinning_files(
     assert registry.memory_snapshot(project.project_id).contents["brief.md"] == "after"
 
 
+@pytest.mark.parametrize("write", ["update_memory", "compare_and_swap_memory"])
+def test_format_one_memory_write_refuses_secret(tmp_path: Path, write: str) -> None:
+    home = tmp_path / ".zeta"
+    advance(home, expected_epoch=0)
+    registry = ProjectRegistry(home / "projects")
+    project = registry.create_project("demo", "scope")
+    registry.initialize_memory(project.project_id)
+    registry.update_memory(project.project_id, {"brief.md": "old brief"})
+    key = "sk-proj-" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+    updates = {"brief.md": f"key {key}"}
+
+    with pytest.raises(ProjectRegistryError) as raised:
+        if write == "update_memory":
+            registry.update_memory(project.project_id, updates)
+        else:
+            registry.compare_and_swap_memory(
+                project.project_id,
+                expected_digest=registry.memory_snapshot(project.project_id).digest,
+                updates=updates,
+            )
+
+    from zeta.project_errors import MemorySecretError
+
+    assert isinstance(raised.value, MemorySecretError)
+    assert key not in str(raised.value)
+    assert dict(registry.load_memory(project.project_id))["brief.md"] == "old brief"
+
+
 def test_project_memory_workflow_and_automatic_session_linkage(tmp_path: Path) -> None:
     home = tmp_path / ".zeta"
     repository = tmp_path / "repository"

@@ -22,6 +22,10 @@ class ProjectRegistryBusyError(ProjectRegistryError):
         )
 
 
+class MemorySecretError(ProjectRegistryError):
+    """A memory write was refused because its text contains a secret."""
+
+
 class UnsupportedMemoryFormatError(ProjectRegistryError):
     """Project memory is valid but this code cannot interpret its format."""
 
