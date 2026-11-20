@@ -44,6 +44,8 @@ def _home_settings(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
                 descriptor = ErrorDescriptor.SETTINGS_BUSY
             case "settings_malformed":
                 descriptor = ErrorDescriptor.SETTINGS_MALFORMED
+            case "telemetry_unavailable":
+                descriptor = ErrorDescriptor.TELEMETRY_UNAVAILABLE
             case _:
                 descriptor = ErrorDescriptor.SETTINGS_UNSAFE
         raise ProtocolError(descriptor, descriptor.meaning, exc.data or None) from None

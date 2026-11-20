@@ -1222,6 +1222,12 @@ STRUCTURED_ERROR_FIXTURES = (
         None,
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"settings.toml is a link or not a regular, unshared file","data":{"code":"settings_unsafe"}}}\n',
     ),
+    (
+        ErrorDescriptor.TELEMETRY_UNAVAILABLE,
+        "telemetry cannot start in this zeta install or environment",
+        {"detail": "OpenTelemetry support is not installed; install zeta[otel]"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"telemetry cannot start in this zeta install or environment","data":{"code":"telemetry_unavailable","detail":"OpenTelemetry support is not installed; install zeta[otel]"}}}\n',
+    ),
 )
 
 

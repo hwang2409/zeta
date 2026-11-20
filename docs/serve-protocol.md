@@ -1178,6 +1178,13 @@ Errors:
   `{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:<64 hex>"}}`
 - another zeta writer held the lock for 250 ms:
   `{"code":-32009,"message":"another zeta process is writing settings.toml","data":{"code":"settings_busy","retryable":true}}`
+- turning telemetry on when it could not start: `zeta[otel]` is not installed,
+  an `OTEL_EXPORTER_OTLP*` or `OTEL_PYTHON_EXPORTER_OTLP*` variable is set, or
+  `OTEL_SDK_DISABLED=true` is set in the server's environment. The server runs
+  the same check zeta runs at startup, before it takes the lock, so nothing is
+  written; `detail` is the startup error text. Turning telemetry off is never
+  refused for this reason:
+  `{"code":-32602,"message":"telemetry cannot start in this zeta install or environment","data":{"code":"telemetry_unavailable","detail":"OpenTelemetry support is not installed; install zeta[otel]"}}`
 - the file does not parse or validate (update only; nothing is written):
   `{"code":-32000,"message":"settings.toml does not parse or validate","data":{"code":"settings_malformed"}}`
 - `settings.toml` is a symbolic link or not a regular, unshared file (get and
@@ -2016,6 +2023,7 @@ Error descriptors are:
 | `settings_busy` | `-32009` | `settings_busy` | another zeta process is writing settings.toml |
 | `settings_malformed` | `-32000` | `settings_malformed` | settings.toml does not parse or validate |
 | `settings_unsafe` | `-32000` | `settings_unsafe` | settings.toml is a link or not a regular, unshared file |
+| `telemetry_unavailable` | `-32602` | `telemetry_unavailable` | telemetry cannot start in this zeta install or environment |
 
 Error objects have `code` and `message`, and may have a method-specific
 `data` object. With `session_park`, a swap over the park limit returns

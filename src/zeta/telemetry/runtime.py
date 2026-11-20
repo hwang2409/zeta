@@ -11,6 +11,7 @@ import time
 from collections import deque
 from collections.abc import Mapping
 from contextlib import contextmanager
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 from . import SpanHandle, TelemetryError, TelemetryStatus
@@ -353,10 +354,10 @@ class _Runtime:
             context.detach(token)
 
 
-def configure(endpoint: str, receiver: object | None = None) -> _Runtime:
-    """``receiver`` is the built-in receiver's supervisor: spans carry its ``home_id``, and
-    export sends only while its ``may_export()`` is true."""
-    endpoint = validate_loopback_endpoint(endpoint)
+def preflight() -> SimpleNamespace:
+    """The checks ``configure`` runs before it builds anything: the OTEL environment and the SDK
+    imports. Raises ``TelemetryError`` when configured telemetry could not start in this process;
+    returns the imported SDK names."""
     for name, value in os.environ.items():
         if name.startswith(("OTEL_EXPORTER_OTLP", "OTEL_PYTHON_EXPORTER_OTLP")) and value:
             raise TelemetryError("OTEL exporter environment is not allowed; configure zeta telemetry explicitly")
@@ -376,13 +377,25 @@ def configure(endpoint: str, receiver: object | None = None) -> _Runtime:
         )
     except ModuleNotFoundError:
         raise TelemetryError("OpenTelemetry support is not installed; install zeta[otel]") from None
+    return SimpleNamespace(
+        requests=requests, OTLPSpanExporter=OTLPSpanExporter, Resource=Resource, SpanLimits=SpanLimits,
+        TracerProvider=TracerProvider, BatchSpanProcessor=BatchSpanProcessor, ALWAYS_ON=ALWAYS_ON,
+        ParentBased=ParentBased, TraceContextTextMapPropagator=TraceContextTextMapPropagator,
+    )
 
-    session = requests.Session()
+
+def configure(endpoint: str, receiver: object | None = None) -> _Runtime:
+    """``receiver`` is the built-in receiver's supervisor: spans carry its ``home_id``, and
+    export sends only while its ``may_export()`` is true."""
+    endpoint = validate_loopback_endpoint(endpoint)
+    sdk = preflight()
+
+    session = sdk.requests.Session()
     session.trust_env = False
     cell = StatusCell()
-    delegate = OTLPSpanExporter(endpoint=endpoint, headers={}, timeout=5, session=session)
+    delegate = sdk.OTLPSpanExporter(endpoint=endpoint, headers={}, timeout=5, session=session)
     exporter = _Exporter(delegate, cell, session, receiver)
-    limits = SpanLimits(
+    limits = sdk.SpanLimits(
         max_attributes=128,
         max_events=128,
         max_links=128,
@@ -394,15 +407,15 @@ def configure(endpoint: str, receiver: object | None = None) -> _Runtime:
     )
     from importlib.metadata import version
 
-    provider = TracerProvider(
-        resource=Resource({
+    provider = sdk.TracerProvider(
+        resource=sdk.Resource({
             "service.name": "zeta", "service.version": version("zeta"),
             **({} if receiver is None else {"zeta.home.id": receiver.home_id}),
         }),
-        sampler=ParentBased(ALWAYS_ON),
+        sampler=sdk.ParentBased(sdk.ALWAYS_ON),
         span_limits=limits,
     )
-    provider.add_span_processor(BatchSpanProcessor(exporter, max_queue_size=2048, max_export_batch_size=256, schedule_delay_millis=5000))
+    provider.add_span_processor(sdk.BatchSpanProcessor(exporter, max_queue_size=2048, max_export_batch_size=256, schedule_delay_millis=5000))
     logger_state: list[tuple[logging.Logger, bool, bool, int, list[logging.Handler]]] = []
     # the trace-context loggers print received tracestate members, which are client input
     for name in ("opentelemetry.exporter", "opentelemetry.sdk._shared_internal", "opentelemetry.trace.span", "opentelemetry.trace.propagation.tracecontext"):
@@ -412,4 +425,4 @@ def configure(endpoint: str, receiver: object | None = None) -> _Runtime:
         logger.propagate = False
         # module loggers below "opentelemetry.exporter" stop here; with no handler found, logging prints them to stderr
         logger.handlers[:] = [logging.NullHandler()]
-    return _Runtime(provider, provider.get_tracer("zeta"), TraceContextTextMapPropagator(), cell, logger_state)
+    return _Runtime(provider, provider.get_tracer("zeta"), sdk.TraceContextTextMapPropagator(), cell, logger_state)

@@ -6,7 +6,9 @@ A client sees an allowlisted projection plus ``revision``, the SHA-256 of the ex
 finished before the reread is never lost. The lock serializes zeta writers only; an editor that
 writes after the reread is not stopped. The edit touches only the built-in endpoint line (under
 ``[otel]``, or a top-level ``otel.endpoint``), checked against a ``tomlkit`` parse, and a
-candidate is published only after ``load_settings``'s own validation accepts it.
+candidate is published only after ``load_settings``'s own validation accepts it. An update that
+turns telemetry on first runs the telemetry start preflight, so it never writes a setting that
+would stop the next start.
 
 Every function blocks (file locks, fsync, a directory scan); call it off the event loop.
 """
@@ -71,6 +73,8 @@ def get(home: Path) -> dict[str, Any]:
 def update(home: Path, expected_revision: object, changes: object) -> dict[str, Any]:
     """Apply ``changes`` if the file still has ``expected_revision``; report what must restart."""
     enabled = _parse_changes(expected_revision, changes)
+    if enabled:
+        _require_telemetry_can_start()
     require_off_loop_lock("home settings")
     home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -95,6 +99,17 @@ def update(home: Path, expected_revision: object, changes: object) -> dict[str, 
         return result
     finally:
         os.close(home_fd)
+
+
+def _require_telemetry_can_start() -> None:
+    """Refuse an on that would stop zeta's next start: the start runs the same preflight."""
+    from ..telemetry import TelemetryError
+    from ..telemetry.runtime import preflight
+
+    try:
+        preflight()
+    except TelemetryError as exc:
+        raise HomeSettingsError("telemetry_unavailable", detail=str(exc)) from None
 
 
 def _parse_changes(expected_revision: object, changes: object) -> bool:
