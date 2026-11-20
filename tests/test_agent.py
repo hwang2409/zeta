@@ -3430,6 +3430,51 @@ async def test_foreground_cancel_cancels_owned_background_descendant_only(
     await loop.close()
 
 
+@pytest.mark.asyncio
+async def test_foreground_cancel_wins_when_child_finishes_before_cancel_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Forced order: the grandchild's cancel frees the child's finish gate, so the
+    # child finishes normally before its own durable cancel write returns.
+    child_returned = asyncio.Event()
+    consume_child = agent_runner_module.consume_child
+
+    async def tracked_consume(child_loop, *args, **kwargs):
+        try:
+            return await consume_child(child_loop, *args, **kwargs)
+        finally:
+            if child_loop.agent_depth == 1:
+                child_returned.set()
+
+    mark = ConversationStore.mark_agent_canceled_async
+
+    async def held_mark(self, tool_call_id):
+        if tool_call_id == "child":
+            await await_or_fail(child_returned.wait(), what="foreground child return")
+        await mark(self, tool_call_id)
+
+    monkeypatch.setattr(agent_runner_module, "consume_child", tracked_consume)
+    monkeypatch.setattr(ConversationStore, "mark_agent_canceled_async", held_mark)
+    backend = ForegroundNestedBackgroundBackend()
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    task = asyncio.create_task(
+        _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+    )
+    try:
+        await await_or_fail(backend.grandchild_started.wait(), what="grandchild start")
+        loop._background_owner.cancel_subtree(f"{store.session_id}:1")
+        with pytest.raises(asyncio.CancelledError):
+            await await_or_fail(task, what="canceled parent turn")
+        result = store.tool_result("child")
+        assert result is not None and "canceled=true" in result.content, result
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await loop.close()
+        store.close()
+
+
 async def _finish_gate_before_end_turn(
     backend: FinishGateBackend,
     gate_engaged: asyncio.Event,
