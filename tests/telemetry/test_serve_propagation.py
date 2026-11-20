@@ -403,6 +403,7 @@ async def test_account_list_serializes_with_registry_writer(tmp_path, monkeypatc
     pytest.param("sk-auth-error-token-canary-0001", "rejected {}", id="canary"),
     pytest.param("sk-proj-AbCdEf1234567890abcdEFGH1234abcd", "Incorrect API key provided: {}", id="sk-proj"),
     pytest.param("sk-proj-AbCdEf12\x1b[0m34567890abcdEFGH", "Incorrect API key provided: {}", id="control-split"),
+    pytest.param("eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlLXZhbHVlLTAx", "Invalid token: {}", id="jwt"),
 ])
 async def test_auth_error_names_failed_account_for_negotiated_clients(
     tmp_path, traced, caplog, controller_negotiated, token, template,
