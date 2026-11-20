@@ -2216,6 +2216,45 @@ Missing project context returns `-32005` (`state_unavailable`). A result that
 cannot fit the response budget returns `-32007` (`result_too_large`). Unexpected
 owner failures return `-32000`. Unnegotiated methods return `-32601`.
 
+### session history read (`session_history_read_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `session_history_read` | `1.0` | `session_history_read_v1` | `read` |
+
+`session_history_read {session_id, cursor?, direction?, limit?, max_bytes?}`
+returns history rows of another top-level session in the attached session's
+project. It does not attach, subscribe, or take the session's execution lease,
+and it takes no lock the session's owner waits for. `direction` is `backward`
+(default, newest rows first) or `forward`. `limit` (1–128, default 50) counts
+history groups, not rows; a group is never split. `max_bytes` (1–1048576,
+default and maximum 1048576) bounds the whole response frame.
+
+The result is `{messages, next_cursor}`. `messages` are the same rows, in the
+same order and with the same projection and redaction, as `session_history`
+returns for that session with this connection's negotiated history features.
+Pass `next_cursor` back with the same `session_id` and `direction` for the next
+page; `null` means no rows are left. A cursor survives appends to the session.
+A rewritten or replaced transcript returns `-32009 stale_history_snapshot`;
+start again without a cursor. The attached session itself is refused with
+`-32602`; page it with `session_history`.
+
+Only the result is bounded. Each call reads and projects the whole target
+transcript off the event loop: a 34 MB transcript costs about 0.85 s and about
+175 MB of transient memory per call. Serve runs at most one
+`session_history_read` at a time. A call while another is in flight returns
+`-32004 operation_busy` with `data.retry_after_ms` (2000) and starts no read.
+Clients must not poll faster than every few seconds.
+
+Errors: `-32602 invalid_params` for bad params or a cursor made for other
+params; `-32602 session_not_found` for an absent session and for a session in
+another project (the same error, so other projects are not disclosed);
+`-32005 state_unavailable` with no attached session or project, for a newer
+stored format, a corrupt or changing transcript, or a read that passes its
+10 s deadline; `-32007 result_too_large` when one group alone is over
+`max_bytes`. Errors set `data.code` and `data.reason` to the named reason and
+never include paths or parser text. An unnegotiated method returns `-32601`.
+
 ## errors
 
 Error responses use standard JSON-RPC codes where applicable. Each emitted variant selects one registered descriptor.
