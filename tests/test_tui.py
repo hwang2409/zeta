@@ -77,7 +77,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
 from tests.support.owned import await_or_fail, close_owned_app, owned_app
-from tests.support.processes import read_pty_until, reap_process
+from tests.support.processes import open_pty, read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from tests.test_agent import CancelledBeforeAnswerBackend, _collect
 from zeta.accounts import (
@@ -8135,57 +8135,42 @@ async def test_ctrl_d_resets_cursor_before_prompt_toolkit_exit() -> None:
 
 
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
-    master_fd, slave_fd = pty.openpty()
-    env = _fixed_terminal_env(tmp_path / "zeta-home")
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "tests.support.scripted_tui",
-            "--provider",
-            "codex",
-        ],
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env=env,
-        close_fds=True,
-    )
-    os.close(slave_fd)
-    try:
-        output = bytearray()
-        read_pty_until(master_fd, b" \xe2\x80\xba ", process=process, output=output)
+    with open_pty() as (master_fd, slave_fd):
+        env = _fixed_terminal_env(tmp_path / "zeta-home")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tests.support.scripted_tui",
+                "--provider",
+                "codex",
+            ],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            close_fds=True,
+        )
+        try:
+            output = bytearray()
+            read_pty_until(master_fd, b" \xe2\x80\xba ", process=process, output=output)
 
-        os.write(master_fd, b"\x04")
-        read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
-        reap_process(process, timeout=10)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select(
-                [master_fd], [], [], max(0, deadline - time.monotonic())
-            )
-            if not ready:
-                break
-            try:
-                chunk = os.read(master_fd, 4096)
-            except OSError as error:
-                if error.errno == errno.EIO:
-                    break
-                raise
-            if not chunk:
-                break
-            output.extend(chunk)
-        assert process.returncode == 0
-        assert b"\x1b[?1049h" in output
-        assert b"\x1b[?1049l" in output
-        assert b"\x1b[0 q" in output
-        assert output.index(b"\x1b[0 q") < output.index(b"\x1b[?1049l")
-        assert output.count(b"\x1b[?1049h") == 1
-    finally:
-        if process.poll() is None:
-            process.kill()
+            os.write(master_fd, b"\x04")
+            read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
             reap_process(process, timeout=10)
-        os.close(master_fd)
+            # The child has exited, so the rest of its output is already queued.
+            while select.select([master_fd], [], [], 0)[0]:
+                output.extend(os.read(master_fd, 4096))
+            assert process.returncode == 0
+            assert b"\x1b[?1049h" in output
+            assert b"\x1b[?1049l" in output
+            assert b"\x1b[0 q" in output
+            assert output.index(b"\x1b[0 q") < output.index(b"\x1b[?1049l")
+            assert output.count(b"\x1b[?1049h") == 1
+        finally:
+            if process.poll() is None:
+                process.kill()
+                reap_process(process, timeout=10)
 
 
 def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
@@ -8243,45 +8228,39 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
 def test_main_pty_normal_command_then_queued_enter_submits(
     tmp_path: Path,
 ) -> None:
-    master_fd, slave_fd = pty.openpty()
-    env = _fixed_terminal_env(tmp_path / "zeta-home")
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "tests.support.scripted_tui",
-            "--provider",
-            "codex",
-        ],
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env=env,
-        close_fds=True,
-    )
-    os.close(slave_fd)
-    output = bytearray()
+    with open_pty() as (master_fd, slave_fd):
+        env = _fixed_terminal_env(tmp_path / "zeta-home")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tests.support.scripted_tui",
+                "--provider",
+                "codex",
+            ],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            close_fds=True,
+        )
+        output = bytearray()
 
-    def read_until(needle: bytes, start: int = 0) -> None:
-        read_pty_until(master_fd, needle, process=process, output=output, start=start)
+        def read_until(needle: bytes, start: int = 0) -> None:
+            read_pty_until(master_fd, needle, process=process, output=output, start=start)
 
-    try:
-        read_until(b" \xe2\x80\xba ")
-        start = len(output)
-        os.write(master_fd, b"abc\x1bx\r")
-        read_until(b"the scripted test backend", start)
-        assert b"you said: ab" in output[start:]
-    finally:
         try:
+            read_until(b" \xe2\x80\xba ")
+            start = len(output)
+            os.write(master_fd, b"abc\x1bx\r")
+            read_until(b"the scripted test backend", start)
+            assert b"you said: ab" in output[start:]
+        finally:
             if process.poll() is None:
                 os.write(master_fd, b"\x04")
-                read_pty_until(
-                    master_fd, b"\x1b[?1049l", process=process, output=output
-                )
+                read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
                 reap_process(process, timeout=10)
             assert process.returncode == 0
-        finally:
-            os.close(master_fd)
 
 
 def test_main_import_compatibility() -> None:

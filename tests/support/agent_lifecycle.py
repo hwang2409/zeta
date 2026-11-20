@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.store import ConversationStore
 from zeta.runtime.loop import AgentLoop
@@ -38,4 +39,7 @@ def watch_delegated_registrations(
 
 async def wait_background_owner(loop: AgentLoop) -> None:
     # test-contract: seam no public owner-drain event.
-    await asyncio.wait_for(loop._background_owner.wait(), timeout=10)
+    # Not wait_for: watchers swallow its cancel, so a stuck drain hung past the bound.
+    await await_or_fail(
+        loop._background_owner.wait(), what="background owner drain (owner.wait)"
+    )
