@@ -521,3 +521,36 @@ def test_redact_secrets_overlapping_patterns_yield_one_clean_marker(
         if fragment in redacted and fragment not in marker_fragments
     ]
     assert leaked == []
+
+
+_SK_DASH_KEYS = [
+    "sk-test-0000000000000000",
+    "sk-proj-AbCdEfGhIjKlMnOpQrStUv0123456789",
+    "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx-0123456789_ab",
+]
+
+
+@pytest.mark.parametrize("key", _SK_DASH_KEYS)
+@pytest.mark.parametrize("template", ["{}", "use {} now", "{}\nnext line", "first\n{}"])
+def test_dash_style_sk_keys_are_detected_and_redacted(key: str, template: str) -> None:
+    from zeta.memory.safety import REDACTED_SECRET, contains_secret, redact_secrets
+
+    text = template.format(key)
+    assert redact_secrets(text) == template.format(REDACTED_SECRET)
+    assert contains_secret(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "task-abcdefghijklmnopqrstu",
+        "risk-assessment-framework-v2",
+        "desk-0123456789abcdefgh",
+        "sk-abc",
+    ],
+)
+def test_sk_lookalikes_are_not_secrets(text: str) -> None:
+    from zeta.memory.safety import contains_secret, redact_secrets
+
+    assert redact_secrets(text) == text
+    assert not contains_secret(text)
