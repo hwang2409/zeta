@@ -46,10 +46,8 @@ def _message_notification_ids(message: Message) -> frozenset[str]:
 def _bounded_text(value: object, limit: int) -> str:
     return str(value or "")[:limit]
 
-def _notification_digest(
-    entry: ConversationEntry, *, observed_epoch: int | None = None
-) -> dict[str, JSONValue]:
-    data = project_inbox_notification(entry.data, observed_epoch=observed_epoch)
+def _notification_digest(entry: ConversationEntry) -> dict[str, JSONValue]:
+    data = project_inbox_notification(entry.data)
     report = data.get("report")
     report_data = report if isinstance(report, Mapping) else {}
     canonical = json.dumps(
@@ -85,15 +83,14 @@ def _notification_message(
     entries: Sequence[ConversationEntry],
     *,
     digest: bool = False,
-    observed_epoch: int | None = None,
 ) -> Message:
     payload = [
-        _notification_digest(entry, observed_epoch=observed_epoch)
+        _notification_digest(entry)
         if digest
         else {
             "notification_id": entry.id,
             "kind": entry.data.get("kind", "agent_completion"),
-            **project_inbox_notification(entry.data, observed_epoch=observed_epoch),
+            **project_inbox_notification(entry.data),
         }
         for entry in entries
     ]
@@ -130,7 +127,6 @@ def _select_notification_delivery(
         pending,
         notification_budget,
         token_counter,
-        observed_epoch=store.observed_storage_epoch,
     )
     if persisted is not None:
         return persisted
@@ -138,7 +134,6 @@ def _select_notification_delivery(
         pending,
         notification_budget,
         token_counter,
-        observed_epoch=store.observed_storage_epoch,
     )
     return selected, message, False
 
@@ -148,8 +143,6 @@ def _reuse_persisted_notification_delivery(
     pending: Sequence[ConversationEntry],
     notification_budget: int | None,
     token_counter: Callable[[Sequence[Message]], int] | None,
-    *,
-    observed_epoch: int | None = None,
 ) -> tuple[list[ConversationEntry], Message, bool] | None:
     if persisted is None or notification_budget == 0:
         return None
@@ -159,7 +152,7 @@ def _reuse_persisted_notification_delivery(
         return None
     selected = [entry for entry in pending if entry.id in represented]
     projected = _restore_persisted_delivery_context(
-        _notification_message(selected, observed_epoch=observed_epoch), persisted
+        _notification_message(selected), persisted
     )
     if not _notification_fits(projected, notification_budget, token_counter):
         return None
@@ -199,28 +192,22 @@ def _largest_fitting_notification_delivery(
     pending: Sequence[ConversationEntry],
     notification_budget: int | None,
     token_counter: Callable[[Sequence[Message]], int] | None,
-    *,
-    observed_epoch: int | None = None,
 ) -> tuple[list[ConversationEntry], Message | None]:
     if not pending or notification_budget == 0:
         return [], None
-    for selected, message in _ordered_notification_candidates(
-        pending, observed_epoch=observed_epoch
-    ):
+    for selected, message in _ordered_notification_candidates(pending):
         if _notification_fits(message, notification_budget, token_counter):
             return selected, message
     return [], None
 
 
 def _ordered_notification_candidates(
-    pending: Sequence[ConversationEntry], *, observed_epoch: int | None = None
+    pending: Sequence[ConversationEntry],
 ) -> Iterator[tuple[list[ConversationEntry], Message]]:
-    yield list(pending), _notification_message(pending, observed_epoch=observed_epoch)
+    yield list(pending), _notification_message(pending)
     for count in range(len(pending), 0, -1):
         selected = list(pending[:count])
-        yield selected, _notification_message(
-            selected, digest=True, observed_epoch=observed_epoch
-        )
+        yield selected, _notification_message(selected, digest=True)
 
 
 def _notification_fits(
