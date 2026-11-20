@@ -218,8 +218,11 @@ class AccountStore(_AccountRegistry):
             ]
 
     def public_identity(self, account: AccountId) -> dict[str, str]:
-        """Name an already selected account without reading its credentials."""
-        with self._home() as home_fd:
+        """Name an already selected account without credentials or a writer lease."""
+        with (
+            _owned_fd(os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)) as home_fd,
+            self._registry_guard(home_fd),
+        ):
             label = self._read_registry(home_fd)["labels"].get(str(account), account.name)
         return {
             "account": str(account),

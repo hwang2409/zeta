@@ -496,3 +496,46 @@ async def test_auth_error_names_failed_account_for_negotiated_clients(
             await await_or_fail(observer.writer.wait_closed(), what="observer close")
         await close_serve(server, controller.writer)
     assert not any(token in text for text in _texts(memory.get_finished_spans()))
+
+
+@pytest.mark.asyncio
+async def test_auth_error_survives_a_broken_account_label_lookup(tmp_path, traced, monkeypatch):
+    from zeta.codex import CodexAuthError
+    from zeta.providers.completion import owned_completion
+    from zeta.storage_format import StorageFormatError
+
+    telemetry, _memory = traced
+    credentials = named_account_credentials(tmp_path, "codex", "work")
+    await asyncio.to_thread(credentials.save, OAuthTokens("token", "refresh", 9_999_999_999))
+
+    def broken(_self, _account):
+        raise StorageFormatError("home format is newer than this zeta")
+
+    monkeypatch.setattr(AccountStore, "public_identity", broken)
+
+    class RejectedBackend:
+        token_store = credentials
+
+        @owned_completion
+        async def complete(self, messages, tool_schemas):
+            if False:
+                yield
+            raise CodexAuthError("rejected")
+
+    server = ZetaServer(
+        home=tmp_path, socket_path=short_socket_path(tmp_path), provider="codex",
+        backend_factory=lambda _provider, model, _home: (RejectedBackend(), model), telemetry=telemetry,
+    )
+    controller = Wire(server, "unix")
+    await controller.open()
+    try:
+        await controller.rpc("hello", "hello", {"protocol_version": "1.2", "features": ["account_list_idle_v1"]})
+        session = json.loads(await controller.rpc("new", "new_session"))["result"]["session"]
+        await controller.rpc("send", "send", {"session_id": session["session_id"], "text": "trigger auth error"})
+        await controller.event("error")
+        error = json.loads(controller.received[-1])["params"]
+        assert error["error"]["code"] == "auth_error", error
+        assert error["data"] == {"login_provider": "codex"}
+        await controller.event("agent_end")
+    finally:
+        await close_serve(server, controller.writer)
