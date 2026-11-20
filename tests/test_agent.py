@@ -3470,7 +3470,9 @@ async def test_foreground_cancel_wins_when_child_finishes_before_cancel_write(
     finally:
         if not task.done():
             task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(task, return_exceptions=True), what="parent turn cleanup"
+        )
         await loop.close()
         store.close()
 
