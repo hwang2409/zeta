@@ -67,7 +67,7 @@ from zeta.storage_format import open_writer
 from zeta.tools._spill import SpillStore
 
 
-async def _fire_redirect(url: str) -> None:
+async def _fire_redirect(url: str) -> bytes:
     """Send a raw HTTP GET to the OAuth redirect listener without httpx."""
 
     parsed = urlparse(url)
@@ -81,9 +81,9 @@ async def _fire_redirect(url: str) -> None:
         f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
     ).encode("ascii")
     writer.write(request)
-    await writer.drain()
     try:
-        await reader.read(-1)
+        await writer.drain()
+        return await reader.read(-1)
     finally:
         writer.close()
         try:

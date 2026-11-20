@@ -143,8 +143,10 @@ class StdioMCPClient(MCPClient):
         *,
         spill_store: SpillStore | None = None,
         limits: MCPCallLimits | None = None,
+        capture_stderr: bool = True,
     ) -> None:
         self.config = config
+        self._capture_stderr = capture_stderr
         self.protocol_version: str | None = None
         self.capabilities: dict[str, object] | None = None
         self._process: asyncio.subprocess.Process | None = None
@@ -176,6 +178,13 @@ class StdioMCPClient(MCPClient):
         if self._failure_sink is not None:
             self._failure_sink(_error_text(error))
 
+    async def _open_stderr_log(self) -> RotatingStderrLog:
+        log_path = mcp_log_path(self.config.name)
+        try:
+            return await RotatingStderrLog.prepare(log_path)
+        except OSError as exc:
+            raise MCPTransportError(f"Could not open MCP stderr log {log_path}: {exc}") from exc
+
     async def connect(self) -> None:
         if self._process is not None:
             return
@@ -187,35 +196,31 @@ class StdioMCPClient(MCPClient):
             if self._invalidation is invalidation:
                 self._invalidation = None
         self._reader_error = None
-        log_path = mcp_log_path(self.config.name)
-        try:
-            stderr_log = await RotatingStderrLog.prepare(log_path)
-        except OSError as exc:
-            raise MCPTransportError(
-                f"Could not open MCP stderr log {log_path}: {exc}"
-            ) from exc
+        stderr_log = await self._open_stderr_log() if self._capture_stderr else None
         try:
             process = await asyncio.create_subprocess_exec(
                 self.config.command,
                 *self.config.args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE if stderr_log is not None else asyncio.subprocess.DEVNULL,
                 env=subprocess_env(self.config.env),
                 start_new_session=True,
             )
         except BaseException:
-            await stderr_log.close()
+            if stderr_log is not None:
+                await stderr_log.close()
             raise
         self._process = process
         generation = self._generation
-        if process.stderr is None:
-            await stderr_log.close()
-            await _kill_and_reap(process, [])
-            raise MCPTransportError("MCP stdio server stderr pipe was not created")
-        self._stderr_task = asyncio.create_task(
-            self._drain_stderr(process.stderr, stderr_log, generation)
-        )
+        if stderr_log is not None:
+            if process.stderr is None:
+                await stderr_log.close()
+                await _kill_and_reap(process, [])
+                raise MCPTransportError("MCP stdio server stderr pipe was not created")
+            self._stderr_task = asyncio.create_task(
+                self._drain_stderr(process.stderr, stderr_log, generation)
+            )
         self._reader_task = asyncio.create_task(self._read_stdout(generation))
         try:
             result = await self._request("initialize", initialize_params())

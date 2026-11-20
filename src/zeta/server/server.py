@@ -46,6 +46,7 @@ from .handlers.projects import (
 )
 from .handlers.registry import dispatch as _dispatch_request
 from .handlers.registry import state_read_available
+from .handlers.resources._mcp_auth import MCPAuth
 from .parking import ParkedPairs
 from .protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,
@@ -258,6 +259,7 @@ class ZetaServer:
             max_turns=max_turns,
             backend_factory=backend_factory,
         )
+        self._mcp_auth = MCPAuth()
         self._max_role = max_role
         self._foreground_event_publisher = foreground_event_publisher
         self._foreground_subscription = None
@@ -481,6 +483,7 @@ class ZetaServer:
         finally:
             self._client = None
             self._client_active = False
+            await self._mcp_auth.aclose()
             self.parking.close_all(approval_settlement_timeout)
             try:
                 try:

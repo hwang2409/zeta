@@ -11,8 +11,10 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal
@@ -21,16 +23,20 @@ from urllib.parse import urlsplit, urlunsplit
 from . import connection as mcp_connection
 from .config import (
     MCPConfig,
+    MCPServerConfig,
     home_config_path,
     load_mcp_config,
     load_mcp_config_overlay,
     project_config_path,
 )
+from .envelope import MCPCallLimits
 from .fs import ensure_directory_below_existing_root
 from .oauth_store import (
     MCPCredentialStore,
     MCPCredentialStoreError,
+    MCPOAuthToken,
     PublicCredentialStoreError,
+    SaveDisposition,
     public_credential_store_error,
     token_state,
 )
@@ -628,6 +634,17 @@ class MCPManagementService:
         assert candidate.revision is not None
         return candidate.revision, candidate.entries
 
+    @contextmanager
+    def _locked_paths(self):
+        self._ensure_open()
+        home_path, project_path, trust_path = self._canonical_paths()
+        paths = tuple(path for path in (home_path, project_path, trust_path) if path is not None)
+        handles, unavailable = self._acquire_locks(paths)
+        try:
+            yield home_path, None if project_path in unavailable else project_path, trust_path, project_path
+        finally:
+            self._release_locks(handles)
+
     def _transaction(
         self,
         mutation: Callable[[Path, Path | None, Path], None] | None = None,
@@ -636,16 +653,7 @@ class MCPManagementService:
         snapshot: bool = False,
         require_project: bool = False,
     ) -> _ManagementCandidate:
-        self._ensure_open()
-        home_path, project_path, trust_path = self._canonical_paths()
-        paths = tuple(
-            path for path in (home_path, project_path, trust_path) if path is not None
-        )
-        handles, unavailable = self._acquire_locks(paths)
-        # A missing project root is unavailable for this transaction only; the
-        # candidate keeps the canonical path so a recreated root works again.
-        usable_project = None if project_path in unavailable else project_path
-        try:
+        with self._locked_paths() as (home_path, usable_project, trust_path, project_path):
             if require_project and usable_project is None:
                 raise self._no_project_error()
             revision_paths = (home_path, usable_project, trust_path)
@@ -656,8 +664,6 @@ class MCPManagementService:
             candidate = self._candidate_locked(home_path, usable_project, trust_path)
             current = self._content_revision(revision_paths) if snapshot or revision is not None else None
             return replace(candidate, project_path=project_path, revision=current)
-        finally:
-            self._release_locks(handles)
 
     def _with_runtime(
         self, entries: tuple[ManagedServer, ...]
@@ -973,12 +979,27 @@ class MCPManagementService:
     def _policy_registry(self) -> ToolRegistry | None:
         return getattr(self.mount, "registry", None)
 
-    def _server_allowed(self, name: str) -> bool:
-        return mcp_connection.mcp_server_allowed(self._policy_registry(), name)
+    def _command_target(self, name: str, scope: Scope) -> tuple[ManagedServer, MCPServerConfig | None]:
+        # Trust and the config used to connect must come from the same lock acquisition.
+        with self._locked_paths() as (home, project, trust_path, _):
+            if scope == "project" and project is None:
+                raise self._no_project_error()
+            for selected, path in (("project", project), ("user", home)):
+                if path is None or scope not in ("effective", selected):
+                    continue
+                servers = self._servers(self._read_object(path), path)
+                if name in servers:
+                    item = self._managed(name, selected, servers[name], self._read_object(trust_path), project)
+                    return item, load_mcp_config(path).configured_servers.get(name)
+        raise MCPManagementError("unknown MCP server", code="invalid_params")
 
-    async def test(self, name: str, *, scope: Scope = "effective") -> dict[str, object]:
-        item = await self.resolve(name, scope=scope)
-        if not self._server_allowed(name):
+    async def test(
+        self, name: str, *, scope: Scope = "effective", wire: bool = False,
+        registry: ToolRegistry | None = None,
+    ) -> dict[str, object]:
+        registry = registry if registry is not None else self._policy_registry()
+        item, config = await asyncio.to_thread(self._command_target, name, scope)
+        if not mcp_connection.mcp_server_allowed(registry, name):
             return {
                 "name": name,
                 "tools": [],
@@ -992,19 +1013,21 @@ class MCPManagementService:
                 "status": "untrusted",
                 "detail": f"trust the server definition first (zeta mcp trust {name})",
             }
-        config = (
-            await asyncio.to_thread(load_mcp_config, self.path(item.scope))
-        ).configured_servers.get(name)
         if config is None:
-            raise MCPManagementError(f"server cannot be tested: {name}")
+            raise MCPManagementError("server cannot be tested")
         client = mcp_connection.build_mcp_client(
             config,
-            registry=self._policy_registry(),
+            registry=registry,
             home=str(self.home) if self.home else None,
+            capture_stderr=not wire,
         )
+        limits = (registry.mcp_limits if registry is not None else None) or MCPCallLimits()
         try:
-            await client.connect()
-            tools = await client.list_tools()
+            async with asyncio.timeout(limits.deadline_seconds):
+                await client.connect()
+                tools = await client.list_tools()
+            if wire:
+                return {"status": "ok", "tool_count": len(tools)}
             summaries = []
             for tool in sorted(tools, key=lambda value: value.name):
                 description = tool.description
@@ -1012,29 +1035,27 @@ class MCPManagementService:
                     description = description[:117] + "..."
                 summaries.append({"name": tool.name, "description": description})
             return {"name": name, "tools": summaries, "status": "ok"}
+        except TimeoutError:
+            return {"name": name, "tools": [], "status": "failed", "detail": "MCP probe timed out"}
         finally:
             await client.close()
 
     async def login(
-        self, name: str, *, scope: Scope = "effective", no_browser: bool = False
+        self, name: str, *, scope: Scope = "effective", no_browser: bool = False,
+        launch_ready: Callable[[str], None] | None = None,
+        before_commit: Callable[[], None] | None = None,
+        registry: ToolRegistry | None = None,
     ) -> None:
         from .oauth import authorize
 
-        item = await self.resolve(name, scope=scope)
-        if not self._server_allowed(name):
-            raise MCPManagementError(f"{name}: skipped by tool policy")
-        if item.config.get("transport") != "streamable-http":
-            raise MCPManagementError(
-                "OAuth requires an HTTP MCP server "
-                f"(got transport {item.config.get('transport')})"
-            )
-        config = (
-            await asyncio.to_thread(load_mcp_config, self.path(item.scope))
-        ).configured_servers.get(name)
-        if config is None:
-            raise MCPManagementError(f"server cannot be used for OAuth: {name}")
-        await self._credential_store.load(name)
-        candidate = await authorize(
+        registry = registry if registry is not None else self._policy_registry()
+        item, config = await asyncio.to_thread(self._command_target, name, scope)
+        if not mcp_connection.mcp_server_allowed(registry, name):
+            raise MCPManagementError("skipped by tool policy")
+        if config is None or item.config.get("transport") != "streamable-http":
+            raise MCPManagementError("OAuth requires an HTTP MCP server", code="invalid_params")
+        flow = partial(
+            authorize,
             server_name=name,
             server_url=config.url or "",
             client_id=config.client_id,
@@ -1043,16 +1064,38 @@ class MCPManagementService:
             scopes=config.scopes,
             authorization_server_url=config.authorization_server_url,
             resource_metadata_url=config.resource_metadata_url,
-            authorization_params=config.authorization_params,
-            no_browser=no_browser,
         )
-        credential = await self._credential_store.save_login(name, candidate)
-        self._credential_status[name] = token_state(credential.token)
+        if launch_ready is not None:
+            token = await self._login_headless(
+                name, partial(flow, launch_ready=launch_ready), before_commit,
+            )
+        else:
+            await self._credential_store.load(name)
+            candidate = await flow(authorization_params=config.authorization_params, no_browser=no_browser)
+            if before_commit is not None:
+                before_commit()
+            token = (await self._credential_store.save_login(name, candidate)).token
+        self._credential_status[name] = token_state(token)
         self.credential_store_error = None
         await self.refresh()
 
+    async def _login_headless(
+        self, name: str, flow: Callable[[], Awaitable[MCPOAuthToken]],
+        before_commit: Callable[[], None] | None,
+    ) -> MCPOAuthToken | None:
+        initial = await self._credential_store.load(name)
+        candidate = await flow()
+        if before_commit is not None:
+            before_commit()
+        saved = await self._credential_store.save_if_current(
+            name, initial.generation, candidate, allow_new_login=True,
+        )
+        if saved.disposition is not SaveDisposition.COMMITTED:
+            raise MCPManagementError("credentials changed during login")
+        return saved.snapshot.token
+
     async def logout(self, name: str, *, scope: Scope = "effective") -> None:
-        await self.resolve(name, scope=scope)
+        await asyncio.to_thread(self._command_target, name, scope)
         await self._credential_store.delete(name)
         self._credential_status[name] = "unauthorized"
         self.credential_store_error = None
