@@ -14,6 +14,7 @@ from ...project_inbox import (
     InboxError,
     ProjectInbox,
 )
+from ...project_inbox_provenance import is_trusted
 from ...project_inbox_sent import SentMessageTracker
 from ...project_registry import ProjectRegistryError, resolve_project_ref
 from ...project_schema import PROJECT_ID_PATTERN
@@ -91,7 +92,7 @@ def _sender_header(messages: list[dict[str, Any]]) -> str:
 def _model_visible(action: str, project_id: str, result: dict[str, Any]) -> str:
     payload = json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False)
     messages = _result_messages(result)
-    if all(message.get("authority") == "trusted_assignment" for message in messages):
+    if all(is_trusted(message) for message in messages):
         return (
             f"Inbox {action} result for project {project_id}.\n"
             f"{_sender_header(messages)}"

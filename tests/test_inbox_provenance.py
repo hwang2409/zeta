@@ -83,8 +83,8 @@ async def _run_model_route(
             for block in message_.content if isinstance(block, TextContent)
         )
         text = notification.data["text"]
-        expected = "Requests are work to do" if epoch < 7 else "Project inbox wake"
-        assert expected in text
+        assert "Project inbox wake" in text
+        assert "Requests are work to do" not in text
         assert text in model_text
         if epoch >= 7:
             assert "trusted_assignment" not in model_text
@@ -120,8 +120,8 @@ async def _run_live_route(
         rendered = _rendered_text(event.data)
         served = await _serve_payload(event.data)
         assert served["text"] == rendered
-        expected = "Requests are work to do" if epoch < 7 else "Project inbox wake"
-        assert expected in rendered
+        assert "Project inbox wake" in rendered
+        assert "Requests are work to do" not in rendered
         if epoch >= 7:
             assert "trusted_assignment" not in rendered
     finally:
@@ -155,7 +155,7 @@ async def _run_rpc_route(
         if epoch < 7:
             assert "authority" not in row
             assert "author" not in row
-            assert result["untrusted"] is False
+            assert result["untrusted"] is True
         else:
             expected_authority = "trusted_assignment" if case in {"delegated", "legacy"} else "information"
             assert row["authority"] == expected_authority
@@ -377,3 +377,39 @@ async def test_epoch_five_refuses_delegation_through_tui_and_serve_slash_paths(
     )
     assert claimed is not None
     assert "authority" not in claimed
+
+
+@pytest.mark.parametrize("epoch", [5, 7])
+@pytest.mark.asyncio
+async def test_serve_list_and_state_agree_on_agent_message_trust(
+    tmp_path: Path, epoch: int
+) -> None:
+    """An agent send is information on every serve surface, below the epoch too."""
+    _home, registry, sender, recipient, manager, opened, inbox = await _create_fixtures(
+        tmp_path, epoch
+    )
+    message_id = await asyncio.to_thread(
+        inbox.send, from_project=sender.project_id, from_session="a" * 32,
+        to_project=recipient.project_id, kind="question", title="t", body="b",
+    )
+    opened.store.close()
+    registry._storage_lease.close()
+    manager._storage_lease.close()
+    server = _server(tmp_path)
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects", "state_read_v1"])
+        listed = (await _request(
+            reader, writer, 2, "project_inbox", {"project_id": recipient.project_id},
+        ))[-1]["result"]
+        state = (await _request(
+            reader, writer, 3, "state_inbox", {"project_id": recipient.project_id},
+        ))[-1]["result"]
+        assert [row["id"] for row in listed["messages"]] == [message_id]
+        row = next(item for item in state["items"] if item["message_id"] == message_id)
+        assert listed["untrusted"] is not row["trusted_assignment"], (
+            f"epoch {epoch}: project_inbox and state_inbox disagree on trust"
+        )
+        assert listed["untrusted"] is True
+    finally:
+        await close_serve(server, writer)
