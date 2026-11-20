@@ -13,6 +13,7 @@ import pytest
 from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
 from zeta.server.handlers.resources import FAMILIES
+from zeta.server.login import Logins
 from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
@@ -121,6 +122,8 @@ _OWNER_FAILURE_CASES = {
     "mcp_server_set_trusted": (f"{_MCP_OWNER}.set_trusted", {
         "revision": _REVISION, "mutation": {"name": "test", "trusted": True},
     }),
+    "account_list": ("zeta.accounts.AccountStore.catalog_snapshot", {}),
+    "login_start": ("zeta.server.login.Logins.login_start", {"provider": "claude"}),
 }
 
 
@@ -136,6 +139,7 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
 
     client = SimpleNamespace(
         connections=SimpleNamespace(run_blocking=run_blocking),
+        logins=Logins(tmp_path),
         server=SimpleNamespace(
             home=tmp_path,
             runtime=SimpleNamespace(

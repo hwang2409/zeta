@@ -12,6 +12,7 @@ from .store import (
     AccountCredentials,
     AccountError,
     AccountId,
+    AccountLockBusyError,
     AccountLoopThreadLockError,
     AccountStore,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "AccountError",
     "AccountId",
     "AccountListSnapshot",
+    "AccountLockBusyError",
     "AccountLoopThreadLockError",
     "AccountRegistryBrokenError",
     "AccountRegistryMissingError",
