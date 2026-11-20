@@ -118,12 +118,10 @@ def _catalog(items, filenames, offset, limit, fits):
 
 
 def _detail(item, document, fits):
-    from ...protocol import ErrorDescriptor, ProtocolError, closed_error
+    from ...protocol import ErrorDescriptor, closed_error, invalid_resource_params
 
     if item is None:
-        raise ProtocolError(ErrorDescriptor.INVALID_PARAMS, "library resource not found", {
-            "code": "invalid_params", "reason": "resource_not_found",
-        })
+        raise invalid_resource_params(reason="resource_not_found")
     metadata, body = (
         (document.metadata, document.body) if document is not None
         else (_fields(item), item.prompt_suffix or item.preamble)
