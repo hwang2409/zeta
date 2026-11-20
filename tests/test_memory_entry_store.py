@@ -472,3 +472,52 @@ def test_memory_source_evidence_rank_is_canonical_and_bounded(
     )
     with pytest.raises(ProjectRegistryError, match="entry source"):
         canonical_state_bytes(invalid_state)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "secret"),
+    [
+        (
+            "api_key = sk_exampleabcdefghijklmnopqrstuvwx1234",
+            "[secret omitted]",
+            "sk_exampleabcdefghijklmnopqrstuvwx1234",
+        ),
+        (
+            "use token=ghp_abcdefghijklmnopqrstuvwx now",
+            "use token=[secret omitted] now",
+            "ghp_abcdefghijklmnopqrstuvwx",
+        ),
+        (
+            "secret: AKIAABCDEFGHIJKLMNOP end",
+            "[secret omitted] end",
+            "AKIAABCDEFGHIJKLMNOP",
+        ),
+        (
+            "key AKIAABCDEFGHIJKLMNOP and password=hunter22",
+            "key [secret omitted] and [secret omitted]",
+            "hunter22",
+        ),
+        (
+            "API_KEY=sk_live_abcdefghijklmnopqrst;PASSWORD: hunter2",
+            "[secret omitted]",
+            "hunter2",
+        ),
+        ("nothing here", "nothing here", ""),
+    ],
+)
+def test_redact_secrets_overlapping_patterns_yield_one_clean_marker(
+    text: str, expected: str, secret: str
+) -> None:
+    from zeta.memory.safety import REDACTED_SECRET, redact_secrets
+
+    redacted = redact_secrets(text)
+    assert redacted == expected
+    marker_fragments = {
+        REDACTED_SECRET[i : i + 4] for i in range(len(REDACTED_SECRET) - 3)
+    }
+    leaked = [
+        fragment
+        for fragment in (secret[i : i + 4] for i in range(len(secret) - 3))
+        if fragment in redacted and fragment not in marker_fragments
+    ]
+    assert leaked == []
