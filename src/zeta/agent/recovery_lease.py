@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Protocol
 
+from ..core.agent_state import BrokenAgentLifecycle, read_agent_lifecycle_state
 from ..core.session_execution import SessionOwnedError
-from ..core.store import ConversationStore, TranscriptLoadError
+from ..core.store import ConversationIntegrityError, ConversationStore
 from ..protocol.types import ToolResult
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class AgentLoopForRecovery(Protocol):
@@ -77,18 +81,33 @@ def acquire_recovery_subtree(
     leases: ExitStack,
     recovery_stores: dict[Path, ConversationStore],
 ) -> bool:
-    """Lease a complete child subtree before any recovery mutation."""
+    """Lease a complete child subtree before any recovery mutation.
+
+    A child whose files cannot be read is left as it is (marker and all) and
+    logged: recovery cannot decide its outcome, and startup must not fail.
+    """
 
     try:
         child_store = open_child_store(parent_store, child_path)
     except SessionOwnedError:
         return False
-    except TranscriptLoadError:
+    except ConversationIntegrityError as exc:
+        _LOGGER.warning("child recovery skipped for %s: %s", child_path, exc)
         return False
     if child_store is None:
         return True
     leases.enter_context(child_store)
     if not leases.enter_context(child_store.orphan_recovery_lease()):
+        return False
+    lifecycle = read_agent_lifecycle_state(
+        child_store.directory_fd, child_store.agent_lifecycle_path
+    )
+    if isinstance(lifecycle, BrokenAgentLifecycle):
+        _LOGGER.warning(
+            "child recovery skipped for %s: broken agent_lifecycle.json (%s)",
+            child_path,
+            lifecycle.reason,
+        )
         return False
     recovery_stores[child_path] = child_store
     return all(
