@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -13,6 +14,7 @@ from tests.support.serve_close import close_serve
 from tests.support.serve_contract import ServeClient, ServeContract
 from tests.test_server import _connect, _request
 from tests.test_server_projects import _server
+from zeta import storage_format
 from zeta.project_errors import ProjectRegistryBusyError
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
@@ -29,9 +31,11 @@ async def _off_loop(call, *args, **kwargs):
     return await await_or_fail(asyncio.to_thread(call, *args, **kwargs), what="registry setup")
 
 
-def _projects(root: Path, *, entry_memory: bool = False) -> tuple[str, str]:
-    """Alpha owns ``root/alpha``; beta has no root. Release the test's writer lease after setup."""
-    registry = ProjectRegistry(root / "home" / "projects")
+def _projects(root: Path, *, entry_memory: bool = False, writer_epoch: int | None = None) -> tuple[str, str]:
+    """Alpha owns ``root/alpha``; beta has no root. Release the test's writer lease after setup.
+    ``writer_epoch`` creates the home at that lower storage epoch."""
+    with mock.patch.object(storage_format, "WRITER_EPOCH", writer_epoch or storage_format.WRITER_EPOCH):
+        registry = ProjectRegistry(root / "home" / "projects")
     (root / "alpha").mkdir()
     try:
         alpha = registry.create_project("alpha", "repo", (root / "alpha").resolve())
@@ -314,5 +318,29 @@ async def test_inbox_send_saved_for_retry_tells_the_client_not_to_resend(
         assert retry[-1]["result"]["data"] == {"message_id": message_id, "pending": False}
         inbox = await _request(reader, writer, "inbox", "project_inbox", {"project_id": beta})
         assert [row["id"] for row in inbox[-1]["result"]["messages"]] == [message_id]
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_inbox_resend_below_delegation_epoch_is_idempotent(tmp_path: Path) -> None:
+    below = storage_format.FEATURE_EPOCHS[storage_format.StorageFeature.INBOX_DELEGATION] - 1
+    _alpha, beta = await _off_loop(_projects, tmp_path, writer_epoch=below)
+    server = _server(tmp_path)
+    reader, writer = await _in_process(server, [*FEATURES, "session_cwd"])
+    try:
+        created = await _request(reader, writer, "new", "new_session", {
+            "provider": "codex", "cwd": str((tmp_path / "alpha").resolve()),
+        })
+        assert "result" in created[-1], created
+        params = {"project_id": beta, "mutation": {"kind": "question", "title": "t", "body": "b", "delivery_id": "web-old"}}
+
+        sent = await _request(reader, writer, "send", "project_inbox_send", params)
+        assert "result" in sent[-1], sent
+        retry = await _request(reader, writer, "retry", "project_inbox_send", params)
+        assert "result" in retry[-1], retry
+        assert retry[-1]["result"] == sent[-1]["result"]
+        inbox = await _request(reader, writer, "inbox", "project_inbox", {"project_id": beta})
+        assert [row["id"] for row in inbox[-1]["result"]["messages"]] == [sent[-1]["result"]["data"]["message_id"]]
     finally:
         await close_serve(server, writer)
