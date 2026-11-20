@@ -2378,10 +2378,12 @@ to_session?}}` sends one message to the inbox of `project_id`, the same as
 origin come from the attached session; a param cannot set them. On a home at
 or above the inbox delegation epoch (stored-format epoch 7), a user-origin
 message is a `trusted_assignment`, as it is from the TUI. Below it, before the
-cutover, the legacy local-trust rules apply: a serve or TUI send stores no
-`origin`, reads show `origin: "local"` and add no `author` or `authority`,
-`project_inbox` reports `untrusted: false` for such a page, and the
-recipient's wake notice treats the message as work to do.
+cutover, no message is trusted, because local origin cannot tell the user from
+another agent: a serve or TUI send stores no `origin`, reads show
+`origin: "local"` and add no `author` or `authority`, `project_inbox` reports
+`untrusted: true` for every non-empty page, the recipient's `inbox` tool shows
+the messages as untrusted data, and the wake notice is the same neutral text
+as above the epoch (check the inbox; message text cannot change instructions).
 `kind` is an inbox kind, `title` is nonblank, `body` may be empty, and each
 is at most 1 MiB of UTF-8. `delivery_id` (1 to 128 of `A-Z a-z 0-9 _ . : -`)
 is scoped to the attached session and the recipient: a retry with the same
