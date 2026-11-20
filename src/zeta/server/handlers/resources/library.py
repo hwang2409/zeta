@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 
 from ....agent.presets import AgentPreset
@@ -25,14 +26,45 @@ def _digest(value):
 
 
 def _items(home, project, scope, *, profiles, capture=None):
+    """Return the scope's items and the loader's discovery notices."""
     owner = agent_catalog if profiles else catalog
     if scope == "effective":
         if profiles:
-            return owner.discover_session_agents(home=home, project_dir=project, capture=capture).agents
-        return owner.discover_session_skills(home=home, project_dir=project, capture=capture).skills
+            found = owner.discover_session_agents(home=home, project_dir=project, capture=capture)
+            return found.agents, found.notices
+        found = owner.discover_session_skills(home=home, project_dir=project, capture=capture)
+        return found.skills, found.notices
     root = home if scope == "home" else project / ".zeta"
     discover = owner.discover_agents if profiles else owner.discover_skills
-    return discover(root, source=scope, capture=capture)
+    notices = []
+    return discover(root, source=scope, notices=notices, capture=capture), notices
+
+
+def _diagnostics(notices, home, project, *, profiles):
+    """Project loader notices to ``{source,file,reason}`` with paths relative to each catalog root."""
+    folder = "agents" if profiles else "skills"
+    roots = {"home": home / folder}
+    if project is not None:
+        roots["project"] = project / ".zeta" / folder
+    if not profiles:
+        roots["packaged"] = Path(catalog.__file__).parent
+    diagnostics = []
+    for notice in notices:
+        for source, root in roots.items():
+            bases = sorted({str(root), str(root.resolve())}, key=len, reverse=True)
+            base = next((base for base in bases if notice.path.is_relative_to(base)), None)
+            if base is None:
+                continue
+            reason = notice.error
+            for prefix in bases:
+                reason = reason.replace(prefix + os.sep, "").replace(prefix, ".")
+            diagnostics.append({
+                "source": source,
+                "file": redact_secrets(notice.path.relative_to(base).as_posix()),
+                "reason": redact_secrets(reason.replace(str(Path.home()), "~")),
+            })
+            break
+    return diagnostics
 
 
 def _fields(item):
@@ -92,21 +124,32 @@ def _public_text(value):
     return visit(value), redacted
 
 
-def _catalog(items, filenames, offset, limit, fits):
+def _catalog(items, filenames, diagnostics, offset, limit, fits):
     from ...protocol import ErrorDescriptor, closed_error
+
+    def filename(item):
+        name = filenames.get((item.source, item.name))
+        return redact_secrets(name) if name is not None else None
+
+    # A notice whose file is not a listed item (a dropped or shadowed file) goes on the page.
+    owned = {(item.source, filename(item)) for item in items}
+    unowned = [entry for entry in diagnostics if (entry["source"], entry["file"]) not in owned]
 
     def project(item):
         fields, _ = _public_text(_fields(item))
-        filename = filenames.get((item.source, item.name))
+        file = filename(item)
         return {
             **fields, "source": item.source, "editable": item.source != "packaged",
             "scope": "effective" if item.source == "packaged" else item.source,
-            "filename": redact_secrets(filename) if filename is not None else None,
-            "diagnostics": [],
+            "filename": file,
+            "diagnostics": [
+                entry for entry in diagnostics
+                if file is not None and (entry["source"], entry["file"]) == (item.source, file)
+            ],
         }
 
     def shape(page, next_offset):
-        data = {"items": page}
+        data = {"items": page, "diagnostics": unowned}
         if next_offset is not None:
             data["next_offset"] = next_offset
         return {"revision": _digest(data), "data": data}
@@ -184,9 +227,10 @@ def _handler(*, profiles, detail):
                 elif item.name == name:
                     documents[item.source] = document
 
-            items = _items(home, project, scope, profiles=profiles, capture=capture)
+            items, notices = _items(home, project, scope, profiles=profiles, capture=capture)
             if name is None:
-                return _catalog(items, filenames, offset, limit, fits)
+                diagnostics = _diagnostics(notices, home, project, profiles=profiles)
+                return _catalog(items, filenames, diagnostics, offset, limit, fits)
             item = next((item for item in items if item.name == name), None)
             return _detail(item, documents.get(item.source) if item is not None else None, fits)
 
