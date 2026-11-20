@@ -28,9 +28,13 @@ async def test_observer_can_list_but_cannot_mutate(tmp_path):
         client = await _connect(contract, "observer")
         listed = await client.request("list", "mcp_server_list")
         assert listed["result"]["data"] == {"items": []}
-        for action in ("add", "remove", "set_enabled", "set_trusted"):
-            method = f"mcp_server_{action}"
-            reply = await client.request(action, method, {"mutation": "intentionally malformed"})
+        status = await client.request("status", "mcp_auth_status", {"name": "example"})
+        assert status["result"] == {"data": {"state": "idle"}}
+        for method in (
+            "mcp_server_add", "mcp_server_remove", "mcp_server_set_enabled", "mcp_server_set_trusted",
+            "mcp_server_test", "mcp_auth_start", "mcp_auth_cancel", "mcp_auth_logout",
+        ):
+            reply = await client.request(method, method, {"mutation": "intentionally malformed"})
             assert reply["error"]["code"] == -32008
             assert reply["error"]["data"] == {
                 "code": "observer_read_only", "reason": "observer_read_only", "method": method,

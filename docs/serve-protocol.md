@@ -2013,6 +2013,11 @@ unnegotiated method returns `-32601`.
 | `mcp_server_remove` | `1.0` | `mcp_management_v1` | `controller_write` |
 | `mcp_server_set_enabled` | `1.0` | `mcp_management_v1` | `controller_write` |
 | `mcp_server_set_trusted` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_server_test` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_auth_start` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_auth_status` | `1.0` | `mcp_management_v1` | `read` |
+| `mcp_auth_cancel` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_auth_logout` | `1.0` | `mcp_management_v1` | `controller_write` |
 
 `mcp_server_list` accepts `{scope?}` and returns `{revision,data:{items}}`.
 Scope is `user`, `project`, or `effective` (default). The active session's
@@ -2053,6 +2058,42 @@ missing project or unreadable configuration). Observers attempting a write
 receive `-32008` with code
 and reason `observer_read_only`, plus the method, before parameter validation.
 Unnegotiated methods return `-32601`.
+
+`mcp_server_test`, `mcp_auth_start`, and `mcp_auth_logout` accept
+`{name,scope?}`, with the same scopes as list. `mcp_server_test` performs a
+bounded connection and lists tools without calling them or returning tool
+names, descriptions, or stdio stderr. It returns `{data:{status,tool_count}}`.
+One MCP call deadline covers initialization and listing. On timeout, the probe
+closes the transport, reaps any stdio child, and returns
+`{data:{status:"failed",tool_count:0}}`.
+Only the controller can run a test. A project stdio definition must be trusted.
+
+`mcp_auth_start` starts one headless HTTP OAuth attempt per serve process.
+It returns `{data:{state:"pending",authorization_url}}` after opening the
+loopback callback listener. The `authorization_url` field is an opaque,
+one-use launch URL on that same `127.0.0.1` listener, not the provider's URL.
+Open it with a browser that can reach the serve host's loopback address; do
+not log or persist it. The first GET redirects the browser to the provider
+with HTTP 302. Reuse returns 404 while the listener is open. Cancel and the
+OAuth callback timeout end the listener and invalidate the launch URL.
+Serve does not return the provider URL in any RPC response.
+
+OAuth uses the exact resource identifier advertised by protected-resource
+metadata, including any path. If discovery falls back to the configured MCP
+URL, that URL is used as the resource, not returned over serve. Headless mode
+still does not forward configured extra authorization parameters.
+
+`mcp_auth_status` and `mcp_auth_cancel` accept `{name}` and return
+`{data:{state}}` (`idle`, `pending`, `succeeded`, `failed`, or `cancelled`).
+Start also returns `failed` if discovery fails before the URL is available.
+Cancel waits for cleanup; a credential commit already in progress is allowed
+to finish. Status is safe for observers and performs no I/O. The attempt state
+is local to the current serve process, not a durable credential status.
+`mcp_auth_logout` cancels a local pending attempt and deletes the named
+credential, returning `{data:{state:"unauthorized"}}`. A concurrent logout
+fences earlier OAuth attempts even across serve processes. Only the controller
+can start, cancel, or log out. Another pending start returns `-32004
+operation_busy`.
 
 ### accounts
 

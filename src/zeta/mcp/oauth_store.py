@@ -192,12 +192,15 @@ class MCPCredentialStore:
         name: str,
         expected_generation: int,
         replacement: MCPOAuthToken,
+        *,
+        allow_new_login: bool = False,
     ) -> SaveIfCurrentResult:
         return await asyncio.to_thread(
             self._save_if_current_transaction,
             name,
             expected_generation,
             replacement,
+            **({"allow_new_login": True} if allow_new_login else {}),
         )
 
     async def delete(self, name: str) -> CredentialSnapshot:
@@ -354,6 +357,8 @@ class MCPCredentialStore:
         name: str,
         expected_generation: int,
         replacement: MCPOAuthToken,
+        *,
+        allow_new_login: bool = False,
     ) -> SaveIfCurrentResult:
         operation: CredentialOperation = "save_if_current"
         self._prepare_home(name, operation)
@@ -361,7 +366,7 @@ class MCPCredentialStore:
             lock_fd = self._lock(name, operation, exclusive=True)
             try:
                 current = self._read_locked(name, operation)
-                if current.token is None:
+                if current.token is None and not allow_new_login:
                     return SaveIfCurrentResult(SaveDisposition.DELETED, current)
                 if current.generation != expected_generation:
                     return SaveIfCurrentResult(SaveDisposition.STALE, current)
