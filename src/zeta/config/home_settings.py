@@ -12,12 +12,10 @@ Every function blocks (file locks and fsync); call it off the event loop.
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import json
 import os
 import re
-import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,6 +27,7 @@ from tomlkit.exceptions import TOMLKitError
 from ..agent.budget import HARD_MAX_AGENT_DEPTH
 from ..core.session_files import (
     SessionError,
+    flock_with_deadline,
     open_session_file,
     require_off_loop_lock,
     write_session_file,
@@ -38,7 +37,6 @@ from .settings import SETTINGS_FILENAME, Settings, validate_home_settings
 
 LOCK_NAME = f"{SETTINGS_FILENAME}.lock"
 LOCK_SECONDS = 0.25
-LOCK_POLL_SECONDS = 0.01
 _REVISION = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _HEADER = re.compile(rb"[ \t]*\[")  # a table or array-of-tables header line
 _OTEL_HEADER = re.compile(rb"""[ \t]*\[[ \t]*(?:otel|"otel"|'otel')[ \t]*\][ \t]*(?:#[^\r\n]*)?\r?\n?\Z""")
@@ -99,7 +97,8 @@ def _locked_home(home: Path) -> Iterator[int]:
     try:
         lock_fd = _open_file(home_fd, LOCK_NAME, os.O_RDWR | os.O_CREAT)
         try:
-            _lock(lock_fd)
+            if not flock_with_deadline(lock_fd, LOCK_SECONDS):
+                raise HomeSettingsError("settings_busy", retryable=True)
             yield home_fd
         finally:
             os.close(lock_fd)
@@ -171,18 +170,6 @@ def _read(home_fd: int) -> bytes:
         return b""
     with os.fdopen(fd, "rb") as handle:
         return handle.read()
-
-
-def _lock(fd: int) -> None:
-    deadline = time.monotonic() + LOCK_SECONDS
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                raise HomeSettingsError("settings_busy", retryable=True) from None
-            time.sleep(LOCK_POLL_SECONDS)
 
 
 def _read_home(home: Path) -> bytes:

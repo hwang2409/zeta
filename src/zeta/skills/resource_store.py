@@ -12,10 +12,8 @@ Every function blocks (file locks and fsync); call it off the event loop.
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import os
-import time
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -26,6 +24,7 @@ from ..agent.presets import AGENT_PRESETS
 from ..core.session_files import (
     SessionError,
     descend_directory,
+    flock_with_deadline,
     open_session_file,
     require_off_loop_lock,
     unlink_session_file,
@@ -37,8 +36,6 @@ from . import agent_catalog, catalog
 from .discovery import MarkdownDocument, NamedItem, parse_document
 
 LOCK_NAME = ".library.lock"
-LOCK_SECONDS = 0.25
-LOCK_POLL_SECONDS = 0.01
 
 
 class LibraryError(Exception):
@@ -120,7 +117,8 @@ def _target(root: Path, *, profiles: bool, name: str) -> Iterator[tuple[int, str
         # The lock lives in the root, so writers from every zeta home that shares it serialize.
         lock_fd = open_session_file(base_fd, LOCK_NAME, os.O_RDWR | os.O_CREAT)
         stack.callback(os.close, lock_fd)
-        _lock(lock_fd)
+        if not flock_with_deadline(lock_fd):
+            raise LibraryError("busy")
         path = _find(base, profiles=profiles, name=name) or base / f"{name}.md"
         if not path.parent.is_relative_to(base):
             raise LibraryError("unsafe_path")
@@ -132,18 +130,6 @@ def _target(root: Path, *, profiles: bool, name: str) -> Iterator[tuple[int, str
                 raise LibraryError("unsafe_path") from None
             raise
         yield directory_fd, path.name, _read(directory_fd, path.name)
-
-
-def _lock(fd: int) -> None:
-    deadline = time.monotonic() + LOCK_SECONDS
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                raise LibraryError("busy") from None
-            time.sleep(LOCK_POLL_SECONDS)
 
 
 def _find(base: Path, *, profiles: bool, name: str) -> Path | None:
@@ -170,6 +156,8 @@ def _read(directory_fd: int, name: str) -> bytes | None:
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise LibraryError("unsafe_path") from None
+        if exc.errno == errno.ENAMETOOLONG:
+            raise LibraryError("name_too_long") from None
         raise
     with os.fdopen(fd, "rb") as handle:
         return handle.read()

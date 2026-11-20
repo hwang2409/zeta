@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from ....memory.safety import redact_secrets
 from ...resource_protocol import (
     Access,
@@ -11,7 +9,7 @@ from ...resource_protocol import (
     require_params,
     require_revision,
 )
-from .library import valid_name
+from .library import project_root, valid_name
 
 FEATURE = "library_write_v1"
 
@@ -46,10 +44,10 @@ def _handler(*, profiles, delete):
         if scope == "home":
             base = client.server.home
         else:
-            opened = client.server.runtime.opened
-            if opened is None:
+            project = project_root(client)
+            if project is None:
                 raise closed_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
-            base = Path(opened.metadata.cwd) / ".zeta"
+            base = project / ".zeta"
         root = base / ("agents" if profiles else "skills")
 
         def run():

@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import subprocess
 import threading
 from pathlib import Path
 
@@ -17,9 +18,10 @@ from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.serve_contract import ServeContract
+from tests.support.server_client import send
 from tests.support.sockets import short_socket_path
 from tests.test_server import _connect, _read, _request
-from zeta.protocol.types import StreamEvent
+from zeta.protocol.types import StreamEvent, StreamEventType
 from zeta.server import ZetaServer
 from zeta.skills import resource_store
 from zeta.tui.render import render_event
@@ -150,6 +152,8 @@ async def test_observer_cannot_write_and_controller_writes_with_cas(tmp_path: Pa
                 "name": name, "scope": "home", "mutation": {"document": _document("x")},
             })
             assert reply["error"]["code"] == -32602
+        too_long = await client.request("too-long", "skill_delete", {"name": "n" * 300, "scope": "home", "revision": "0" * 64})
+        assert _reason(too_long) == "name_too_long"
         (outside / "target.md").write_text("outside")
         (home / "skills" / "evil.md").symlink_to(outside / "target.md")
         linked_file = await client.request("linked-file", "skill_write", {
@@ -198,7 +202,7 @@ def _server(tmp_path: Path) -> ZetaServer:
 
 async def _hello(reader, writer) -> None:
     await _request(reader, writer, "hello", "hello", {
-        "protocol_version": "1.2", "features": ["library_write_v1", "live_config_changed"],
+        "protocol_version": "1.2", "features": ["library_read_v1", "library_write_v1", "live_config_changed"],
     })
 
 
@@ -212,6 +216,7 @@ async def test_create_race_loses_to_the_file_published_first(tmp_path: Path, mon
         original(current, revision, name, profiles=profiles)
         target.write_text(winner)  # another creator publishes after our missing-file check
 
+    # test-contract: seam forces the create race between the missing-file check and the publish
     monkeypatch.setattr(resource_store, "_check", check_then_lose)
     server = _server(tmp_path)
     reader, writer = await _connect(server)
@@ -294,17 +299,59 @@ async def test_written_skill_refreshes_live_catalog_once(tmp_path: Path) -> None
         }))[-1]
         assert "result" in created
 
-        events: list[StreamEvent] = []
-        loop.set_background_event_sink(events.append)
         await await_or_fail(loop.refresh_live_config(), what="turn-boundary refresh")
         await await_or_fail(loop.refresh_live_config(), what="second refresh")
-        assert len(events) == 1, "one write must produce one config_changed"
         assert "fresh" in {skill.name for skill in loop.tool_registry.skill_catalog.skills}
-        rendered = render_event(events[0])
+        # the serve sink delivers every published event before the probe's reply
+        await send(reader, writer, "probe", "skill_catalog")
+        changes = []
+        while (frame := await _read(reader)).get("id") != "probe":
+            if frame.get("params", {}).get("event") == "config_changed":
+                changes.append(frame["params"]["data"])
+        assert len(changes) == 1, "one write must produce one config_changed"
+        assert changes[0]["message"] == "skills changed: added fresh"
+        rendered = render_event(StreamEvent(StreamEventType.CONFIG_CHANGED, data=changes[0]))
         assert isinstance(rendered, Text) and rendered.plain == "skills changed: added fresh"
-        await server.control._event(events[0], background=True)
-        frame = await _read(reader)
-        assert frame["params"]["event"] == "config_changed"
-        assert frame["params"]["data"]["message"] == "skills changed: added fresh"
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_project_scope_uses_the_root_sessions_load_from_a_worktree(tmp_path: Path) -> None:
+    repo, home = tmp_path / "repo", tmp_path / "home"
+    worktree = repo / ".worktrees" / "wt"
+    repo.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.com", *args],
+                       cwd=repo, check=True, capture_output=True)
+
+    git("init")
+    git("commit", "--allow-empty", "-m", "initial")
+    git("worktree", "add", "-b", "feature", str(worktree))
+    cwd = worktree / "sub"
+    cwd.mkdir()
+    server = ZetaServer(
+        provider="codex", home=home, cwd=cwd, socket_path=short_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer)
+        await _request(reader, writer, "start", "new_session", {"provider": "codex"})
+        document = _document("alpha")
+        written = (await _request(reader, writer, "write", "skill_write", {
+            "name": "alpha", "scope": "project", "mutation": {"document": document},
+        }))[-1]
+        assert "result" in written, written
+        landed = sorted(path.relative_to(tmp_path).as_posix() for path in tmp_path.rglob("alpha.md"))
+        assert landed == ["repo/.zeta/skills/alpha.md"], "write must land in the root sessions load from"
+        assert (repo / ".zeta" / "skills" / "alpha.md").read_text() == document
+        catalog = (await _request(reader, writer, "catalog", "skill_catalog", {"scope": "project"}))[-1]
+        assert [item["name"] for item in catalog["result"]["data"]["items"]] == ["alpha"]
+        loop = server.runtime.loop
+        assert loop is not None
+        await await_or_fail(loop.refresh_live_config(), what="live refresh")
+        assert "alpha" in {skill.name for skill in loop.tool_registry.skill_catalog.skills}
     finally:
         await close_serve(server, writer)

@@ -199,6 +199,12 @@ def _detail(item, document, fits):
     return result
 
 
+def project_root(client):
+    """The project root running sessions load skills and agents from, or None without a session."""
+    runtime = client.server.runtime
+    return runtime.project_dir if runtime.opened is not None else None
+
+
 def valid_name(name):
     """A name that maps to one file component under a catalog root."""
     return (
@@ -224,8 +230,7 @@ def _handler(*, profiles, detail):
         if scope not in _SCOPES or type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
             raise invalid_resource_params()
         home = client.server.home
-        opened = client.server.runtime.opened
-        project = Path(opened.metadata.cwd) if opened is not None and scope != "home" else None
+        project = project_root(client) if scope != "home" else None
         if scope == "project" and project is None:
             raise closed_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
 

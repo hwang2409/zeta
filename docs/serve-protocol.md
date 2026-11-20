@@ -2189,7 +2189,10 @@ lower-tier file that a higher tier shadows, has no item: its warning is in the
 page-level `data.diagnostics`, which every page carries in full. Reasons are
 untrusted text.
 
-Project scope reads `.zeta` under the attached session's working directory.
+Project scope reads `.zeta` under the attached session's project root: the
+primary checkout of its git repository (also for a linked worktree or a
+subdirectory), or its working directory outside git. Running sessions load
+project skills and agent profiles from the same directory.
 Without an attached session, explicit `project` scope is unavailable and
 `effective` reads only home and packaged items. In `effective`, project
 shadows home and home shadows packaged definitions of the same name.
@@ -2227,7 +2230,8 @@ owner failures return `-32000`. Unnegotiated methods return `-32601`.
 
 `skill_write` and `agent_profile_write` take
 `{name,scope,revision?,mutation:{document}}`. `scope` is `home` or `project`
-(the `.zeta` directory under the attached session's working directory).
+(the `.zeta` directory under the attached session's project root, the same
+directory the catalog reads and running sessions load).
 `document` is the whole markdown file: YAML frontmatter and body, at most
 128 KiB of UTF-8. The server validates it with the same loader as the
 catalogs before it writes anything; its frontmatter `name` must equal `name`.
@@ -2256,6 +2260,7 @@ existing `config_changed` event; there is no new event.
 Errors: `-32602` (`data.code: invalid_params`) for bad parameters, with
 `data.reason` set to `invalid_document` (and a public loader message in
 `data.detail`), `name_mismatch`, `document_too_large`, `unsafe_path`,
+`name_too_long` (the file name is longer than the file system allows),
 `resource_not_found`, or `packaged_read_only` for a packaged item (the
 catalog's `effective` scope, or a name that only a packaged item defines);
 `-32009 stale_library_revision` (both `data.code` and `data.reason`) for a
