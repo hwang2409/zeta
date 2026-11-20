@@ -42,7 +42,7 @@ async def test_observer_library_reads(tmp_path: Path) -> None:
         assert page == {"items": [{
             "name": "alpha", "description": "Notes [secret omitted]", "keywords": [], "source": "home",
             "scope": "home", "filename": "alpha.md", "editable": True, "diagnostics": [],
-        }], "next_offset": 1}
+        }], "diagnostics": [], "next_offset": 1}
         tail = (await observer.request("tail", "skill_catalog", {
             "scope": "home", "offset": page["next_offset"], "limit": 1,
         }))["result"]["data"]
@@ -69,5 +69,39 @@ async def test_observer_library_reads(tmp_path: Path) -> None:
         assert "result" in await controller.request("start", "new_session", {"provider": "codex"})
         effective = (await observer.request("effective", "skill_read", {"name": "alpha", "scope": "effective"}))["result"]["data"]
         assert (effective["source"], effective["body"]) == ("project", "Project body")
+    finally:
+        await contract.close()
+
+
+@pytest.mark.asyncio
+async def test_catalog_reports_loader_diagnostics(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "skills").mkdir(parents=True)
+    (home / "agents").mkdir()
+    (home / "skills" / "broken.md").write_text("---\nname: [\n---\nbody\n")
+    (home / "agents" / "broken.md").write_text("---\nname: [\n---\nbody\n")
+    (home / "agents" / "drifter.md").write_text("---\nname: drifter\ndescription: d\nmodel: nonsense\n---\nbody\n")
+    contract = await ServeContract.start(tmp_path, "websocket")
+    try:
+        observer = await contract.connect("observer")
+        await observer.request("hello", "hello", {
+            "protocol_version": "1.2", "role": "observer", "features": ["serve_observers", "library_read_v1"],
+        })
+        skills = await observer.request("skills", "skill_catalog", {"scope": "home"})
+        assert skills["result"]["data"].get("diagnostics") == [
+            {"source": "home", "file": "broken.md", "reason": "skill broken.md has invalid YAML frontmatter"},
+        ]
+        profiles = await observer.request("profiles", "agent_profile_catalog")
+        data = profiles["result"]["data"]
+        assert data.get("diagnostics") == [
+            {"source": "home", "file": "broken.md", "reason": "agent broken.md has invalid YAML frontmatter"},
+        ]
+        drifter = next(item for item in data["items"] if item["name"] == "drifter")
+        assert drifter["diagnostics"] == [{
+            "source": "home", "file": "drifter.md",
+            "reason": "unknown model; agent will inherit the parent model",
+        }]
+        assert str(tmp_path) not in json.dumps([skills, profiles])
+        assert str(Path.home()) not in json.dumps([skills, profiles])
     finally:
         await contract.close()

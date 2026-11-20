@@ -2163,7 +2163,7 @@ TUI already shows skills and agent profiles.
 Catalog requests accept `{scope?,offset?,limit?}`. `scope` is `effective`
 (default), `home`, or `project`. `offset` starts at zero; `limit` is an integer
 from 1 through 100 (default 50). Catalogs return
-`{revision,data:{items,next_offset?}}`. Items are sorted by name. Use the
+`{revision,data:{items,diagnostics,next_offset?}}`. Items are sorted by name. Use the
 returned `next_offset` to continue; omission means the end. The revision is a
 SHA-256 of the canonical JSON of the returned page data, not a document
 revision. Catalog pages are live and may change between requests.
@@ -2175,8 +2175,19 @@ revision. Catalog pages are live and may change between requests.
 `source` is `packaged`, `home`, or `project`. The item `scope` is the selector
 for a detail request: `effective` for packaged items, otherwise its source.
 `filename` is relative to the catalog root, or null for a built-in agent
-profile. Packaged items are not editable. `diagnostics` is an empty array;
-owner warnings and their paths are not sent over serve.
+profile. Packaged items are not editable.
+
+`diagnostics` carries the load warnings that the TUI prints at startup, as
+`[{source,file,reason}]`. `file` is relative to the `source` catalog root
+(`.` for the root directory itself); `reason` is the loader's message with
+catalog root paths made relative, the user's home directory shown as `~`, and
+the shared secret redactor applied. A warning about a listed item (for example
+an unknown profile model, or the agent "custom definition overrides packaged
+preset" warning, which goes on the overriding item) is in that item's
+`diagnostics`. Only a file the loader skipped, or the own warning of a
+lower-tier file that a higher tier shadows, has no item: its warning is in the
+page-level `data.diagnostics`, which every page carries in full. Reasons are
+untrusted text.
 
 Project scope reads `.zeta` under the attached session's working directory.
 Without an attached session, explicit `project` scope is unavailable and
