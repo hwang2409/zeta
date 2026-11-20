@@ -792,7 +792,10 @@ class CheckpointTranscriptMixin:
                     ):
                         data = {
                             "notification_id": entry.id,
-                            **project_notification_data(entry.data),
+                            **project_notification_data(
+                                entry.data,
+                                observed_epoch=self.loop.store.observed_storage_epoch,
+                            ),
                         }
                         rendered = self._presenter.render_event(
                             StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=data)

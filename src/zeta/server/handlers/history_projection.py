@@ -70,6 +70,7 @@ class HistoryProjection:
     frontier_row_id: str | None = None
     approval_origins: Mapping[str, object] = MappingProxyType({})
     nested_anchors: frozenset[str] = frozenset()
+    observed_epoch: int | None = None
 
 
 @dataclass
@@ -408,6 +409,7 @@ def history_projection(
         frontier_row_id=branch[-1].id if branch else None,
         approval_origins=MappingProxyType(approval_origins),
         nested_anchors=frozenset(nested_approval_anchors(branch)),
+        observed_epoch=getattr(store, "observed_storage_epoch", None),
     )
     if stable_generation is None or skip_cache:
         return built
@@ -493,6 +495,7 @@ def _history_entry_rows(
     fidelity: bool = False,
     content_read: bool = False,
     approval_origin: bool = False,
+    observed_epoch: int | None = None,
 ) -> list[dict[str, object]]:
     """Project one durable entry to one atomic group of history rows."""
 
@@ -532,7 +535,7 @@ def _history_entry_rows(
     if entry_type == "warning":
         return [_transcript_recovery_history_row(entry)]
     if entry_type == "notification":
-        data = project_notification_data(entry.data)
+        data = project_notification_data(entry.data, observed_epoch=observed_epoch)
         kind = data.get("kind", "agent_completion")
         if kind == "task_exited":
             text = (
@@ -726,6 +729,7 @@ def _history_group(
             fidelity=fidelity,
             content_read=content_read,
             approval_origin=approval_origin,
+            observed_epoch=projection.observed_epoch,
         )
     ]
     forward, forward_size = _project_history_group(raw, {"next_offset": end})
@@ -781,6 +785,7 @@ def _history_group_fits(
             fidelity=fidelity,
             content_read=content_read,
             approval_origin=approval_origin,
+            observed_epoch=projection.observed_epoch,
         )
     ]
     group, size = _project_history_group(raw, kwargs)

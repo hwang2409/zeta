@@ -10,7 +10,6 @@ from typing import Literal
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.store import ConversationStore
 from ..core.store._child_runs import run_row_identity
-from ..project_inbox_sent.notifications import project_inbox_notification
 from ..protocol.types import (
     Message,
     MessageOrigin,
@@ -87,10 +86,8 @@ class AgentNotificationMixin:
                 data={
                     "notification_id": notification.id,
                     **project_notification_data(
-                        project_inbox_notification(
-                            notification.data,
-                            observed_epoch=self.store.observed_storage_epoch,
-                        )
+                        notification.data,
+                        observed_epoch=self.store.observed_storage_epoch,
                     ),
                     "kind": notification.data.get("kind", "agent_completion"),
                     "tui_presented": self.store.is_agent_notification_presented_to_tui(
