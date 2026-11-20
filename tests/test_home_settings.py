@@ -86,19 +86,13 @@ def test_missing_file_projects_defaults_and_update_creates_it(tmp_path: Path) ->
 
     assert got == {
         "revision": _revision(b""),
-        "settings": {
-            "telemetry": {"enabled": False, "source": "off", "editable": True},
-            "model": None, "agents": {"max_depth": 3, "explicit_finish": False},
-        },
+        "settings": {"telemetry": {"enabled": False, "source": "off", "editable": True}},
         "settings_malformed": False,
     }
     written = (home / "settings.toml").read_bytes()
     assert written == f'otel.endpoint = "{BUILTIN}"\n'.encode()
     assert updated["revision"] == _revision(written)
-    assert updated["settings"] == {
-        "telemetry": {"enabled": True, "source": "builtin", "editable": True},
-        "model": None, "agents": {"max_depth": 3, "explicit_finish": False},
-    }
+    assert updated["settings"] == {"telemetry": {"enabled": True, "source": "builtin", "editable": True}}
 
 
 @pytest.mark.parametrize("body", [b"model = [\n", b"model = \"\xff\"\n", b"[otel]\nendpoint = 5\n"])
@@ -245,40 +239,15 @@ def _set(home: Path, changes: list) -> bytes | None:
     return _bytes(home)
 
 
-_SCALAR_ROUND_TRIPS = {
-    "model": (
-        b"text = \"\"\"\nmodel = 'decoy'\n\"\"\"\nmodel   =  \"gpt-5.5\"  # keep\n",
-        b"text = \"\"\"\nmodel = 'decoy'\n\"\"\"\nmodel   =  \"gpt-5.6-luna\"  # keep\n",
-        "gpt-5.5", "gpt-5.6-luna",
-    ),
-    "agents.max_depth": (
-        b"[agents] # keep\r\n'max_depth' = 3 # keep\r\nexplicit_finish = false",
-        b"[agents] # keep\r\n'max_depth' = 2 # keep\r\nexplicit_finish = false",
-        3, 2,
-    ),
-    "agents.explicit_finish": (
-        b"'agents' . explicit_finish  = false # keep\n[future]\nfoo = 8\n",
-        b"'agents' . explicit_finish  = true # keep\n[future]\nfoo = 8\n",
-        False, True,
-    ),
-}
-
-
-@pytest.mark.parametrize(
-    ("original", "off", "on", "key", "before", "after"),
-    [(*row, "telemetry.enabled", False, True) for row in _LAYOUTS.values()]
-    + [(off, off, on, key, before, after) for key, (off, on, before, after) in _SCALAR_ROUND_TRIPS.items()],
-    ids=[*_LAYOUTS, *_SCALAR_ROUND_TRIPS],
-)
-def test_updates_preserve_bytes_outside_the_changed_setting(tmp_path, original, off, on, key, before, after):
+@pytest.mark.parametrize(("original", "off", "on"), list(_LAYOUTS.values()), ids=list(_LAYOUTS))
+def test_toggles_change_only_the_endpoint_line(tmp_path: Path, original: bytes | None, off: bytes, on: bytes) -> None:
     home = _home(tmp_path, original)
-    reset = [{"key": key, "value": before}]
-    change = [{"key": key, "value": after}]
 
-    assert _set(home, reset) == (None if original is None else off)
-    assert _set(home, change) == on
-    assert _set(home, change) == on
-    assert _set(home, reset) == off
+    assert _set(home, OFF) == (None if original is None else off)  # off on a missing file writes nothing
+    assert _set(home, ON) == on
+    assert _set(home, ON) == on
+    assert _set(home, OFF) == off
+    assert home_settings.get(home)["settings"]["telemetry"] == {"enabled": False, "source": "off", "editable": True}
 
 
 @pytest.mark.parametrize(("original", "changes", "code"), list(_REFUSED.values()), ids=list(_REFUSED))
@@ -311,7 +280,7 @@ def test_custom_endpoint_is_read_only_and_byte_identical(tmp_path: Path) -> None
         assert (home / "settings.toml").read_bytes() == original
 
     assert refusals == ["invalid_params", "invalid_params"]
-    assert got["settings"]["telemetry"] == {"enabled": True, "source": "custom", "editable": False}
+    assert got["settings"] == {"telemetry": {"enabled": True, "source": "custom", "editable": False}}
 
 
 @pytest.mark.parametrize(

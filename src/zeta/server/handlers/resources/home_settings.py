@@ -25,10 +25,6 @@ def _public(result: dict[str, Any], *, home) -> dict[str, Any]:
                           if key in settings["telemetry"]},
         },
     }
-    public = view["settings"]
-    if "agents" in settings:
-        public["agents"] = {key: settings["agents"][key] for key in ("max_depth", "explicit_finish")}
-        public["model"] = settings["model"]
     if "settings_malformed" in result:
         view["settings_malformed"] = result["settings_malformed"]
     if "changed" in result:

@@ -87,10 +87,7 @@ async def test_observers_read_but_never_update_home_settings(tmp_path: Path) -> 
     assert "home_settings_update" not in observer_hello["capabilities"]["requests"]
     assert got["result"] == {
         "revision": _revision(b'model = "gpt-5.6-luna"\n'),
-        "settings": {
-            "telemetry": {"enabled": False, "source": "off", "editable": True},
-            "model": "gpt-5.6-luna", "agents": {"max_depth": 3, "explicit_finish": False},
-        },
+        "settings": {"telemetry": {"enabled": False, "source": "off", "editable": True}},
         "settings_malformed": False,
     }
     assert refused["error"] == {
@@ -147,10 +144,7 @@ async def test_controller_update_checks_revision_and_lists_restarts(tmp_path: Pa
     assert written == f'otel.endpoint = "{BUILTIN}"\n'.encode()
     assert updated["result"] == {
         "revision": _revision(written),
-        "settings": {
-            "telemetry": {"enabled": True, "source": "builtin", "editable": True},
-            "model": None, "agents": {"max_depth": 3, "explicit_finish": False},
-        },
+        "settings": {"telemetry": {"enabled": True, "source": "builtin", "editable": True}},
         "restart": {"serve": True, "sessions": [session_id], "complete": True},
     }
 
@@ -209,33 +203,6 @@ async def test_turning_telemetry_on_runs_the_start_preflight_first(
         enabled = changes[0]["value"]
         assert reply["result"]["settings"]["telemetry"]["enabled"] is enabled
         assert settings.read_bytes() == (f'otel.endpoint = "{BUILTIN}"\n'.encode() if enabled else b"")
-
-
-@pytest.mark.asyncio
-async def test_new_serve_sessions_read_updated_home_defaults_without_restarting_serve(tmp_path: Path) -> None:
-    contract = await ServeContract.start(tmp_path, "websocket")
-    try:
-        controller, _ = await _client(contract)
-        first = (await controller.request("first", "new_session", {"provider": "codex"}))["result"]["session"]
-        assert first["model"] == "gpt-5.6-luna"
-        revision = (await controller.request("get", "home_settings_get"))["result"]["revision"]
-        for key, value in (("model", "gpt-5.5"), ("agents.max_depth", 2), ("agents.explicit_finish", True)):
-            reply = await controller.request(key, "home_settings_update", {
-                "expected_revision": revision, "changes": [{"key": key, "value": value}],
-            })
-            assert "result" in reply, reply
-            result = reply["result"]
-            assert result["restart"] == {"serve": False, "sessions": [first["session_id"]], "complete": True}
-            revision = result["revision"]
-        before = (await controller.request("before", "status"))["result"]
-        assert before["session"]["model"] == "gpt-5.6-luna"
-        assert (before["max_agent_depth"], before["explicit_finish"]) == (3, False)
-        second = (await controller.request("second", "new_session", {"provider": "codex"}))["result"]["session"]
-        assert second["model"] == "gpt-5.5"
-        after = (await controller.request("after", "status"))["result"]
-        assert (after["max_agent_depth"], after["explicit_finish"]) == (2, True)
-    finally:
-        await contract.close()
 
 
 @pytest.mark.asyncio

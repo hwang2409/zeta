@@ -1921,21 +1921,17 @@ cannot spawn. Without `child_run_control_v1`, the methods return `-32601`.
 | `home_settings_update` | `1.0` | `home_settings_v1` | `controller_write` |
 
 These methods read and change `$ZETA_HOME/settings.toml`. The allowlist is
-`model` (a nonblank model identifier, at most 256 characters),
-`agents.max_depth` (integer from 0 to 5), `agents.explicit_finish` (boolean),
-and `telemetry.enabled` (boolean). Other keys, including approval settings,
-are neither returned nor editable. Endpoints, paths and credentials are
+`telemetry.enabled` (boolean). Other keys are neither returned nor editable. Endpoints, paths and credentials are
 never projected. No event is sent.
 
 `revision` is `sha256:` plus the SHA-256 of the exact file bytes. A missing
-file hashes as empty bytes and projects the defaults. `model: null` means
-no model is set in the home file. `telemetry.source` is `off` when no
+file hashes as empty bytes and projects the defaults. `telemetry.source` is `off` when no
 `[otel].endpoint` is set, `builtin` for zeta's built-in receiver, or `custom`
 for any other valid endpoint. A custom endpoint is not editable.
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"home_settings_get","params":{}}
-{"jsonrpc":"2.0","id":1,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":false,"source":"off","editable":true},"model":null,"agents":{"max_depth":3,"explicit_finish":false}},"settings_malformed":false}}
+{"jsonrpc":"2.0","id":1,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":false,"source":"off","editable":true}},"settings_malformed":false}}
 ```
 
 An invalid file projects only `{"telemetry":{"source":"unknown","editable":false}}`
@@ -1955,7 +1951,7 @@ client. Uneditable layouts (for example inline tables) return `invalid_params`.
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"home_settings_update","params":{"expected_revision":"sha256:<64 hex>","changes":[{"key":"telemetry.enabled","value":true}]}}
-{"jsonrpc":"2.0","id":2,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true},"model":null,"agents":{"max_depth":3,"explicit_finish":false}},"restart":{"serve":true,"sessions":["<session id>"],"complete":true}}}
+{"jsonrpc":"2.0","id":2,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"restart":{"serve":true,"sessions":["<session id>"],"complete":true}}}
 ```
 
 `restart.serve` is true only for a change to telemetry: the receiver is
@@ -1963,8 +1959,6 @@ configured once per serve process. `restart.sessions` lists the sorted IDs of
 running top-level sessions, found through their `runtime.lease` locks. Child
 agents restart with their owning sessions. `restart.complete` is false if the
 one-second scan deadline or an unreadable directory prevented a complete list.
-New sessions load the new model and agent defaults without restarting serve;
-project settings and explicit session options still take precedence.
 
 Errors: `-32602 invalid_params` for bad parameters, unknown or non-editable
 keys, and bad values; `-32009 stale_settings_revision` (both `data.code` and
