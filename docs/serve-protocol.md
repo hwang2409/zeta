@@ -2139,11 +2139,14 @@ profile. Packaged items are not editable.
 `diagnostics` carries the load warnings that the TUI prints at startup, as
 `[{source,file,reason}]`. `file` is relative to the `source` catalog root
 (`.` for the root directory itself); `reason` is the loader's message with
-catalog root paths made relative and the shared secret redactor applied. A
-warning about a listed item (for example an unknown profile model) is in that
-item's `diagnostics`. A file the loader skipped, or a shadowed item, has no
-item: its warning is in the page-level `data.diagnostics`, which every page
-carries in full. Reasons are untrusted text.
+catalog root paths made relative, the user's home directory shown as `~`, and
+the shared secret redactor applied. A warning about a listed item (for example
+an unknown profile model, or the agent "custom definition overrides packaged
+preset" warning, which goes on the overriding item) is in that item's
+`diagnostics`. Only a file the loader skipped, or the own warning of a
+lower-tier file that a higher tier shadows, has no item: its warning is in the
+page-level `data.diagnostics`, which every page carries in full. Reasons are
+untrusted text.
 
 Project scope reads `.zeta` under the attached session's working directory.
 Without an attached session, explicit `project` scope is unavailable and

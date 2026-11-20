@@ -40,6 +40,21 @@ def _items(home, project, scope, *, profiles, capture=None):
     return discover(root, source=scope, notices=notices, capture=capture), notices
 
 
+def _relative(notice, source, bases):
+    """Return ``notice`` as ``{source,file,reason}`` if it lies under one of ``bases``, else None."""
+    base = next((base for base in bases if notice.path.is_relative_to(base)), None)
+    if base is None:
+        return None
+    reason = notice.error
+    for prefix in bases:
+        reason = reason.replace(prefix + os.sep, "").replace(prefix, ".")
+    return {
+        "source": source,
+        "file": redact_secrets(notice.path.relative_to(base).as_posix()),
+        "reason": redact_secrets(reason.replace(str(Path.home()), "~")),
+    }
+
+
 def _diagnostics(notices, home, project, *, profiles):
     """Project loader notices to ``{source,file,reason}`` with paths relative to each catalog root."""
     folder = "agents" if profiles else "skills"
@@ -48,22 +63,18 @@ def _diagnostics(notices, home, project, *, profiles):
         roots["project"] = project / ".zeta" / folder
     if not profiles:
         roots["packaged"] = Path(catalog.__file__).parent
+    sources = [
+        (source, sorted({str(root), str(root.resolve())}, key=len, reverse=True)) for source, root in roots.items()
+    ]
     diagnostics = []
     for notice in notices:
-        for source, root in roots.items():
-            bases = sorted({str(root), str(root.resolve())}, key=len, reverse=True)
-            base = next((base for base in bases if notice.path.is_relative_to(base)), None)
-            if base is None:
-                continue
-            reason = notice.error
-            for prefix in bases:
-                reason = reason.replace(prefix + os.sep, "").replace(prefix, ".")
-            diagnostics.append({
-                "source": source,
-                "file": redact_secrets(notice.path.relative_to(base).as_posix()),
-                "reason": redact_secrets(reason.replace(str(Path.home()), "~")),
-            })
-            break
+        # A plain-str notice has no path or source, and its text can hold an absolute path;
+        # skip it rather than fail the read or leak the path.
+        if not hasattr(notice, "path"):
+            continue
+        entry = next(filter(None, (_relative(notice, source, bases) for source, bases in sources)), None)
+        if entry is not None:
+            diagnostics.append(entry)
     return diagnostics
 
 
