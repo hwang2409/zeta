@@ -6,6 +6,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 from multiprocessing import Pipe, Process
 from multiprocessing.connection import Connection
 from pathlib import Path
@@ -197,6 +198,33 @@ def test_read_pty_until_names_early_exit_and_output() -> None:
         finally:
             if process.poll() is None:
                 reap_process(process, timeout=0)
+
+
+def test_read_pty_until_times_out_while_output_keeps_arriving() -> None:
+    with open_pty() as (master, slave):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import sys\nwhile True: sys.stdout.write('x' * 4096)"],
+            stdout=slave,
+            stderr=slave,
+        )
+        errors: list[AssertionError] = []
+
+        def read() -> None:
+            try:
+                read_pty_until(master, b"NEVER", process=process, output=bytearray(), timeout=1)
+            except AssertionError as error:
+                errors.append(error)
+
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        try:
+            reader.join(30)
+            assert not reader.is_alive(), "read_pty_until ignored its deadline"
+            assert "timed out waiting for PTY marker" in str(errors[0])
+        finally:
+            process.kill()
+            reap_process(process, timeout=10)
+            reader.join(10)
 
 
 def test_reap_process_kills_a_process_that_does_not_exit() -> None:

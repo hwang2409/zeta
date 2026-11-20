@@ -227,23 +227,21 @@ def read_pty_until(
         selector.register(master_fd, selectors.EVENT_READ)
         while marker not in output[start:]:
             remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(
+                    f"timed out waiting for PTY marker {marker!r}; "
+                    f"return code: {process.poll()!r}; captured: {bytes(output[start:])!r}"
+                )
             # A slave held open by open_pty never gives EOF, so check for exit in slices.
-            if not selector.select(max(0, min(remaining, 0.1))):
-                if process.poll() is not None:
-                    # Output written before exit is buffered by now; read it first.
-                    if selector.select(0):
-                        continue
+            if not selector.select(min(remaining, 0.1)):
+                # select(0) covers output that arrived between the empty select and poll().
+                if process.poll() is not None and not selector.select(0):
                     raise AssertionError(
                         f"process exited before PTY marker {marker!r}; "
                         f"return code: {process.returncode!r}; "
                         f"captured: {bytes(output[start:])!r}"
                     )
-                if remaining > 0:
-                    continue
-                raise AssertionError(
-                    f"timed out waiting for PTY marker {marker!r}; "
-                    f"return code: {process.poll()!r}; captured: {bytes(output[start:])!r}"
-                )
+                continue
             try:
                 chunk = os.read(master_fd, 4096)
             except OSError:
@@ -373,7 +371,6 @@ def wait_for_path_command(
     owner_pid = os.getpid() if owner_pid is None else owner_pid
     source = f"""
 import os
-import pty
 import pathlib
 import time
 
