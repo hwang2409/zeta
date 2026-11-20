@@ -7,6 +7,7 @@ from . import (
     home_settings,
     library,
     mcp_management,
+    project_writes,
     session_read,
 )
 
@@ -18,4 +19,5 @@ FAMILIES = (
     account_list,
     library,
     session_read,
+    project_writes,
 )

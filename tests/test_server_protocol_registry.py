@@ -12,6 +12,7 @@ import pytest
 
 from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
+from zeta.project_registry import ProjectRegistry
 from zeta.server.handlers.resources import FAMILIES
 from zeta.server.handlers.resources._mcp_auth import MCPAuth
 from zeta.server.login import Logins
@@ -137,6 +138,14 @@ _OWNER_FAILURE_CASES = {
     "mcp_auth_logout": (f"{_MCP_OWNER}.logout", {"name": "test"}),
     "account_list": ("zeta.accounts.AccountStore.catalog_snapshot", {}),
     "login_start": ("zeta.server.login.Logins.login_start", {"provider": "claude"}),
+    "project_memory_update": ("zeta.project_registry.ProjectRegistry.show_project", {
+        "project_id": "test-project", "revision": _REVISION,
+        "mutation": {"format": 1, "op": "set", "file": "brief.md", "content": "test"},
+    }),
+    "project_inbox_send": ("zeta.project_registry.ProjectRegistry.show_project", {
+        "project_id": "test-project",
+        "mutation": {"kind": "question", "title": "test", "body": "test", "delivery_id": "test-delivery"},
+    }),
 }
 
 
@@ -158,7 +167,8 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
             home=tmp_path,
             runtime=SimpleNamespace(
                 opened=SimpleNamespace(metadata=SimpleNamespace(project_id="test-project", cwd=tmp_path)),
-                session_id="test-session", manager=None,
+                session_id="test-session",
+                manager=SimpleNamespace(project_registry=ProjectRegistry.for_state_read(tmp_path / "projects", 0)),
                 loop=SimpleNamespace(_mcp_project_dir_value=tmp_path, tool_registry=None),
             ),
             _mcp_auth=MCPAuth(),
