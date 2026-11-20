@@ -130,14 +130,14 @@ def test_unsafe_file_is_refused_and_never_followed_or_replaced(tmp_path: Path, k
     assert settings.is_symlink() is (kind == "symlink")
 
 
-def test_stale_revision_does_not_disclose_the_current_revision_or_write(tmp_path: Path) -> None:
+def test_stale_revision_names_the_current_revision_and_writes_nothing(tmp_path: Path) -> None:
     home = _home(tmp_path, b'model = "a"\n')
     old = home_settings.get(home)["revision"]
     (home / "settings.toml").write_bytes(b'model = "b"\n')
 
     refused = _refused("stale_revision", lambda: home_settings.update(home, old, ON))
 
-    assert refused.data == {}
+    assert refused.data == {"current_revision": _revision(b'model = "b"\n')}
     assert (home / "settings.toml").read_bytes() == b'model = "b"\n'
 
 
@@ -223,11 +223,11 @@ _LAYOUTS = {
 
 # (original, the update that would edit it, the refusal); the file stays byte-identical.
 _REFUSED = {
-    "inline-table": (f'otel = {{ endpoint = "{BUILTIN}" }}\n'.encode(), OFF, "invalid_params"),
-    "empty-inline-table": (b"otel = {}\n", ON, "invalid_params"),
-    "custom-dotted": (b'otel.endpoint = "http://127.0.0.1:9999/v1/traces"\n', OFF, "invalid_params"),
-    "multiline-basic-header-decoy": (b'text = """\n[otel]\n"""\n', ON, "invalid_params"),
-    "multiline-literal-header-decoy": (b"text = '''\n[otel]\n'''\n", ON, "invalid_params"),
+    "inline-table": (f'otel = {{ endpoint = "{BUILTIN}" }}\n'.encode(), OFF, "custom_home_setting"),
+    "empty-inline-table": (b"otel = {}\n", ON, "custom_home_setting"),
+    "custom-dotted": (b'otel.endpoint = "http://127.0.0.1:9999/v1/traces"\n', OFF, "custom_home_setting"),
+    "multiline-basic-header-decoy": (b'text = """\n[otel]\n"""\n', ON, "custom_home_setting"),
+    "multiline-literal-header-decoy": (b"text = '''\n[otel]\n'''\n", ON, "custom_home_setting"),
     "sub-table-before": (b"[otel.sub]\n[otel]\n", ON, "settings_malformed"),
     "sub-table-after": (b"[otel]\n[otel.sub]\n", ON, "settings_malformed"),
     "bom": (b'\xef\xbb\xbfmodel = "a"\n', ON, "settings_malformed"),
@@ -279,7 +279,7 @@ def test_custom_endpoint_is_read_only_and_byte_identical(tmp_path: Path) -> None
             refusals.append(exc.code)
         assert (home / "settings.toml").read_bytes() == original
 
-    assert refusals == ["invalid_params", "invalid_params"]
+    assert refusals == ["custom_home_setting", "custom_home_setting"]
     assert got["settings"] == {"telemetry": {"enabled": True, "source": "custom", "editable": False}}
 
 
@@ -379,7 +379,7 @@ def test_simultaneous_updates_from_one_revision_apply_once(tmp_path: Path, monke
     written = (home / "settings.toml").read_bytes()
     assert isinstance(results["second"], HomeSettingsError)
     assert results["second"].code == "stale_revision"
-    assert results["second"].data == {}
+    assert results["second"].data == {"current_revision": _revision(written)}
     assert written == f'otel.endpoint = "{BUILTIN}"\n'.encode()
 
 

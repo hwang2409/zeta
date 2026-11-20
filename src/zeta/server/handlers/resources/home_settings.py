@@ -1,4 +1,8 @@
-"""Wire adapter for the existing home settings owner."""
+"""Wire adapter for the existing home settings owner.
+
+``home_settings_v1`` shipped on main before the shared resource codes; its replies stay exactly
+main's (its own error descriptors, owner ``data`` such as ``current_revision`` and ``detail``).
+"""
 
 from __future__ import annotations
 
@@ -10,38 +14,43 @@ from ...resource_protocol import (
     require_params,
     require_revision,
     restart_report,
-    run_owner,
 )
 
 FEATURE = "home_settings_v1"
 
 
-def _public(result: dict[str, Any], *, home) -> dict[str, Any]:
-    settings = result["settings"]
-    view = {
-        "revision": result["revision"],
-        "settings": {
-            "telemetry": {key: settings["telemetry"][key] for key in ("enabled", "source", "editable")
-                          if key in settings["telemetry"]},
-        },
-    }
-    if "settings_malformed" in result:
-        view["settings_malformed"] = result["settings_malformed"]
-    if "changed" in result:
-        view["restart"] = restart_report(home, serve=result["restart_serve"], changed=result["changed"])
-    return view
+def _error(exc) -> Exception:
+    from ...protocol import ErrorDescriptor, ProtocolError, invalid_resource_params
+
+    match exc.code:
+        case "invalid_params":
+            return invalid_resource_params()
+        case "custom_home_setting":
+            descriptor = ErrorDescriptor.CUSTOM_HOME_SETTING
+        case "stale_revision":
+            descriptor = ErrorDescriptor.STALE_REVISION
+        case "settings_busy":
+            descriptor = ErrorDescriptor.SETTINGS_BUSY
+        case "settings_malformed":
+            descriptor = ErrorDescriptor.SETTINGS_MALFORMED
+        case "telemetry_unavailable":
+            descriptor = ErrorDescriptor.TELEMETRY_UNAVAILABLE
+        case _:
+            descriptor = ErrorDescriptor.SETTINGS_UNSAFE
+    # the owner's data is fixed text or a revision hash; it names no path
+    return ProtocolError(descriptor, descriptor.meaning, exc.data or None)
 
 
 async def _run(client, call):
     from ....config.home_settings import HomeSettingsError
-    from ...protocol import ErrorDescriptor
 
-    return await run_owner(client, call, family="settings", project=lambda result: _public(result, home=client.server.home), owner_error=HomeSettingsError, errors={
-        "settings_busy": ErrorDescriptor.RESOURCE_BUSY,
-        "settings_malformed": ErrorDescriptor.SETTINGS_MALFORMED,
-        "settings_unsafe": ErrorDescriptor.SETTINGS_UNSAFE,
-        "telemetry_unavailable": ErrorDescriptor.TELEMETRY_UNAVAILABLE,
-    })
+    def run():
+        try:
+            return call()
+        except HomeSettingsError as exc:
+            raise _error(exc) from None
+
+    return await client.connections.run_blocking(run)
 
 
 async def home_settings_get(client, request_id, params):
@@ -56,7 +65,14 @@ async def home_settings_update(client, request_id, params):
 
     require_params(params, "expected_revision", "changes")
     require_revision(params["expected_revision"], prefix="sha256:")
-    return await _run(client, lambda: home_settings.update(client.server.home, params["expected_revision"], params["changes"]))
+    home = client.server.home
+
+    def update() -> dict[str, Any]:
+        result = home_settings.update(home, params["expected_revision"], params["changes"])
+        # serve configured telemetry once at startup, so v1 always reports serve and scans sessions
+        return {**result, "restart": restart_report(home, serve=True, changed=True)}
+
+    return await _run(client, update)
 
 
 METHODS = (

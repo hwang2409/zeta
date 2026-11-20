@@ -128,12 +128,7 @@ def owner_errors(
     owner_error: type[Exception] | tuple[type[Exception], ...] = (),
     errors: Mapping[str, Any] | None = None,
 ):
-    """Close unexpected failures and optionally map an owner's known errors.
-
-    Owner detail never crosses the wire, with one exception: ``telemetry_unavailable`` keeps the
-    owner's ``data`` (``code`` and ``detail``). Its detail is one of the fixed telemetry preflight
-    messages that tells the user how to fix the install or environment; it names no path or value.
-    """
+    """Close unexpected failures and optionally map an owner's known errors."""
     from .protocol import (
         ErrorDescriptor,
         ProtocolError,
@@ -156,8 +151,6 @@ def owner_errors(
                 raise invalid_resource_params() from None
             if errors is not None:
                 descriptor = errors.get(code, descriptor)
-            if descriptor is ErrorDescriptor.TELEMETRY_UNAVAILABLE:
-                raise ProtocolError(descriptor, descriptor.meaning, getattr(exc, "data", None) or None) from None
         raise closed_error(descriptor) from None
 
 

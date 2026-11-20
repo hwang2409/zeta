@@ -3,12 +3,15 @@
 A client sees an allowlisted projection plus ``revision``, the SHA-256 of the exact file bytes
 (an absent file hashes as empty bytes). An update names that revision; it takes the sibling
 ``settings.toml.lock``, rereads the bytes under the lock, and refuses a stale revision, so an edit
-finished before the reread is never lost. The lock serializes zeta writers only; an editor that writes after the reread is not stopped.
-Edits preserve bytes outside the changed setting and are validated by the startup parser. An
-update that turns telemetry on first runs the telemetry start preflight, so it never writes a
-setting that would stop the next start.
+finished before the reread is never lost. The lock serializes zeta writers only; an editor that
+writes after the reread is not stopped. The edit touches only the built-in endpoint line (under
+``[otel]``, or a top-level ``otel.endpoint``), checked against a ``tomlkit`` parse, and a
+candidate is published only after ``load_settings``'s own validation accepts it. An update that
+turns telemetry on first runs the telemetry start preflight, so it never writes a setting that
+would stop the next start.
 
 Every function blocks (file locks and fsync); call it off the event loop.
+The serve adapter adds the restart report (``resource_protocol.restart_report``).
 """
 
 from __future__ import annotations
@@ -17,8 +20,6 @@ import errno
 import hashlib
 import os
 import re
-from collections.abc import Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -56,40 +57,43 @@ class HomeSettingsError(Exception):
 
 def get(home: Path) -> dict[str, Any]:
     """The safe projection of ``home``'s settings and their revision."""
-    with _locked_home(home) as home_fd:
-        raw = _read(home_fd)
-        revision = _revision(raw)
+    raw = _read_home(home)
     try:
         settings = _project(raw, home)
     except HomeSettingsError:
         settings = {"telemetry": {"source": "unknown", "editable": False}}
-        return {"revision": revision, "settings": settings, "settings_malformed": True}
-    return {"revision": revision, "settings": settings, "settings_malformed": False}
+        return {"revision": _revision(raw), "settings": settings, "settings_malformed": True}
+    return {"revision": _revision(raw), "settings": settings, "settings_malformed": False}
 
 
 def update(home: Path, expected_revision: object, changes: object) -> dict[str, Any]:
-    """Apply one change if the file still has the expected revision."""
+    """Apply ``changes`` if the file still has ``expected_revision``."""
     enabled = _parse_changes(expected_revision, changes)
     if enabled:
         _require_telemetry_can_start()
-    with _locked_home(home) as home_fd:
-        raw = _read(home_fd)
-        revision = _revision(raw)
-        if revision != expected_revision:
-            raise HomeSettingsError("stale_revision")
-        settings = _project(raw, home)
-        candidate = _edit(raw, settings, enabled)
-        changed = candidate != raw
-        if changed:
-            settings = _project(candidate, home)  # validate before publication
-            write_session_file(home_fd, SETTINGS_FILENAME, candidate)
-            revision = _revision(candidate)
-    return {
-        "revision": revision,
-        "settings": settings,
-        "changed": changed,
-        "restart_serve": changed,
-    }
+    require_off_loop_lock("home settings")
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        lock_fd = _open_file(home_fd, LOCK_NAME, os.O_RDWR | os.O_CREAT)
+        try:
+            if not flock_with_deadline(lock_fd, LOCK_SECONDS):
+                raise HomeSettingsError("settings_busy", retryable=True)
+            raw = _read(home_fd)
+            if _revision(raw) != expected_revision:
+                raise HomeSettingsError("stale_revision", current_revision=_revision(raw))
+            current = _project(raw, home)["telemetry"]
+            if current["source"] == "custom":
+                raise HomeSettingsError("custom_home_setting")
+            candidate = raw if current["enabled"] == enabled else _with_telemetry(raw, enabled)
+            _project(candidate, home)  # the same validation load_settings runs, before publication
+            if candidate != raw:
+                write_session_file(home_fd, SETTINGS_FILENAME, candidate)
+            raw = _read(home_fd)
+        finally:
+            os.close(lock_fd)  # closing the descriptor releases the lock
+        return {"revision": _revision(raw), "settings": _project(raw, home)}
+    finally:
+        os.close(home_fd)
 
 
 def _require_telemetry_can_start() -> None:
@@ -101,22 +105,6 @@ def _require_telemetry_can_start() -> None:
         preflight()
     except TelemetryError as exc:
         raise HomeSettingsError("telemetry_unavailable", detail=str(exc)) from None
-
-
-@contextmanager
-def _locked_home(home: Path) -> Iterator[int]:
-    require_off_loop_lock("home settings")
-    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        lock_fd = _open_file(home_fd, LOCK_NAME, os.O_RDWR | os.O_CREAT)
-        try:
-            if not flock_with_deadline(lock_fd, LOCK_SECONDS):
-                raise HomeSettingsError("settings_busy", retryable=True)
-            yield home_fd
-        finally:
-            os.close(lock_fd)
-    finally:
-        os.close(home_fd)
 
 
 def _parse_changes(expected_revision: object, changes: object) -> bool:
@@ -133,13 +121,6 @@ def _parse_changes(expected_revision: object, changes: object) -> bool:
     ):
         raise HomeSettingsError("invalid_params")
     return change["value"]
-
-
-def _edit(raw: bytes, settings: dict[str, Any], enabled: bool) -> bytes:
-    telemetry = settings["telemetry"]
-    if not telemetry["editable"]:
-        raise HomeSettingsError("invalid_params")
-    return raw if telemetry["enabled"] == enabled else _with_telemetry(raw, enabled)
 
 
 def _revision(raw: bytes) -> str:
@@ -223,7 +204,7 @@ def _with_telemetry(raw: bytes, enabled: bool) -> bytes:
                 return candidate
         except HomeSettingsError:
             pass  # the edit does not parse here; try the next one
-    raise HomeSettingsError("invalid_params")
+    raise HomeSettingsError("custom_home_setting")
 
 
 def _on_edits(lines: list[bytes], newline: bytes) -> list[list[bytes]]:
@@ -263,3 +244,4 @@ def _document(raw: bytes, enabled: bool | None = None) -> dict[str, Any]:
     if document.get("otel") == {}:
         del document["otel"]
     return document
+

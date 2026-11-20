@@ -571,7 +571,8 @@ async def dispatch(
     descriptor = MethodDescriptor.for_wire(method, client.features)  # type: ignore[attr-defined]
     require_access(
         getattr(client, "role", None), method, descriptor.access if descriptor is not None else None,
-        resource=isinstance(descriptor, ResourceDescriptor),
+        # home_settings_v1 shipped on main before the shared resource codes and keeps main's reply
+        resource=isinstance(descriptor, ResourceDescriptor) and descriptor.feature != "home_settings_v1",
     )
     if descriptor is None:
         raise ProtocolError(

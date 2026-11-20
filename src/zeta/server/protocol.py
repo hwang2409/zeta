@@ -167,6 +167,9 @@ class ErrorDescriptor(Enum):
         "the telemetry database schema is not the one this zeta reads",
     )
     RESULT_TOO_LARGE = (-32007, "result_too_large", "not even one item fits one frame")
+    CUSTOM_HOME_SETTING = (-32602, "custom_home_setting", "the setting has a custom value that serve does not change")
+    STALE_REVISION = (-32009, "stale_revision", "settings.toml changed since the given revision")
+    SETTINGS_BUSY = (-32009, "settings_busy", "another zeta process is writing settings.toml")
     STALE_RESOURCE_REVISION = (-32009, None, "resource revision is stale")
     RESOURCE_BUSY = (-32004, "operation_busy", "another process is writing this resource")
     SETTINGS_MALFORMED = (-32000, "settings_malformed", "settings.toml does not parse or validate")

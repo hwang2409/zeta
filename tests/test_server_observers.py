@@ -34,7 +34,7 @@ from zeta.protocol.types import (
 )
 from zeta.server import ZetaServer, approval_settlement, protocol
 from zeta.server.handlers import history as history_module
-from zeta.server.handlers.resources import home_settings
+from zeta.server.handlers.resources import agent_catalog
 from zeta.server.protocol import EventDescriptor
 from zeta.server.resource_protocol import Access, collect_families
 
@@ -201,8 +201,8 @@ async def test_observer_project_and_account_requests_are_read_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Exercise a controller-only resource read without changing any shipped method's access.
-    read, write = home_settings.METHODS
-    monkeypatch.setattr(home_settings, "METHODS", (replace(read, access=Access.CONTROLLER_READ), write))
+    (read,) = agent_catalog.METHODS
+    monkeypatch.setattr(agent_catalog, "METHODS", (replace(read, access=Access.CONTROLLER_READ),))
     resources = collect_families()
     # test-contract: seam replace the import-time table to exercise access for a collected resource
     monkeypatch.setattr(protocol, "_SERVED_METHODS", (*protocol.MethodDescriptor, *resources))
@@ -216,14 +216,14 @@ async def test_observer_project_and_account_requests_are_read_only(
     writer = None
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT)
-        version = {"protocol_version": "1.2", "features": [home_settings.FEATURE]}
+        version = {"protocol_version": "1.2", "features": [agent_catalog.FEATURE]}
         controller_hello = (await _request(controller_reader, controller_writer, 1, "hello", version))[-1]
         assert read.wire in controller_hello["result"]["capabilities"]["requests"]
         await _request(
             controller_reader, controller_writer, 2, "new_session", {"provider": "codex"}
         )
         observer_hello = (await _request(reader, writer, 1, "hello", {
-            **version, "role": "observer", "features": ["serve_observers", home_settings.FEATURE],
+            **version, "role": "observer", "features": ["serve_observers", agent_catalog.FEATURE],
         }))[-1]
         assert read.wire not in observer_hello["result"]["capabilities"]["requests"]
         refused = (await _request(reader, writer, 2, read.wire))[-1]["error"]
