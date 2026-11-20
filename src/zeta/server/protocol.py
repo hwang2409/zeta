@@ -732,8 +732,11 @@ def resource_error(descriptor: ErrorDescriptor) -> ProtocolError:
     return ProtocolError(descriptor, descriptor.meaning, {"code": reason, "reason": reason})
 
 
-def invalid_resource_params() -> ProtocolError:
-    return ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid params", {"code": "invalid_params"})
+def invalid_resource_params(*, reason: str | None = None) -> ProtocolError:
+    data = {"code": "invalid_params"}
+    if reason is not None:
+        data["reason"] = reason
+    return ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid params", data)
 
 
 def stale_resource_revision(family: str) -> ProtocolError:

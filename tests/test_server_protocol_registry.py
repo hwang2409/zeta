@@ -109,6 +109,12 @@ _OWNER_FAILURE_CASES = {
     "child_run_cancel": ("zeta.agent.runner.cancel_child_run", {
         "session_id": "test-session", "run_id": "test-run",
     }),
+    "skill_catalog": ("zeta.skills.catalog.discover_session_skills", {}),
+    "skill_read": ("zeta.skills.catalog.discover_session_skills", {"name": "test", "scope": "effective"}),
+    "agent_profile_catalog": ("zeta.skills.agent_catalog.discover_session_agents", {}),
+    "agent_profile_read": (
+        "zeta.skills.agent_catalog.discover_session_agents", {"name": "test", "scope": "effective"},
+    ),
     "mcp_server_list": (f"{_MCP_OWNER}.read_disk", {}),
     "mcp_server_add": (f"{_MCP_OWNER}.add", {
         "revision": _REVISION, "mutation": {"name": "test", "scope": "user", "command": "test"},
@@ -143,7 +149,8 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
         server=SimpleNamespace(
             home=tmp_path,
             runtime=SimpleNamespace(
-                opened=object(), session_id="test-session", loop=SimpleNamespace(_mcp_project_dir_value=tmp_path),
+                opened=SimpleNamespace(metadata=SimpleNamespace(cwd=tmp_path)),
+                session_id="test-session", loop=SimpleNamespace(_mcp_project_dir_value=tmp_path),
             ),
             control=SimpleNamespace(
                 _reject_if_unhealthy=lambda: None,

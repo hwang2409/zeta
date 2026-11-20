@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
@@ -223,6 +223,7 @@ def discover_skills(
     *,
     source: str = "",
     notices: list[str] | None = None,
+    capture: Callable[[SkillMeta, MarkdownDocument], None] | None = None,
     skills_dir: Path | None = None,
 ) -> list[SkillMeta]:
     """Discover one tier of flat and Claude-Code-style skills."""
@@ -255,12 +256,14 @@ def discover_skills(
         kind="skill",
         build=build,
         notices=notices,
+        capture=capture,
         document_name="SKILL.md",
     )
 
 
 def discover_session_skills(
-    *, home: str | Path | None = None, project_dir: str | Path | None = None
+    *, home: str | Path | None = None, project_dir: str | Path | None = None,
+    capture: Callable[[SkillMeta, MarkdownDocument], None] | None = None,
 ) -> SkillCatalog:
     """Discover packaged, home, and project skills for one session."""
 
@@ -272,9 +275,10 @@ def discover_session_skills(
             source="packaged",
             notices=notices,
             skills_dir=_PACKAGED_SKILLS_DIR,
+            capture=capture,
         ),
         discover=lambda root, source, notices: discover_skills(
-            root, source=source, notices=notices
+            root, source=source, notices=notices, capture=capture
         ),
     )
     return SkillCatalog(skills, notices)
