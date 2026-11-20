@@ -2357,15 +2357,17 @@ and the client reads again. Each memory format keeps its own operations;
 
 `project_show` does not return the format; read it from the memory shape.
 `memory.files` means format 1, and `memory.kinds` (the `projects-memory-v2`
-view) means format 2. A wrong `mutation.format` returns the same
-`-32009 stale_project_memory_revision` as a stale digest.
+view) means format 2. The shape depends on negotiation: a client with
+`projects-memory-v2` gets `kinds`, a client without it gets `files`, and a
+project in the other format returns an error. A wrong `mutation.format`
+returns the same `-32009 stale_project_memory_revision` as a stale digest.
 
 The result is `{revision, data: {format}}` (format 2 adds `version_id`).
 `revision` is the digest of the state this write produced. An owner rejection
 (unknown entry, empty history) returns `-32602` with `data.reason`
 `operation_rejected`. When serve itself runs inside a Zeta tool subprocess
-(`ZETA_TOOL_SUBPROCESS` is set), every memory write returns this
-`operation_rejected`; start serve from a terminal. Content that holds a
+(`ZETA_TOOL_SUBPROCESS` is set), every otherwise valid memory write returns
+this `operation_rejected`; start serve from a terminal. Content that holds a
 secret (the shared memory secret check) returns `-32602` with `data.reason`
 `secret_refused`; nothing is written. A user write emits no event, the same
 as a TUI `/memory` write; running sessions read the change at their next prompt.
@@ -2373,18 +2375,21 @@ as a TUI `/memory` write; running sessions read the change at their next prompt.
 `project_inbox_send {project_id, mutation: {kind, title, body, delivery_id,
 to_session?}}` sends one message to the inbox of `project_id`, the same as
 `/inbox send` in the TUI. The sender project, sender session, and the user
-origin come from the attached session; a param cannot set them. A user-origin
-message is a `trusted_assignment`, as it is from the TUI, on a home at or
-above the inbox delegation epoch (stored-format epoch 7). Below it, before the
-cutover, a serve or TUI send stores no `origin`, and reads add no `author` or
-`authority`, so the recipient treats the message as information (untrusted).
+origin come from the attached session; a param cannot set them. On a home at
+or above the inbox delegation epoch (stored-format epoch 7), a user-origin
+message is a `trusted_assignment`, as it is from the TUI. Below it, before the
+cutover, the legacy local-trust rules apply: a serve or TUI send stores no
+`origin`, reads show `origin: "local"` and add no `author` or `authority`,
+`project_inbox` reports `untrusted: false` for such a page, and the
+recipient's wake notice treats the message as work to do.
 `kind` is an inbox kind, `title` is nonblank, `body` may be empty, and each
 is at most 1 MiB of UTF-8. `delivery_id` (1 to 128 of `A-Z a-z 0-9 _ . : -`)
 is scoped to the attached session and the recipient: a retry with the same
 payload returns the same `message_id` and makes no second message; a different
-payload returns `-32602` with `data.reason` `delivery_id_reused`. This holds while the
-recipient keeps the message record; after a done message is pruned, a late
-retry creates a new message. The result is `{data: {message_id, pending}}`.
+payload returns `-32602` with `data.reason` `delivery_id_reused`. This holds
+while the recipient keeps the message record; after a done message is
+pruned, a late retry creates a new message. The result is
+`{data: {message_id, pending}}`.
 `pending: false` means the message is in the recipient inbox, and the
 recipient's running sessions get the existing `project_inbox` notification.
 `pending: true` means the recipient could not be reached now, but the message
