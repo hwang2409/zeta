@@ -166,7 +166,7 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
             home=tmp_path,
             runtime=SimpleNamespace(
                 opened=SimpleNamespace(metadata=SimpleNamespace(project_id="test-project", cwd=tmp_path)),
-                session_id="test-session", manager=None,
+                project_dir=tmp_path, session_id="test-session", manager=None,
                 loop=SimpleNamespace(_mcp_project_dir_value=tmp_path, tool_registry=None),
             ),
             _mcp_auth=MCPAuth(),
