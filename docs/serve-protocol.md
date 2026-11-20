@@ -1920,65 +1920,95 @@ cannot spawn. Without `child_run_control_v1`, the methods return `-32601`.
 | `home_settings_get` | `1.0` | `home_settings_v1` | `read` |
 | `home_settings_update` | `1.0` | `home_settings_v1` | `controller_write` |
 
-These methods read and change `$ZETA_HOME/settings.toml`. The allowlist is
-`model` (a nonblank model identifier, at most 256 characters),
-`agents.max_depth` (integer from 0 to 5), `agents.explicit_finish` (boolean),
-and `telemetry.enabled` (boolean). Other keys, including approval settings,
-are neither returned nor editable. Endpoints, paths and credentials are
-never projected. No event is sent.
+The shared resource error shapes (`data.reason`, `-32009 stale_<family>_revision`,
+`-32004 operation_busy`) apply to the newer resource families, not to
+`home_settings_v1`: its replies are exactly the ones below.
 
-`revision` is `sha256:` plus the SHA-256 of the exact file bytes. A missing
-file hashes as empty bytes and projects the defaults. `model: null` means
-no model is set in the home file. `telemetry.source` is `off` when no
-`[otel].endpoint` is set, `builtin` for zeta's built-in receiver, or `custom`
-for any other valid endpoint. A custom endpoint is not editable.
+`home_settings_get` and `home_settings_update` read and change the home
+`$ZETA_HOME/settings.toml`. Only an allowlisted projection crosses the wire;
+endpoints, paths, environment values, and other keys are never returned or
+accepted. The only key in v1 is `telemetry.enabled`. Controllers and observers
+may call `home_settings_get`; `home_settings_update` is controller-only, and an
+observer receives `-32008` `observer_read_only`. Both run off the event loop.
+Serve sends no event and the TUI shows nothing for these methods; a client
+reads the result.
+
+`revision` is `sha256:` plus the SHA-256 of the exact file bytes; a missing
+file hashes as empty bytes and projects defaults. `telemetry.source` is
+`builtin` (endpoint `http://127.0.0.1:4323/v1/traces`, `enabled: true`),
+`off` (no `[otel].endpoint`, `enabled: false`), or `custom` (any other valid
+endpoint, `enabled: true`, `editable: false`).
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"home_settings_get","params":{}}
-{"jsonrpc":"2.0","id":1,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":false,"source":"off","editable":true},"model":null,"agents":{"max_depth":3,"explicit_finish":false}},"settings_malformed":false}}
+{"jsonrpc":"2.0","id":1,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"settings_malformed":false}}
 ```
 
-An invalid file projects only `{"telemetry":{"source":"unknown","editable":false}}`
-with `settings_malformed: true`. It cannot be updated through serve.
+A file that does not parse or that zeta would refuse at startup projects as
+`{"telemetry":{"source":"unknown","editable":false}}` with
+`settings_malformed: true`.
 
-`home_settings_update` takes exactly `expected_revision` and `changes`, a list
-containing one `{"key": ..., "value": ...}`. The owner checks the revision under
-`settings.toml.lock`, validates the candidate like zeta startup does, then
-atomically replaces the file (mode `0600`, file and directory fsync). A manual
-editor does not honor this lock; an edit after the locked read can be lost.
-An unchanged setting succeeds without a write or a restart requirement.
-
-Edits preserve bytes outside the changed setting, including unrelated comments
-and line endings. The telemetry switch inserts or removes only the built-in
-`otel.endpoint` assignment, not a second setting or a raw URL passed by the
-client. Uneditable layouts (for example inline tables) return `invalid_params`.
+`home_settings_update` params are exactly `expected_revision` and `changes`,
+a list with one `{"key":"telemetry.enabled","value":true|false}`. The update
+changes only the built-in endpoint line and never adds or removes an `[otel]`
+header. If the file has an `[otel]` table, `true` inserts
+`endpoint = "http://127.0.0.1:4323/v1/traces"` under its header and `false`
+removes that line. If it has none, `true` inserts the top-level line
+`otel.endpoint = "http://127.0.0.1:4323/v1/traces"` before the first table (or
+at the end) and `false` removes it. Every other byte is kept, with the file's
+line endings (LF or CRLF) and its trailing-newline state, so on then off
+returns the exact original bytes. An update that must edit a layout neither
+form can express (an `otel` inline table, a line inside a multiline string)
+is refused as `custom_home_setting`; an update that changes nothing succeeds
+without a write. Under the sibling lock
+`settings.toml.lock` the server rereads the file, compares its revision,
+validates the changed file as zeta's startup does, and only then replaces the
+file atomically (mode `0600`, file and directory fsync). The lock serializes
+zeta writers only; an editor that writes after that reread is not detected.
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"home_settings_update","params":{"expected_revision":"sha256:<64 hex>","changes":[{"key":"telemetry.enabled","value":true}]}}
-{"jsonrpc":"2.0","id":2,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true},"model":null,"agents":{"max_depth":3,"explicit_finish":false}},"restart":{"serve":true,"sessions":["<session id>"],"complete":true}}}
+{"jsonrpc":"2.0","id":2,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"restart":{"serve":true,"sessions":["<session id>"],"complete":true}}}
 ```
 
-`restart.serve` is true only for a change to telemetry: the receiver is
-configured once per serve process. `restart.sessions` lists the sorted IDs of
-running top-level sessions, found through their `runtime.lease` locks. Child
-agents restart with their owning sessions. `restart.complete` is false if the
-one-second scan deadline or an unreadable directory prevented a complete list.
-New sessions load the new model and agent defaults without restarting serve;
-project settings and explicit session options still take precedence.
+The result has the settings read back from the file after the write. A
+process reads `[otel]` once at startup, so `restart` lists what must restart
+to use the change: `serve` is always `true` (this process), and `sessions` are
+the sorted ids of every top-level session a live process owns, found through
+the kernel lock on each session's `runtime.lease` (never a stored pid).
+Child agents restart with their top-level session. The scan has no row cap
+and a 1 second deadline; `complete` is `false` when the deadline or an
+unreadable directory stopped it, and `sessions` then has the owners found so
+far.
 
-Errors: `-32602 invalid_params` for bad parameters, unknown or non-editable
-keys, and bad values; `-32009 stale_settings_revision` (both `data.code` and
-`data.reason`) when the revision is stale, without the current revision;
-`-32004 operation_busy` for a lock held longer than 250 ms; and `-32000`
-`settings_malformed` or `settings_unsafe` for malformed or unsafe files.
+Errors:
 
-Turning telemetry on is refused with nothing written when telemetry could not
-start: `zeta[otel]` is not installed, an `OTEL_EXPORTER_OTLP*` or
-`OTEL_PYTHON_EXPORTER_OTLP*` variable is set, or `OTEL_SDK_DISABLED=true` is
-set in the server's environment. The server runs the same check zeta runs at
-startup, before it takes the lock. `detail` is the fixed startup error text.
-Turning telemetry off is never refused for this reason:
-`{"code":-32602,"message":"telemetry cannot start in this zeta install or environment","data":{"code":"telemetry_unavailable","detail":"OpenTelemetry support is not installed; install zeta[otel]"}}`
+- unknown, duplicate, or extra keys, a non-boolean value, or a malformed
+  revision: `{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}`
+- a custom endpoint or custom dotted `otel` value is set; the file is not
+  changed:
+  `{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}`
+  The built-in dotted `otel.endpoint` is an on no-op and is removed when
+  disabling telemetry. An `otel` inline table remains custom.
+- the file changed since `expected_revision`:
+  `{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:<64 hex>"}}`
+- another zeta writer held the lock for 250 ms:
+  `{"code":-32009,"message":"another zeta process is writing settings.toml","data":{"code":"settings_busy","retryable":true}}`
+- turning telemetry on when it could not start: `zeta[otel]` is not installed,
+  an `OTEL_EXPORTER_OTLP*` or `OTEL_PYTHON_EXPORTER_OTLP*` variable is set, or
+  `OTEL_SDK_DISABLED=true` is set in the server's environment. The server runs
+  the same check zeta runs at startup, before it takes the lock, so nothing is
+  written; `detail` is the startup error text. Turning telemetry off is never
+  refused for this reason:
+  `{"code":-32602,"message":"telemetry cannot start in this zeta install or environment","data":{"code":"telemetry_unavailable","detail":"OpenTelemetry support is not installed; install zeta[otel]"}}`
+- the file does not parse or validate (update only; nothing is written):
+  `{"code":-32000,"message":"settings.toml does not parse or validate","data":{"code":"settings_malformed"}}`
+- `settings.toml` is a symbolic link or not a regular, unshared file (get and
+  update; it is never followed or replaced):
+  `{"code":-32000,"message":"settings.toml is a link or not a regular, unshared file","data":{"code":"settings_unsafe"}}`
+- any other failure, such as a missing or moved home directory (get and
+  update): `{"code":-32000,"message":"unexpected server or storage failure"}`;
+  the reply never carries a path or the underlying error text
 
 ### agent run catalog (`agent_run_catalog_v1` feature)
 
@@ -2473,6 +2503,9 @@ Error descriptors are:
 | `telemetry_off` | `-32005` | `telemetry_off` | no telemetry database exists |
 | `telemetry_schema_mismatch` | `-32000` | `telemetry_schema_mismatch` | the telemetry database schema is not the one this zeta reads |
 | `result_too_large` | `-32007` | `result_too_large` | not even one item fits one frame |
+| `custom_home_setting` | `-32602` | `custom_home_setting` | the setting has a custom value that serve does not change |
+| `stale_revision` | `-32009` | `stale_revision` | settings.toml changed since the given revision |
+| `settings_busy` | `-32009` | `settings_busy` | another zeta process is writing settings.toml |
 | `stale_resource_revision` | `-32009` | none | resource revision is stale |
 | `resource_busy` | `-32004` | `operation_busy` | another process is writing this resource |
 | `settings_malformed` | `-32000` | `settings_malformed` | settings.toml does not parse or validate |

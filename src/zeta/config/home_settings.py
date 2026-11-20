@@ -3,30 +3,29 @@
 A client sees an allowlisted projection plus ``revision``, the SHA-256 of the exact file bytes
 (an absent file hashes as empty bytes). An update names that revision; it takes the sibling
 ``settings.toml.lock``, rereads the bytes under the lock, and refuses a stale revision, so an edit
-finished before the reread is never lost. The lock serializes zeta writers only; an editor that writes after the reread is not stopped.
-Edits preserve bytes outside the changed setting and are validated by the startup parser. An
-update that turns telemetry on first runs the telemetry start preflight, so it never writes a
-setting that would stop the next start.
+finished before the reread is never lost. The lock serializes zeta writers only; an editor that
+writes after the reread is not stopped. The edit touches only the built-in endpoint line (under
+``[otel]``, or a top-level ``otel.endpoint``), checked against a ``tomlkit`` parse, and a
+candidate is published only after ``load_settings``'s own validation accepts it. An update that
+turns telemetry on first runs the telemetry start preflight, so it never writes a setting that
+would stop the next start.
 
 Every function blocks (file locks and fsync); call it off the event loop.
+The serve adapter adds the restart report (``resource_protocol.restart_report``).
 """
 
 from __future__ import annotations
 
 import errno
 import hashlib
-import json
 import os
 import re
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import tomlkit
 from tomlkit.exceptions import TOMLKitError
 
-from ..agent.budget import HARD_MAX_AGENT_DEPTH
 from ..core.session_files import (
     SessionError,
     flock_with_deadline,
@@ -58,40 +57,43 @@ class HomeSettingsError(Exception):
 
 def get(home: Path) -> dict[str, Any]:
     """The safe projection of ``home``'s settings and their revision."""
-    with _locked_home(home) as home_fd:
-        raw = _read(home_fd)
-        revision = _revision(raw)
+    raw = _read_home(home)
     try:
         settings = _project(raw, home)
     except HomeSettingsError:
         settings = {"telemetry": {"source": "unknown", "editable": False}}
-        return {"revision": revision, "settings": settings, "settings_malformed": True}
-    return {"revision": revision, "settings": settings, "settings_malformed": False}
+        return {"revision": _revision(raw), "settings": settings, "settings_malformed": True}
+    return {"revision": _revision(raw), "settings": settings, "settings_malformed": False}
 
 
 def update(home: Path, expected_revision: object, changes: object) -> dict[str, Any]:
-    """Apply one change if the file still has the expected revision."""
-    key, value = _parse_changes(expected_revision, changes)
-    if key == "telemetry.enabled" and value is True:
+    """Apply ``changes`` if the file still has ``expected_revision``."""
+    enabled = _parse_changes(expected_revision, changes)
+    if enabled:
         _require_telemetry_can_start()
-    with _locked_home(home) as home_fd:
-        raw = _read(home_fd)
-        revision = _revision(raw)
-        if revision != expected_revision:
-            raise HomeSettingsError("stale_revision")
-        settings = _project(raw, home)
-        candidate = _edit(raw, settings, key, value)
-        changed = candidate != raw
-        if changed:
-            settings = _project(candidate, home)  # validate before publication
-            write_session_file(home_fd, SETTINGS_FILENAME, candidate)
-            revision = _revision(candidate)
-    return {
-        "revision": revision,
-        "settings": settings,
-        "changed": changed,
-        "restart_serve": changed and key == "telemetry.enabled",
-    }
+    require_off_loop_lock("home settings")
+    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        lock_fd = _open_file(home_fd, LOCK_NAME, os.O_RDWR | os.O_CREAT)
+        try:
+            if not flock_with_deadline(lock_fd, LOCK_SECONDS):
+                raise HomeSettingsError("settings_busy", retryable=True)
+            raw = _read(home_fd)
+            if _revision(raw) != expected_revision:
+                raise HomeSettingsError("stale_revision", current_revision=_revision(raw))
+            current = _project(raw, home)["telemetry"]
+            if current["source"] == "custom":
+                raise HomeSettingsError("custom_home_setting")
+            candidate = raw if current["enabled"] == enabled else _with_telemetry(raw, enabled)
+            _project(candidate, home)  # the same validation load_settings runs, before publication
+            if candidate != raw:
+                write_session_file(home_fd, SETTINGS_FILENAME, candidate)
+            raw = _read(home_fd)
+        finally:
+            os.close(lock_fd)  # closing the descriptor releases the lock
+        return {"revision": _revision(raw), "settings": _project(raw, home)}
+    finally:
+        os.close(home_fd)
 
 
 def _require_telemetry_can_start() -> None:
@@ -105,59 +107,20 @@ def _require_telemetry_can_start() -> None:
         raise HomeSettingsError("telemetry_unavailable", detail=str(exc)) from None
 
 
-@contextmanager
-def _locked_home(home: Path) -> Iterator[int]:
-    require_off_loop_lock("home settings")
-    home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        lock_fd = _open_file(home_fd, LOCK_NAME, os.O_RDWR | os.O_CREAT)
-        try:
-            if not flock_with_deadline(lock_fd, LOCK_SECONDS):
-                raise HomeSettingsError("settings_busy", retryable=True)
-            yield home_fd
-        finally:
-            os.close(lock_fd)
-    finally:
-        os.close(home_fd)
-
-
-def _valid_model(value: object) -> bool:
-    return (type(value) is str and 0 < len(value) <= 256 and value == value.strip()
-            and all(char.isprintable() for char in value))
-
-
-_VALUE_VALIDATORS: dict[str, Callable[[object], bool]] = {
-    "telemetry.enabled": lambda value: type(value) is bool,
-    "agents.explicit_finish": lambda value: type(value) is bool,
-    "agents.max_depth": lambda value: type(value) is int and 0 <= value <= HARD_MAX_AGENT_DEPTH,
-    "model": _valid_model,
-}
-
-
-def _parse_changes(expected_revision: object, changes: object) -> tuple[str, Any]:
+def _parse_changes(expected_revision: object, changes: object) -> bool:
     if type(expected_revision) is not str or _REVISION.fullmatch(expected_revision) is None:
         raise HomeSettingsError("invalid_params")
     if type(changes) is not list or len(changes) != 1:
         raise HomeSettingsError("invalid_params")
     change = changes[0]
-    if type(change) is not dict or change.keys() != {"key", "value"}:
+    if (
+        type(change) is not dict
+        or change.keys() != {"key", "value"}
+        or change["key"] != "telemetry.enabled"
+        or type(change["value"]) is not bool
+    ):
         raise HomeSettingsError("invalid_params")
-    key, value = change["key"], change["value"]
-    validate = _VALUE_VALIDATORS.get(key) if type(key) is str else None
-    if validate is None or not validate(value):
-        raise HomeSettingsError("invalid_params")
-    return key, value
-
-
-def _edit(raw: bytes, settings: dict[str, Any], key: str, value: Any) -> bytes:
-    if key == "telemetry.enabled":
-        telemetry = settings["telemetry"]
-        if not telemetry["editable"]:
-            raise HomeSettingsError("invalid_params")
-        return raw if telemetry["enabled"] == value else _with_telemetry(raw, value)
-    table, _, name = key.rpartition(".")
-    current = settings[table].get(name) if table else settings[name]
-    return raw if current == value else _with_scalar(raw, table, name, value)
+    return change["value"]
 
 
 def _revision(raw: bytes) -> str:
@@ -202,15 +165,7 @@ def read_settings(home: Path) -> Settings:
 
 def _project(raw: bytes, home: Path) -> dict[str, Any]:
     try:
-        settings = validate_home_settings(raw, home)
-        return {
-            "telemetry": telemetry_projection(settings),
-            "model": settings.model,
-            "agents": {
-                "max_depth": settings.agents_max_depth,
-                "explicit_finish": settings.agents_explicit_finish is True,
-            },
-        }
+        return {"telemetry": telemetry_projection(validate_home_settings(raw, home))}
     except (ValueError, TypeError):
         raise HomeSettingsError("settings_malformed") from None
 
@@ -249,7 +204,7 @@ def _with_telemetry(raw: bytes, enabled: bool) -> bytes:
                 return candidate
         except HomeSettingsError:
             pass  # the edit does not parse here; try the next one
-    raise HomeSettingsError("invalid_params")
+    raise HomeSettingsError("custom_home_setting")
 
 
 def _on_edits(lines: list[bytes], newline: bytes) -> list[list[bytes]]:
@@ -274,61 +229,6 @@ def _first_table(lines: list[bytes], start: int) -> int:
     return next((i for i in range(start, len(lines)) if _HEADER.match(lines[i])), len(lines))
 
 
-def _with_scalar(raw: bytes, table: str, name: str, value: str | int | bool) -> bytes:
-    """Replace only a scalar's bytes, or insert a line without formatting existing lines."""
-    newline = b"\r\n" if b"\r\n" in raw else b"\n"
-    unterminated = bool(raw) and not raw.endswith(b"\n")
-    lines = (raw + newline if unterminated else raw).splitlines(keepends=True)
-    expected = _document(raw)
-    parent = expected.setdefault(table, {}) if table else expected
-    if not isinstance(parent, dict):
-        raise HomeSettingsError("invalid_params")
-    present = name in parent
-    parent[name] = value
-    encoded = json.dumps(value, ensure_ascii=False).encode()
-    # Only accept a byte edit that changes the intended TOML value, not a matching decoy.
-    for candidate in _scalar_edits(lines, newline, table, name, encoded, present=present):
-        if unterminated:
-            candidate = candidate.removesuffix(newline)
-        try:
-            if _document(candidate) == expected:
-                return candidate
-        except HomeSettingsError:
-            pass
-    raise HomeSettingsError("invalid_params")
-
-
-def _scalar_edits(
-    lines: list[bytes], newline: bytes, table: str, name: str, encoded: bytes, *, present: bool,
-) -> Iterator[bytes]:
-    def atom(name: bytes) -> bytes:
-        return rb"(?:" + name + rb"|'" + name + rb"'|\"" + name + rb"\")"
-
-    key = name.encode()
-    dotted = (table + "." + name).encode() if table else key
-    scalar = rb'''("(?:[^"\\\r\n]|\\.)*"|'[^'\r\n]*'|[-+a-zA-Z0-9_]+)'''
-    plain = atom(key)
-    patterns = [plain]
-    if table:
-        namespace = atom(table.encode())
-        header = re.compile(rb"[ \t]*\[[ \t]*" + namespace + rb"[ \t]*\][ \t]*(?:#[^\r\n]*)?\r?\n?\Z")
-        headers = [i for i, line in enumerate(lines) if header.match(line)]
-        patterns.append(namespace + rb"[ \t]*\.[ \t]*" + plain)
-    else:
-        headers = []
-
-    if not present:
-        for i, spelling in [(0, dotted), *((i + 1, key) for i in headers)]:
-            yield b"".join(lines[:i] + [spelling + b" = " + encoded + newline] + lines[i:])
-        return
-    for pattern in patterns:
-        line_pattern = re.compile(rb"[ \t]*" + pattern + rb"[ \t]*=[ \t]*" + scalar + rb"[ \t]*(?:#.*)?\r?\n?\Z")
-        for i, line in enumerate(lines):
-            if match := line_pattern.match(line):
-                start, end = match.span(1)
-                yield b"".join(lines[:i] + [line[:start] + encoded + line[end:]] + lines[i + 1:])
-
-
 def _document(raw: bytes, enabled: bool | None = None) -> dict[str, Any]:
     """``raw`` as plain data, with the endpoint set (``enabled``) or removed, and no empty ``otel``."""
     try:
@@ -344,3 +244,4 @@ def _document(raw: bytes, enabled: bool | None = None) -> dict[str, Any]:
     if document.get("otel") == {}:
         del document["otel"]
     return document
+

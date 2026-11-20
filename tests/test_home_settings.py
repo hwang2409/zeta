@@ -86,19 +86,13 @@ def test_missing_file_projects_defaults_and_update_creates_it(tmp_path: Path) ->
 
     assert got == {
         "revision": _revision(b""),
-        "settings": {
-            "telemetry": {"enabled": False, "source": "off", "editable": True},
-            "model": None, "agents": {"max_depth": 3, "explicit_finish": False},
-        },
+        "settings": {"telemetry": {"enabled": False, "source": "off", "editable": True}},
         "settings_malformed": False,
     }
     written = (home / "settings.toml").read_bytes()
     assert written == f'otel.endpoint = "{BUILTIN}"\n'.encode()
     assert updated["revision"] == _revision(written)
-    assert updated["settings"] == {
-        "telemetry": {"enabled": True, "source": "builtin", "editable": True},
-        "model": None, "agents": {"max_depth": 3, "explicit_finish": False},
-    }
+    assert updated["settings"] == {"telemetry": {"enabled": True, "source": "builtin", "editable": True}}
 
 
 @pytest.mark.parametrize("body", [b"model = [\n", b"model = \"\xff\"\n", b"[otel]\nendpoint = 5\n"])
@@ -136,14 +130,14 @@ def test_unsafe_file_is_refused_and_never_followed_or_replaced(tmp_path: Path, k
     assert settings.is_symlink() is (kind == "symlink")
 
 
-def test_stale_revision_does_not_disclose_the_current_revision_or_write(tmp_path: Path) -> None:
+def test_stale_revision_names_the_current_revision_and_writes_nothing(tmp_path: Path) -> None:
     home = _home(tmp_path, b'model = "a"\n')
     old = home_settings.get(home)["revision"]
     (home / "settings.toml").write_bytes(b'model = "b"\n')
 
     refused = _refused("stale_revision", lambda: home_settings.update(home, old, ON))
 
-    assert refused.data == {}
+    assert refused.data == {"current_revision": _revision(b'model = "b"\n')}
     assert (home / "settings.toml").read_bytes() == b'model = "b"\n'
 
 
@@ -229,11 +223,11 @@ _LAYOUTS = {
 
 # (original, the update that would edit it, the refusal); the file stays byte-identical.
 _REFUSED = {
-    "inline-table": (f'otel = {{ endpoint = "{BUILTIN}" }}\n'.encode(), OFF, "invalid_params"),
-    "empty-inline-table": (b"otel = {}\n", ON, "invalid_params"),
-    "custom-dotted": (b'otel.endpoint = "http://127.0.0.1:9999/v1/traces"\n', OFF, "invalid_params"),
-    "multiline-basic-header-decoy": (b'text = """\n[otel]\n"""\n', ON, "invalid_params"),
-    "multiline-literal-header-decoy": (b"text = '''\n[otel]\n'''\n", ON, "invalid_params"),
+    "inline-table": (f'otel = {{ endpoint = "{BUILTIN}" }}\n'.encode(), OFF, "custom_home_setting"),
+    "empty-inline-table": (b"otel = {}\n", ON, "custom_home_setting"),
+    "custom-dotted": (b'otel.endpoint = "http://127.0.0.1:9999/v1/traces"\n', OFF, "custom_home_setting"),
+    "multiline-basic-header-decoy": (b'text = """\n[otel]\n"""\n', ON, "custom_home_setting"),
+    "multiline-literal-header-decoy": (b"text = '''\n[otel]\n'''\n", ON, "custom_home_setting"),
     "sub-table-before": (b"[otel.sub]\n[otel]\n", ON, "settings_malformed"),
     "sub-table-after": (b"[otel]\n[otel.sub]\n", ON, "settings_malformed"),
     "bom": (b'\xef\xbb\xbfmodel = "a"\n', ON, "settings_malformed"),
@@ -245,40 +239,15 @@ def _set(home: Path, changes: list) -> bytes | None:
     return _bytes(home)
 
 
-_SCALAR_ROUND_TRIPS = {
-    "model": (
-        b"text = \"\"\"\nmodel = 'decoy'\n\"\"\"\nmodel   =  \"gpt-5.5\"  # keep\n",
-        b"text = \"\"\"\nmodel = 'decoy'\n\"\"\"\nmodel   =  \"gpt-5.6-luna\"  # keep\n",
-        "gpt-5.5", "gpt-5.6-luna",
-    ),
-    "agents.max_depth": (
-        b"[agents] # keep\r\n'max_depth' = 3 # keep\r\nexplicit_finish = false",
-        b"[agents] # keep\r\n'max_depth' = 2 # keep\r\nexplicit_finish = false",
-        3, 2,
-    ),
-    "agents.explicit_finish": (
-        b"'agents' . explicit_finish  = false # keep\n[future]\nfoo = 8\n",
-        b"'agents' . explicit_finish  = true # keep\n[future]\nfoo = 8\n",
-        False, True,
-    ),
-}
-
-
-@pytest.mark.parametrize(
-    ("original", "off", "on", "key", "before", "after"),
-    [(*row, "telemetry.enabled", False, True) for row in _LAYOUTS.values()]
-    + [(off, off, on, key, before, after) for key, (off, on, before, after) in _SCALAR_ROUND_TRIPS.items()],
-    ids=[*_LAYOUTS, *_SCALAR_ROUND_TRIPS],
-)
-def test_updates_preserve_bytes_outside_the_changed_setting(tmp_path, original, off, on, key, before, after):
+@pytest.mark.parametrize(("original", "off", "on"), list(_LAYOUTS.values()), ids=list(_LAYOUTS))
+def test_toggles_change_only_the_endpoint_line(tmp_path: Path, original: bytes | None, off: bytes, on: bytes) -> None:
     home = _home(tmp_path, original)
-    reset = [{"key": key, "value": before}]
-    change = [{"key": key, "value": after}]
 
-    assert _set(home, reset) == (None if original is None else off)
-    assert _set(home, change) == on
-    assert _set(home, change) == on
-    assert _set(home, reset) == off
+    assert _set(home, OFF) == (None if original is None else off)  # off on a missing file writes nothing
+    assert _set(home, ON) == on
+    assert _set(home, ON) == on
+    assert _set(home, OFF) == off
+    assert home_settings.get(home)["settings"]["telemetry"] == {"enabled": False, "source": "off", "editable": True}
 
 
 @pytest.mark.parametrize(("original", "changes", "code"), list(_REFUSED.values()), ids=list(_REFUSED))
@@ -310,8 +279,8 @@ def test_custom_endpoint_is_read_only_and_byte_identical(tmp_path: Path) -> None
             refusals.append(exc.code)
         assert (home / "settings.toml").read_bytes() == original
 
-    assert refusals == ["invalid_params", "invalid_params"]
-    assert got["settings"]["telemetry"] == {"enabled": True, "source": "custom", "editable": False}
+    assert refusals == ["custom_home_setting", "custom_home_setting"]
+    assert got["settings"] == {"telemetry": {"enabled": True, "source": "custom", "editable": False}}
 
 
 @pytest.mark.parametrize(
@@ -410,7 +379,7 @@ def test_simultaneous_updates_from_one_revision_apply_once(tmp_path: Path, monke
     written = (home / "settings.toml").read_bytes()
     assert isinstance(results["second"], HomeSettingsError)
     assert results["second"].code == "stale_revision"
-    assert results["second"].data == {}
+    assert results["second"].data == {"current_revision": _revision(written)}
     assert written == f'otel.endpoint = "{BUILTIN}"\n'.encode()
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.support.serve_contract import ServeContract
 
 FEATURES = ["home_settings_v1"]
@@ -51,6 +53,11 @@ def _otel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str]
             monkeypatch.delenv(name)
 
 
+def _wire(value: object) -> str:
+    """Key order counts: these replies are the bytes main shipped for ``home_settings_v1``."""
+    return json.dumps(value)
+
+
 def _revision(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
@@ -76,7 +83,7 @@ async def test_observers_read_but_never_update_home_settings(tmp_path: Path) -> 
         unnegotiated = await plain.request("get", "home_settings_get")
         got = await observer.request("get", "home_settings_get")
         refused = await observer.request(
-            "update", "home_settings_update", {"changes": "not a change"}
+            "update", "home_settings_update", {"expected_revision": got["result"]["revision"], "changes": ON}
         )
     finally:
         await contract.close()
@@ -85,19 +92,16 @@ async def test_observers_read_but_never_update_home_settings(tmp_path: Path) -> 
     assert unnegotiated["error"]["code"] == -32601
     assert "home_settings_get" in observer_hello["capabilities"]["requests"]
     assert "home_settings_update" not in observer_hello["capabilities"]["requests"]
-    assert got["result"] == {
+    assert _wire(got["result"]) == _wire({
         "revision": _revision(b'model = "gpt-5.6-luna"\n'),
-        "settings": {
-            "telemetry": {"enabled": False, "source": "off", "editable": True},
-            "model": "gpt-5.6-luna", "agents": {"max_depth": 3, "explicit_finish": False},
-        },
+        "settings": {"telemetry": {"enabled": False, "source": "off", "editable": True}},
         "settings_malformed": False,
-    }
-    assert refused["error"] == {
+    })
+    assert _wire(refused["error"]) == _wire({
         "code": -32008,
         "message": "method is unavailable to read-only observers",
-        "data": {"code": "observer_read_only", "method": "home_settings_update", "reason": "observer_read_only"},
-    }
+        "data": {"code": "observer_read_only", "method": "home_settings_update"},
+    })
     assert settings.read_bytes() == b'model = "gpt-5.6-luna"\n'
 
 
@@ -120,10 +124,6 @@ async def test_controller_update_checks_revision_and_lists_restarts(tmp_path: Pa
                 "expected_revision": got["result"]["revision"],
                 "changes": [{"key": "yolo", "value": True}],
             }),
-            await controller.request("depth-bool", "home_settings_update", {
-                "expected_revision": got["result"]["revision"],
-                "changes": [{"key": "agents.max_depth", "value": True}],
-            }),
         ]
         stale = await controller.request(
             "stale", "home_settings_update", {"expected_revision": _revision(b"other"), "changes": ON}
@@ -136,23 +136,20 @@ async def test_controller_update_checks_revision_and_lists_restarts(tmp_path: Pa
         await contract.close()
 
     assert {"home_settings_get", "home_settings_update"} <= set(hello["capabilities"]["requests"])
-    assert [reply["error"] for reply in invalid] == [INVALID] * 4
-    assert stale["error"] == {
+    assert _wire([reply["error"] for reply in invalid]) == _wire([INVALID, INVALID, INVALID])
+    assert _wire(stale["error"]) == _wire({
         "code": -32009,
-        "message": "resource revision is stale",
-        "data": {"code": "stale_settings_revision", "reason": "stale_settings_revision"},
-    }
+        "message": "settings.toml changed since the given revision",
+        "data": {"code": "stale_revision", "current_revision": got["result"]["revision"]},
+    })
     assert unchanged is False
     written = settings.read_bytes()
     assert written == f'otel.endpoint = "{BUILTIN}"\n'.encode()
-    assert updated["result"] == {
+    assert _wire(updated["result"]) == _wire({
         "revision": _revision(written),
-        "settings": {
-            "telemetry": {"enabled": True, "source": "builtin", "editable": True},
-            "model": None, "agents": {"max_depth": 3, "explicit_finish": False},
-        },
+        "settings": {"telemetry": {"enabled": True, "source": "builtin", "editable": True}},
         "restart": {"serve": True, "sessions": [session_id], "complete": True},
-    }
+    })
 
 
 UNAVAILABLE = {
@@ -202,40 +199,13 @@ async def test_turning_telemetry_on_runs_the_start_preflight_first(
         await contract.close()
 
     if refusal is not None:
-        assert reply.get("error") == refusal
+        assert _wire(reply.get("error")) == _wire(refusal)
         assert settings.read_bytes() == body
     else:
         assert "error" not in reply, reply
         enabled = changes[0]["value"]
         assert reply["result"]["settings"]["telemetry"]["enabled"] is enabled
         assert settings.read_bytes() == (f'otel.endpoint = "{BUILTIN}"\n'.encode() if enabled else b"")
-
-
-@pytest.mark.asyncio
-async def test_new_serve_sessions_read_updated_home_defaults_without_restarting_serve(tmp_path: Path) -> None:
-    contract = await ServeContract.start(tmp_path, "websocket")
-    try:
-        controller, _ = await _client(contract)
-        first = (await controller.request("first", "new_session", {"provider": "codex"}))["result"]["session"]
-        assert first["model"] == "gpt-5.6-luna"
-        revision = (await controller.request("get", "home_settings_get"))["result"]["revision"]
-        for key, value in (("model", "gpt-5.5"), ("agents.max_depth", 2), ("agents.explicit_finish", True)):
-            reply = await controller.request(key, "home_settings_update", {
-                "expected_revision": revision, "changes": [{"key": key, "value": value}],
-            })
-            assert "result" in reply, reply
-            result = reply["result"]
-            assert result["restart"] == {"serve": False, "sessions": [first["session_id"]], "complete": True}
-            revision = result["revision"]
-        before = (await controller.request("before", "status"))["result"]
-        assert before["session"]["model"] == "gpt-5.6-luna"
-        assert (before["max_agent_depth"], before["explicit_finish"]) == (3, False)
-        second = (await controller.request("second", "new_session", {"provider": "codex"}))["result"]["session"]
-        assert second["model"] == "gpt-5.5"
-        after = (await controller.request("after", "status"))["result"]
-        assert (after["max_agent_depth"], after["explicit_finish"]) == (2, True)
-    finally:
-        await contract.close()
 
 
 @pytest.mark.asyncio
@@ -261,4 +231,73 @@ async def test_a_filesystem_failure_names_no_path(tmp_path: Path, monkeypatch: p
 
     for reply in replies:
         assert tmp_path.name not in json.dumps(reply)
-        assert reply["error"] == {"code": -32000, "message": "unexpected server or storage failure"}
+        assert _wire(reply["error"]) == _wire({"code": -32000, "message": "unexpected server or storage failure"})
+
+
+CUSTOM = b'otel.endpoint = "http://127.0.0.1:9999/v1/traces"\n'
+NO_RESTART = {"serve": True, "sessions": [], "complete": True}
+OFF_SETTINGS = {"telemetry": {"enabled": False, "source": "off", "editable": True}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "layout", "method", "changes", "reply"),
+    [
+        pytest.param(f'otel.endpoint = "{BUILTIN}"\n'.encode(), "file", "home_settings_update", OFF, {"result": {
+            "revision": _revision(b""), "settings": OFF_SETTINGS, "restart": NO_RESTART,
+        }}, id="update-off"),
+        pytest.param(b'model = "a"\n', "file", "home_settings_update", OFF, {"result": {
+            "revision": _revision(b'model = "a"\n'), "settings": OFF_SETTINGS, "restart": NO_RESTART,
+        }}, id="unchanged-update-still-reports-serve"),
+        pytest.param(b"", "locked", "home_settings_update", OFF, {"error": {
+            "code": -32009, "message": "another zeta process is writing settings.toml",
+            "data": {"code": "settings_busy", "retryable": True},
+        }}, id="busy"),
+        pytest.param(b'model = "a"\n', "locked", "home_settings_get", None, {"result": {
+            "revision": _revision(b'model = "a"\n'), "settings": OFF_SETTINGS, "settings_malformed": False,
+        }}, id="get-never-waits-for-the-write-lock"),
+        pytest.param(CUSTOM, "file", "home_settings_update", OFF, {"error": {
+            "code": -32602, "message": "the setting has a custom value that serve does not change",
+            "data": {"code": "custom_home_setting"},
+        }}, id="custom-endpoint"),
+        pytest.param(f'otel = {{ endpoint = "{BUILTIN}" }}\n'.encode(), "file", "home_settings_update", OFF, {"error": {
+            "code": -32602, "message": "the setting has a custom value that serve does not change",
+            "data": {"code": "custom_home_setting"},
+        }}, id="custom-layout"),
+        pytest.param(b"model = [\n", "file", "home_settings_update", OFF, {"error": {
+            "code": -32000, "message": "settings.toml does not parse or validate", "data": {"code": "settings_malformed"},
+        }}, id="malformed-update"),
+        pytest.param(b"model = [\n", "file", "home_settings_get", None, {"result": {
+            "revision": _revision(b"model = [\n"), "settings": {"telemetry": {"source": "unknown", "editable": False}},
+            "settings_malformed": True,
+        }}, id="malformed-get"),
+        pytest.param(b"", "symlink", "home_settings_update", OFF, {"error": {
+            "code": -32000, "message": "settings.toml is a link or not a regular, unshared file",
+            "data": {"code": "settings_unsafe"},
+        }}, id="unsafe"),
+    ],
+)
+async def test_v1_replies_are_main_shipped_bytes(tmp_path: Path, body, layout, method, changes, reply) -> None:
+    """Each reply equals main's ``home_settings_v1`` reply, key order included."""
+    home = tmp_path / "home"
+    contract = await ServeContract.start(tmp_path, "websocket")
+    lock = None
+    try:
+        settings = home / "settings.toml"
+        if layout == "symlink":
+            (tmp_path / "target.toml").write_bytes(body)
+            settings.symlink_to(tmp_path / "target.toml")
+        else:
+            settings.write_bytes(body)  # after start: serve does not start on a malformed file
+        if layout == "locked":
+            lock = os.open(home / "settings.toml.lock", os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(lock, fcntl.LOCK_EX)  # another zeta process writing settings.toml
+        controller, _ = await _client(contract)
+        params = {} if changes is None else {"expected_revision": _revision(body), "changes": changes}
+        got = await await_or_fail(controller.request("call", method, params), what=f"{method} reply")
+    finally:
+        if lock is not None:
+            os.close(lock)
+        await contract.close()
+
+    assert _wire({key: got[key] for key in ("result", "error") if key in got}) == _wire(reply)
