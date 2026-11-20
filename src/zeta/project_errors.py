@@ -28,3 +28,16 @@ class UnsupportedMemoryFormatError(ProjectRegistryError):
 
 class ProjectNotFoundError(ProjectRegistryError):
     """The requested project does not exist in a valid registry."""
+
+
+class MemoryDigestMismatchError(ProjectRegistryError):
+    """Project memory changed since the caller read its digest."""
+
+    def __init__(self) -> None:
+        super().__init__("project memory digest mismatch")
+
+
+def require_memory_digest(actual: str, expected: str | None) -> None:
+    """Compare under the memory lock; ``None`` keeps an unconditional write."""
+    if expected is not None and actual != expected:
+        raise MemoryDigestMismatchError

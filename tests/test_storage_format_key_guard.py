@@ -49,6 +49,7 @@ _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
     ("zeta.server.control", "revoke", "rpc params"),
     ("zeta.server.handlers.history", "_validate_history_params", "rpc params"),
     ("zeta.server.handlers.projects", "_only", "rpc params"),
+    ("zeta.server.handlers.resources.project_writes", "_memory_write", "rpc params"),
     ("zeta.server.handlers.registry", "child_run_events", "rpc params"),
     ("zeta.server.handlers.registry", "mcp_refresh_tools", "rpc params"),
     ("zeta.server.host_commands.__init__", "parse", "rpc params"),

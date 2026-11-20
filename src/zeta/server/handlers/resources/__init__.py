@@ -8,6 +8,7 @@ from . import (
     library,
     library_writes,
     mcp_management,
+    project_writes,
     session_read,
 )
 
@@ -20,4 +21,5 @@ FAMILIES = (
     library,
     library_writes,
     session_read,
+    project_writes,
 )
