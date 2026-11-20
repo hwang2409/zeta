@@ -17,6 +17,7 @@ from typing import Any
 from .memory.entry_history import EntryMemoryHistoryMixin, logical_history
 from .memory.entry_views import GENERATED_MIRROR_HEADER
 from .memory.pinned_snapshot import pin_snapshot_files, read_pinned_snapshot
+from .memory.safety import contains_secret
 from .memory.version_store import (
     PreparedVersion,
     PublicationContext,
@@ -24,7 +25,7 @@ from .memory.version_store import (
     require_memory_format,
 )
 from .memory_migration_plan import reachable_version_pruning_plan
-from .project_errors import ProjectRegistryError
+from .project_errors import MemorySecretError, ProjectRegistryError
 from .project_schema import MAX_MEMORY_FILE_SIZE
 from .storage_format import reject_unknown_keys
 
@@ -51,6 +52,13 @@ def _now() -> str:
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z")
     )
+
+
+def _refuse_secrets(updates: Mapping[str, str]) -> None:
+    """Refuse an explicit write, like format 2 entries; imports stay unchecked."""
+    for name, content in updates.items():
+        if contains_secret(content):
+            raise MemorySecretError(f"memory file {name} contains a secret")
 
 
 @dataclass(frozen=True, slots=True)
@@ -970,6 +978,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
             raise ProjectRegistryError("invalid memory digest")
         self._validate_updates(updates)
+        _refuse_secrets(updates)
         provenance_value = self._validate_provenance(provenance)
         with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             directory_fd = os.dup(project_fd)
@@ -1022,6 +1031,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         self, project_id: str, updates: Mapping[str, str]
     ) -> list[tuple[str, str]]:
         self._validate_updates(updates)
+        _refuse_secrets(updates)
         with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             directory_fd = os.dup(project_fd)
             try:
