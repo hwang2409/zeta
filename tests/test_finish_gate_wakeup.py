@@ -60,7 +60,10 @@ async def test_owned_work_wait_wakes_when_last_owned_child_unregisters(
     finally:
         grandchild_done.set()
         waiter.cancel()
-        await asyncio.gather(waiter, grandchild, child_run, return_exceptions=True)
+        await await_or_fail(
+            asyncio.gather(waiter, grandchild, child_run, return_exceptions=True),
+            what="test task cleanup",
+        )
         owner.unregister("root:1")
         await await_or_fail(child.close(), what="child loop close")
         store.close()
