@@ -192,6 +192,10 @@ def _detail(item, document, fits):
     if len(encoded) > _BODY_BYTES:
         data["body"] = encoded[:_BODY_BYTES].decode(errors="ignore")
         data["truncated"] = True
+    if document is not None and not data["redacted"] and len(document.raw) <= _BODY_BYTES:
+        text = document.raw.decode()  # discovery already parsed these bytes as strict UTF-8
+        if redact_secrets(text) == text:  # a secret outside the parsed fields still keeps the raw text back
+            data["document"] = text
     revision = hashlib.sha256(document.raw).hexdigest() if document is not None else _digest(data)
     result = {"revision": revision, "data": data}
     if not fits(result):

@@ -355,3 +355,26 @@ async def test_project_scope_uses_the_root_sessions_load_from_a_worktree(tmp_pat
         assert "alpha" in {skill.name for skill in loop.tool_registry.skill_catalog.skills}
     finally:
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_saving_a_masked_read_back_is_refused(tmp_path: Path) -> None:
+    skills = tmp_path / "home" / "skills"
+    skills.mkdir(parents=True)
+    raw = _document("alpha", "uses sk_library_mask_secret_12345").encode()
+    (skills / "alpha.md").write_bytes(raw)
+    contract = await ServeContract.start(tmp_path, "websocket")
+    try:
+        client = await contract.connect()
+        await client.request("hello", "hello", {"protocol_version": "1.2", "features": _FEATURES})
+        read = (await client.request("read", "skill_read", {"name": "alpha", "scope": "home"}))["result"]
+        assert read["data"]["redacted"] is True and "document" not in read["data"]
+        masked = _document("alpha", read["data"]["body"])
+        saved = await client.request("save", "skill_write", {
+            "name": "alpha", "scope": "home", "revision": read["revision"], "mutation": {"document": masked},
+        })
+        assert "result" not in saved, f"masked save accepted; file now {(skills / 'alpha.md').read_bytes()!r}"
+        assert _reason(saved) == "contains_redaction_marker"
+        assert (skills / "alpha.md").read_bytes() == raw
+    finally:
+        await contract.close()

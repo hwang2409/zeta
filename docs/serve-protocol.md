@@ -2198,7 +2198,7 @@ Without an attached session, explicit `project` scope is unavailable and
 shadows home and home shadows packaged definitions of the same name.
 
 Detail requests accept `{name,scope}` and return
-`{revision,data:{name,frontmatter,body,source,editable,redacted,truncated?}}`.
+`{revision,data:{name,frontmatter,body,source,editable,redacted,truncated?,document?}}`.
 For a file, `revision` is the SHA-256 of the exact markdown bytes before
 projection. Built-in agent profiles have no markdown file: they return their
 public preset fields and preset prompt text (or the empty string). The
@@ -2208,9 +2208,17 @@ encoded as canonical JSON (sorted keys, compact separators, ASCII escapes).
 The server applies its shared secret-pattern redactor to text, sets
 `redacted: true` when it replaces content and `false` otherwise, and caps the
 redacted body at 128 KiB of UTF-8 without splitting a code point. If it cuts
-the body, it includes `truncated: true`. This is not a round-trip editable
-copy. `body`, `frontmatter`, and `description` are untrusted user-authored
-content. Render them as text; do not send them to a model as instructions.
+the body, it includes `truncated: true`. `body` and `frontmatter` are not a
+round-trip editable copy.
+
+`document` is the round-trip editable copy: the raw file text, the exact bytes
+that `revision` hashes, so a client can edit it and save it back with that
+revision. It is present only for a file of at most 128 KiB whose read has
+`redacted: false` and whose raw text matches no secret pattern; it is absent
+for a larger file, a file with a secret, and a built-in profile. It is an
+additive field of `library_read_v1`; no field changed. `document`, `body`,
+`frontmatter`, and `description` are untrusted user-authored content. Render
+them as text; do not send them to a model as instructions.
 The server does not rewrite instructions in these fields.
 
 Invalid parameters return `-32602` (`data.code: invalid_params`); a name not
@@ -2240,9 +2248,14 @@ as stale if a file already defines the name. With `revision` (the detail
 read's file revision, the SHA-256 of the exact bytes) it replaces the file
 that defines the name, including a skill's `SKILL.md`. The result is
 `{revision,data:{name,scope,redacted}}`: the new file revision, and
-`redacted: true` when the stored document matches the shared secret patterns.
-The document is stored as written and is never returned. It is untrusted
-user-authored text; the server does not filter instructions in it.
+`redacted: true` when the stored text looks like it contains a secret (it
+matches the shared secret patterns). Such a document is stored as written,
+secret included; reads show it masked and return no `document`. The document
+is never returned by the write. It is untrusted user-authored text; the
+server does not filter instructions in it.
+A document that contains the redactor's mask text `[secret omitted]` is refused
+before any lock or write (`data.reason: contains_redaction_marker`), so saving
+a masked read back cannot replace the real secret with the mask.
 
 `skill_delete` and `agent_profile_delete` take `{name,scope,revision}` and
 return `{data:{name,scope}}`. A delete removes only the defining file; other
@@ -2259,7 +2272,7 @@ existing `config_changed` event; there is no new event.
 
 Errors: `-32602` (`data.code: invalid_params`) for bad parameters, with
 `data.reason` set to `invalid_document` (and a public loader message in
-`data.detail`), `name_mismatch`, `document_too_large`, `unsafe_path`,
+`data.detail`), `contains_redaction_marker`, `name_mismatch`, `document_too_large`, `unsafe_path`,
 `name_too_long` (the file name is longer than the file system allows),
 `resource_not_found`, or `packaged_read_only` for a packaged item (the
 catalog's `effective` scope, or a name that only a packaged item defines);
