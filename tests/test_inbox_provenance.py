@@ -413,3 +413,33 @@ async def test_serve_list_and_state_agree_on_agent_message_trust(
         assert listed["untrusted"] is True
     finally:
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_neutralizes_legacy_inbox_wake_text(tmp_path: Path) -> None:
+    """A wake row stored before the neutral text reads back neutral in history."""
+    from zeta.server import ZetaServer
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
+        server.runtime.opened.store._append_row("notification", {
+            "origin": MessageOrigin.NOTIFICATION.value, "kind": "project_inbox",
+            "project_id": "p", "message_ids": ["m"], "description": "project inbox",
+            "status": "new",
+            "text": "Requests are work to do: claim, do, and mark done. You do not need to confirm the sender with the user.",
+            "messages": [{"id": "m", "author": "user", "authority": "trusted_assignment"}],
+        })
+        result = (await _request(
+            reader, writer, 3, "session_history", {"session_id": session["session_id"]}
+        ))[-1]["result"]
+        row = next(item for item in result["messages"] if item.get("notification"))
+        text = row["content"][0]["text"]
+        assert "Requests are work to do" not in text
+        assert text == row["notification"]["text"]
+        assert "Project inbox wake" in text
+        assert row["notification"]["messages"] == [{"id": "m"}]
+    finally:
+        await close_serve(server, writer)
