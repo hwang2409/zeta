@@ -9,6 +9,7 @@ from pathlib import Path
 
 from ....agent.presets import AgentPreset
 from ....memory.safety import REDACTED_SECRET, redact_secrets
+from ....project_schema import MAX_MEMORY_FILE_SIZE
 from ....read_page import TooLarge, offset_page
 from ....skills import agent_catalog, catalog
 from ....skills.discovery import is_slash_safe_name
@@ -16,7 +17,7 @@ from ...resource_protocol import Access, ResourceMethod, require_params
 
 FEATURE = "library_read_v1"
 _SCOPES = ("effective", "home", "project")
-_BODY_BYTES = 128 * 1024
+_BODY_BYTES = MAX_MEMORY_FILE_SIZE  # same 128 KiB cap as project memory text
 
 
 def _digest(value):
