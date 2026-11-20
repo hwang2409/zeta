@@ -197,11 +197,18 @@ async def mcp_auth_logout(client, request_id, params):
     await auth.cancel(name)
     with owner_errors(**_error_rules()), private_management_io():
         work = asyncio.create_task(_owner(client).logout(name, scope=scope))
-        try:
-            await asyncio.shield(work)
-        except asyncio.CancelledError:
-            await asyncio.gather(asyncio.shield(work), return_exceptions=True)
-            raise
+        cancelled = False
+        # Every cancellation waits for the credential delete before unwinding.
+        while not work.done():
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError:
+                cancelled = True
+        if cancelled:
+            if not work.cancelled():
+                work.exception()  # Mark it retrieved; a cancelled request never relays it.
+            raise asyncio.CancelledError
+        work.result()
     auth.forget(name)
     return {"data": {"state": "unauthorized"}}
 
