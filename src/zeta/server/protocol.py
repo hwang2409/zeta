@@ -171,6 +171,7 @@ class ErrorDescriptor(Enum):
     SETTINGS_BUSY = (-32009, "settings_busy", "another zeta process is writing settings.toml")
     SETTINGS_MALFORMED = (-32000, "settings_malformed", "settings.toml does not parse or validate")
     SETTINGS_UNSAFE = (-32000, "settings_unsafe", "settings.toml is a link or not a regular, unshared file")
+    TELEMETRY_UNAVAILABLE = (-32602, "telemetry_unavailable", "telemetry cannot start in this zeta install or environment")
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
         self.code = code

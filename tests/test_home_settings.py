@@ -23,6 +23,12 @@ ON = [{"key": "telemetry.enabled", "value": True}]
 OFF = [{"key": "telemetry.enabled", "value": False}]
 
 
+@pytest.fixture(autouse=True)
+def _telemetry_can_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests cover the file edit; the start preflight's refusal is tested through serve."""
+    monkeypatch.setattr("zeta.telemetry.runtime.preflight", lambda: None)
+
+
 def _revision(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 

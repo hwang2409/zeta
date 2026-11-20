@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +18,40 @@ FEATURES = ["home_settings_v1"]
 BUILTIN = "http://127.0.0.1:4323/v1/traces"
 ON = [{"key": "telemetry.enabled", "value": True}]
 INVALID = {"code": -32602, "message": "invalid params", "data": {"code": "invalid_params"}}
+
+
+# the names ``zeta.telemetry.runtime.preflight`` imports, so a stub tree on PYTHONPATH decides
+# whether the serve subprocess can start telemetry, with or without zeta[otel] installed
+_SDK_STUBS = {
+    "requests/__init__.py": "",
+    "opentelemetry/__init__.py": "",
+    "opentelemetry/exporter/__init__.py": "",
+    "opentelemetry/exporter/otlp/__init__.py": "",
+    "opentelemetry/exporter/otlp/proto/__init__.py": "",
+    "opentelemetry/exporter/otlp/proto/http/__init__.py": "",
+    "opentelemetry/exporter/otlp/proto/http/trace_exporter.py": "OTLPSpanExporter = None\n",
+    "opentelemetry/sdk/__init__.py": "",
+    "opentelemetry/sdk/resources.py": "Resource = None\n",
+    "opentelemetry/sdk/trace/__init__.py": "SpanLimits = TracerProvider = None\n",
+    "opentelemetry/sdk/trace/export.py": "BatchSpanProcessor = None\n",
+    "opentelemetry/sdk/trace/sampling.py": "ALWAYS_ON = ParentBased = None\n",
+    "opentelemetry/trace/__init__.py": "",
+    "opentelemetry/trace/propagation/__init__.py": "",
+    "opentelemetry/trace/propagation/tracecontext.py": "TraceContextTextMapPropagator = None\n",
+}
+_SDK_MISSING = {"opentelemetry/__init__.py": "raise ModuleNotFoundError(\"No module named 'opentelemetry'\")\n"}
+
+
+def _otel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, files: dict[str, str]) -> None:
+    """Shadow the OpenTelemetry SDK for the serve subprocess and clear the OTEL environment."""
+    root = tmp_path / "otel-stub"
+    for name, body in files.items():
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text(body)
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(root), os.environ.get("PYTHONPATH")])))
+    for name in list(os.environ):
+        if name.startswith(("OTEL_EXPORTER_OTLP", "OTEL_PYTHON_EXPORTER_OTLP")) or name == "OTEL_SDK_DISABLED":
+            monkeypatch.delenv(name)
 
 
 def _revision(raw: bytes) -> str:
@@ -67,7 +102,8 @@ async def test_observers_read_but_never_update_home_settings(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_controller_update_checks_revision_and_lists_restarts(tmp_path: Path) -> None:
+async def test_controller_update_checks_revision_and_lists_restarts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _otel(tmp_path, monkeypatch, _SDK_STUBS)
     settings = tmp_path / "home" / "settings.toml"
     contract = await ServeContract.start(tmp_path, "websocket")
     try:
@@ -112,6 +148,62 @@ async def test_controller_update_checks_revision_and_lists_restarts(tmp_path: Pa
     }
 
 
+UNAVAILABLE = {
+    "code": -32602,
+    "message": "telemetry cannot start in this zeta install or environment",
+    "data": {"code": "telemetry_unavailable", "detail": "OpenTelemetry support is not installed; install zeta[otel]"},
+}
+EXPORTER_ENV = {
+    **UNAVAILABLE,
+    "data": {
+        "code": "telemetry_unavailable",
+        "detail": "OTEL exporter environment is not allowed; configure zeta telemetry explicitly",
+    },
+}
+OFF = [{"key": "telemetry.enabled", "value": False}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sdk", "environment", "body", "changes", "refusal"),
+    [
+        pytest.param(_SDK_MISSING, {}, b"", ON, UNAVAILABLE, id="sdk-missing-on-refused"),
+        pytest.param(
+            _SDK_STUBS, {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:9/"}, b"", ON, EXPORTER_ENV,
+            id="exporter-env-on-refused",
+        ),
+        pytest.param(_SDK_STUBS, {}, b"", ON, None, id="clean-on-accepted"),
+        pytest.param(_SDK_MISSING, {}, f'otel.endpoint = "{BUILTIN}"\n'.encode(), OFF, None, id="sdk-missing-off-accepted"),
+    ],
+)
+async def test_turning_telemetry_on_runs_the_start_preflight_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sdk, environment, body, changes, refusal
+) -> None:
+    """An on that would stop zeta's next start is refused with nothing written; off always applies."""
+    _otel(tmp_path, monkeypatch, sdk)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)  # serve starts with telemetry off, so only the update checks it
+    settings = tmp_path / "home" / "settings.toml"
+    contract = await ServeContract.start(tmp_path, "websocket")
+    try:
+        settings.write_bytes(body)  # after start: serve would refuse to start with this telemetry on
+        controller, _ = await _client(contract)
+        reply = await controller.request(
+            "update", "home_settings_update", {"expected_revision": _revision(body), "changes": changes}
+        )
+    finally:
+        await contract.close()
+
+    if refusal is not None:
+        assert reply.get("error") == refusal
+        assert settings.read_bytes() == body
+    else:
+        assert "error" not in reply, reply
+        enabled = changes[0]["value"]
+        assert reply["result"]["settings"]["telemetry"]["enabled"] is enabled
+        assert settings.read_bytes() == (f'otel.endpoint = "{BUILTIN}"\n'.encode() if enabled else b"")
+
+
 @pytest.mark.asyncio
 async def test_update_handler_writes_only_through_home_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[tuple] = []
@@ -133,7 +225,8 @@ async def test_update_handler_writes_only_through_home_settings(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
-async def test_a_filesystem_failure_names_no_path(tmp_path: Path) -> None:
+async def test_a_filesystem_failure_names_no_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _otel(tmp_path, monkeypatch, _SDK_STUBS)
     home = tmp_path / "home"
     contract = await ServeContract.start(tmp_path, "websocket")
     try:
