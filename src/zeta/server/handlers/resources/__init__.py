@@ -6,6 +6,7 @@ from . import (
     child_control,
     home_settings,
     library,
+    library_writes,
     mcp_management,
     project_writes,
     session_read,
@@ -18,6 +19,7 @@ FAMILIES = (
     mcp_management,
     account_list,
     library,
+    library_writes,
     session_read,
     project_writes,
 )

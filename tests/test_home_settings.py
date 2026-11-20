@@ -67,7 +67,7 @@ def _signal_contention(monkeypatch: pytest.MonkeyPatch) -> Iterator[threading.Ev
             contended.set()
             raise
 
-    monkeypatch.setattr(home_settings.fcntl, "flock", flock)
+    monkeypatch.setattr(fcntl, "flock", flock)
     monkeypatch.setattr(home_settings, "LOCK_SECONDS", 10.0)
     yield contended
 
