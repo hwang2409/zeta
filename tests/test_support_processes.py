@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import pty
 import shlex
 import signal
 import subprocess
@@ -18,6 +17,7 @@ from tests.support.processes import (
     ChildHandshake,
     child_handshake,
     kill_group_if_present,
+    open_pty,
     owned_child_process,
     read_pty_until,
     reap_process,
@@ -164,49 +164,39 @@ def test_child_handshake_exception_restores_file_descriptors() -> None:
     assert _fd_count() == baseline
 
 
-def test_read_pty_until_accumulates_through_marker() -> None:
-    master, slave = pty.openpty()
-    process = subprocess.Popen(
-        [sys.executable, "-c", "print('before READY', flush=True)"],
-        stdout=slave,
-        stderr=slave,
-    )
-    os.close(slave)
-    output = bytearray()
-    try:
-        read_pty_until(master, b"READY", process=process, output=output)
-        assert b"before READY" in output
-        assert reap_process(process) == 0
-    finally:
-        if process.poll() is None:
-            reap_process(process, timeout=0)
-        os.close(master)
+def test_read_pty_until_keeps_output_written_before_exit() -> None:
+    with open_pty() as (master, slave):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "print('before READY', flush=True)"],
+            stdout=slave,
+            stderr=slave,
+        )
+        try:
+            # Forced order: the child writes and exits before the first read.
+            assert process.wait(timeout=10) == 0
+            output = bytearray()
+            read_pty_until(master, b"READY", process=process, output=output)
+            assert b"before READY" in output
+        finally:
+            if process.poll() is None:
+                reap_process(process, timeout=0)
 
 
 def test_read_pty_until_names_early_exit_and_output() -> None:
-    master, slave = pty.openpty()
-    process = subprocess.Popen(
-        [sys.executable, "-c", "print('partial', flush=True); raise SystemExit(4)"],
-        stdout=slave,
-        stderr=slave,
-    )
-    output = bytearray()
-    try:
-        process.wait(timeout=10)
-        read_pty_until(
-            master, b"partial", process=process, output=output, timeout=10
+    with open_pty() as (master, slave):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "print('partial', flush=True); raise SystemExit(4)"],
+            stdout=slave,
+            stderr=slave,
         )
-        os.close(slave)
-        slave = -1
-        with pytest.raises(AssertionError, match="partial"):
-            read_pty_until(master, b"missing", process=process, output=output)
-        assert reap_process(process) == 4
-    finally:
-        if process.poll() is None:
-            reap_process(process, timeout=0)
-        if slave >= 0:
-            os.close(slave)
-        os.close(master)
+        try:
+            assert process.wait(timeout=10) == 4
+            output = bytearray()
+            with pytest.raises(AssertionError, match="exited.*return code: 4.*partial"):
+                read_pty_until(master, b"missing", process=process, output=output)
+        finally:
+            if process.poll() is None:
+                reap_process(process, timeout=0)
 
 
 def test_reap_process_kills_a_process_that_does_not_exit() -> None:

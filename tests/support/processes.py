@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pty
 import select
 import selectors
 import shlex
@@ -197,6 +198,21 @@ def child_handshake() -> Iterator[ChildHandshake]:
         handshake._close()
 
 
+@contextmanager
+def open_pty() -> Iterator[tuple[int, int]]:
+    """Yield a PTY (master, slave) pair; the parent keeps the slave open until exit.
+
+    macOS discards unread PTY output when the last slave fd closes, so a child
+    that writes and exits before the first read would leave nothing to read.
+    """
+    master_fd, slave_fd = pty.openpty()
+    try:
+        yield master_fd, slave_fd
+    finally:
+        os.close(slave_fd)
+        os.close(master_fd)
+
+
 def read_pty_until(
     master_fd: int,
     marker: bytes,
@@ -211,7 +227,19 @@ def read_pty_until(
         selector.register(master_fd, selectors.EVENT_READ)
         while marker not in output[start:]:
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not selector.select(remaining):
+            # A slave held open by open_pty never gives EOF, so check for exit in slices.
+            if not selector.select(max(0, min(remaining, 0.1))):
+                if process.poll() is not None:
+                    # Output written before exit is buffered by now; read it first.
+                    if selector.select(0):
+                        continue
+                    raise AssertionError(
+                        f"process exited before PTY marker {marker!r}; "
+                        f"return code: {process.returncode!r}; "
+                        f"captured: {bytes(output[start:])!r}"
+                    )
+                if remaining > 0:
+                    continue
                 raise AssertionError(
                     f"timed out waiting for PTY marker {marker!r}; "
                     f"return code: {process.poll()!r}; captured: {bytes(output[start:])!r}"
@@ -345,6 +373,7 @@ def wait_for_path_command(
     owner_pid = os.getpid() if owner_pid is None else owner_pid
     source = f"""
 import os
+import pty
 import pathlib
 import time
 
