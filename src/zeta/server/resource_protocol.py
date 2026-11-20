@@ -10,14 +10,11 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from importlib import import_module
 from pathlib import Path
-from pkgutil import iter_modules
 from typing import Any
 
 from ..core.session_execution import execution_owner_state
 from ..core.session_files import SessionError, child_directory
-from .handlers import resources
 
 RESTART_SCAN_SECONDS = 1.0
 
@@ -36,6 +33,7 @@ class ResourceMethod:
     access: Access
     handler: Callable[..., Awaitable[Any]]
     since: str | None = None
+    extends_legacy: bool = False
 
 
 @dataclass(frozen=True)
@@ -45,6 +43,7 @@ class ResourceDescriptor:
     feature: str
     access: Access
     handler: Callable[..., Awaitable[Any]]
+    extends_legacy: bool
 
 
 def _close_handler_errors(handler: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
@@ -56,11 +55,13 @@ def _close_handler_errors(handler: Callable[..., Awaitable[Any]]) -> Callable[..
 
 
 def collect_families() -> tuple[ResourceDescriptor, ...]:
-    """Only collect modules from the packaged resource-family directory, never user plugins."""
+    """Collect explicitly registered resource families."""
+    # Family modules import the wire rules defined here.
+    from .handlers.resources import FAMILIES
+
     descriptors = []
     flags = set()
-    for entry in sorted(iter_modules(resources.__path__), key=lambda item: item.name):
-        family = import_module(f"{resources.__name__}.{entry.name}")
+    for family in FAMILIES:
         if family.FEATURE in flags or not family.METHODS:
             raise RuntimeError("duplicate or empty serve resource family")
         flags.add(family.FEATURE)
@@ -69,6 +70,7 @@ def collect_families() -> tuple[ResourceDescriptor, ...]:
                 raise RuntimeError("serve resource methods must declare read, controller read, or controller write access")
             descriptors.append(ResourceDescriptor(
                 method.wire, method.since, family.FEATURE, method.access, _close_handler_errors(method.handler),
+                method.extends_legacy,
             ))
     return tuple(descriptors)
 
@@ -104,7 +106,7 @@ async def run_owner(
     *,
     family: str,
     project: Callable[[Any], Any],
-    owner_error: type[Exception],
+    owner_error: type[Exception] | tuple[type[Exception], ...],
     errors: Mapping[str, Any],
 ) -> Any:
     """Run the owner and an explicit public projection off-loop. Never relay owner error details.

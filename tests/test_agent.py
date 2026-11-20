@@ -16,6 +16,7 @@ from io import StringIO
 from itertools import pairwise
 from pathlib import Path
 from types import MethodType, SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
 from rich.console import Console
@@ -3339,53 +3340,52 @@ async def test_parent_routing_lives_until_grandchild_cancellation_publishes(
     parent_id = f"{store.session_id}:1"
     grandchild_id = f"{parent_id}:1"
     grandchild_publication_started = asyncio.Event()
+    parent_waiting = asyncio.Event()
     release_grandchild_publication = asyncio.Event()
     original_publish = owner.conversation_channel.publish_completion
-    original_unregister = owner.conversation_channel.unregister_delivery_flow
-    original_wait = getattr(owner, "wait_for_descendant_watchers", None)
+    original_wait = owner.wait_for_descendant_watchers
 
     async def hold_grandchild_publication(**kwargs):
         if kwargs["child_instance_id"] == grandchild_id:
             grandchild_publication_started.set()
-            await release_grandchild_publication.wait()
+            await await_or_fail(
+                release_grandchild_publication.wait(), what="release grandchild publication"
+            )
         return await original_publish(**kwargs)
 
-    async def unregister_delivery_flow(instance_id: str) -> None:
-        await original_unregister(instance_id)
+    async def observe_parent_wait(instance_id: str) -> None:
         if instance_id == parent_id:
-            release_grandchild_publication.set()
+            parent_waiting.set()
+        await original_wait(instance_id)
 
     monkeypatch.setattr(
         owner.conversation_channel, "publish_completion", hold_grandchild_publication
     )
-    monkeypatch.setattr(
-        owner.conversation_channel,
-        "unregister_delivery_flow",
-        unregister_delivery_flow,
-    )
-    if original_wait is not None:
-
-        async def release_while_parent_waits(instance_id: str) -> None:
-            if instance_id == parent_id:
-                release_grandchild_publication.set()
-            await original_wait(instance_id)
-
-        monkeypatch.setattr(
-            owner, "wait_for_descendant_watchers", release_while_parent_waits
+    monkeypatch.setattr(owner, "wait_for_descendant_watchers", observe_parent_wait)
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await await_or_fail(backend.grandchild_started.wait(), what="grandchild start")
+        loop.abort()
+        await await_or_fail(
+            grandchild_publication_started.wait(), what="grandchild publication start"
         )
+        await await_or_fail(parent_waiting.wait(), what="parent waiting for descendants")
+        # Watchers defer cancellation through publication. Release our gate
+        # before waiting for them.
+        release_grandchild_publication.set()
+        await await_or_fail(owner.wait(), what="background watchers")
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(backend.grandchild_started.wait(), timeout=1)
-    loop.abort()
-    await asyncio.wait_for(grandchild_publication_started.wait(), timeout=1)
-    await asyncio.wait_for(owner.wait(), timeout=1)
-
-    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
-    notifications = child_store.agent_notifications(pending_only=False)
-    assert [notification.data["status"] for notification in notifications] == [
-        "canceled"
-    ]
-    await loop.close()
+        child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+        try:
+            notifications = child_store.agent_notifications(pending_only=False)
+            assert [notification.data["status"] for notification in notifications] == [
+                "canceled"
+            ]
+        finally:
+            child_store.close()
+    finally:
+        release_grandchild_publication.set()
+        await await_or_fail(loop.close(), what="agent loop close")
 
 
 @pytest.mark.asyncio
@@ -3746,12 +3746,14 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
         notification = await original_publish(**kwargs)
         if kwargs["child_instance_id"].count(":") == 1:
             completion_published.set()
-            await release_child_watcher.wait()
+            await await_or_fail(release_child_watcher.wait(), what="release child publication")
         return notification
+
+    hold_child_loop = asyncio.Event()
 
     async def hold_child_loop_cancellation(coroutine):
         try:
-            await asyncio.Event().wait()
+            await await_or_fail(hold_child_loop.wait(), what="release child-local cleanup")
         finally:
             coroutine.close()
 
@@ -3765,31 +3767,49 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
             )
         return original_create_task(loop_self, coroutine)
 
-    def cancel_all() -> None:
-        original_cancel_all()
+    def signal_cancellation(*args, **kwargs) -> None:
+        original_cancel_all(*args, **kwargs)
         cancellation_requested.set()
 
     monkeypatch.setattr(
         owner.conversation_channel, "publish_completion", pause_after_publication
     )
     monkeypatch.setattr(AgentLoop, "_create_task", create_task)
-    monkeypatch.setattr(owner, "cancel_all", cancel_all)
+    monkeypatch.setattr(
+        owner, "cancel_all", create_autospec(original_cancel_all, side_effect=signal_cancellation)
+    )
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await asyncio.wait_for(completion_published.wait(), timeout=10)
-    closing = asyncio.create_task(loop.close())
+    closing = None
     try:
-        await asyncio.wait_for(cancellation_requested.wait(), timeout=10)
-        release_child_watcher.set()
-        await asyncio.wait_for(closing, timeout=10)
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await await_or_fail(completion_published.wait(), what="child publishes completion")
+        grandchild_id, = (run_id for run_id in owner.active_instance_ids if run_id.count(":") == 2)
+        assert owner.controls_child(store, grandchild_id)
+        grandchild_store, _ = owner._active_stores[grandchild_id]
+        closing = asyncio.create_task(loop.close())
+
+        # Watch close itself too, so a premature exception cannot look like a stuck wake.
+        async def release_on_cancellation():
+            await await_or_fail(cancellation_requested.wait(), what="root requested child cancellation")
+            release_child_watcher.set()
+
+        async with asyncio.TaskGroup() as group:
+            group.create_task(release_on_cancellation())
+            group.create_task(await_or_fail(closing, what="close joins adopted child"))
+        assert grandchild_store.agent_lifecycle()["state"] == "canceled"
+        assert grandchild_store.directory_fd == -1
         assert not owner.running
     finally:
         release_child_watcher.set()
         backend.release_grandchild.set()
-        if not closing.done():
-            closing.cancel()
-        await asyncio.gather(closing, return_exceptions=True)
-        await asyncio.wait_for(owner.wait(), timeout=10)
+        if closing is not None:
+            await await_or_fail(
+                asyncio.gather(closing, return_exceptions=True), what="drain root close task"
+            )
+        else:
+            await await_or_fail(loop.close(), what="close after failed setup")
+        await await_or_fail(owner.wait(), what="drain background owner")
+        hold_child_loop.set()
         store.close()
 
 

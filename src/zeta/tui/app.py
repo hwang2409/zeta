@@ -697,7 +697,8 @@ class TUIApp(
         self._agent_navigation.transcript_control.prompt_history.reset_navigation()
         finder = self._active_finder
         if finder.finder_active:
-            self._finder_cancel()
+            self._finder_return = None
+            FinderRuntimeMixin._finder_cancel(self)
         else:
             self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
@@ -732,8 +733,10 @@ class TUIApp(
     def _move_history(self, direction: str, move: Callable[[], None]) -> None:
         """Own scrolling: move the view and load the page at the edge it meets."""
 
+        owner = self._agent_navigation.transcript_control
+        owner.cancel_finder_return()
         transcript = self._viewed_transcript()
-        pager = self._agent_navigation.transcript_control.history_pager
+        pager = owner.history_pager
         if direction == "newer":
             if transcript.follow_tail and pager.can_load_newer:
                 # The resident tail is not the session tail: load first so this
@@ -761,6 +764,7 @@ class TUIApp(
         self._move_history("newer", lambda: self._viewed_transcript().scroll_down())
 
     def _navigate_history_user(self, direction: str) -> None:
+        self._agent_navigation.transcript_control.cancel_finder_return()
         # Presses wait for the reveal before them, so each moves one prompt.
         self._user_nav_presses.append(direction)
         if self._user_nav_task is None or self._user_nav_task.done():
@@ -820,6 +824,9 @@ class TUIApp(
         return tuple(descriptor.key for descriptor in pager.descriptors)
 
     def _finder_open(self) -> None:
+        navigation = getattr(self, "_agent_navigation", None)
+        if navigation is not None:
+            navigation.transcript_control.cancel_finder_return()
         transcript = self._viewed_transcript()
         if transcript.search_active:
             # A new search replaces the accepted one and its match keys.
@@ -828,7 +835,7 @@ class TUIApp(
         # search finds nothing return to it.
         self._finder_return = (
             None
-            if getattr(self, "_agent_navigation", None) is None
+            if navigation is None
             else (
                 transcript.follow_tail,
                 transcript.durable_scroll_anchor,
@@ -842,23 +849,28 @@ class TUIApp(
         FinderRuntimeMixin._finder_cancel(self)
         # A search or reveal still in flight must not move the view after Esc.
         navigation = getattr(self, "_agent_navigation", None)
-        if navigation is not None and navigation.transcript_control.search_task is not None:
-            navigation.transcript_control.search_task.cancel()
+        if navigation is None:
+            return
+        owner = navigation.transcript_control
+        if owner.search_task is not None:
+            owner.search_task.cancel()
         if saved is not None and saved[2] != self._resident_page_keys():
             # A durable preview replaced the pages: the line index no longer
             # points at the old rows, so load them back.
-            asyncio.create_task(self._return_to_view(saved[0], saved[1]))
+            owner.start_finder_return(
+                lambda: self._return_to_view(saved[0], saved[1])
+            )
 
     async def _return_to_view(self, follow_tail: bool, anchor: Any) -> None:
         transcript = self._viewed_transcript()
-        if follow_tail or anchor is None:
-            await self._load_transcript_page(reset=True)
+        tail = follow_tail or anchor is None
+        pager = self._agent_navigation.transcript_control.history_pager
+        if not (await pager.reveal(None if tail else anchor[0])).segments:
+            return
+        self._render_active_resident_history()
+        if tail:
             transcript.scroll_to_bottom()
         else:
-            pager = self._agent_navigation.transcript_control.history_pager
-            if not (await pager.reveal(anchor[0])).segments:
-                return
-            self._render_active_resident_history()
             transcript.restore_durable_scroll_anchor(anchor)
         self._invalidate_prompt()
 

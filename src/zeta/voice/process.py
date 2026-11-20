@@ -25,7 +25,7 @@ class StdoutSink(Protocol):
 
 
 class OwnedProcess:
-    """A child in its own process group that is always reaped.
+    """A child in its own process group, reaped on exit.
 
     Popen, pipe reads, signals, and waits run on worker threads. The loop only
     receives bounded results.
@@ -107,24 +107,31 @@ class OwnedProcess:
         await run_must_complete_thread_call(self.kill_blocking)
 
     def kill_blocking(self) -> None:
-        """SIGTERM the group, SIGKILL after a deadline, and always reap."""
-        for sig, deadline in ((signal.SIGTERM, TERMINATE_SECONDS), (signal.SIGKILL, KILL_SECONDS)):
-            if self._popen.poll() is not None:
+        """SIGTERM the group, escalate on timeout, and reap the exited child."""
+        try:
+            for sig, deadline in ((signal.SIGTERM, TERMINATE_SECONDS), (signal.SIGKILL, KILL_SECONDS)):
+                if self._popen.poll() is not None:
+                    break
+                try:
+                    os.killpg(self.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    # macOS can stop finding a signalable member before waitpid can reap it.
+                    pass
+                try:
+                    self._popen.wait(timeout=deadline)
+                except subprocess.TimeoutExpired:
+                    continue
                 break
-            try:
-                os.killpg(self._popen.pid, sig)
-            except ProcessLookupError:
-                break
-            try:
-                self._popen.wait(timeout=deadline)
-            except subprocess.TimeoutExpired:
-                continue
-        self._wait_blocking()
-        if self._popen.stdin is not None:
-            try:
-                self._popen.stdin.close()
-            except OSError:
-                pass
+            else:
+                if self._popen.poll() is None:
+                    raise RuntimeError(f"voice child pid {self.pid} did not exit by the SIGKILL deadline")
+            self._wait_blocking()
+        finally:
+            if self._popen.stdin is not None:
+                try:
+                    self._popen.stdin.close()
+                except OSError:
+                    pass
 
 
 async def run_stoppable[T](

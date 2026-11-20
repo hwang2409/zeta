@@ -1880,6 +1880,38 @@ Controllers can write; observers can only read. A resource write from an
 observer returns `-32008` with `data.code` and `data.reason` both set to
 `observer_read_only` and `data.method` set to the method name. Resource
 calls run off the event loop and never return storage paths or exception text.
+Every family returns `-32000` with the fixed message
+`"unexpected server or storage failure"` and no `data` for unexpected failures.
+
+### child run control (`child_run_control_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `child_run_spawn` | `1.0` | `child_run_control_v1` | `controller_write` |
+| `child_run_cancel` | `1.0` | `child_run_control_v1` | `controller_write` |
+
+`child_run_spawn {session_id, agent_type, task, cwd?, background?}` starts a
+background child in the attached session when its parent is idle. `agent_type`
+is a session preset name (up to 256 UTF-8 bytes). `task` is nonblank and at most
+64 KiB of UTF-8. If supplied, `cwd` is an existing absolute directory (up to
+4096 UTF-8 bytes) and `background` must be `true`. No model or tool overrides
+are accepted. The response is `{data: {accepted: true, run_id}}`. `run_id` is
+the same handle as in `child_run_list`; the existing `child_started`,
+`child_progress`, and `child_ended` events describe the run when negotiated.
+
+`child_run_cancel {session_id, run_id, reason?}` accepts only `"user_cancelled"`
+for `reason`. It returns `{data: {accepted: true, run_id, state}}`, with
+`state: "cancelling"` when cancellation is admitted. A terminal run is unchanged
+and returns `"completed"`, `"failed"`, or `"canceled"`. No revision is required
+for either command.
+
+Unknown fields or invalid input (including an unknown preset or invalid `cwd`)
+return `-32602` with `data.code: "invalid_params"`. Other command errors include
+`-32003 no_active_session` or `session_mismatch`, `-32004 operation_busy`,
+`-32005 state_unavailable` when the child-run owner reports unavailable state,
+and `-32012 child_run_not_found`; these errors set
+both `data.code` and `data.reason` to the named reason. A detached controller
+cannot spawn. Without `child_run_control_v1`, the methods return `-32601`.
 
 ### home settings (`home_settings_v1` feature)
 
@@ -1939,8 +1971,38 @@ keys, and bad values; `-32009 stale_settings_revision` (both `data.code` and
 `data.reason`) when the revision is stale, without the current revision;
 `-32004 operation_busy` for a lock held longer than 250 ms; and `-32000`
 `settings_malformed` or `settings_unsafe` for malformed or unsafe files.
-Unexpected failures return only the generic `-32000` error.
 
+### agent run catalog (`agent_run_catalog_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `agent_run_catalog` | `1.0` | `agent_run_catalog_v1` | `read` |
+
+`agent_run_catalog` works without an attached session. All fields are optional:
+`limit` (integer 1–100, default 50), `state` (`running`, `idle`, `finishing`,
+`completed`, `failed`, or `canceled`), `root_session_id` (exact top-level session
+id), and `cursor` (the opaque `next_cursor` from the previous response with
+identical filters). There is no offset or update event.
+
+The result is `{revision,data:{items,next_cursor?}}`. `revision` is a lowercase
+SHA-256 of the returned page data, not a snapshot or a write token. `items`
+uses the `child_run_list` row shape, including `run_id`, `session_id` (root),
+`parent_run_id` (null for direct children), `description`, `agent_type`,
+`status`, `accepts_follow_ups`, `turns_used`, `tool_count`, `current_step`,
+`started_at`, `finished_at`, and `elapsed_seconds`. The read uses durable
+lifecycle metadata, never transcripts, and omits final results.
+
+Roots sort by session directory mtime descending, then id ascending. Within
+one root, runs sort depth first by lexicographic slot name. Unreadable or
+invalid child records are skipped independently. Metadata processing stops
+after 128 candidate roots/runs or a full page. A short or empty page with a
+`next_cursor` is not the end; follow it until it is absent. This is a live
+view: ordering and contents can change between pages if sessions change.
+
+Invalid params or mismatched cursors return `-32602` (`invalid_params`). An
+unavailable store returns `-32005` (`state_unavailable`). If not even one row
+fits the frame, the method returns `-32007` (`result_too_large`). An
+unnegotiated method returns `-32601`.
 
 ### MCP management (`mcp_management_v1` feature)
 
@@ -1992,8 +2054,8 @@ configuration without restarting serve.
 Errors: `-32602 invalid_params` (including unknown or duplicate names),
 `-32009 stale_mcp_revision` (`data.code` and `data.reason`; re-list),
 `-32004 operation_busy` (lock timeout), `-32005 state_unavailable` (such as
-missing project or unreadable configuration), and generic `-32000` for
-unexpected failures. Observers attempting a write receive `-32008` with code
+missing project or unreadable configuration). Observers attempting a write
+receive `-32008` with code
 and reason `observer_read_only`, plus the method, before parameter validation.
 Unnegotiated methods return `-32601`.
 
@@ -2032,6 +2094,58 @@ credential, returning `{data:{state:"unauthorized"}}`. A concurrent logout
 fences earlier OAuth attempts even across serve processes. Only the controller
 can start, cancel, or log out. Another pending start returns `-32004
 operation_busy`.
+
+### accounts
+
+With protocol 1.1 or later and `account_list_idle_v1`, the controller can call
+`account_list` with `{}` even before a session is active. The result is
+`{"revision":"<64 lowercase hex digits>","data":{"accounts":[...]}}`. Rows have
+`account`, `label`, `detail`, `available`, `current`, `default`, and `usage`.
+`detail` is always null on this version: credential metadata is not projected.
+`current` is false without an active session; otherwise it reflects the active
+session's selection. `default` reflects the stored provider default. The revision
+identifies stored public catalog content, not the active session's selection or
+wall-clock usage freshness.
+
+An empty catalog returns an empty array. Bad or missing credentials make only
+that account unavailable. The read uses the account registry lock and does not
+migrate, recover credentials, or call a provider. An unavailable catalog returns
+`-32005` with `data.code: "state_unavailable"`. Unknown params return `-32602`
+with `data.code: "invalid_params"`. This read remains controller-only; observers
+receive `-32008` with `data.code` and `data.reason` set to `observer_read_only`
+and `data.method: "account_list"`.
+
+The same feature extends the controller-only `login_start` request to
+`{provider, account?}`. `provider` is `claude` or `codex`. `account` is a named
+account's short name, label, or qualified ID (for example `anthropic:work` for
+`claude`). Omit `account` to keep the legacy login target. Without the feature,
+`account` is ignored as before. The pending, failure, status and cancel shapes
+are unchanged. With the feature, a pending login on this connection or a
+provider lock held by another connection or TUI returns `-32005` with
+`data.code: "login_in_progress"`. An already pending local login takes
+precedence over account lookup. Without the feature, shared provider lock
+contention still returns `state: "failed"` with `error.code: "login_failed"`.
+A malformed or unknown account, unsupported provider or unknown param returns
+`-32602` with
+`data.code: "invalid_params"`. An unavailable account registry returns `-32005`
+with `data.code: "state_unavailable"`. An observer receives `-32008` with
+`data.code` and `data.reason` set to `observer_read_only` and
+`data.method: "login_start"` before params are validated.
+
+When a named subscription account fails authentication, the live `error`
+event adds `params.data.auth_account: {account, label, provider}` for each
+connection that negotiated this feature, including observers subscribed to the
+session's replay stream. `account` is the qualified ID, `label` is the public
+account label, and `provider` uses the login provider spelling (`claude` or
+`codex`). The event uses `params.error: {code: "auth_error", message:
+"Account sign-in required."}` instead of the provider's raw error text. The
+existing `data.login_provider` hint remains when applicable. API-key failures
+have no named account. This is a live-only addition; legacy event and history
+shapes are unchanged.
+
+Unexpected errors that reach the negotiated resource handler's error boundary
+return `-32000` with the fixed message `unexpected server or storage failure`.
+The unnegotiated methods keep legacy error handling.
 
 ## errors
 
@@ -2612,7 +2726,8 @@ error code and message. Provider status and origin remain internal.
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
 - `session_settings`: returns `model`, `approval_mode`, and `plan_mode`. with the negotiated `otel` feature it also returns `telemetry` (`enabled`, `state`, and `reason`); endpoint and exporter details are never returned.
-- `account_list`: takes `session_id` and returns every named subscription
+- `account_list` without `account_list_idle_v1`: takes `session_id` and
+  returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and
   `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
   null `snapshot` or the normalized `version`, `captured_at`, `source`, and
@@ -2850,6 +2965,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `turn_context` | adds `set_turn_context` for one-shot context on the next server-started turn |
 | `delivery_id` | `send` and `steer` accept durable idempotency IDs; with `send_images_delivery_id`, `send_images` does too; adds `delivery_status` |
 | `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
+| `account_list_idle_v1` | enables controller-only idle `account_list` and named `login_start`; adds public failed-account identity to live auth errors for controllers and observers |
 | `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers"); observers use the same `list_sessions` catalog projection as controllers |
 | `session_grants` | adds `session_grants`, controller-only `revoke_session_grants`, and live `session_grants_changed` events for inspecting and removing session approval grants |
 | `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals, and a failed decision or history write marks approval persistence unhealthy. it changes no output |

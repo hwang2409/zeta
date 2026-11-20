@@ -98,6 +98,8 @@ class _ToolUnit:
         start_event: StreamEvent | None = None,
     ) -> None:
         self.call = call
+        parent = start_event.data.get("code_parent_id") if start_event is not None else None
+        self.code_parent_id = parent if isinstance(parent, str) else None
         self.output: list[str] = []
         self.finished = False
         self.revision = 0
@@ -142,6 +144,10 @@ class _ToolUnit:
         compact: bool = True,
         on_final_tail: Callable[[], None] | None = None,
     ) -> None:
+        # Replayed approval cards can learn their code parent only at completion.
+        parent = event.data.get("code_parent_id") if event is not None else None
+        if isinstance(parent, str):
+            self.code_parent_id = parent
         self.finished = True
         self.search_renderable = rendered
         self.renderable = (
@@ -210,6 +216,7 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._history_entry_id: str | None = None
         self._history_unit_ordinal = 0
         self._follow_tail = True
+        self.on_mouse_scroll: Callable[[], None] | None = None
         self._scroll_offset = 0
         self._viewport_height = 1
         self._content_width = 80
@@ -583,9 +590,13 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._bump_revision()
 
     def toggle_latest_agent(self) -> bool:
-        """Toggle the newest child card and keep its tail bounded."""
+        """Toggle the newest card, treating each code cell as one card."""
 
-        for unit in reversed(tuple(self._card_units.values())):
+        for (session_id, _), unit in reversed(self._card_units.items()):
+            if unit.code_parent_id is not None:
+                parent = self._card_units.get((session_id, unit.code_parent_id))
+                if parent is not None and parent.call.name == "code":
+                    unit = parent
             if unit.toggle():
                 self._bump_revision()
                 self._prime_search_value(unit)
@@ -1275,6 +1286,10 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
     def mouse_handler(self, mouse_event: MouseEvent):
         """Scroll on the wheel and leave other mouse events to the terminal."""
 
+        if self.on_mouse_scroll is not None and mouse_event.event_type in (
+            MouseEventType.SCROLL_UP, MouseEventType.SCROLL_DOWN
+        ):
+            self.on_mouse_scroll()
         if mouse_event.event_type is MouseEventType.SCROLL_UP:
             self.scroll_up()
             return None

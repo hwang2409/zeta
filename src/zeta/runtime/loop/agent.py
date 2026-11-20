@@ -17,6 +17,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
+from ...accounts import AccountCredentials, AccountError
 from ...agent import recovery_lease
 from ...agent.background_owner import BackgroundAgentOwner
 from ...agent.budget import (
@@ -45,11 +46,12 @@ from ...agent.turn_limit import ChildTurnControl
 from ...core.abort import AbortSignal as ToolAbortSignal
 from ...core.approval import ApprovalPolicy
 from ...core.context import BudgetExceeded, ContextAssembler
+from ...core.context_parts.code_audit import nested_approval_anchors
 from ...core.hooks import HookManager
 from ...core.session_links import ChildLineagePublisher
 from ...core.store import ConversationStore
 from ...core.store._approval_display import ApprovalAuditRequest
-from ...core.tool_dispatch import dispatch_tool_calls
+from ...core.tool_dispatch import dispatch_tool_calls, execute_owned_tool
 from ...mcp import MCPManagementService, MCPMount
 from ...memory.auto import AutoMemoryReconciler
 from ...prompts import load_identity
@@ -461,9 +463,19 @@ class AgentLoop(
             execution_context=execution_context,
         )
 
+    def _nested_executor_for(self, call, abort, publish, environment, coordinator):
+        from .nested_tools import LoopNestedToolExecutor
+
+        return LoopNestedToolExecutor(
+            self, call, abort or self.tool_registry.abort_signal, publish, environment,
+            coordinator=coordinator,
+        )
+
     def prepare_resume_pending_tool(self, tool_call: ToolCall) -> bool:
         """Reserve the abort generation before resuming an approved tool."""
         if self._existing_tool_result(tool_call.id) is not None:
+            return False
+        if ":code:" in tool_call.id and tool_call.id in self._nested_approval_ids():
             return False
         if not self.store.prepare_pending_approval_execution(
             tool_call.id,
@@ -523,15 +535,12 @@ class AgentLoop(
                 self.tool_registry.background_tasks.begin_shutdown(
                     background_task_cause
                 )
-                self._background_owner.cancel_all()
+                await self._background_owner.close_children()
             elif cancel_background:
                 for cancel in tuple(self._background_child_cancellers.values()):
                     cancel()
-            watchers = tuple(self._background_child_watchers.values())
-            if cancel_background and watchers:
+                watchers = tuple(self._background_child_watchers.values())
                 await asyncio.gather(*watchers, return_exceptions=True)
-            if cancel_background and self.agent_depth == 0:
-                await self._background_owner.wait()
             tracked_tasks = tuple(
                 task
                 for task in self._tracked_tasks
@@ -594,6 +603,7 @@ class AgentLoop(
         for item in self._pending_task_recovery:
             await self.tool_registry.background_tasks.deliver_recovered_exit(item)
         self._pending_task_recovery = ()
+        await self._recover_nested_approvals()
         await recovery_lease.activate_agent_children(self)
         self.session_start()
         if self.memory_reconciler is not None:
@@ -602,6 +612,22 @@ class AgentLoop(
         # Render now; MCP-dependent operations await the background connection.
         if not self._mcp_mount_attempted and self._mcp_mount_task is None:
             self._mcp_mount_task = asyncio.create_task(self._mount_mcp_servers())
+    def _nested_approval_ids(self) -> dict[str, str]:
+        return nested_approval_anchors(tuple(self.store.entry(ref) for ref in self.store.branch_refs()))
+
+    async def _recover_nested_approvals(self) -> None:
+        for call_id in self._nested_approval_ids():
+            if self._existing_tool_result(call_id) is not None:
+                continue
+            state = self.store.approval_state_now(call_id)
+            if state is None:
+                continue
+            if state[1] is None:
+                await self.store.resolve_approval_async(call_id, "abort", reason="turn_canceled")
+            self._finalize_tool_results([state[0]], [ToolResult(
+                call_id, "code invocation interrupted; inner call cannot resume", True, is_canceled=True,
+            )])
+
     async def resume_pending_tool(
         self,
         request_id: str,
@@ -619,6 +645,8 @@ class AgentLoop(
         existing = self._existing_tool_result(tool_call.id)
         if existing is not None:
             return existing
+        if ":code:" in request_id and request_id in self._nested_approval_ids():
+            return None
         if not self.plan_mode_allows(tool_call):
             result = ToolResult(
                 tool_call.id,
@@ -646,8 +674,8 @@ class AgentLoop(
                     )
                 )
         try:
-            result = await self.tool_registry.execute(
-                tool_call,
+            result = await execute_owned_tool(
+                self, tool_call, _validated_tool_result,
                 abort_signal=abort_signal,
                 _scope_signal=abort_signal,
                 _host_environment=host_environment,
@@ -669,7 +697,6 @@ class AgentLoop(
             raise
         except Exception as exc:  # noqa: BLE001 - report execution failures
             result = ToolResult(tool_call.id, str(exc), is_error=True)
-        result = _validated_tool_result(result, tool_call.id)
         if result.is_canceled:
             result = self.finalize_canceled(tool_call)
         else:
@@ -833,6 +860,7 @@ class AgentLoop(
             provider_error: ErrorInfo | None = None
             provider_error_source: BaseException | ErrorInfo | None = None
             provider_error_data: dict[str, Any] = {}
+            attempt_credentials = None
             provider_retry_usage: dict[str, Any] | None = None
             incomplete_tool_name: str | None = None
             provider_started = False
@@ -964,6 +992,7 @@ class AgentLoop(
                         stream=True,
                         conversation_id=self.conversation_id,
                     ))
+                    attempt_credentials = getattr(self.backend, "token_store", None)
                     completion = self.context_assembler.dispatch_admitted_request(
                         self.backend,
                         admitted_request,
@@ -1133,10 +1162,19 @@ class AgentLoop(
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
                 )
+                auth_account = None
+                if provider_error.provider_auth_failure and isinstance(attempt_credentials, AccountCredentials):
+                    try:
+                        auth_account = await asyncio.to_thread(
+                            attempt_credentials.store.public_identity, attempt_credentials.account
+                        )
+                    except (OSError, AccountError):
+                        pass  # Account registry unavailable; the original error still applies.
                 yield StreamEvent(
                     StreamEventType.ERROR,
                     error=provider_error,
                     data=provider_error_data,
+                    auth_account=auth_account,
                 )
                 if self.agent_instance_id is None:
                     await step_delivery.admit_terminal("foreground_end")

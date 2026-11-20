@@ -7,11 +7,17 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from ..accounts import AccountId, AccountStore, AccountUsage, account_provider
+from ..accounts import (
+    AccountError,
+    AccountId,
+    AccountStore,
+    AccountUsage,
+    account_provider,
+)
 from ..accounts.usage import UsageState, usage_json
 from ..core.session import account_home
-from ..providers.factory import build_backend
 from .protocol import ErrorDescriptor, ProtocolError
+from .resource_protocol import run_owner
 from .runtime import ServerRuntime
 
 
@@ -64,6 +70,37 @@ async def list_accounts(
     }
 
 
+async def list_account_catalog(client: Any) -> dict[str, object]:
+    runtime = client.server.runtime
+    context = getattr(runtime.loop, "account_context", None)
+    selected = context.snapshot() if context is not None else {}
+
+    def read():
+        store = context.store if context is not None else AccountStore(account_home(client.server.home))
+        return store.catalog_snapshot()
+
+    def project(snapshot):
+        revision, displays, defaults = snapshot
+        return {"revision": revision, "data": {"accounts": [
+            {
+                "account": str(item.account),
+                "label": item.label,
+                "detail": None,  # Credential metadata is free text and not safe to project.
+                "available": item.available,
+                "current": selected.get(item.account.provider) == item.account,
+                "default": defaults.get(item.account.provider) == str(item.account),
+                "usage": usage_json(item.usage),
+            }
+            for item in displays
+        ]}}
+
+    return await run_owner(
+        client, read, family="account", project=project,
+        owner_error=(AccountError, OSError, RecursionError, ValueError),
+        errors={None: ErrorDescriptor.STATE_READ_UNAVAILABLE},
+    )
+
+
 async def refresh(runtime: ServerRuntime) -> dict[str, object]:
     return await refresh_accounts(runtime)
 
@@ -110,12 +147,13 @@ async def switch(
     def prepare_backend(selected: AccountId) -> object | None:
         if selected.provider != current_provider:
             return None
-        backend, _ = build_backend(
+        backend, _ = runtime._build_backend(
             provider,
             loop.backend.model,
-            home=context.home,
+            context.home,
             account=selected,
             token_budget=loop.context_assembler.token_budget,
+            use_backend_factory=False,
         )
         return backend
 

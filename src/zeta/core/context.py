@@ -3,6 +3,7 @@
 from __future__ import annotations
 import asyncio
 import logging
+from dataclasses import replace
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 from .context_parts.budget import ContextRequestBudget
@@ -27,6 +28,7 @@ from .context_parts.admission import (
     SessionRequestAdmission,
     ollama_model_window_guidance,
 )
+from .context_parts.code_audit import code_projection, nested_approval_anchors
 from .store import ConversationEntry, ConversationStore
 from .store._client_delivery import without_client_delivery_marker
 from ..context_eviction import (
@@ -90,6 +92,19 @@ def _with_interrupted_results(
         if entry.type == "message"
         for request in entry.data.get("approval_requests", ())
     }
+    nested = nested_approval_anchors(entries)
+    if nested:
+        anchors = set(nested.values())
+        items = [item for item in items if (
+            (item.entry is None or item.entry.id not in anchors)
+            and (item.message.tool_result is None or item.message.tool_result.tool_call_id not in nested)
+        )]
+    for i, item in enumerate(items):
+        result = item.message.tool_result
+        if result is not None and code_projection(result.structured_content):
+            items[i] = replace(item, message=replace(
+                item.message, tool_result=replace(result, structured_content=None),
+            ), count_source=None)
     return repair_tool_batches(
         items,
         lambda item: item.message,
