@@ -812,7 +812,8 @@ async def _fail_d1_cancel_write(tmp_path, monkeypatch, mode):
         await run.settle()
         await _closed(run)
         status, text = await _d5_after(run)
-        _expect_terminal("canceled", status, "canceled")
+        # D1 is checked after restart: a failed write leaves it to recovery.
+        _expect("D5", status == "canceled", status)
         _expect("D5 notice", "terminal state not saved" in text, text)
         _expect("D4 kept", bool(await _d4(run)))
         _expect_terminal(*await _restart(run), "canceled")
@@ -829,7 +830,8 @@ async def _fail_d1_finish_write(tmp_path, monkeypatch, mode):
         await run.settle()
         await _closed(run)
         status, text = await _d5_after(run)
-        _expect_terminal("completed", status, "completed")
+        # D1 is checked after restart: a failed write leaves it to recovery.
+        _expect("D5", status == "completed", status)
         _expect("D5 notice", "terminal state not saved" in text, text)
         _expect("D4 kept", bool(await _d4(run)))
         _expect_terminal(*await _restart(run), "completed")
