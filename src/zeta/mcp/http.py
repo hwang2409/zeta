@@ -763,9 +763,10 @@ class StreamableHTTPMCPClient(MCPClient):
         if self.config.auth_type == "bearer" and self.config.auth_token is not None:
             headers["authorization"] = f"Bearer {self.config.auth_token}"
         elif self.config.auth_type == "oauth" and oauth_token is not None:
-            headers["authorization"] = (
-                f"{oauth_token.token_type} {oauth_token.access_token}"
-            )
+            scheme = oauth_token.token_type
+            if scheme.casefold() == "bearer":
+                scheme = "Bearer"
+            headers["authorization"] = f"{scheme} {oauth_token.access_token}"
         return headers
 
 
