@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import fcntl  # noqa: F401 - re-exported by the compatibility store facade
 import json  # noqa: F401 - re-exported by the compatibility store facade
 import math  # noqa: F401 - re-exported by the compatibility store facade
 import os
