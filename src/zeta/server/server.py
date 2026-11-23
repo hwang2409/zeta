@@ -477,29 +477,26 @@ class ZetaServer:
             )
         elif self._close_task.done():
             return
-        try:
-            await asyncio.shield(self._close_task)
-        except asyncio.CancelledError:
-            with contextlib.suppress(BaseException):
-                await asyncio.shield(self._close_task)
-            raise
+        # Waiting must not cancel the one coordinator, even on repeated cancels.
+        cancelled: asyncio.CancelledError | None = None
+        while not self._close_task.done():
+            try:
+                await asyncio.wait((self._close_task,))
+            except asyncio.CancelledError as exc:
+                cancelled = cancelled or exc
+        if cancelled is not None:
+            if not self._close_task.cancelled():
+                self._close_task.exception()
+            raise cancelled
+        self._close_task.result()
 
     async def _close_all(self, approval_settlement_timeout: float | None) -> None:
         first: BaseException | None = None
 
         async def attempt(operation: Awaitable[object]) -> None:
             nonlocal first
-            task = asyncio.ensure_future(operation)
             try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError as exc:
-                if first is None:
-                    first = exc
-                try:
-                    await asyncio.shield(task)
-                except BaseException as task_error:  # noqa: BLE001
-                    if first is None:
-                        first = task_error
+                await operation
             except BaseException as exc:  # noqa: BLE001
                 if first is None:
                     first = exc
@@ -537,7 +534,7 @@ class ZetaServer:
             handler.cancel()
         await attempt(asyncio.gather(*handlers, return_exceptions=True))
         for client in clients:
-            await attempt(client.close(graceful=True))
+            await attempt(client.close())
         try:
             self.parking.close_all(approval_settlement_timeout)
         except BaseException as exc:  # noqa: BLE001
@@ -1000,12 +997,20 @@ class _Client:
             if close is not None:
                 try:
                     close()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass  # The peer already closed the transport.
                 except BaseException as exc:  # noqa: BLE001
                     if first is None:
                         first = exc
             wait_closed = getattr(self.writer, "wait_closed", None)
             if wait_closed is not None:
-                await attempt(wait_closed())
+                try:
+                    await wait_closed()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass  # asyncio can report the same peer loss on wait_closed().
+                except BaseException as exc:  # noqa: BLE001
+                    if first is None:
+                        first = exc
             if had_physical_controller or self.server.controllers.is_controller(self):
                 try:
                     self.server.controllers.release_connection(self)

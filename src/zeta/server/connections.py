@@ -788,7 +788,7 @@ class ConnectionRegistry(ReplayOutput):
     async def _complete_output_phase(
         self, state: _Connection, output: _OutputState
     ) -> bool:
-        if output.released:
+        if output.released or output.phase == "closed":
             return True
         if output.phase == "flushing":
             output.phase = "ready"
@@ -994,10 +994,10 @@ class ConnectionRegistry(ReplayOutput):
         writer_task.cancel()
 
     def _settle_output(self, output: _OutputState) -> None:
-        while output.queue:
-            item = output.queue.popleft()
-            self._finish_frame_accounting(output, item)
-            self._finish_future(item.future, False)
+        # A physical write can consume cancellation while reporting its outcome.
+        # Close admission before joining the writer, and don't let it wait again.
+        output.phase = "closed"
+        self._clear_output(output, result=False)
         if output.writer_task is not None:
             output.writer_task.cancel()
         self._cancel_overflow_deadline(output)
