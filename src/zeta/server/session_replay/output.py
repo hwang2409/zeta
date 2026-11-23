@@ -48,6 +48,8 @@ class ReplayOutput:
         fields: dict[str, object],
         covers: rows.Covers,
         replay_row: rows.RowFacts | None = None,
+        *,
+        feature_fields: event_contract.FeatureFields | None = None,
     ) -> None:
         """Send an event to observers that joined its replay scope."""
         if EVENT_ACCESS.get(event, Access.READ) is not Access.READ:
@@ -58,7 +60,7 @@ class ReplayOutput:
                     observer,
                     event,
                     session_id,
-                    self._fields_for_connection(observer, event, fields),
+                    self._fields_for_connection(observer, event, fields, feature_fields=feature_fields),
                     covers,
                     replay_row=replay_row,
                 )
@@ -261,7 +263,7 @@ class ReplayOutput:
                 if not self.replay.is_pending(connection):
                     return
             self.replay.hold(
-                connection, event, {**shaped, "_session_id": scope.value}, len(frame)
+                connection, event, scope.value, shaped, len(frame)
             )
 
     def _frontier_holds(
@@ -456,7 +458,8 @@ class ReplayOutput:
         published = self.replay.commit(
             connection,
             event,
-            {**fields, "_session_id": session_id},
+            session_id,
+            dict(fields),
             prepared,
             len(frame),
             covers,
@@ -511,17 +514,12 @@ class ReplayOutput:
         stream_id = self.replay.pending_stream_id(connection)
         items: list[_OutputFrame] = [_OutputFrame(frame)]
         for frame_state in held:
-            public = {
-                key: value
-                for key, value in frame_state.fields.items()
-                if key != "_session_id"
-            }
             payload = connection.codec.notification(
                 frame_state.event,
-                frame_state.fields["_session_id"],
+                frame_state.session_id,
                 stream_id=stream_id,
                 seq=frame_state.seq,
-                **public,
+                **frame_state.fields,
             )
             if payload is None:
                 self.invalidate_replay_connection(connection)

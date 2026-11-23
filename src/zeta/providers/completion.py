@@ -48,6 +48,7 @@ MAX_ACCOUNT_LOCK_ATTEMPTS = 5
 MAX_ACCOUNT_LOCK_RETRY_SECONDS = 120.0
 TRANSPORT_IDLE_SECONDS = 90.0
 MAX_STALL_RETRIES = 2
+MAX_INVALID_REQUEST_RETRIES = 1
 MODEL_PROGRESS_IDLE_SECONDS = 15 * 60.0
 _RETRYABLE_STATUS_CODES = {
     408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529
@@ -126,6 +127,8 @@ class CompletionRetryBudget:
     exhausted: bool = False
     max_stall_retries: int = MAX_STALL_RETRIES
     stall_retries: int = 0
+    max_invalid_request_retries: int = MAX_INVALID_REQUEST_RETRIES
+    invalid_request_retries: int = 0
     excluded_stall_seconds: float = 0.0
     records: list[dict[str, object]] = field(default_factory=list)
     attempt_records: list[dict[str, object]] = field(default_factory=list)
@@ -216,6 +219,13 @@ class CompletionRetryBudget:
                 self.records.append({"decision": "budget-exhausted"})
                 return None
             self.stall_retries += 1
+        if getattr(source, "retry_reason", None) == "invalid_request_error":
+            # A provider-side pre-output stream error gets one retry, then stays terminal.
+            if self.invalid_request_retries >= self.max_invalid_request_retries:
+                self.exhausted = True
+                self.records.append({"decision": "budget-exhausted"})
+                return None
+            self.invalid_request_retries += 1
         assert self.started_at is not None
         elapsed = (
             now
@@ -1241,6 +1251,8 @@ def retry_error_label(error: BaseException | object) -> str:
         return "529 overloaded"
     if getattr(error, "retry_reason", None) == "stream_error":
         return "provider error (stream_error)"
+    if getattr(error, "retry_reason", None) == "invalid_request_error":
+        return "provider error (invalid_request_error)"
     if status_code is not None:
         return f"{status_code} server error"
     if getattr(error, "retryable", False):

@@ -536,7 +536,7 @@ def valid_eviction_view(
     ):
         return False
     seqs = [item.get("seq") for item in view]
-    return (
+    if not (
         all(type(seq) is int for seq in seqs)
         and seqs == sorted(set(seqs))
         and all(
@@ -545,7 +545,33 @@ def valid_eviction_view(
             and seq < entry.seq
             for seq in seqs
         )
-    )
+    ):
+        return False
+    tool_call_ids: set[str] = set()
+    orphan_result = False
+    for item in view:
+        message_data = item.get("message")
+        if not isinstance(message_data, Mapping):
+            return False
+        if message_data.get("role") == MessageRole.ASSISTANT.value:
+            content = message_data.get("content", [])
+            if isinstance(content, list):
+                tool_call_ids.update(
+                    block["tool_call"]["id"]
+                    for block in content
+                    if isinstance(block, Mapping)
+                    and block.get("type") == "tool_use"
+                    and isinstance(block.get("tool_call"), Mapping)
+                    and isinstance(block["tool_call"].get("id"), str)
+                )
+        elif message_data.get("role") == MessageRole.TOOL_RESULT.value:
+            result = message_data.get("tool_result")
+            if (
+                isinstance(result, Mapping)
+                and result.get("tool_call_id") not in tool_call_ids
+            ):
+                orphan_result = True
+    return not orphan_result
 
 
 def invalid_eviction_markers(

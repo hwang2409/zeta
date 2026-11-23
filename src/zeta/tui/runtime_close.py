@@ -72,6 +72,9 @@ class RuntimeCloseMixin:
             await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)
             await attempt_async(self._cancel_model_catalog_load)
+            close_voice = getattr(self, "_close_voice", None)
+            if close_voice is not None:
+                await attempt_async(close_voice)
             prepare_ui_session_change = getattr(
                 self, "_prepare_ui_session_change", None
             )
@@ -151,6 +154,8 @@ class RuntimeCloseMixin:
             self._draft_session = None
             self._session = None
             self._closed = True
+            # last, so every close step above can still export; off the loop, idempotent
+            await attempt_async(lambda: asyncio.to_thread(self.telemetry.shutdown))
         restore_closed_history = getattr(self, "_restore_closed_history", None)
         if restore_closed_history is not None:
             attempt(restore_closed_history)

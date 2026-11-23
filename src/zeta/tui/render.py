@@ -13,6 +13,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 
+from ..memory.safety import redact_secrets
 from ..protocol.types import (
     ErrorInfo,
     RedactedThinkingContent,
@@ -185,9 +186,15 @@ def render_error_card(event: StreamEvent) -> Panel:
 
     error = event.error
     code = error.code if error is not None and error.code else "backend_error"
-    raw_reason = error.message if error is not None else "unknown error"
-    reason = _strip_terminal_controls(raw_reason).strip()
-    reason = reason or "unknown error"
+    reason = _strip_terminal_controls(error.message if error is not None else "unknown error").strip()
+    label = "reason"
+    if event.auth_account is not None:
+        # 401 bodies can echo part of a key; the provider text tells an expired token from a revoked key.
+        # redact the visible text: the strip keeps SGR codes, which can split a key past redaction.
+        reason = redact_secrets(Text.from_ansi(reason).plain)
+        label = "provider"
+    if event.auth_account is None:
+        reason = reason or "unknown error"
     try:
         is_json_payload = json.loads(reason) is not None
     except (json.JSONDecodeError, TypeError):
@@ -200,14 +207,15 @@ def render_error_card(event: StreamEvent) -> Panel:
         title = "model loop stopped"
     elif code == "project_registry_busy":
         title = "project registry busy"
-    elif code == "auth_error":
+    elif code == "auth_error" or (error is not None and error.provider_auth_failure):
         title = "login required"
     else:
         title = "provider failure" if retryable else "error"
     content: list[RenderableType] = [Text(f"{title} · {code}", style=theme.ERROR)]
-    if not is_json_payload:
-        content.append(_safe_text(f"reason: {reason}", style=theme.BODY, wrap=True))
-    else:
+    if event.auth_account is not None:
+        content.append(Text(f"account: {event.auth_account['label']}", style=theme.BODY))
+        content.append(Text("reason: Account sign-in required.", style=theme.BODY))
+    if is_json_payload:
         content.extend(
             (
                 Text("payload · json", style=theme.DIM),
@@ -220,6 +228,8 @@ def render_error_card(event: StreamEvent) -> Panel:
                 ),
             )
         )
+    elif reason:
+        content.append(_safe_text(f"{label}: {reason}", style=theme.BODY, wrap=True))
     if retryable:
         content.append(Text("retry: ctrl+y", style=theme.AFFORDANCE))
     return Panel(
@@ -729,6 +739,8 @@ def render_event(
         return _tool_card(event, running=True)
     if event.type is StreamEventType.TOOL_EXECUTION_UPDATE and event.delta is not None:
         stream = event.data.get("stream")
+        if isinstance(event.data.get("step"), str):
+            return _safe_text(f"  ↳ {event.delta}", style=theme.NOTICE)
         label = f"[{stream}] " if stream in {"stdout", "stderr"} else ""
         return _safe_text(f"  ↳ {label}{event.delta}", style=theme.DIM)
     if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_result:

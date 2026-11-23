@@ -1239,7 +1239,7 @@ class ServeControl:
             if not foreground and self._approvals.release_or_hold_terminal(
                 _approval_key(event), session_id, fields
             ):
-                await self._notify(wire_event, session_id, _admitted=True, **fields)
+                await self._notify(wire_event, session_id, admitted=True, **fields)
                 return
             await self._notify(
                 wire_event, session_id, replay_row=RowFacts(seq=event.row_seq), **fields
@@ -1273,9 +1273,7 @@ class ServeControl:
             login_provider = None
             if foreground and event.error is not None:
                 failed_provider = self.runtime.metadata.provider
-                offers_login = event.error.provider_error and (
-                    event.error.code == "auth_error" or event.error.status_code == 401
-                )
+                offers_login = event.error.provider_auth_failure
                 recovered = await model_selection.recover_async(
                     self.runtime, event.error
                 )
@@ -1283,15 +1281,12 @@ class ServeControl:
                     error = recovered
                     if offers_login:
                         login_provider = failed_provider
-            await self._notify(
-                wire_event,
-                session_id,
-                error=error,
-                data={
-                    **event.data,
-                    **({"login_provider": login_provider} if login_provider else {}),
-                },
-            )
+            login_hint = {"login_provider": login_provider} if login_provider else {}
+            overrides = event_contract.auth_error_feature_fields(event, login_hint)
+            notify = self._notify
+            if overrides:
+                notify = functools.partial(notify, feature_fields=overrides)
+            await notify(wire_event, session_id, error=error, data={**event.data, **login_hint})
             return
         if kind is StreamEventType.COMPACTION_START:
             await self._notify(wire_event, session_id, data=dict(event.data))
@@ -1373,9 +1368,10 @@ class ServeControl:
         return connections.try_admit_controller(event, session_id, **fields)
 
     async def _notify(
-        self, event: EventDescriptor, session_id: str | None = None, **fields: object
+        self, event: EventDescriptor, session_id: str | None = None, *, admitted: bool = False,
+        feature_fields: event_contract.FeatureFields | None = None, **fields: object,
     ) -> bool:
-        if fields.pop("_admitted", False):
+        if admitted:
             return True
         if session_id is None and self.runtime.opened is not None:
             session_id = self.runtime.session_id
@@ -1384,6 +1380,10 @@ class ServeControl:
             if connections is not None:
                 self._maybe_idle()  # a dropped frame of a parked pair may change its row
             return False
+        if feature_fields is not None:
+            return await connections.publish_controller(
+                event, session_id, feature_fields=feature_fields, **fields
+            )
         return await connections.publish_controller(event, session_id, **fields)
 
     async def _end_approval(

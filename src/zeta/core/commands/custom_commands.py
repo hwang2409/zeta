@@ -158,7 +158,7 @@ async def resolve_custom_input(
 def load_custom_commands(
     *,
     home: str | Path | None,
-    project_dir: str | Path,
+    project_dir: str | Path | None,
 ) -> CommandLoadResult:
     """Load project commands over home commands without touching other homes."""
 
@@ -167,7 +167,8 @@ def load_custom_commands(
     directories: list[tuple[str, Path]] = []
     if home is not None:
         directories.append(("home", Path(home).resolve() / "commands"))
-    directories.append(("project", Path(project_dir).resolve() / ".zeta" / "commands"))
+    if project_dir is not None:
+        directories.append(("project", Path(project_dir).resolve() / ".zeta" / "commands"))
     for source, directory in directories:
         for path in _markdown_files(directory, notices):
             command, notice = _read_command(path, source)

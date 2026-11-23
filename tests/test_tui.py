@@ -36,7 +36,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application.current import set_app
+from prompt_toolkit.application.current import create_app_session, set_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
@@ -77,7 +77,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
 from tests.support.owned import await_or_fail, close_owned_app, owned_app
-from tests.support.processes import read_pty_until, reap_process
+from tests.support.processes import open_pty, read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from tests.test_agent import CancelledBeforeAnswerBackend, _collect
 from zeta.accounts import (
@@ -869,7 +869,8 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     original_durable_write = ConversationStore._run_committed_mutation
-    ack_committed = threading.Event()
+    loop = asyncio.get_running_loop()
+    ack_committed = asyncio.Event()
     release_ack = threading.Event()
     apps: list[TUIApp] = []
 
@@ -880,8 +881,10 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
             self, command, expected_generation, cancelled_before_write
         )
         if type(command).__name__ == "_AcknowledgeStagedDeliveryCommand":
-            ack_committed.set()
-            assert release_ack.wait(timeout=5)
+            loop.call_soon_threadsafe(ack_committed.set)
+            assert release_ack.wait(timeout=30), (
+                "test did not release the acknowledgement worker"
+            )
         return result
 
     # test-contract: seam pauses after durable acknowledgement commit
@@ -894,14 +897,19 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
             "background_macro",
             "natural_exit_success",
             app_sink=apps.append,
-        )
+        ),
+        name="background completion transcript",
     )
     try:
-        assert await asyncio.to_thread(ack_committed.wait, 5)
+        await await_or_fail(
+            ack_committed.wait(), what="durable delivery acknowledgement"
+        )
         assert len(apps) == 1
         apps[0].request_exit()
         release_ack.set()
-        count, rendered = await await_or_fail(transcript, what="test await")
+        count, rendered = await await_or_fail(
+            transcript, what="background completion transcript"
+        )
         assert count == 1, rendered
         markers = {ref.type for ref in apps[0].loop.store.branch_refs()}
         assert "notification_tui_presented" in markers
@@ -910,7 +918,8 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         if not transcript.done():
             transcript.cancel()
             await await_or_fail(
-                asyncio.gather(transcript, return_exceptions=True), what="test await"
+                asyncio.gather(transcript, return_exceptions=True),
+                what="drain background completion transcript",
             )
 
 
@@ -1708,6 +1717,7 @@ def _tool_contract_events(name: str) -> tuple[StreamEvent, StreamEvent, StreamEv
         {
             "path": "sample.txt",
             "command": "printf sample",
+            "script": "output(\"sample\")",
             "content": "sample",
             "items": [],
             "name": "sample",
@@ -1736,7 +1746,7 @@ def _assert_tool_contract(name: str) -> None:
     assert all(item is not None for item in rendered), name
     plain = [terminal_plain(item).lower() for item in rendered]
     assert name.lower() in plain[0], name
-    assert "sample" in plain[0], name
+    assert ("1 lines" if name == "code" else "sample") in plain[0], name
     assert "contract result" in plain[1] or name.lower() in plain[1], name
     assert "contract error" in plain[2], name
     assert any(marker in plain[2] for marker in ("error", "failed", "denied")), name
@@ -1767,6 +1777,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
     top_level = ToolRegistry(
         tmp_path,
         session_store=stores[0],
+        code_mode_enabled=True,
         skill_catalog=SkillCatalog.empty(),
         project_id="project-1",
         project_registry=SimpleNamespace(),
@@ -1859,7 +1870,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
 async def test_tool_card_registry_only_names_real_or_supported_alias_tools(
     tmp_path: Path,
 ) -> None:
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty(), code_mode_enabled=True)
     try:
         assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {
             "exec",
@@ -6477,6 +6488,80 @@ async def test_mcp_notices_suppressed_while_suspended_for_fork_and_rendered_afte
         await asyncio.wait_for(resumed_task, timeout=2)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["live", "resume"])
+async def test_code_cell_shortcut_reveals_source(tmp_path: Path, resume: bool) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    script = 'const pointer = await tools.read({path: "pointer"});'
+    outer = ToolCall("cell", "code", {"script": script})
+    steps = (
+        (ToolCall("cell:code:1", "read", {"path": "pointer"}), "target-name"),
+        (ToolCall("cell:code:2", "grep", {"pattern": "needle"}), "matching-line"),
+    )
+    output = ToolResult(outer.id, "done", structured_content={"code_mode": {
+        "version": 1,
+        "state": "completed",
+        "calls": [
+            {"id": call.id, "name": call.name, "summary": content, "state": "completed"}
+            for call, content in steps
+        ],
+    }})
+    if resume:
+        # Approval audit rows retain the full read; the other call is in the projection only.
+        inner, content = steps[0]
+        try:
+            store.append_message(with_message_origin(
+                Message(MessageRole.USER, [TextContent("run code cell")]), MessageOrigin.USER,
+            ))
+            store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(outer)]))
+            store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(inner)]))
+            store.append_message(Message(
+                MessageRole.TOOL_RESULT, tool_result=ToolResult(inner.id, content),
+            ))
+            store.append_message(Message(MessageRole.TOOL_RESULT, tool_result=output))
+        finally:
+            store.close()
+        store = ConversationStore(store.root_dir, session_id=store.session_id)
+
+    app = _test_tui_app(store, StringIO())
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
+        session = app._make_session()
+        running = asyncio.create_task(app.run(session))
+        try:
+            await wait_until(lambda: app._input_loop_active and app.interaction_ready())
+            if not resume:
+                app._handle_tool_event(
+                    StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=outer)
+                )
+                for index, (inner, content) in enumerate(steps, start=1):
+                    data = {"code_parent_id": outer.id, "code_call_index": index}
+                    app._handle_tool_event(StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_START, tool_call=inner, data=data,
+                    ))
+                    app._handle_tool_event(StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_END, tool_call=inner, data=data,
+                        tool_result=ToolResult(inner.id, content),
+                    ))
+                app._handle_tool_event(StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END, tool_call=outer, tool_result=output,
+                ))
+            before = Text.from_ansi(app._transcript.render(120)).plain
+            assert "code · 2 calls" in before
+            for label in ("read pointer", "grep", "target-name"):
+                assert label in before
+            assert script not in before, "code cell source must start collapsed"
+            # The following character confirms the key processor consumed the chord.
+            pipe.send_text("\x18\x0fx")
+            await wait_until(lambda: session.default_buffer.text == "x")
+            after = Text.from_ansi(app._transcript.render(120)).plain
+            assert script in after, "Ctrl-X Ctrl-O did not reveal the code cell source"
+            for label in ("read pointer", "grep", "target-name"):
+                assert label in after
+        finally:
+            app.request_exit()
+            await asyncio.wait_for(running, timeout=10)
+
+
 def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
     bindings = build_key_bindings(
         on_history_previous=lambda _buffer: None,
@@ -7054,6 +7139,7 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
     assert rendered == (
         "Status\n\0overlay-rule\0\n"
         "session_id: status-fixture\nprovider: codex\nmodel: gpt-5.6-luna\n"
+        "otel: off\n"
         "completion_client_setups: none\n"
         "vim_mode: on\nplan_mode: off\nexplicit_finish: on\nmax_agent_depth: 3\n"
         "retained_tail: 6\ntokens_used_this_session: 150\n"
@@ -8049,57 +8135,42 @@ async def test_ctrl_d_resets_cursor_before_prompt_toolkit_exit() -> None:
 
 
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
-    master_fd, slave_fd = pty.openpty()
-    env = _fixed_terminal_env(tmp_path / "zeta-home")
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "tests.support.scripted_tui",
-            "--provider",
-            "codex",
-        ],
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env=env,
-        close_fds=True,
-    )
-    os.close(slave_fd)
-    try:
-        output = bytearray()
-        read_pty_until(master_fd, b" \xe2\x80\xba ", process=process, output=output)
+    with open_pty() as (master_fd, slave_fd):
+        env = _fixed_terminal_env(tmp_path / "zeta-home")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tests.support.scripted_tui",
+                "--provider",
+                "codex",
+            ],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            close_fds=True,
+        )
+        try:
+            output = bytearray()
+            read_pty_until(master_fd, b" \xe2\x80\xba ", process=process, output=output)
 
-        os.write(master_fd, b"\x04")
-        read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
-        reap_process(process, timeout=10)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select(
-                [master_fd], [], [], max(0, deadline - time.monotonic())
-            )
-            if not ready:
-                break
-            try:
-                chunk = os.read(master_fd, 4096)
-            except OSError as error:
-                if error.errno == errno.EIO:
-                    break
-                raise
-            if not chunk:
-                break
-            output.extend(chunk)
-        assert process.returncode == 0
-        assert b"\x1b[?1049h" in output
-        assert b"\x1b[?1049l" in output
-        assert b"\x1b[0 q" in output
-        assert output.index(b"\x1b[0 q") < output.index(b"\x1b[?1049l")
-        assert output.count(b"\x1b[?1049h") == 1
-    finally:
-        if process.poll() is None:
-            process.kill()
+            os.write(master_fd, b"\x04")
+            read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
             reap_process(process, timeout=10)
-        os.close(master_fd)
+            # The child has exited, so the rest of its output is already queued.
+            while select.select([master_fd], [], [], 0)[0]:
+                output.extend(os.read(master_fd, 4096))
+            assert process.returncode == 0
+            assert b"\x1b[?1049h" in output
+            assert b"\x1b[?1049l" in output
+            assert b"\x1b[0 q" in output
+            assert output.index(b"\x1b[0 q") < output.index(b"\x1b[?1049l")
+            assert output.count(b"\x1b[?1049h") == 1
+        finally:
+            if process.poll() is None:
+                process.kill()
+                reap_process(process, timeout=10)
 
 
 def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
@@ -8157,45 +8228,39 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
 def test_main_pty_normal_command_then_queued_enter_submits(
     tmp_path: Path,
 ) -> None:
-    master_fd, slave_fd = pty.openpty()
-    env = _fixed_terminal_env(tmp_path / "zeta-home")
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "tests.support.scripted_tui",
-            "--provider",
-            "codex",
-        ],
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env=env,
-        close_fds=True,
-    )
-    os.close(slave_fd)
-    output = bytearray()
+    with open_pty() as (master_fd, slave_fd):
+        env = _fixed_terminal_env(tmp_path / "zeta-home")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tests.support.scripted_tui",
+                "--provider",
+                "codex",
+            ],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            close_fds=True,
+        )
+        output = bytearray()
 
-    def read_until(needle: bytes, start: int = 0) -> None:
-        read_pty_until(master_fd, needle, process=process, output=output, start=start)
+        def read_until(needle: bytes, start: int = 0) -> None:
+            read_pty_until(master_fd, needle, process=process, output=output, start=start)
 
-    try:
-        read_until(b" \xe2\x80\xba ")
-        start = len(output)
-        os.write(master_fd, b"abc\x1bx\r")
-        read_until(b"the scripted test backend", start)
-        assert b"you said: ab" in output[start:]
-    finally:
         try:
+            read_until(b" \xe2\x80\xba ")
+            start = len(output)
+            os.write(master_fd, b"abc\x1bx\r")
+            read_until(b"the scripted test backend", start)
+            assert b"you said: ab" in output[start:]
+        finally:
             if process.poll() is None:
                 os.write(master_fd, b"\x04")
-                read_pty_until(
-                    master_fd, b"\x1b[?1049l", process=process, output=output
-                )
+                read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
                 reap_process(process, timeout=10)
             assert process.returncode == 0
-        finally:
-            os.close(master_fd)
 
 
 def test_main_import_compatibility() -> None:
@@ -9475,11 +9540,12 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
     )
     replay_started = asyncio.Event()
     release_replay = asyncio.Event()
+    terminal_restored = asyncio.Event()
 
     async def delayed_replay(*, batch_size: int = 1) -> bool:
         del batch_size
         replay_started.set()
-        await release_replay.wait()
+        await await_or_fail(release_replay.wait(), what="release startup replay")
         return False
 
     monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
@@ -9492,14 +9558,28 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
         def restore_terminal() -> None:
             restored.append(None)
             original_restore()
+            terminal_restored.set()
 
         monkeypatch.setattr(session, "restore_terminal", restore_terminal)
-        run_task = asyncio.create_task(app.run(session))
-        await replay_started.wait()
-        app.request_exit()
-        release_replay.set()
-        await asyncio.wait_for(run_task, timeout=1)
-        await asyncio.sleep(0)
+        run_task = asyncio.create_task(app.run(session), name="full-screen replay exit")
+        try:
+            await await_or_fail(replay_started.wait(), what="startup replay entry")
+            app.request_exit()
+            release_replay.set()
+            await await_or_fail(
+                terminal_restored.wait(), what="full-screen terminal restore"
+            )
+            await await_or_fail(
+                run_task, what="full-screen session close after terminal restore"
+            )
+            await asyncio.sleep(0)
+        finally:
+            release_replay.set()
+            run_task.cancel()
+            await await_or_fail(
+                asyncio.gather(run_task, return_exceptions=True),
+                what="drain full-screen replay exit task",
+            )
 
     prompt_toolkit_tasks = [
         task

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -75,6 +75,8 @@ class BackgroundAgentOwner:
         self._store_close_tasks: set[asyncio.Task[Any]] = set()
         self._store_close_stores: dict[asyncio.Task[Any], ConversationStore] = {}
         self._observed_close_failures: set[asyncio.Task[Any]] = set()
+        self._setup_tasks: set[asyncio.Task[Any]] = set()
+        self._setup_closed = False
         self._cancellation_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
             str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
@@ -106,6 +108,23 @@ class BackgroundAgentOwner:
     def notify_wake(self) -> None:
         """Wake the frontend after a durable completion notification."""
         self._notify_frontend()
+
+    def start_child_setup[Result](
+        self, setup: Callable[[], Coroutine[Any, Any, Result]],
+    ) -> asyncio.Task[Result]:
+        """Own child setup until it hands off to a registered run or exits."""
+        if self._setup_closed:
+            raise asyncio.CancelledError
+
+        task = asyncio.create_task(setup())
+        self._setup_tasks.add(task)
+        task.add_done_callback(self._setup_tasks.discard)
+        return task
+
+    def finish_child_setup(self) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._setup_tasks.discard(task)
 
     def create_cancellation_task[TaskResult](
         self, awaitable: Awaitable[TaskResult]
@@ -330,11 +349,15 @@ class BackgroundAgentOwner:
         self._parent_stores.pop(instance_id, None)
         self._active_stores.pop(instance_id, None)
         self._descriptions.pop(instance_id, None)
-        self._parent_ids.pop(instance_id, None)
+        parent_id = self._parent_ids.pop(instance_id, None)
         self._original_parent_ids.pop(instance_id, None)
         self._cancel_requested.discard(instance_id)
         self._cancel_confirmations.pop(instance_id, None)
         self.causal_episodes.release_member(instance_id)
+        if parent_id is not None:
+            # The completion notice wakes the parent before this unregister, so a
+            # parent waiting for owned work must re-check after the child leaves.
+            self.conversation_channel.wake(parent_id)
 
     def adopt(
         self,
@@ -364,11 +387,20 @@ class BackgroundAgentOwner:
     def parent_store(self, instance_id: str, default: ConversationStore) -> ConversationStore:
         return self.parent_edge(instance_id, default)[0]
 
+    async def close_children(self) -> None:
+        """Stop admission and cancel and join the whole child tree."""
+        self._setup_closed = True
+        self.cancel_all()
+        await self.wait()
+
     def cancel_all(self) -> None:
         if self._canceling:
             return
         self._canceling = True
         try:
+            for setup in tuple(self._setup_tasks):
+                if not setup.done() and not setup.cancelling():
+                    setup.cancel()
             for instance_id in tuple(self._cancellers):
                 self._request_cancellation(instance_id)
         finally:
@@ -419,13 +451,18 @@ class BackgroundAgentOwner:
     async def wait(self) -> None:
         current = asyncio.current_task()
         while True:
+            setups = self._setup_tasks - {current}
             for instance_id, watcher in tuple(self._watchers.items()):
                 if watcher.done():
                     self.unregister(instance_id)
             watchers = tuple(
                 watcher for watcher in self._watchers.values() if watcher is not current
             )
-            if not watchers:
+            # Snapshot watchers before setup drains: they can unregister during cleanup.
+            if setups:
+                await asyncio.wait(setups)
+            if watchers:
+                await asyncio.gather(*watchers, return_exceptions=True)
+            elif not setups:
                 await self.wait_for_store_closes()
                 return
-            await asyncio.gather(*watchers, return_exceptions=True)

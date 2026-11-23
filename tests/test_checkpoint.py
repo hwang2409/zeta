@@ -630,6 +630,40 @@ def test_live_and_replay_agent_notification_bytes_match(
     asyncio.run(app.close())
 
 
+def test_tui_replay_neutralizes_legacy_inbox_wake_text(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store._append_row("notification", {
+        "origin": "notification", "kind": "project_inbox", "project_id": "p",
+        "message_ids": ["m"], "description": "project inbox", "status": "new",
+        "text": "Requests are work to do: claim, do, and mark done.",
+        "messages": [{"id": "m", "author": "user", "authority": "trusted_assignment"}],
+    })
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    try:
+        app._active_session = app._make_session()
+        presented: list[dict] = []
+        render_event = app._presenter.render_event
+
+        def capture(event):
+            presented.append(dict(event.data))
+            return render_event(event)
+
+        app._presenter.render_event = capture
+        app._rebuild_transcript()
+        rendered = app._transcript.render(120)
+        assert "Requests are work to do" not in rendered
+        assert "Project inbox wake" in rendered
+        inbox = [data for data in presented if data.get("kind") == "project_inbox"]
+        assert [data["messages"] for data in inbox] == [[{"id": "m"}]]
+    finally:
+        asyncio.run(app.close())
+
+
 def test_display_only_agent_notification_remains_visible_in_tui_replay(
     tmp_path: Path,
 ) -> None:

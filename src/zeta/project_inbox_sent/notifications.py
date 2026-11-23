@@ -5,8 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from ..storage_format import StorageFeature, feature_enabled
-
 PROJECT_INBOX_NOTIFICATION_KIND = "project_inbox"
 
 NEUTRAL_INBOX_TEXT = (
@@ -16,17 +14,14 @@ NEUTRAL_INBOX_TEXT = (
 )
 
 
-def project_inbox_notification(
-    data: Mapping[str, Any], *, observed_epoch: int | None = None
-) -> dict[str, Any]:
-    """Project one inbox notification using the held home epoch gate."""
+def project_inbox_notification(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one inbox notification the same way at every epoch."""
     result = dict(data)
-    if (
-        result.get("kind") != PROJECT_INBOX_NOTIFICATION_KIND
-        or observed_epoch is None
-        or not feature_enabled(observed_epoch, StorageFeature.INBOX_DELEGATION)
-    ):
+    if result.get("kind") != PROJECT_INBOX_NOTIFICATION_KIND:
         return result
+    # every epoch: a stored wake text must never call inbox messages work
+    result["text"] = NEUTRAL_INBOX_TEXT
+    # below INBOX_DELEGATION zeta never writes author/authority, so this is a no-op there
     messages = result.get("messages")
     if isinstance(messages, list):
         result["messages"] = [
@@ -38,5 +33,4 @@ def project_inbox_notification(
             for message in messages
             if isinstance(message, Mapping)
         ]
-    result["text"] = NEUTRAL_INBOX_TEXT
     return result

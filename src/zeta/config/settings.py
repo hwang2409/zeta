@@ -57,6 +57,8 @@ from ..models.catalog import PROVIDERS, REMOVED_PROVIDER_ERROR, provider_for_mod
 from .tool_policy import parse_tool_patterns, validate_tool_patterns
 
 SETTINGS_FILENAME = "settings.toml"
+DEFAULT_VOICE_ENGINE = "whisper.cpp"
+DEFAULT_VOICE_MODEL = "small.en"
 
 
 class SettingsError(ValueError):
@@ -80,6 +82,7 @@ _TOP_KEYS = frozenset(
         "ollama_base_url",
         "auto_project",
         "memory",
+        "code_mode",
         "inbox",
         "commands",
         "anthropic",
@@ -92,6 +95,8 @@ _TOP_KEYS = frozenset(
         "agents",
         "mcp",
         "retention",
+        "otel",
+        "voice",
     }
 )
 _PROJECT_SAFE_KEYS = frozenset(
@@ -110,6 +115,7 @@ _APPROVAL_KEYS = frozenset({"allow", "deny", "ask"})
 _INBOX_KEYS = frozenset({"enabled"})
 _ANTHROPIC_KEYS = frozenset({"oauth_compat"})
 _COMMAND_KEYS = frozenset({"command_niceness"})
+_VOICE_KEYS = frozenset({"engine", "model"})
 _AGENTS_KEYS = frozenset({"explicit_finish", "max_depth"})
 _EMPTY_MAPPING: Mapping[str, Any] = MappingProxyType({})
 
@@ -133,6 +139,7 @@ class Settings:
     ollama_base_url: str | None = None
     auto_project: bool | None = None
     inbox_enabled: bool | None = None
+    code_mode_enabled: bool = False
     anthropic_oauth_compat: bool | None = None
     agents_explicit_finish: bool | None = None
     agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
@@ -150,6 +157,10 @@ class Settings:
     mcp_call_deadline_seconds: float = 300.0
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
+    otel_endpoint: str | None = None
+    voice_engine: str = DEFAULT_VOICE_ENGINE
+    voice_model: str = DEFAULT_VOICE_MODEL
+    redacted_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +181,7 @@ class ResolvedConfig:
     workspace_snapshot_cap: int | None = None
     auto_project: bool = True
     inbox_enabled: bool = True
+    code_mode_enabled: bool = False
     agents_explicit_finish: bool = False
     agents_max_depth: int = DEFAULT_MAX_AGENT_DEPTH
     tool_allow: tuple[str, ...] | None = None
@@ -186,6 +198,9 @@ class ResolvedConfig:
     mcp_call_deadline_seconds: float = 300.0
     mcp_max_wire_bytes: int = 64 * 1024 * 1024
     mcp_spill_after_bytes: int = 256 * 1024
+    otel_endpoint: str | None = None
+    voice_engine: str = DEFAULT_VOICE_ENGINE
+    voice_model: str = DEFAULT_VOICE_MODEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,13 +224,56 @@ def load_settings(
     """
 
     notices: list[str] = []
-    warnings: list[str] = []
     global_path = _settings_path(home)
     project_path = _settings_path(project_dir)
     global_data = _parse(global_path, notices)
     project_data = (
         _parse(project_path, notices) if project_path != global_path else {}
     )
+    return _load_layers(global_data, global_path, project_data, project_path, notices)
+
+
+def validate_home_settings(raw: bytes, home: str | Path) -> Settings:
+    """Validate ``settings.toml`` bytes for ``home`` exactly as ``load_settings`` would.
+
+    Raises ``SettingsError`` for bytes that zeta would refuse to start with.
+    """
+
+    notices: list[str] = []
+    path = Path(home).expanduser() / SETTINGS_FILENAME
+    data = _parse_bytes(raw, path, notices)
+    settings = _load_layers(data, path, {}, None, notices).settings
+    return replace(settings, redacted_keys=tuple(sorted(_secret_keys(data))))
+
+
+# Only disclose recognized field names, never arbitrary table names or values.
+_SECRET_KEYS = {"api_key", "access_token", "refresh_token", "token", "client_secret", "password", "secret"}
+
+
+def _secret_keys(data: Mapping[str, Any]) -> set[str]:
+    keys = set()
+    pending = [data]
+    while pending:
+        for key, value in pending.pop().items():
+            if key.casefold() in _SECRET_KEYS:
+                keys.add(key)
+            if isinstance(value, Mapping):
+                pending.append(value)
+    return keys
+
+
+def _load_layers(
+    global_data: dict[str, Any],
+    global_path: Path | None,
+    project_data: dict[str, Any],
+    project_path: Path | None,
+    notices: list[str],
+) -> LoadedSettings:
+    warnings: list[str] = []
+    if "otel" in project_data:
+        # [otel] picks a local collector for the whole process; a repository must not.
+        where = _display_path(project_path) if project_path is not None else "project settings"
+        raise SettingsError(f"[otel] is global-only; remove it from {where}")
     project_data = _strip_unsafe_project_keys(project_data, project_path, warnings)
     global_allow, global_deny = _validate_policy_layer(global_data, global_path)
     project_allow, project_deny = _validate_policy_layer(project_data, project_path)
@@ -330,6 +388,7 @@ def resolve(
         workspace_snapshot_cap=settings.workspace_snapshot_cap,
         auto_project=settings.auto_project is not False,
         inbox_enabled=settings.inbox_enabled is not False,
+        code_mode_enabled=settings.code_mode_enabled,
         agents_explicit_finish=settings.agents_explicit_finish is True,
         agents_max_depth=settings.agents_max_depth,
         tool_allow=settings.tool_allow if cli_allow is None else cli_allow,
@@ -356,6 +415,9 @@ def resolve(
         mcp_call_deadline_seconds=settings.mcp_call_deadline_seconds,
         mcp_max_wire_bytes=settings.mcp_max_wire_bytes,
         mcp_spill_after_bytes=settings.mcp_spill_after_bytes,
+        otel_endpoint=settings.otel_endpoint,
+        voice_engine=settings.voice_engine,
+        voice_model=settings.voice_model,
     )
 
 
@@ -389,6 +451,10 @@ def _parse(path: Path | None, notices: list[str]) -> dict[str, Any]:
     except OSError as exc:
         notices.append(f"settings · could not read {_display_path(path)}: {exc}")
         return {}
+    return _parse_bytes(raw, path, notices)
+
+
+def _parse_bytes(raw: bytes, path: Path, notices: list[str]) -> dict[str, Any]:
     try:
         parsed = tomllib.loads(raw.decode("utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
@@ -533,6 +599,18 @@ def _validated_mcp_limits(value: object) -> MCPCallLimits:
         raise SettingsError(f"invalid mcp settings: {exc}") from exc
 
 
+def _validated_voice(voice: object) -> tuple[str, str]:
+    if not isinstance(voice, Mapping) or set(voice) - _VOICE_KEYS:
+        raise SettingsError("invalid voice settings")
+    voice_engine = voice.get("engine", DEFAULT_VOICE_ENGINE)
+    voice_model = voice.get("model", DEFAULT_VOICE_MODEL)
+    if type(voice_engine) is not str or voice_engine != DEFAULT_VOICE_ENGINE:
+        raise SettingsError(f"voice.engine must be '{DEFAULT_VOICE_ENGINE}'")
+    if type(voice_model) is not str or voice_model != DEFAULT_VOICE_MODEL:
+        raise SettingsError(f"voice.model must be '{DEFAULT_VOICE_MODEL}'")
+    return voice_engine, voice_model
+
+
 def _validate(
     data: Mapping[str, Any], notices: list[str], warnings: list[str]
 ) -> Settings:
@@ -573,6 +651,12 @@ def _validate(
         )
     allow_hooks = _validated_bool(data, "allow_hooks", notices)
     allow_external_tools = _validated_bool(data, "allow_external_tools", notices)
+    code_mode = data.get("code_mode", {})
+    if not isinstance(code_mode, Mapping) or set(code_mode) - {"enabled"}:
+        raise SettingsError("invalid code_mode settings")
+    code_mode_enabled = code_mode.get("enabled", False)
+    if type(code_mode_enabled) is not bool:
+        raise SettingsError("code_mode.enabled must be a boolean")
     memory = data.get("memory", {})
     if not isinstance(memory, Mapping):
         notices.append("settings · ignored key 'memory': expected table")
@@ -603,6 +687,19 @@ def _validate(
     command_niceness = _validated_int_range(
         commands, "command_niceness", notices, minimum=0, maximum=19
     )
+    otel = data.get("otel", {})
+    if not isinstance(otel, Mapping) or set(otel) - {"endpoint"}:
+        raise SettingsError("invalid otel settings")
+    otel_endpoint = otel.get("endpoint")
+    if otel_endpoint is not None:
+        from ..telemetry import TelemetryError
+        from ..telemetry.runtime import validate_loopback_endpoint
+
+        try:
+            validate_loopback_endpoint(otel_endpoint)
+        except TelemetryError as exc:
+            raise SettingsError(str(exc)) from None
+    voice_engine, voice_model = _validated_voice(data.get("voice", {}))
     mcp = data.get("mcp", {})
     mcp_limits = _validated_mcp_limits(mcp)
     mcp = cast(Mapping[str, Any], mcp)
@@ -630,6 +727,7 @@ def _validate(
         ollama_base_url=ollama_base_url,
         auto_project=auto_project,
         inbox_enabled=inbox_enabled,
+        code_mode_enabled=code_mode_enabled,
         anthropic_oauth_compat=anthropic_oauth_compat,
         agents_explicit_finish=agents_explicit_finish,
         agents_max_depth=agents_max_depth,
@@ -647,6 +745,9 @@ def _validate(
         mcp_call_deadline_seconds=mcp_limits.deadline_seconds,
         mcp_max_wire_bytes=mcp_limits.max_wire_bytes,
         mcp_spill_after_bytes=mcp_limits.spill_after_bytes,
+        otel_endpoint=otel_endpoint,
+        voice_engine=voice_engine,
+        voice_model=voice_model,
     )
 
 

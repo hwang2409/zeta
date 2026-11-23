@@ -24,6 +24,7 @@ _DURABILITY_CALLBACKS = {
     ("project_registry.py", "publish", "atomic_publish_file"),
     ("project_registry.py", "_backup_session_records", "write_session_file_if_absent"),
     ("core/agent_state.py", "ensure_turn_limit_handoff", "write_session_file_if_absent"),
+    ("skills/resource_store.py", "write", "write_session_file_if_absent"),
     ("project_inbox_sent/__init__.py", "publish", "atomic_publish_file"),
     ("project_inbox_sent/__init__.py", "_write_spill", "atomic_publish_file"),
     ("project_inbox.py", "_publish_record", "atomic_publish_file"),
@@ -58,6 +59,8 @@ _RAW_PUBLICATION = {
     ("core/session_links.py", "_quarantine_entry", "os.rename"),
     ("core/session_files.py", "write_session_file", "os.replace"),
     ("core/session_files.py", "bump_generation", "os.replace"),
+    # immutable model cache: published only after its pinned sha256 matches
+    ("voice/whisper_cpp.py", "download_model", "os.replace"),
     ("core/transcript_recovery/__init__.py", "repair_transcript", "os.replace"),
     ("memory/reconciliation_state.py", "_write_receipt_archive", "os.replace"),
     ("memory/reconciliation_state.py", "_publish_bytes", "os.replace"),
@@ -107,6 +110,7 @@ _RAW_DELETION = {
     ("core/store/_history_index.py", "_remove_file", "unlink"),
     ("tui/stderr_capture.py", "_open_capture", "unlink"),
     ("tui/stderr_capture.py", "_retain_logs", "unlink"),
+    ("telemetry/receiver/process.py", "_home_id", "unlink"),
     ("core/transcript_recovery/__init__.py", "_unlink_if_present", "unlink"),
     ("diagnostics/tui_stalls.py", "_append_bounded_record", "unlink"),
     ("mcp/management.py", "_atomic_json", "unlink"),
@@ -157,6 +161,9 @@ _RAW_DELETION = {
     ("transcript_search/index.py", "_temporary_database", "unlink"),
     ("transcript_search/index.py", "_clear_building_path", "unlink"),
     ("tui/paste_runtime/__init__.py", "_delete_staged", "unlink"),
+    # private capture files and a failed model download's partial file
+    ("voice/audio.py", "remove_file", "unlink"),
+    ("voice/whisper_cpp.py", "download_model", "unlink"),
 }
 
 _VARIANT_APPEND_SEAMS = {

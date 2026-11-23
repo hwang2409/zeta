@@ -61,6 +61,7 @@ def _app_for_finder(
             prompt_history=None,
             search_results=(),
             end_search=lambda: None,
+            cancel_finder_return=lambda: None,
             start_search=lambda *_args: None,
             search_task=None,
             history_pager=SimpleNamespace(descriptors=()),

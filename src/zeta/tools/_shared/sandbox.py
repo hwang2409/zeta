@@ -27,6 +27,7 @@ from ...core.approval import (
     ApprovedPathExisting,
 )
 from ...runtime.execution import ToolExecutionContext
+from .cwd_state import require_bash_cwd
 
 if TYPE_CHECKING:
     from ..registry import ToolRegistry
@@ -64,6 +65,13 @@ def resolve_shell_cwd(
     if not candidate.is_absolute():
         candidate = Path(persisted_cwd) / candidate
     return os.path.abspath(candidate)
+
+
+def _resolve_file_path(registry: ToolRegistry, raw_path: str) -> Path:
+    candidate = Path(expand_user_path(raw_path))
+    if not candidate.is_absolute():
+        candidate = require_bash_cwd(registry.bash_cwd) / candidate
+    return Path(os.path.abspath(candidate))
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,6 +518,7 @@ def open_parent(
 ) -> Iterator[tuple[int, str, Path]]:
     """Yield the verified parent descriptor for atomic absent-file publication."""
 
+    candidate = _resolve_file_path(registry, raw_path)
     approved = execution_context.consume_path_binding(raw_path)
     if approved is not None:
         if not isinstance(approved.target_state, ApprovedPathAbsent):
@@ -521,7 +530,7 @@ def open_parent(
             yield parent_fd, components[-1], Path(approved.target)
         return
 
-    resolved = registry.policy.resolve(raw_path)
+    resolved = registry.policy.resolve(str(candidate))
     if resolved.in_cwd:
         components = _cwd_relative_components(registry.cwd, resolved.absolute)
         with _open_parent_in_cwd(
@@ -573,12 +582,13 @@ def open_target(
     callers must not open the target by path a second time.
     """
 
+    candidate = _resolve_file_path(registry, raw_path)
     approved = execution_context.consume_path_binding(raw_path)
-    candidate = Path(expand_user_path(raw_path))
-    if not candidate.is_absolute():
-        candidate = registry.cwd / candidate
-    candidate = Path(os.path.abspath(candidate))
-    if not flags & (os.O_WRONLY | os.O_RDWR) and registry.spills.contains(candidate):
+    if (
+        not flags & (os.O_WRONLY | os.O_RDWR)
+        and (approved is None or candidate == Path(approved.target))
+        and registry.spills.contains(candidate)
+    ):
         file_descriptor = registry.spills.open_read(candidate)
         try:
             yield file_descriptor, candidate
@@ -595,7 +605,7 @@ def open_target(
             yield target_info
         return
 
-    resolved = registry.policy.resolve(raw_path)
+    resolved = registry.policy.resolve(str(candidate))
     if resolved.in_cwd:
         with _open_target_in_cwd(
             registry,

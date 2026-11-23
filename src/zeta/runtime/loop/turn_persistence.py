@@ -43,6 +43,15 @@ class TurnPersistenceMixin:
         finally:
             for call in calls:
                 self.store.complete_pending_approval_execution(call.id)
+        self._publish_cwd_recovery()
+        return results
+
+    def _run_tool_post_effects(self: AgentLoop, call: ToolCall, result: ToolResult) -> None:
+        if self.hooks is not None:
+            self.hooks.post_tool(call.name, result.content)
+        self._publish_cwd_recovery()
+
+    def _publish_cwd_recovery(self: AgentLoop) -> None:
         for removed, fallback in self.tool_registry.take_cwd_recovery_notices():
             self.store.append_message(
                 harness_notice(
@@ -51,7 +60,6 @@ class TurnPersistenceMixin:
                     event="shell_cwd_recovered",
                 )
             )
-        return results
 
     def _annotate_current_turn(self: AgentLoop, message: Message) -> Message:
         """Apply provider metadata before any assistant message is persisted."""

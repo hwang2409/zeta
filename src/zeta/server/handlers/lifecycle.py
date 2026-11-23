@@ -21,6 +21,7 @@ from .. import model_selection
 from ..host_commands import SessionHostCommands
 from ..protocol import MAX_FRAME_BYTES, ErrorDescriptor, ProtocolError
 from . import validation
+from .telemetry import live_view
 
 if TYPE_CHECKING:
     from ...runtime.loop import AgentLoop
@@ -634,6 +635,8 @@ async def status(
     status.update(suffix)
     if "session_park" in self.features:
         status["parked_sessions"] = self.server.parking.rows()
+    if "telemetry_read_v1" in self.features:
+        status["telemetry"] = live_view(self.server.telemetry)
     slash_command = controller.control.slash_lock.status()
     if slash_command is not None:
         status["slash_command"] = slash_command

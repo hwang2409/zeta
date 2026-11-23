@@ -17,6 +17,7 @@ from typing import Any
 from .memory.entry_history import EntryMemoryHistoryMixin, logical_history
 from .memory.entry_views import GENERATED_MIRROR_HEADER
 from .memory.pinned_snapshot import pin_snapshot_files, read_pinned_snapshot
+from .memory.safety import contains_secret
 from .memory.version_store import (
     PreparedVersion,
     PublicationContext,
@@ -24,7 +25,11 @@ from .memory.version_store import (
     require_memory_format,
 )
 from .memory_migration_plan import reachable_version_pruning_plan
-from .project_errors import ProjectRegistryError
+from .project_errors import (
+    MemorySecretError,
+    ProjectRegistryError,
+    require_memory_digest,
+)
 from .project_schema import MAX_MEMORY_FILE_SIZE
 from .storage_format import reject_unknown_keys
 
@@ -51,6 +56,13 @@ def _now() -> str:
         .isoformat(timespec="microseconds")
         .replace("+00:00", "Z")
     )
+
+
+def _refuse_secrets(updates: Mapping[str, str]) -> None:
+    """Refuse an explicit write, like format 2 entries; imports stay unchecked."""
+    for name, content in updates.items():
+        if contains_secret(content):
+            raise MemorySecretError(f"memory file {name} contains a secret")
 
 
 @dataclass(frozen=True, slots=True)
@@ -850,8 +862,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         directory_fd = os.dup(project_fd)
         try:
             before = self._snapshot_locked(directory_fd)
-            if before.digest != expected_digest:
-                raise ProjectRegistryError("project memory digest mismatch")
+            require_memory_digest(before.digest, expected_digest)
             records = self._records_locked(directory_fd)
             if (
                 before.contents == exported.contents
@@ -970,6 +981,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
             raise ProjectRegistryError("invalid memory digest")
         self._validate_updates(updates)
+        _refuse_secrets(updates)
         provenance_value = self._validate_provenance(provenance)
         with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             directory_fd = os.dup(project_fd)
@@ -1001,8 +1013,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
                         list(current.items()), False, str(duplicate["version"])
                     )
                 snapshot = self._snapshot_locked(directory_fd)
-                if snapshot.digest != expected_digest:
-                    raise ProjectRegistryError("project memory digest mismatch")
+                require_memory_digest(snapshot.digest, expected_digest)
                 contents = dict(snapshot.contents)
                 contents.update(updates)
                 version = self._publish_version(
@@ -1022,6 +1033,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
         self, project_id: str, updates: Mapping[str, str]
     ) -> list[tuple[str, str]]:
         self._validate_updates(updates)
+        _refuse_secrets(updates)
         with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             directory_fd = os.dup(project_fd)
             try:
@@ -1040,7 +1052,9 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             finally:
                 os.close(directory_fd)
 
-    def accept_memory(self, project_id: str, name: str) -> list[tuple[str, str]]:
+    def accept_memory(
+        self, project_id: str, name: str, *, expected_digest: str | None = None
+    ) -> list[tuple[str, str]]:
         """Mark one automatic memory file as trusted by explicit user action."""
         if name not in PROJECT_MEMORY_FILES:
             raise ProjectRegistryError("invalid memory file name")
@@ -1048,6 +1062,7 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             directory_fd = os.dup(project_fd)
             try:
                 snapshot = self._snapshot_locked(directory_fd)
+                require_memory_digest(snapshot.digest, expected_digest)
                 self._publish_version(
                     directory_fd,
                     project_id=project_id,
@@ -1086,11 +1101,18 @@ class ProjectMemoryHistoryMixin(EntryMemoryHistoryMixin):
             return read(project_fd)
 
     def undo_memory(
-        self, project_id: str, *, expected_current: str | None = None
+        self,
+        project_id: str,
+        *,
+        expected_current: str | None = None,
+        expected_digest: str | None = None,
     ) -> list[tuple[str, str]]:
         with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             directory_fd = os.dup(project_fd)
             try:
+                require_memory_digest(
+                    self._snapshot_locked(directory_fd).digest, expected_digest
+                )
                 records = self._records_locked(directory_fd)
                 undone = {
                     item.get("target_version")

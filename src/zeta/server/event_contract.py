@@ -5,6 +5,7 @@ from enum import Enum, auto
 
 from ..core.checkpoints import ConversationEntry
 from ..protocol.types import Message, StreamEvent, StreamEventType
+from .handlers.resources.account_list import FEATURE as ACCOUNT_FEATURE
 from .protocol import TOOL_OUTPUT_MAX_BYTES, EventDescriptor, bounded
 
 
@@ -58,6 +59,24 @@ def image_stub(block: Mapping[str, object]) -> dict[str, object]:
         stub["size"] = len(data) * 3 // 4 - padding
     stub["data_omitted"] = True
     return stub
+
+
+FeatureFields = Mapping[str, Mapping[str, object]]
+
+
+def auth_error_feature_fields(
+    event: StreamEvent, login_hint: Mapping[str, str],
+) -> FeatureFields:
+    """Replace legacy provider details only for clients that opted in."""
+    if event.auth_account is None:
+        return {}
+    public_data = {**login_hint, "auth_account": event.auth_account}
+    if "agent_instance_id" in event.data:
+        public_data["agent_instance_id"] = event.data["agent_instance_id"]
+    return {ACCOUNT_FEATURE: {
+        "error": {"code": "auth_error", "message": "Account sign-in required."},
+        "data": public_data,
+    }}
 
 
 def config_changed_wire_fields(event: StreamEvent) -> dict[str, object]:
@@ -197,6 +216,9 @@ def tool_start(
 
 def tool_output(event: StreamEvent, *, fidelity: bool = False) -> dict[str, object]:
     data = dict(event.data)
+    step = data.pop("step", None)
+    if isinstance(step, str):
+        data["step"] = bounded(step)
     if fidelity:
         data, _ = project_tool_value(data)
     tool_call = _tool_call(event)

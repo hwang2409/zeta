@@ -24,6 +24,8 @@ from rich.padding import Padding
 from rich.text import Text
 
 from ..config.settings import (
+    DEFAULT_VOICE_ENGINE,
+    DEFAULT_VOICE_MODEL,
     load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
 )
 from ..core.approval import ApprovalPolicy
@@ -32,7 +34,7 @@ from ..core.project_context import (
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
     project_instructions_editor_command,
 )
-from ..core.session import SessionMetadata
+from ..core.session import SessionMetadata, env_home
 from ..core.slash import (
     SlashStatus,
     UsageTracker,
@@ -47,6 +49,7 @@ from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
+from ..telemetry import Telemetry
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import overlay, theme
 from .agent_card import (
@@ -80,6 +83,7 @@ from .paste_runtime import PasteRuntime
 from .runtime.overlay_opener import OverlayOpenerMixin
 from .runtime.prompt import PromptRuntimeMixin
 from .runtime.stream import StreamEventMixin
+from .runtime.voice import VoiceInputMixin
 from .runtime_close import RuntimeCloseMixin
 from .session_prompt_history import SessionPromptHistory
 from .slash_handlers import SlashHandlerMixin
@@ -177,6 +181,7 @@ class TUIApp(
     OverlayOpenerMixin,
     StreamEventMixin,
     PromptRuntimeMixin,
+    VoiceInputMixin,
 ):
     """Full-screen transcript, persistent composer, and follow-up queue."""
 
@@ -213,6 +218,10 @@ class TUIApp(
         on_session_close: Callable[[], Awaitable[None]] | None = None,
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         observer_host: Any | None = None,
+        telemetry: Telemetry | None = None,
+        otel_endpoint: str | None = None,
+        voice_engine: str = DEFAULT_VOICE_ENGINE,
+        voice_model: str = DEFAULT_VOICE_MODEL,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
@@ -220,6 +229,8 @@ class TUIApp(
             foreground_event_publisher or ForegroundEventPublisher()
         )
         self.observer_host = observer_host
+        self.telemetry = telemetry or Telemetry.disabled()
+        self._otel_endpoint = otel_endpoint
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -323,6 +334,7 @@ class TUIApp(
         self._account_switch_finished = asyncio.Event()
         self._account_switch_finished.set()
         self._zeta_home = Path(zeta_home).resolve() if zeta_home is not None else None
+        self._init_voice(self._zeta_home or env_home(), voice_engine, voice_model)
         if project_dir is None:
             discovery = discover_project(self.loop.store.cwd)
             repo_root = discovery.primary_root or discovery.cwd
@@ -538,6 +550,9 @@ class TUIApp(
             on_exit=lambda: app.request_exit(),
             on_submit=lambda value: app._submit_input(value),
             on_paste=lambda event: app._paste_from_keybinding(event),
+            on_voice_toggle=lambda: app._toggle_voice(),
+            on_voice_cancel=lambda: app._cancel_voice(),
+            voice_active=lambda: app.voice_active,
             on_status_close=lambda: app.close_status_card(),
             status_active=lambda: app.status_card_active,
             on_status_scroll=lambda amount: app._status_move(amount),
@@ -678,10 +693,12 @@ class TUIApp(
         if path == owner.view_path:
             return
         owner.view_path = path
+        self._cancel_voice()  # a late transcript must not reach another session
         self._agent_navigation.transcript_control.prompt_history.reset_navigation()
         finder = self._active_finder
         if finder.finder_active:
-            self._finder_cancel()
+            self._finder_return = None
+            FinderRuntimeMixin._finder_cancel(self)
         else:
             self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
@@ -716,8 +733,10 @@ class TUIApp(
     def _move_history(self, direction: str, move: Callable[[], None]) -> None:
         """Own scrolling: move the view and load the page at the edge it meets."""
 
+        owner = self._agent_navigation.transcript_control
+        owner.cancel_finder_return()
         transcript = self._viewed_transcript()
-        pager = self._agent_navigation.transcript_control.history_pager
+        pager = owner.history_pager
         if direction == "newer":
             if transcript.follow_tail and pager.can_load_newer:
                 # The resident tail is not the session tail: load first so this
@@ -745,6 +764,7 @@ class TUIApp(
         self._move_history("newer", lambda: self._viewed_transcript().scroll_down())
 
     def _navigate_history_user(self, direction: str) -> None:
+        self._agent_navigation.transcript_control.cancel_finder_return()
         # Presses wait for the reveal before them, so each moves one prompt.
         self._user_nav_presses.append(direction)
         if self._user_nav_task is None or self._user_nav_task.done():
@@ -804,6 +824,9 @@ class TUIApp(
         return tuple(descriptor.key for descriptor in pager.descriptors)
 
     def _finder_open(self) -> None:
+        navigation = getattr(self, "_agent_navigation", None)
+        if navigation is not None:
+            navigation.transcript_control.cancel_finder_return()
         transcript = self._viewed_transcript()
         if transcript.search_active:
             # A new search replaces the accepted one and its match keys.
@@ -812,7 +835,7 @@ class TUIApp(
         # search finds nothing return to it.
         self._finder_return = (
             None
-            if getattr(self, "_agent_navigation", None) is None
+            if navigation is None
             else (
                 transcript.follow_tail,
                 transcript.durable_scroll_anchor,
@@ -826,23 +849,28 @@ class TUIApp(
         FinderRuntimeMixin._finder_cancel(self)
         # A search or reveal still in flight must not move the view after Esc.
         navigation = getattr(self, "_agent_navigation", None)
-        if navigation is not None and navigation.transcript_control.search_task is not None:
-            navigation.transcript_control.search_task.cancel()
+        if navigation is None:
+            return
+        owner = navigation.transcript_control
+        if owner.search_task is not None:
+            owner.search_task.cancel()
         if saved is not None and saved[2] != self._resident_page_keys():
             # A durable preview replaced the pages: the line index no longer
             # points at the old rows, so load them back.
-            asyncio.create_task(self._return_to_view(saved[0], saved[1]))
+            owner.start_finder_return(
+                lambda: self._return_to_view(saved[0], saved[1])
+            )
 
     async def _return_to_view(self, follow_tail: bool, anchor: Any) -> None:
         transcript = self._viewed_transcript()
-        if follow_tail or anchor is None:
-            await self._load_transcript_page(reset=True)
+        tail = follow_tail or anchor is None
+        pager = self._agent_navigation.transcript_control.history_pager
+        if not (await pager.reveal(None if tail else anchor[0])).segments:
+            return
+        self._render_active_resident_history()
+        if tail:
             transcript.scroll_to_bottom()
         else:
-            pager = self._agent_navigation.transcript_control.history_pager
-            if not (await pager.reveal(anchor[0])).segments:
-                return
-            self._render_active_resident_history()
             transcript.restore_durable_scroll_anchor(anchor)
         self._invalidate_prompt()
 

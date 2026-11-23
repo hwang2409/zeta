@@ -4689,3 +4689,175 @@ async def test_codex_overload_stream_errors_are_retryable(shape, detail, retryab
         assert (raised.value.retry_reason == "overloaded_error") is retryable
     finally:
         await response.aclose()
+
+
+def _invalid_request_failed(detail: str) -> list[dict[str, object]]:
+    return [
+        event("response.created", response={"id": "response-test"}),
+        event(
+            "response.failed",
+            response={"error": {"code": "invalid_request_error", "message": detail}},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pre_output_invalid_request_retries_once_then_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
+    )
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = (
+            _invalid_request_failed("codex upstream incident marker")
+            if len(requests) == 1
+            else message_stream()
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    conversation = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(
+        CodexBackend(client=client, token_store=store_for(tmp_path / "codex.json")),
+        conversation,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        events = [item async for item in loop.run_turn("hi", origin=MessageOrigin.USER)]
+
+        assert len(requests) == 2
+        assert [item.type for item in events].count(StreamEventType.RETRY) == 1
+        assert not any(item.type is StreamEventType.ERROR for item in events)
+        messages = branch_messages(conversation)
+        assert messages[-1].content == [TextContent("hello")]
+        assert all("turn_error" not in (message.metadata or {}) for message in messages)
+    finally:
+        await loop.close()
+        conversation.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_two_pre_output_invalid_request_failures_end_turn_with_detail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
+    )
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(_invalid_request_failed("codex upstream incident marker")),
+            request=request,
+        )
+
+    diagnostics = tmp_path / "stream-diagnostics.jsonl"
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    conversation = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(
+        CodexBackend(
+            client=client,
+            token_store=store_for(tmp_path / "codex.json"),
+            diagnostics_path=diagnostics,
+        ),
+        conversation,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        events = [item async for item in loop.run_turn("hi", origin=MessageOrigin.USER)]
+
+        assert len(requests) == 2
+        assert any(item.type is StreamEventType.ERROR for item in events)
+        turn_error = branch_messages(conversation)[-1].metadata["turn_error"]
+        assert turn_error["code"] == "invalid_request_error"
+        records = [json.loads(line) for line in diagnostics.read_text().splitlines()]
+        assert [record["code"] for record in records] == [
+            "invalid_request_error",
+            "invalid_request_error",
+        ]
+        assert [record["will_retry"] for record in records] == [True, False]
+        # the provider's free-text detail is never logged, only the structured code
+        assert "codex upstream incident marker" not in diagnostics.read_text()
+    finally:
+        await loop.close()
+        conversation.close()
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_invalid_request_failure_after_output_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "zeta.providers.completion.retry_wait_seconds", lambda *_args: 0.0
+    )
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = [
+            event("response.created", response={"id": "response-test"}),
+            event(
+                "response.output_item.added",
+                output_index=0,
+                item={"type": "message", "id": "message-test", "role": "assistant"},
+            ),
+            event(
+                "response.content_part.added",
+                output_index=0,
+                content_index=0,
+                part={"type": "output_text"},
+            ),
+            event(
+                "response.output_text.delta",
+                output_index=0,
+                content_index=0,
+                delta="partial",
+            ),
+            event(
+                "response.failed",
+                response={
+                    "error": {
+                        "code": "invalid_request_error",
+                        "message": "codex upstream incident marker",
+                    }
+                },
+            ),
+        ]
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse(stream),
+            request=request,
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    conversation = ConversationStore(tmp_path / "sessions")
+    loop = AgentLoop(
+        CodexBackend(client=client, token_store=store_for(tmp_path / "codex.json")),
+        conversation,
+        skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        events = [item async for item in loop.run_turn("hi", origin=MessageOrigin.USER)]
+
+        assert len(requests) == 1
+        assert all(item.type is not StreamEventType.RETRY for item in events)
+        assert any(item.type is StreamEventType.ERROR for item in events)
+    finally:
+        await loop.close()
+        conversation.close()
+        await client.aclose()

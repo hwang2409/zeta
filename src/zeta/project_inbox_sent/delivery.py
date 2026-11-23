@@ -31,7 +31,11 @@ class SentDelivery:
     def deliver_tracked(
         self, *, on_visible: Callable[[], None] | None = None, **kwargs: Any
     ) -> tuple[str, SentLedgerOutcome[None]]:
-        from ..project_inbox import InboxConflictError, InboxError
+        from ..project_inbox import (
+            InboxConflictError,
+            InboxDeliveryPendingError,
+            InboxError,
+        )
 
         inbox = self._inbox
         session, target, message_id, to_session, body, record = inbox._outgoing(**kwargs)
@@ -77,7 +81,7 @@ class SentDelivery:
                     if durable:
                         # The intent is already durable; a later poll re-publishes
                         # it. Tell the caller so the model does not duplicate it.
-                        raise InboxError(
+                        raise InboxDeliveryPendingError(
                             "inbox message saved; the recipient could not be "
                             "reached now and delivery will be retried "
                             "automatically. Do not resend this message."

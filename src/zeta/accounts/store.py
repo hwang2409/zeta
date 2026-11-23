@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import hashlib
 import json
 import logging
+import math
 import os
 import stat
 import threading
@@ -61,6 +63,7 @@ from .registry import (
     _UNSAFE_REGISTRY_WARNINGS,
     AccountError,
     AccountId,
+    AccountRegistryBrokenError,
     _account_label,
     _AccountRegistry,
     _publication_record,
@@ -89,6 +92,10 @@ class AccountCredentialLockTimeoutError(AccountError):
         if account is not None:
             message = f"cannot access {account}: {message}; retry the turn"
         super().__init__(message)
+
+
+class AccountLockBusyError(AccountError):
+    """Another holder owns the account lock."""
 
 
 class AccountLoopThreadLockError(AccountError):
@@ -136,7 +143,7 @@ class AccountStore(_AccountRegistry):
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
             except BlockingIOError as exc:
-                raise AccountError(
+                raise AccountLockBusyError(
                     "a login for this provider is already in progress"
                 ) from exc
             yield
@@ -168,12 +175,14 @@ class AccountStore(_AccountRegistry):
             yield
 
     def _read_usage_bytes(self, account: AccountId) -> bytes | None:
-        with self._home() as home_fd:
-            try:
-                with _open_account_directory(home_fd, account) as account_fd:
-                    return _read_optional_bytes(account_fd, "usage.json")
-            except FileNotFoundError:
-                return None
+        try:
+            with (
+                _owned_fd(os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)) as home_fd,
+                _open_account_directory(home_fd, account) as account_fd,
+            ):
+                return _read_optional_bytes(account_fd, "usage.json")
+        except FileNotFoundError:
+            return None
 
     def _write_usage_bytes(self, account: AccountId, data: bytes) -> None:
         with (
@@ -208,10 +217,91 @@ class AccountStore(_AccountRegistry):
                 for key in self._read_registry(home_fd)["accounts"]
             ]
 
+    def public_identity(self, account: AccountId) -> dict[str, str]:
+        """Name an already selected account without credentials or a writer lease."""
+        with (
+            _owned_fd(os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)) as home_fd,
+            self._registry_guard(home_fd),
+        ):
+            label = self._read_registry(home_fd)["labels"].get(str(account), account.name)
+        return {
+            "account": str(account),
+            "label": label,
+            "provider": "claude" if account.provider == "anthropic" else account.provider,
+        }
+
     def list_catalog(self) -> list[availability.AccountDisplay]:
         with self._home() as home_fd:
             value = self._read_registry(home_fd)
         return availability.catalog_display(value)
+
+    def state_rows(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """Project stored account status without a writer lease, refresh, or selection change."""
+        from .usage import read_usage
+
+        rows: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        now = time.time()
+        with _owned_fd(os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)) as home_fd:
+            try:
+                registry = self._read_registry(home_fd)
+            except AccountRegistryBrokenError:
+                return [], ["account registry is invalid"]
+            for item in availability.catalog_display(registry):
+                account = item.account
+                selected = registry["defaults"].get(account.provider) == str(account)
+                usage = read_usage(self, account)
+                try:
+                    tokens = _read_account_tokens(home_fd, account)
+                except AccountError:
+                    tokens = None
+                if tokens is None or not math.isfinite(tokens.expires_at) or tokens.expires_at <= now:
+                    status = "error"
+                    warnings.append(f"{account}: credentials unavailable or expired")
+                elif usage.known_exhausted():
+                    status = "exhausted"
+                else:
+                    status = "selected" if selected else "available"
+                if usage.error:
+                    warnings.append(f"{account}: usage could not be checked")
+                checked = usage.snapshot.captured_at if usage.snapshot else None
+                rows.append({
+                    "provider": account.provider, "account_id": str(account), "status": status,
+                    "selected": selected, "refreshable": bool(tokens and tokens.refresh_token),
+                    "last_checked_ns": int(checked.timestamp() * 1_000_000_000) if checked else None,
+                })
+        return rows, warnings
+
+    def catalog_snapshot(
+        self,
+    ) -> tuple[str, list[availability.AccountDisplay], dict[str, str]]:
+        """Read a consistent catalog without a writer lease or credential recovery."""
+        from .usage import UsageState, read_usage, usage_json
+
+        displays = []
+        with (
+            _owned_fd(os.open(self.home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)) as home_fd,
+            self._registry_guard(home_fd),
+        ):
+            registry = self._read_registry(home_fd)
+            defaults = registry["defaults"]
+            content = []
+            for item in availability.catalog_display(registry):
+                try:
+                    available = _read_account_tokens(home_fd, item.account) is not None
+                except (AccountError, ValueError, OverflowError, RecursionError):
+                    available = False
+                try:
+                    usage = read_usage(self, item.account)
+                except (OverflowError, RecursionError):
+                    usage = UsageState(None, "usage unknown", "invalid usage response")
+                displays.append(availability.AccountDisplay(
+                    item.account, item.label, usage=usage, available=available,
+                ))
+                # Do not hash tokens or derived freshness, which can change without a file write.
+                content.append((str(item.account), item.label, available, usage_json(usage)["snapshot"]))
+            revision = hashlib.sha256(json.dumps((defaults, content), sort_keys=True).encode()).hexdigest()
+        return revision, displays, defaults
 
     def list_display(self) -> list[availability.AccountDisplay]:
         return availability.list_display(self)
@@ -311,12 +401,13 @@ class AccountStore(_AccountRegistry):
             raise AccountError("account reference must be provider:name") from exc
         return self.resolve_reference(provider, reference)
 
-    def resolve_reference(self, provider: str, name_or_label: str) -> AccountId:
+    def resolve_reference(
+        self, provider: str, name_or_label: str, *, refuse_orphans: bool = False,
+    ) -> AccountId:
         reference = AccountId(provider, name_or_label)
         with self._home() as home_fd, self._registry_guard(home_fd):
-            resolved = _registry_reference_index(self._read_registry(home_fd)).get(
-                (provider, reference.name)
-            )
+            registry = self._read_registry(home_fd, refuse_orphans=refuse_orphans)
+            resolved = _registry_reference_index(registry).get((provider, reference.name))
         if resolved is not None:
             return resolved
         raise AccountError(f"account {reference} does not exist")

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from collections import deque
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol, TypeVar
@@ -15,10 +18,50 @@ from ..protocol.types import (
     ToolCall,
     ToolResult,
 )
+from ..telemetry import SpanHandle, Telemetry
 from .abort import AbortSignal
 from .agent_progress import read_agent_lifecycle
 
 TaskResult = TypeVar("TaskResult")
+
+
+class ToolDispatchCoordinator:
+    """Hold a slot through execution; exclusive calls fence both sides of the queue."""
+
+    def __init__(self, max_parallel: int) -> None:
+        self._max_parallel = max_parallel
+        self._waiting: deque[object] = deque()
+        self._active = 0
+        self._exclusive = False
+        self._changed = asyncio.Event()
+
+    def _wake(self) -> None:
+        self._changed.set()
+        self._changed = asyncio.Event()
+
+    @asynccontextmanager
+    async def slot(self, *, parallel_safe: bool) -> AsyncIterator[None]:
+        ticket = object()
+        self._waiting.append(ticket)
+        try:
+            while (self._waiting[0] is not ticket or self._exclusive
+                   or self._active >= self._max_parallel
+                   or (not parallel_safe and self._active)):
+                await self._changed.wait()
+        except BaseException:
+            self._waiting.remove(ticket)
+            self._wake()
+            raise
+        self._waiting.popleft()
+        self._active += 1
+        self._exclusive = not parallel_safe
+        self._wake()
+        try:
+            yield
+        finally:
+            self._active -= 1
+            self._exclusive = False
+            self._wake()
 
 
 class _ToolDefinition(Protocol):
@@ -40,11 +83,19 @@ class _ToolRegistry(Protocol):
         _retain_approval_origin: bool = False,
         _host_environment: Mapping[str, str] | None = None,
         _pending_execution_owner: asyncio.Task[object] | None = None,
+        _span: SpanHandle | None = None,
     ) -> Coroutine[Any, Any, StructuredToolResult]: ...
+
+    def is_mcp_tool(self, name: str) -> bool: ...
+
+    def is_code_mode_call(self, name: str) -> bool: ...
 
 
 class _AgentLoop(Protocol):
     tool_registry: _ToolRegistry | None
+    telemetry: Telemetry
+    agent_profile: str
+    conversation_id: str
 
     def plan_mode_allows(self, tool_call: ToolCall) -> bool: ...
 
@@ -78,6 +129,56 @@ async def _prepare_tool_result(call: ToolCall, result: ToolResult) -> ToolResult
         result,
         lifecycle_projection=lifecycle if type(lifecycle) is dict else {},
     )
+
+
+async def _traced_execute(
+    loop: _AgentLoop, tool_call: ToolCall, **options: Any
+) -> StructuredToolResult:
+    """Run one call under its ``execute_tool`` span.
+
+    Callers start this inside the call's own task, so parallel calls are
+    sibling spans. The ``with`` is the span's one owner: it ends the span once
+    on return, error, or cancellation.
+    """
+
+    registry = loop.tool_registry
+    name = tool_call.name
+    tool_type = (
+        "agent" if name.casefold() == "agent"
+        else "mcp" if registry.is_mcp_tool(name)
+        else "function"
+    )
+    with loop.telemetry.tool_span(
+        name,
+        tool_type=tool_type,
+        call_id=tool_call.id,
+        agent_name=loop.agent_profile,
+        conversation_id=loop.conversation_id,
+    ) as span:
+        result = await registry.execute(tool_call, _span=span, **options)
+        if result.get("isError"):
+            span.fail(None, code="tool_error")
+        if loop.telemetry.enabled():
+            span.set_sizes(
+                argument_bytes=_json_bytes(tool_call.arguments),
+                result_bytes=_json_bytes(result.get("content")),
+            )
+        return result
+
+
+async def execute_owned_tool(
+    loop: _AgentLoop, call: ToolCall, validate_result: Callable[[object, str], ToolResult],
+    **options: Any,
+) -> ToolResult:
+    try:
+        value = await _traced_execute(loop, call, **options)
+    except Exception as exc:
+        value = ToolResult(call.id, str(exc), is_error=True)
+    return await _prepare_tool_result(call, validate_result(value, call.id))
+
+
+def _json_bytes(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False, default=str).encode())
 
 
 async def dispatch_tool_calls(
@@ -135,7 +236,24 @@ async def dispatch_tool_calls(
                 )
             )
 
-    active_task: asyncio.Task[StructuredToolResult] | None = None
+    def execution_options(call: ToolCall) -> dict[str, Any]:
+        return {
+            "abort_signal": abort_signal,
+            "_scope_signal": abort_signal,
+            "_host_environment": host_environment,
+            "_pending_execution_owner": execution_owner,
+            "_stream_sink": enqueue_tool_update,
+            "_lifecycle_sink": lambda kind, event_call=call, data=None, tool_result=None: enqueue_tool_lifecycle(
+                kind, event_call, data, tool_result
+            ),
+            "_lifecycle_payload_sink": lambda kind, data: enqueue_tool_lifecycle(kind, call, data),
+            "_retain_approval_origin": True,
+        }
+
+    coordinator = ToolDispatchCoordinator(max_parallel=max(1, len(calls)))
+
+    update_task: asyncio.Task[StreamEvent] | None = None
+    active_task: asyncio.Task[ToolResult] | None = None
     parallel_tasks: dict[asyncio.Task[StructuredToolResult], tuple[int, ToolCall]] = {}
     parallel_results: list[ToolResult | None] = [None] * len(calls)
     try:
@@ -158,44 +276,35 @@ async def dispatch_tool_calls(
                 call_index += 1
                 continue
             parallel_calls: list[ToolCall] = []
-            if loop.tool_registry is not None:
-                definition = loop.tool_registry.definitions_by_name.get(
-                    calls[call_index].name
-                )
-                if definition is not None and definition.parallel_safe:
+            registry = loop.tool_registry
+            if registry is not None:
+                definition = registry.definitions_by_name.get(tool_call.name)
+                if (
+                    definition is not None and definition.parallel_safe
+                    and not registry.is_code_mode_call(tool_call.name)
+                ):
                     parallel_calls.append(calls[call_index])
                     while call_index + len(parallel_calls) < len(calls):
                         next_call = calls[call_index + len(parallel_calls)]
                         if not loop.plan_mode_allows(next_call):
                             break
-                        next_definition = loop.tool_registry.definitions_by_name.get(
-                            next_call.name
-                        )
-                        if next_definition is None or not next_definition.parallel_safe:
+                        next_definition = registry.definitions_by_name.get(next_call.name)
+                        if (
+                            next_definition is None or not next_definition.parallel_safe
+                            or registry.is_code_mode_call(next_call.name)
+                        ):
                             break
                         parallel_calls.append(next_call)
             if len(parallel_calls) > 1:
+                async def run_parallel(tool_call: ToolCall) -> StructuredToolResult:
+                    async with coordinator.slot(parallel_safe=True):
+                        return await _traced_execute(
+                            loop, tool_call, **execution_options(tool_call),
+                        )
+
                 parallel_tasks = {
                     loop._create_task(
-                        loop.tool_registry.execute(
-                            tool_call,
-                            abort_signal=abort_signal,
-                            _scope_signal=abort_signal,
-                            _host_environment=host_environment,
-                            _pending_execution_owner=execution_owner,
-                            _stream_sink=enqueue_tool_update,
-                            _lifecycle_sink=(
-                                lambda kind, call=tool_call, data=None, tool_result=None: enqueue_tool_lifecycle(
-                                    kind, call, data, tool_result
-                                )
-                            ),
-                            _lifecycle_payload_sink=(
-                                lambda kind, data, call=tool_call: enqueue_tool_lifecycle(
-                                    kind, call, data
-                                )
-                            ),
-                            _retain_approval_origin=True,
-                        )
+                        run_parallel(tool_call),
                     ): (call_index + offset, tool_call)
                     for offset, tool_call in enumerate(parallel_calls)
                 }
@@ -252,27 +361,26 @@ async def dispatch_tool_calls(
                 continue
 
             tool_call = calls[call_index]
-            active_task = loop._create_task(
-                loop.tool_registry.execute(
-                    tool_call,
-                    abort_signal=abort_signal,
-                    _scope_signal=abort_signal,
-                    _host_environment=host_environment,
-                    _pending_execution_owner=execution_owner,
-                    _stream_sink=enqueue_tool_update,
-                    _lifecycle_sink=(
-                        lambda kind, call=tool_call, data=None, tool_result=None: enqueue_tool_lifecycle(
-                            kind, call, data, tool_result
+            async def run_single(tool_call: ToolCall) -> ToolResult:
+                async with coordinator.slot(parallel_safe=False):
+                    registry = loop.tool_registry
+                    nested_factory = getattr(loop, "_nested_executor_for", None)
+                    nested = (
+                        # The outer slot stays held until its own inner scope has drained.
+                        nested_factory(tool_call, abort_signal, enqueue_tool_update, host_environment,
+                                       ToolDispatchCoordinator(max_parallel=8))
+                        if (
+                            nested_factory is not None and registry is not None
+                            and registry.is_code_mode_call(tool_call.name)
                         )
-                    ),
-                    _lifecycle_payload_sink=(
-                        lambda kind, data, call=tool_call: enqueue_tool_lifecycle(
-                            kind, call, data
-                        )
-                    ),
-                    _retain_approval_origin=True,
-                )
-            )
+                        else None
+                    )
+                    return await execute_owned_tool(
+                        loop, tool_call, validate_result, **execution_options(tool_call),
+                        **({"_nested_tool_executor": nested} if nested is not None else {}),
+                    )
+
+            active_task = loop._create_task(run_single(tool_call))
             try:
                 while True:
                     update_task = loop._create_task(stream_updates.get())
@@ -296,8 +404,6 @@ async def dispatch_tool_calls(
                 active_task = None
             except Exception as exc:
                 result = ToolResult(tool_call.id, str(exc), is_error=True)
-            result = validate_result(result, tool_call.id)
-            result = await _prepare_tool_result(tool_call, result)
             result = loop._finalize_tool_results([tool_call], [result])[0]
             completed_tool_indexes.add(call_index)
             yield StreamEvent(
@@ -308,6 +414,8 @@ async def dispatch_tool_calls(
             call_index += 1
     except (asyncio.CancelledError, GeneratorExit):
         pending_tasks: list[asyncio.Task[StructuredToolResult]] = []
+        if update_task is not None and not update_task.done():
+            update_task.cancel()
         await asyncio.sleep(0)
         if active_task is not None and not active_task.done():
             active_task.cancel()
@@ -325,7 +433,7 @@ async def dispatch_tool_calls(
             else:
                 task.cancel()
                 pending_tasks.append(task)
-        await asyncio.gather(*pending_tasks, return_exceptions=True)
+        await asyncio.gather(*pending_tasks, *([update_task] if update_task else []), return_exceptions=True)
         pending_indexes = [
             index for index in range(len(calls)) if index not in completed_tool_indexes
         ]
