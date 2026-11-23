@@ -2330,9 +2330,10 @@ observer_read_only` for an observer. Unexpected failures return `-32000`.
 
 `session_history_read {session_id, cursor?, direction?, limit?, max_bytes?}`
 returns history rows of another top-level session in the attached session's
-project or, when serve is idle, the project a new session in the serve launch
-cwd would get. When that scope has no project, only top-level sessions with
-no project are readable. Child-agent sessions are not readable by id. It does
+project. When serve is idle, the read scope is the project `new_session` would
+resolve for the serve launch cwd at the time of the read; if that scope cannot
+be determined, the read returns `-32005 state_unavailable`. When the scope has
+no project, only top-level sessions with no project are readable. Child-agent sessions are not readable by id. It does
 not attach, subscribe, or take the session's execution lease, and it takes no
 lock the session's owner waits for. `direction` is `backward`
 (default, newest rows first) or `forward`. `limit` (1–128, default 50) counts
