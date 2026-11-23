@@ -492,8 +492,8 @@ class ServerRuntime:
 
     def launch_project_id(self) -> str | None:
         """Resolve the project a default new session would get, without opening one."""
-        _, _, _, projection, project, _ = self._new_session_project(self.cwd, None, None)
-        if projection is None or projection.health is not None:
+        discovery, _, _, projection, project, _ = self._new_session_project(self.cwd, None, None)
+        if discovery.git_unavailable or projection is None or projection.health is not None:
             raise ProjectRegistryError("cannot establish the serve launch project")
         return project.project_id if project is not None else None
 

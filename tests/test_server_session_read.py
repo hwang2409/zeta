@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.serve_contract import ServeClient
 from tests.support.sockets import short_socket_path
+from zeta.core import project_context
 from zeta.core.session_execution import execution_owner_state
 from zeta.core.session_files import child_directory, session_root
 from zeta.core.store import ConversationStore
@@ -309,6 +311,39 @@ async def test_idle_history_read_rejects_malformed_launch_project(tmp_path: Path
         await asyncio.to_thread(record.write_text, "{")
 
         reply = await read(observer, "unresolved", session_id=target)
+        assert "error" in reply, reply
+        assert (reply["error"]["code"], reply["error"]["data"]["code"]) == (-32005, "state_unavailable")
+    finally:
+        await close_serve(harness.server, *harness.writers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "os-error", "incomplete-output"])
+async def test_idle_history_read_rejects_failed_launch_git_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    harness, _ = await start(tmp_path, attach=False)
+    try:
+        cwd = harness.server.runtime.cwd
+        await asyncio.to_thread(subprocess.run, ["git", "init", str(cwd)], check=True, capture_output=True)
+        target = await asyncio.to_thread(harness.session, harness.project, 1)
+        projectless = await asyncio.to_thread(harness.session, None, 1)
+        observer = await harness.client()
+        assert texts((await read(observer, "healthy", session_id=target))["result"])
+        real_run = project_context.subprocess.run
+
+        def failed_discovery(command, **kwargs):
+            if command[3:6] != ["-C", str(cwd), "rev-parse"]:
+                return real_run(command, **kwargs)
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+            if failure == "os-error":
+                raise OSError("injected launch git failure")
+            return subprocess.CompletedProcess(command, 0, stdout=f"{cwd}\n", stderr="")
+
+        # test-contract: seam force a failure at the launch Git subprocess, not at the history handler
+        monkeypatch.setattr(project_context.subprocess, "run", failed_discovery)
+        reply = await read(observer, "failed-discovery", session_id=projectless)
         assert "error" in reply, reply
         assert (reply["error"]["code"], reply["error"]["data"]["code"]) == (-32005, "state_unavailable")
     finally:

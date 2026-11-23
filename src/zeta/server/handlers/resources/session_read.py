@@ -173,6 +173,36 @@ def _read_idle(home, runtime, session_id, request_id, features, start, backward,
     return page
 
 
+def _read_scope(client, session_id):
+    from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
+
+    runtime = client.server.runtime
+    home = client.server.home
+    opened = runtime.opened
+    if opened is None:
+        generation = runtime.attachment_generation
+
+        def validate():
+            # A session can attach and detach during the read.
+            if (
+                client.server.runtime is not runtime or runtime.opened is not None
+                or runtime.attachment_generation != generation
+            ):
+                raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
+
+        return partial(_read_idle, home, runtime, session_id), validate
+
+    if session_id == runtime.session_id:
+        raise invalid_resource_params()  # the attached session pages through session_history
+    project_id = opened.metadata.project_id
+
+    def validate():
+        if runtime.opened is not opened or opened.metadata.project_id != project_id:
+            raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
+
+    return partial(_read, home, runtime.manager, session_id, project_id), validate
+
+
 def _retrieve(future: asyncio.Future) -> None:
     if not future.cancelled():
         future.exception()  # a timed-out caller no longer awaits this result
@@ -205,12 +235,7 @@ async def _handle(client, request_id, params):
         start = resume(params.get("cursor"), (_METHOD, session_id, direction), (0,), _ORDER)
     except (SessionError, InvalidParams):
         raise invalid_resource_params() from None
-    runtime = client.server.runtime
-    opened = runtime.opened
-    generation = runtime.attachment_generation if opened is None else None
-    project_id = opened.metadata.project_id if opened is not None else None
-    if opened is not None and session_id == runtime.session_id:
-        raise invalid_resource_params()  # the attached session pages through session_history
+    reader, validate_scope = _read_scope(client, session_id)
     loop = asyncio.get_running_loop()
     if loop in _in_flight:
         error = resource_error(ErrorDescriptor.OPERATION_BUSY)
@@ -218,11 +243,6 @@ async def _handle(client, request_id, params):
         raise error
     features = history_features(client.features)
 
-    home = client.server.home
-    reader = (
-        partial(_read_idle, home, runtime, session_id) if opened is None
-        else partial(_read, home, runtime.manager, session_id, project_id)
-    )
     read_page = partial(reader, request_id, features, start, direction == "backward", limit, max_bytes)
     read = asyncio.ensure_future(client.connections.run_blocking(read_page))
     _in_flight[loop] = read
@@ -233,15 +253,7 @@ async def _handle(client, request_id, params):
             page = await asyncio.shield(read)
     except TimeoutError:
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
-    if opened is None:
-        # A session can attach and detach before the worker returns to an idle serve.
-        if (
-            client.server.runtime is not runtime or runtime.opened is not None
-            or runtime.attachment_generation != generation
-        ):
-            raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
-    elif runtime.opened is not opened or opened.metadata.project_id != project_id:
-        raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
+    validate_scope()
     return page
 
 
