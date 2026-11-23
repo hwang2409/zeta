@@ -23,6 +23,7 @@ from ..core.checkpoints.workspace import (
     WorkspaceSnapshotStore,
     git_repo_root,
 )
+from ..core.context_parts.code_audit import code_projection, nested_call_data
 from ..core.gc_policy import freeze_long_lived_heap
 from ..protocol.types import (
     FAILED_TURN_ERROR,
@@ -36,6 +37,7 @@ from ..protocol.types import (
     TextContent,
     ThinkingContent,
     ToolCall,
+    ToolResult,
     ToolUseContent,
     assistant_text,
     is_passive_harness_message,
@@ -619,10 +621,10 @@ class CheckpointTranscriptMixin:
         """Reset root paging after a branch or repair change."""
 
         branch_id = self.loop.store.active_branch_head_id()
-        self._prompt_history.bind(
+        self._agent_navigation.transcript_control.prompt_history.bind(
             self._viewed_session_path(), self._history_source, branch_id
         )
-        self._history_pager.reset(endpoint_id=branch_id)
+        self._agent_navigation.transcript_control.history_pager.reset(endpoint_id=branch_id)
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -638,17 +640,29 @@ class CheckpointTranscriptMixin:
         await asyncio.sleep(0)
         if self._exit_requested:
             return False
-        self._prompt_history.bind(
+        self._agent_navigation.transcript_control.prompt_history.bind(
             self._viewed_session_path(),
             self._history_source,
             self.loop.store.active_branch_head_id(),
         )
-        await self._load_transcript_page(reset=True)
+        # A finder search typed during startup may have revealed the place the
+        # user moved to: the first page must not replace it. Lines printed
+        # during startup are live rows, not a place.
+        if not (self._startup_replay_active and self._history_pages_resident()):
+            await self._load_transcript_page(reset=True)
         if self._exit_requested:
             return False
         if self._resumed_session and not _PROCESS_HEAP_FROZEN:
             await asyncio.to_thread(_freeze_process_heap_once)
         return not self._exit_requested
+
+    def _history_pages_resident(self) -> bool:
+        """True once a page of stored history is resident; live rows do not count."""
+
+        return any(
+            not descriptor.key.startswith("live:")
+            for descriptor in self._agent_navigation.transcript_control.history_pager.descriptors
+        )
 
     async def _load_transcript_page(
         self,
@@ -660,22 +674,18 @@ class CheckpointTranscriptMixin:
         """Read one page off-loop, then repaint the bounded resident window."""
 
         if reset:
-            self._history_pager.reset(
+            self._agent_navigation.transcript_control.history_pager.reset(
                 endpoint_id=self.loop.store.active_branch_head_id()
             )
-        anchor = self._transcript.durable_scroll_anchor
-        scroll_generation = self._transcript.scroll_generation
-        page = await self._history_pager.load(direction)
+        transcript = self._viewed_transcript()
+        page = await self._agent_navigation.transcript_control.history_pager.load(direction)
         if not page.units or self._exit_requested:
             return
-        restore_anchor = (
-            anchor
-            if scroll_generation == self._transcript.scroll_generation
-            else self._transcript.durable_scroll_anchor
-        )
-        self._render_resident_history()
+        # The place shown now, not at the read's start: a move during the read wins.
+        restore_anchor = transcript.durable_scroll_anchor
+        self._render_active_resident_history()
         if restore_anchor is not None:
-            self._transcript.restore_durable_scroll_anchor(restore_anchor)
+            transcript.restore_durable_scroll_anchor(restore_anchor)
         if then is not None:
             then()
         if self._history_marker_tasks:
@@ -684,10 +694,9 @@ class CheckpointTranscriptMixin:
 
     def _render_resident_history(self) -> None:
         rendered_notifications: list[str] = []
-        self._dismiss_model_picker()
         self._presenter.clear()
         self._failed_turn = None
-        pages = self._history_pager.pages
+        pages = self._agent_navigation.transcript_control.history_pager.pages
         entries = tuple(
             unit.value
             for page in pages
@@ -899,8 +908,38 @@ def render_replayed_message(
             tool_call=tool_calls.get(message.tool_result.tool_call_id),
             tool_result=message.tool_result,
         )
+        result = message.tool_result
+        projection = code_projection(result.structured_content)
         replay = getattr(presenter, "replay_tool_result", None)
-        if replay_tool_results and callable(replay):
+        is_code = event.tool_call is not None and event.tool_call.name == "code"
+        if is_code and projection:
+            summaries = projection.get("calls")
+            for summary in summaries if isinstance(summaries, list) else ():
+                if not isinstance(summary, dict):
+                    continue
+                call_id, name, content = (summary.get(key) for key in ("id", "name", "summary"))
+                if not all(isinstance(value, str) for value in (call_id, name, content)):
+                    continue
+                data = nested_call_data(call_id, event.tool_call.id)
+                if not data or call_id in tool_calls:
+                    continue
+                inner = StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END,
+                    tool_call=ToolCall(call_id, name, {}),
+                    tool_result=ToolResult(call_id, content, is_error=summary.get("state") == "error",
+                                           is_canceled=summary.get("state") == "canceled"),
+                    data=data,
+                )
+                if callable(replay):
+                    replay(inner)
+                else:
+                    print_unit(render_event(inner))
+        if event.tool_call is not None:
+            parent, _, _ = result.tool_call_id.rpartition(":code:")
+            if parent in tool_calls and tool_calls[parent].name == "code":
+                event = replace(event, data=nested_call_data(result.tool_call_id, parent))
+        # Code cells need disclosure controls even in normal history replay.
+        if callable(replay) and (replay_tool_results or is_code or event.data.get("code_parent_id")):
             replay(event)
         else:
             print_unit(render_event(event))

@@ -9,6 +9,7 @@ import logging
 import math
 import time
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -18,6 +19,7 @@ from ..protocol.types import (
     ToolContentBlock,
     validate_tool_content_block,
 )
+from ..telemetry import SpanHandle, Telemetry
 from ..tools.registry import text_block
 from .config import MCPServerConfig
 
@@ -146,6 +148,9 @@ class MCPClient(Protocol):
     ) -> StructuredToolResult:
         """Call one remote tool."""
 
+    def seal(self) -> None:
+        """Send nothing new; requests already sent keep running until close."""
+
     async def close(self) -> None:
         """Close the transport and release child processes or clients."""
 
@@ -241,6 +246,51 @@ def initialize_params() -> dict[str, object]:
         "capabilities": {},
         "clientInfo": {"name": "zeta", "version": "0.1.0"},
     }
+
+
+# requests a caller queues through an MCP actor; only these carry the caller's trace context.
+CALLER_METHODS = frozenset({"tools/call", "prompts/get", "resources/list", "resources/read"})
+
+
+@dataclass(frozen=True, slots=True)
+class CallerTrace:
+    """The telemetry and MCP span of the caller whose actor request a task runs."""
+
+    telemetry: Telemetry
+    span: SpanHandle
+
+
+# set only around the creation of a caller request's operation task, so actor
+# setup, refresh, and notification work never carries a caller's context.
+CALLER_TRACE: ContextVar[CallerTrace | None] = ContextVar("zeta_mcp_caller_trace", default=None)
+
+
+def caller_trace_context(method: str) -> dict[str, str]:
+    """The W3C ``traceparent``/``tracestate`` for one outgoing request, or ``{}``."""
+
+    caller = CALLER_TRACE.get()
+    if caller is None or method not in CALLER_METHODS:
+        return {}
+    return caller.telemetry.current_trace_context()
+
+
+def traced_params(
+    method: str,
+    params: Mapping[str, object],
+    request_id: int,
+    protocol_version: str | None,
+) -> dict[str, object]:
+    """Request params with the caller's context merged into ``_meta``; unchanged without one."""
+
+    caller = CALLER_TRACE.get()
+    if caller is None or method not in CALLER_METHODS:
+        return dict(params)
+    caller.span.set_mcp_request(request_id=request_id, protocol_version=protocol_version)
+    carrier = caller.telemetry.current_trace_context()
+    meta = params.get("_meta", {})
+    if not carrier or type(meta) is not dict:
+        return dict(params)
+    return {**params, "_meta": {**meta, **carrier}}
 
 
 def make_error_result(message: str) -> StructuredToolResult:

@@ -27,6 +27,8 @@ def capture_slash_status(
     usage_tracker: UsageTracker,
     project_context_health: str | None,
     transcript_session_id: str | None = None,
+    otel_status: str = "off",
+    otel_receiver: str | None = None,
 ) -> SlashStatusSnapshot:
     """Capture loop-owned status state without transcript-sized processing."""
 
@@ -88,6 +90,8 @@ def capture_slash_status(
                 else ()
             ),
             project_context_health=project_context_health,
+            otel_status=otel_status,
+            otel_receiver=otel_receiver,
         ),
         transcript_entries=transcript_store.transcript_rows(transcript_refs),
         token_counter=context_assembler.token_counter,

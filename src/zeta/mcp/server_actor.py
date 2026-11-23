@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -14,6 +14,8 @@ from weakref import WeakKeyDictionary, WeakSet
 from ..core.abort import AbortSignal
 from ..tools.registry import ToolRegistry
 from ..protocol.types import StructuredToolResult
+from ..telemetry import Telemetry
+from .abandoned_closes import AbandonedCloses, live_abandoned_closes
 from .call_deadline import MCPCallDeadline, finish_call_cleanup
 from .client import (
     MCPClient,
@@ -68,6 +70,7 @@ from .actors.prompt import (
     cancel_request as _cancel_request,
     cancel_prompt_request,
     CancelRequest as _CancelRequest,
+    create_caller_task as _create_caller_task,
     PromptFinished as _PromptFinished,
     PromptRequest as _PromptRequest,
     discover_prompts,
@@ -89,7 +92,6 @@ AUTO_RECONNECT_MAX_DELAY_SECONDS = 30.0
 MCP_EAGER_TOOL_LIMIT = 32
 
 NoticeSink = Callable[[str], None]
-
 
 @dataclass(frozen=True, slots=True)
 class _SetupOutcome:
@@ -153,8 +155,10 @@ class MCPServerActor(MCPDefinitionPublisher):
         auto_max_delay: float = AUTO_RECONNECT_MAX_DELAY_SECONDS,
         deadline_clock: Callable[[], float] | None = None,
         limits: MCPCallLimits | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         self.config = config
+        self._telemetry = telemetry or Telemetry.disabled()
         self.source = source
         self._registry = registry
         self._owned_registries: WeakSet[ToolRegistry] = WeakSet(
@@ -181,6 +185,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._requests: dict[int, _CallRequest | _PromptRequest] = {}
         self._resource_requests: dict[int, _ResourceRequest] = {}
         self._scheduled_closes: dict[int, tuple[MCPClient, asyncio.Task[object]]] = {}
+        # at most one abandoned (timed-out) close per server stays referenced
+        # here; later ones are dropped so re-binds cannot stack leaked tasks.
+        self._abandoned_closes = AbandonedCloses()
         self._next_identifier = 0
         self._client: MCPClient | None = None
         self._tools: tuple[MCPTool, ...] = ()
@@ -192,6 +199,8 @@ class MCPServerActor(MCPDefinitionPublisher):
         self._binding_detached = False
         # calls made while detached wait in _requests (no task) until this ends.
         self._detached_hold: asyncio.Future[None] | None = None
+        # sealed clients of a detached binding whose sent calls still run.
+        self._draining: set[MCPClient] = set()
         self._notice_sink: NoticeSink | None = None
         self._tool_refresh = ToolRefreshActor(self)
         self._status = MCPServerStatus(
@@ -321,26 +330,30 @@ class MCPServerActor(MCPDefinitionPublisher):
         *,
         generation: int,
     ) -> StructuredToolResult:
-        future: asyncio.Future[StructuredToolResult] = (
-            asyncio.get_running_loop().create_future()
-        )
-        self._next_identifier += 1
-        request = _CallRequest(
-            self._next_identifier,
-            tool_name,
-            dict(arguments),
-            abort_signal,
-            generation,
-            future,
-        )
-        if self.is_terminal:
-            return _unavailable_result(self.name)
-        self._queue.put_nowait(request)
-        try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            await _cancel_request(self, request.identifier)
-            raise
+        telemetry = self._telemetry
+        with telemetry.mcp_span("tools/call", server=self.name, target=tool_name) as span:
+            future: asyncio.Future[StructuredToolResult] = (
+                asyncio.get_running_loop().create_future()
+            )
+            self._next_identifier += 1
+            request = _CallRequest(
+                self._next_identifier,
+                tool_name,
+                dict(arguments),
+                abort_signal,
+                generation,
+                future,
+                telemetry.current_trace_context(),
+                span,
+            )
+            if self.is_terminal:
+                return _unavailable_result(self.name)
+            self._queue.put_nowait(request)
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                await _cancel_request(self, request.identifier)
+                raise
 
     async def get_prompt(
         self, prompt_name: str, arguments: dict[str, str], *, generation: int
@@ -909,7 +922,9 @@ class MCPServerActor(MCPDefinitionPublisher):
         client: MCPClient,
     ) -> None:
         request.client = client
-        request.task = asyncio.create_task(self._invoke_call(request, client))
+        request.task = _create_caller_task(
+            self, request, self._invoke_call(request, client)
+        )
         self._requests[request.identifier] = request
         self._children.add(request.task)
         request.task.add_done_callback(
@@ -990,6 +1005,16 @@ class MCPServerActor(MCPDefinitionPublisher):
     def _handle_call_finished(self, message: _CallFinished) -> None:
         self._children.discard(message.task)
         request = self._requests.pop(message.request.identifier, message.request)
+        if request.client in self._draining:
+            # sent before the binding left: the model gets the server's real answer.
+            _set_result(
+                request.result,
+                message.result
+                if message.result is not None
+                else _detached_result(self.name, started=True),
+            )
+            self._close_drained_clients()
+            return
         if isinstance(message.error, asyncio.CancelledError):
             _set_result(request.result, _unavailable_result(self.name))
             return
@@ -1035,6 +1060,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             request.task.cancel()
         self._requests.pop(message.identifier, None)
         self._resource_requests.pop(message.identifier, None)
+        self._close_drained_clients()
         _set_result(message.acknowledged, None)
 
     async def _handle_suspend(self, message: _Suspend) -> None:
@@ -1042,11 +1068,17 @@ class MCPServerActor(MCPDefinitionPublisher):
         if operation is not None:
             self._cancel_current_operation()
             if operation.task is not None:
-                await asyncio.gather(operation.task, return_exceptions=True)
+                await self._drain_closes(
+                    (operation.task,), "setup cancellation during suspend"
+                )
             self._finish_cancelled(operation)
         while self._pending_starts:
             self._resolve_message(self._pending_starts.pop(0))
-        for request in self._requests.values():
+        client = self._client
+        sent = self._keep_sent_calls(message.hold)
+        for identifier, request in self._requests.items():
+            if identifier in sent:
+                continue
             if request.task is not None:
                 request.task.cancel()
             if isinstance(request, _CallRequest):
@@ -1056,10 +1088,10 @@ class MCPServerActor(MCPDefinitionPublisher):
                 )
             else:
                 cancel_prompt_request(request, self.name)
-        self._requests.clear()
+        self._requests = sent
+        self._close_drained_clients()
         cancel_terminated_resources(self)
         await self._tool_refresh.close()
-        client = self._client
         self._client = None
         self._tools = ()
         self._prompts = ()
@@ -1067,13 +1099,12 @@ class MCPServerActor(MCPDefinitionPublisher):
         # hidden, not removed: a call the model already chose gets the detached
         # result rather than "unknown tool" until the client re-attaches.
         self._unregister_tools(keep_primary=True)
-        if client is not None:
-            await self._schedule_close(client)
-        if self._scheduled_closes:
-            await asyncio.gather(
-                *(task for _, task in self._scheduled_closes.values()),
-                return_exceptions=True,
-            )
+        if client is not None and client not in self._draining:
+            self._schedule_close(client)
+        await self._drain_closes(
+            tuple(task for _, task in self._scheduled_closes.values()),
+            "server close during suspend",
+        )
         self.config = message.config
         self.source = message.source
         self._set_status(
@@ -1101,13 +1132,40 @@ class MCPServerActor(MCPDefinitionPublisher):
             if isinstance(request, _CallRequest) and request.task is None
         ]
 
+    def _keep_sent_calls(
+        self, hold: asyncio.Future[None] | None
+    ) -> dict[int, _CallRequest | _PromptRequest]:
+        """Under a hold, a call already sent keeps running on its sealed client
+        and returns its real result; the client closes when the last one ends."""
+        if hold is None:
+            return {}
+        sent: dict[int, _CallRequest | _PromptRequest] = {}
+        for identifier, request in self._requests.items():
+            if isinstance(request, _CallRequest) and request.task and request.client:
+                sent[identifier] = request
+                self._seal(request.client)
+        return sent
+
     def _handle_hold_ended(self, hold: asyncio.Future[None]) -> None:
         if hold is not self._detached_hold:
             return
         self._detached_hold = None
-        for request in self._held_calls():
+        # no client came back: waiting calls and calls still running on an old
+        # client end as they would have at the disconnect.
+        for request in [*self._held_calls(), *self._calls_on_sealed_clients()]:
             self._requests.pop(request.identifier)
-            _set_result(request.result, _detached_result(self.name))
+            started = request.task is not None
+            _set_result(request.result, _detached_result(self.name, started=started))
+            if request.task is not None:
+                request.task.cancel()
+        self._close_drained_clients()
+
+    def _calls_on_sealed_clients(self) -> list[_CallRequest]:
+        return [
+            request
+            for request in self._requests.values()
+            if isinstance(request, _CallRequest) and request.client in self._draining
+        ]
 
     async def _handle_remove(self, result: asyncio.Future[None]) -> None:
         await self._terminate(result)
@@ -1164,6 +1222,7 @@ class MCPServerActor(MCPDefinitionPublisher):
             else:
                 cancel_prompt_request(request, self.name)
         self._requests.clear()
+        self._close_drained_clients()
         cancel_terminated_resources(self)
         self._prompts = ()
         self._unregister_tools()
@@ -1239,6 +1298,49 @@ class MCPServerActor(MCPDefinitionPublisher):
             if message.waiter is not None:
                 _set_result(message.waiter.result, _unavailable_result(self.name))
 
+    async def _drain_closes(
+        self, tasks: Iterable[asyncio.Task[object]], what: str
+    ) -> None:
+        """Wait a bounded time for close/cancel tasks, then abandon the rest.
+
+        The actor's single loop runs this inline. An MCP client close() can
+        ignore cancellation (anyio/httpx against a restarting peer), so even
+        safe_close's inner wait_for may never return; waiting for it here would
+        wedge the loop and pin the controller slot on resume (RCA resume-stuck).
+        Wait at most CLIENT_CLOSE_TIMEOUT_SECONDS, then cancel the stragglers
+        and abandon them through _abandon_close, which drops them from the owned
+        sets so repeated re-binds cannot stack leaked tasks.
+        """
+        pending = {task for task in tasks if not task.done()}
+        if not pending:
+            return
+        _, still = await asyncio.wait(pending, timeout=CLIENT_CLOSE_TIMEOUT_SECONDS)
+        if not still:
+            return
+        for task in still:
+            task.cancel()
+            self._abandon_close(task)
+        logger.warning(
+            "MCP server %s: %d %s did not finish in %.1fs; abandoning them "
+            "(%d abandoned closes live)",
+            self.name,
+            len(still),
+            what,
+            CLIENT_CLOSE_TIMEOUT_SECONDS,
+            live_abandoned_closes(),
+        )
+
+    def _abandon_close(self, task: asyncio.Task[object]) -> None:
+        """Drop a timed-out close from the actor's owned sets and hand it to the
+        abandoned-close owner, which keeps at most one live per server so
+        repeated re-binds cannot accumulate references."""
+        for client_id, (_, scheduled) in list(self._scheduled_closes.items()):
+            if scheduled is task:
+                del self._scheduled_closes[client_id]
+                break
+        self._children.discard(task)
+        self._abandoned_closes.abandon(task)
+
     def _schedule_close(
         self,
         client: MCPClient,
@@ -1282,6 +1384,23 @@ class MCPServerActor(MCPDefinitionPublisher):
         if outcome.client is not None:
             self._schedule_close(outcome.client)
 
+    def _seal(self, client: MCPClient) -> None:
+        if client in self._draining:
+            return
+        self._draining.add(client)
+        self._detach_failure_sink(client)
+        client.seal()
+
+    def _close_drained_clients(self) -> None:
+        busy = {
+            request.client
+            for request in self._requests.values()
+            if isinstance(request, _CallRequest)
+        }
+        for client in self._draining - busy:
+            self._draining.discard(client)
+            self._schedule_close(client)
+
     def _queue_child_finished(self, task: asyncio.Task[object]) -> None:
         self._queue.put_nowait(_ChildFinished(task))
 
@@ -1297,16 +1416,30 @@ class MCPServerActor(MCPDefinitionPublisher):
         # a setup that ignores its cancel (httpcore can lose it) still queues a
         # connected client while we wait; drain again so that client gets closed.
         # wait, not gather: gather returns at once for done tasks, before their
-        # queued done callback has put _SetupFinished in the queue
-        while tasks := tuple(
-            task for task in self._children if task is not asyncio.current_task()
-        ):
-            await asyncio.wait(tasks)
-            for task in tasks:
+        # queued done callback has put _SetupFinished in the queue.
+        # in-flight calls and setup are waited for in full (a cancellation-
+        # resistant call returns its real result; #1336/#1353); only client
+        # closes are bounded, so an uncancellable aclose against a dead peer
+        # cannot hang process or session exit.
+        while True:
+            close_tasks = {task for _, task in self._scheduled_closes.values()}
+            others = tuple(
+                task
+                for task in self._children
+                if task is not asyncio.current_task() and task not in close_tasks
+            )
+            if not others:
+                break
+            await asyncio.wait(others)
+            for task in others:
                 if not task.cancelled():
                     task.exception()  # mark retrieved, as gather did
-            self._children.difference_update(tasks)
+            self._children.difference_update(others)
             self._drain_queue()
+        await self._drain_closes(
+            tuple(task for _, task in self._scheduled_closes.values()),
+            "server close at shutdown",
+        )
         self._children.clear()
 
     def _drain_queue(self) -> None:

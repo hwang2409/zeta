@@ -3,29 +3,42 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import inspect
 import time
-from collections import deque
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from collections import OrderedDict
+from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import replace
 from pathlib import Path
 from time import monotonic as _monotonic
 from typing import Any
 
+from prompt_toolkit.application.current import get_app
+from prompt_toolkit.document import Document
 from prompt_toolkit.layout.containers import HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.dimension import Dimension
-from prompt_toolkit.mouse_events import MouseEvent
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from rich.console import Console
 from rich.text import Text
 
-from ..core.agent_progress import live_agent_lifecycle
-from ..core.checkpoints import ConversationIntegrityError, load_session_json
-from ..core.session_files import SessionError, open_session_file, session_directory
+from ..core.checkpoints import ConversationIntegrityError
+from ..core.session_files import SessionError
 from ..core.store import ConversationStore
-from ..core.transcript_recovery.runtime import repair_command_for_child_path
-from ..protocol.types import Message, ToolCall, is_passive_harness_message
+from ..protocol.types import Message, ToolCall
 from . import theme
+from .agent_view_state import (
+    _TERMINAL_AGENT_STATES,
+    MAX_AGENT_SCAN_BYTES,
+    MAX_AGENT_VIEW_LINES,
+    AgentEntry,
+    _agent_metadata,
+    agent_navigation_style_rules,
+    capture_inactive_view,
+    read_agent_transcript,
+)
+from .agent_view_state import InactiveViewState as _InactiveViewState
+from .agent_view_state import NavigationSnapshot as _NavigationSnapshot
+from .agent_view_state import PreparedNavigation as _PreparedNavigation
 from .cards.agent import (
     AgentCard,
     AgentRunCommandMixin,
@@ -34,7 +47,6 @@ from .cards.agent import (
     render_agent_progress,
     render_agent_receipt,
 )
-from .cards.agent_lifetime import AgentTranscriptLifetime
 from .cards.agent_list import (
     AGENT_LIST_PAGE_SIZE,
     MAX_AGENT_LIST_ROWS,
@@ -43,7 +55,6 @@ from .cards.agent_list import (
 from .cards.agent_shutdown import close_agent_owners
 from .cards.agent_sync import (
     AgentTodoControl,
-    AgentTranscriptSnapshot,
     agent_child_paths,
     agent_path_signature,
     agent_tree_signature,
@@ -62,11 +73,12 @@ from .cards.shared import (
     scan_tool_output as _scan_tool_output,
 )
 from .cards.tool import TOOL_CARD_REGISTRY, register_tool_card
-from .checkpoints import render_replayed_message, session_replay_provider
+from .checkpoints import render_replayed_message
 from .todo import TodoSnapshot
 from .user import displayed_user_text, user_message
 
 __all__ = [
+    "MAX_AGENT_SCAN_BYTES",
     "MAX_AGENT_VIEW_LINES",
     "MAX_CARD_COLUMNS",
     "MAX_CARD_LINES",
@@ -88,452 +100,29 @@ __all__ = [
     "time",
 ]
 
-MAX_AGENT_VIEW_LINES = 240
-MAX_AGENT_LINE_CHARS = 2_000
-MAX_AGENT_SCAN_BYTES = MAX_AGENT_VIEW_LINES * (MAX_AGENT_LINE_CHARS + 256)
-_TRUNCATION_MARKER = "[older lines omitted]"
-_TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
 _AGENT_REFRESH_INTERVAL_SECONDS = 1.0
 _AGENT_IDLE_REFRESH_INTERVAL_SECONDS = 4.0
 
-def agent_navigation_style_rules() -> dict[str, str]:
-    """Return the prompt-toolkit style rules for the subagent navigator.
 
-    Defined next to the navigator it styles so the composition root keeps a
-    single owner for these class names. Subagents read as green identity in
-    both the list and the breadcrumb; the main agent stays blue; red is left
-    for real failures.
-    """
+async def _anchored_pages(source: Any, anchor: tuple[Any, ...] | None) -> tuple[Any, ...]:
+    """Return the tail page, or the anchor's page plus the rows after it."""
 
-    return {
-        "agent-list": f"fg:{theme.AGENT_CHILD}",
-        "agent-list.selected": f"fg:{theme.AGENT_CHILD} bold",
-        "agent-breadcrumb": f"fg:{theme.CHROME}",
-        "agent-breadcrumb.main": f"fg:{theme.AGENT_MAIN} bold",
-        "agent-breadcrumb.child": f"fg:{theme.AGENT_CHILD} bold",
-        "agent-view": f"fg:{theme.BODY}",
-    }
+    if anchor is None:
+        return (await source.page(None, direction="older"),)
+    page = await source.reveal(anchor[0])
+    if page.newer is None:
+        return (page,)
+    # Rows after the anchor let the viewport start exactly at it.
+    return (page, await source.page(page.newer, direction="newer"))
 
-
-@dataclass(frozen=True, slots=True)
-class BoundedAgentMessages:
-    """The bounded message tail and its locked truncation marker."""
-
-    messages: tuple[dict[str, Any], ...]
-    marker: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class AgentEntry:
-    """One session shown in the current agent list."""
-
-    path: Path
-    label: str
-    agent_type: str
-    state: str
-
-
-def _short(value: object, limit: int = MAX_AGENT_LINE_CHARS) -> str:
-    text = str(value).replace("\r", " ").replace("\n", " ")
-    return text if len(text) <= limit else text[: limit - 3] + "..."
-
-
-def _read_json(path: Path) -> dict[str, Any]:
-    try:
-        value = load_session_json(path)
-    except (ConversationIntegrityError, OSError):
-        return {}
-    return value if type(value) is dict else {}
-
-
-def _agent_metadata(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
-    lifecycle_path = path / "agent_lifecycle.json"
-    lifecycle = live_agent_lifecycle(lifecycle_path) or _read_json(lifecycle_path)
-    if lifecycle:
-        return lifecycle
-    state = _read_json(path / "session_state.json")
-    parent = state.get("agent_parent")
-    result = dict(fallback or {})
-    if isinstance(parent, dict):
-        result.setdefault("agent_type", parent.get("agent_type"))
-    return result
-
-
-def _text_lines(text: str, tail: int | None = None) -> Iterator[str]:
-    if not text:
-        yield ""
-        return
-    if tail is not None:
-        yield from text.splitlines()[-tail:]
-        return
-    start = 0
-    while start < len(text):
-        ends = [
-            index
-            for index in (text.find("\n", start), text.find("\r", start))
-            if index >= 0
-        ]
-        end = min(ends) if ends else -1
-        if end < 0:
-            yield text[start:]
-            return
-        yield text[start:end]
-        start = end + 1
-        if text[end] == "\r" and start < len(text) and text[start] == "\n":
-            start += 1
-
-
-def _bounded_text(text: str) -> str:
-    return "\n".join(_short(line) for line in _text_lines(text))
-
-
-def _bounded_message(message: dict[str, Any]) -> dict[str, Any]:
-    """Keep replayed text within the transcript's per-line bound."""
-
-    result = dict(message)
-    content = message.get("content")
-    if isinstance(content, list):
-        bounded_content: list[dict[str, Any]] = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            bounded_block = dict(block)
-            if (
-                block.get("type") in {"text", "thinking"}
-                and isinstance(block.get("text"), str)
-            ):
-                bounded_block["text"] = _bounded_text(block["text"])
-            bounded_content.append(bounded_block)
-        result["content"] = bounded_content
-    tool_result = message.get("tool_result")
-    if isinstance(tool_result, dict) and isinstance(tool_result.get("content"), str):
-        bounded_result = dict(tool_result)
-        bounded_content = _bounded_text(tool_result["content"])
-        bounded_result["content"] = bounded_content
-        if bounded_content != tool_result["content"]:
-            bounded_result.pop("content_blocks", None)
-        result["tool_result"] = bounded_result
-    return result
-
-
-def _message_lines(
-    message: dict[str, Any], *, tail: int | None = None
-) -> Iterator[str]:
-    role = _short(message.get("role", "message"), 32)
-    metadata = message.get("metadata")
-    if (
-        role == "user"
-        and isinstance(metadata, dict)
-        and metadata.get("zeta.origin") == "agent_send"
-    ):
-        role = "parent message"
-    content = message.get("content")
-    if isinstance(content, list):
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if block.get("type") == "text" and isinstance(block.get("text"), str):
-                for line in _text_lines(block["text"], tail):
-                    yield f"{role}: {_short(line)}"
-            elif block.get("type") == "thinking":
-                yield f"{role}: thought"
-                if isinstance(block.get("text"), str):
-                    for line in _text_lines(block["text"], tail):
-                        yield f"{role}: {_short(line)}"
-            elif block.get("type") == "redacted_thinking":
-                yield f"{role}: thought: redacted"
-            elif block.get("type") == "tool_use" and isinstance(block.get("tool_call"), dict):
-                call = block["tool_call"]
-                name = call.get("name", "tool")
-                arguments = call.get("arguments", {})
-                if isinstance(arguments, dict):
-                    args = " ".join(
-                        f"{key}={_short(value, 160)}"
-                        for key, value in sorted(arguments.items())
-                    )
-                    yield f"tool: {_short(name, 64)} {_short(args, 400)}".rstrip()
-    result = message.get("tool_result")
-    if isinstance(result, dict):
-        content = result.get("content")
-        if isinstance(content, str):
-            for line in _text_lines(content, tail):
-                yield f"tool result: {_short(line)}"
-
-
-def _message_line_count(message: dict[str, Any]) -> int:
-    """Count persisted rows without synthetic thought headers."""
-
-    count = sum(1 for _ in _message_lines(message))
-    content = message.get("content")
-    if isinstance(content, list):
-        count -= sum(block.get("type") == "thinking" for block in content if isinstance(block, dict))
-    return count
-
-
-def _read_partial_row_tail(handle: Any, limit: int) -> bytes:
-    chunk = handle.read(limit)
-    line, separator, remainder = chunk.partition(b"\n")
-    if separator and remainder:
-        handle.seek(-len(remainder), os.SEEK_CUR)
-    return line if separator else chunk
-
-
-def _oversized_message(raw_tail: bytes) -> dict[str, Any] | None:
-    """Recover the final text value from a row whose prefix was bounded away."""
-
-    backslashes = 0
-    closing_quote: int | None = None
-    for index, value in enumerate(raw_tail):
-        if value == 92:
-            backslashes += 1
-            continue
-        if value == 34 and backslashes % 2 == 0:
-            closing_quote = index
-            break
-        backslashes = 0
-    if closing_quote is None:
-        return None
-    encoded_tail = raw_tail[:closing_quote]
-    for offset in range(min(8, len(encoded_tail))):
-        try:
-            text = load_session_json(b'"' + encoded_tail[offset:] + b'"')
-        except ConversationIntegrityError:
-            continue
-        if isinstance(text, str):
-            return {
-                "role": "assistant",
-                "content": [{"type": "text", "text": text}],
-            }
-    return None
-
-
-def _tail_message(message: dict[str, Any], limit: int) -> dict[str, Any]:
-    """Keep a renderable tail when one message exceeds the row bound."""
-
-    if limit <= 0:
-        return {**message, "content": []}
-    rendered_lines = list(_message_lines(message))
-    if len(rendered_lines) <= limit:
-        return message
-
-    result = dict(message)
-    content = message.get("content")
-    skipped = len(rendered_lines) - limit
-    if isinstance(content, list):
-        retained_content: list[dict[str, Any]] = []
-        seen = 0
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            block_type = block.get("type")
-            if block_type in {"text", "thinking"} and isinstance(
-                block.get("text"), str
-            ):
-                lines = list(_text_lines(block["text"]))
-                header_lines = 1 if block_type == "thinking" else 0
-                block_lines = header_lines + len(lines)
-                block_start = max(0, skipped - seen)
-                block_end = min(block_lines, limit + skipped - seen)
-                if block_start < block_end:
-                    retained = dict(block)
-                    text_start = max(0, block_start - header_lines)
-                    text_end = min(len(lines), block_end - header_lines)
-                    if text_start or text_end < len(lines):
-                        retained["text"] = "\n".join(lines[text_start:text_end])
-                    retained_content.append(retained)
-                seen += block_lines
-            elif block_type == "redacted_thinking" or (
-                block_type == "tool_use" and isinstance(block.get("tool_call"), dict)
-            ):
-                if skipped <= seen < limit + skipped:
-                    retained_content.append(block)
-                seen += 1
-            else:
-                retained_content.append(block)
-        result["content"] = retained_content
-
-    tool_result = message.get("tool_result")
-    if isinstance(tool_result, dict) and isinstance(tool_result.get("content"), str):
-        lines = list(_text_lines(tool_result["content"]))
-        block_start = max(0, skipped - seen)
-        block_end = min(len(lines), limit + skipped - seen)
-        if block_start < block_end:
-            retained_result = dict(tool_result)
-            if block_start or block_end < len(lines):
-                retained_result["content"] = "\n".join(lines[block_start:block_end])
-                # A clipped result must use the normal text-card path. Keeping
-                # full content_blocks here would bypass the bounded content.
-                retained_result.pop("content_blocks", None)
-            result["tool_result"] = retained_result
-
-    return result
-
-
-def _tool_call_only(message: dict[str, Any], call_id: str) -> dict[str, Any] | None:
-    content = message.get("content")
-    if not isinstance(content, list):
-        return None
-    tool_blocks = [
-        block
-        for block in content
-        if isinstance(block, dict)
-        and block.get("type") == "tool_use"
-        and isinstance(block.get("tool_call"), dict)
-        and block["tool_call"].get("id") == call_id
-    ]
-    if not tool_blocks:
-        return None
-    return {"role": "assistant", "content": tool_blocks[:1]}
-
-
-def _has_tool_call(message: dict[str, Any], call_id: str) -> bool:
-    content = message.get("content")
-    return (
-        isinstance(content, list)
-        and any(
-            isinstance(block, dict)
-            and block.get("type") == "tool_use"
-            and isinstance(block.get("tool_call"), dict)
-            and block["tool_call"].get("id") == call_id
-            for block in content
-        )
-    )
-
-
-def _read_bounded_messages(
-    path: Path, limit: int = MAX_AGENT_VIEW_LINES
-) -> BoundedAgentMessages:
-    """Read a bounded, renderable tail of one agent's direct messages."""
-
-    messages: deque[tuple[dict[str, Any], int]] = deque()
-    retained_lines = 0
-    byte_omitted = False
-    overflow_count = 0
-    tool_calls: dict[str, dict[str, Any]] = {}
-
-    def append_message(message: dict[str, Any]) -> None:
-        nonlocal overflow_count, retained_lines
-        message = _bounded_message(message)
-        rendered_lines = _message_line_count(message)
-        paired_call: dict[str, Any] | None = None
-        tool_result = message.get("tool_result")
-        if isinstance(tool_result, dict):
-            call_id = tool_result.get("tool_call_id")
-            if isinstance(call_id, str):
-                paired_call = tool_calls.get(call_id)
-        if rendered_lines > limit:
-            pair_lines = 1 if paired_call is not None else 0
-            retained_limit = max(0, limit - pair_lines)
-            retained_message = _tail_message(message, retained_limit)
-            overflow_count += (
-                retained_lines + rendered_lines - retained_limit - pair_lines
-            )
-            messages.clear()
-            retained_lines = retained_limit
-            if paired_call is not None:
-                messages.append((paired_call, pair_lines))
-            messages.append((retained_message, retained_limit))
-            retained_lines += pair_lines
-            return
-        if paired_call is not None and not any(
-            _has_tool_call(candidate, tool_result["tool_call_id"])
-            for candidate, _ in messages
-        ):
-            messages.append((paired_call, 1))
-            retained_lines += 1
-        messages.append((message, rendered_lines))
-        retained_lines += rendered_lines
-        while retained_lines > limit and messages:
-            oldest, dropped = messages[0]
-            excess = retained_lines - limit
-            if dropped > excess:
-                retained = _tail_message(oldest, dropped - excess)
-                messages[0] = (retained, dropped - excess)
-                retained_lines -= excess
-                overflow_count += excess
-                break
-            messages.popleft()
-            retained_lines -= dropped
-            overflow_count += dropped
-
-    try:
-        with session_directory(path.parent, path.name) as (_, directory_fd), os.fdopen(
-            open_session_file(directory_fd, "conversation.jsonl", os.O_RDONLY), "rb"
-        ) as handle:
-            handle.seek(0, os.SEEK_END)
-            file_size = handle.tell()
-            start = max(0, file_size - MAX_AGENT_SCAN_BYTES)
-            byte_omitted = start > 0
-            handle.seek(start)
-            if start:
-                handle.seek(start - 1)
-                at_line_start = handle.read(1) == b"\n"
-                handle.seek(start)
-                if not at_line_start:
-                    raw_tail = _read_partial_row_tail(handle, MAX_AGENT_SCAN_BYTES)
-                    message = _oversized_message(raw_tail)
-                    if message is not None:
-                        append_message(message)
-            for raw_line in handle:
-                try:
-                    row = load_session_json(raw_line)
-                except ConversationIntegrityError:
-                    continue
-                if not isinstance(row, dict) or row.get("type") != "message":
-                    continue
-                data = row.get("data")
-                message = data.get("message") if isinstance(data, dict) else None
-                if isinstance(message, dict):
-                    if is_passive_harness_message(message):
-                        continue
-                    append_message(message)
-                    content = message.get("content")
-                    if isinstance(content, list):
-                        for block in content:
-                            if not isinstance(block, dict):
-                                continue
-                            call = block.get("tool_call")
-                            if (
-                                block.get("type") == "tool_use"
-                                and isinstance(call, dict)
-                                and isinstance(call.get("id"), str)
-                            ):
-                                tool_calls[call["id"]] = _tool_call_only(
-                                    message, call["id"]
-                                ) or message
-    except (OSError, SessionError):
-        return BoundedAgentMessages((), None)
-    marker: str | None = None
-    if byte_omitted or overflow_count:
-        marker = _TRUNCATION_MARKER
-    return BoundedAgentMessages(tuple(message for message, _ in messages), marker)
-
-
-def read_agent_transcript(path: Path, limit: int = MAX_AGENT_VIEW_LINES) -> list[str]:
-    """Read one agent's direct transcript, without nested child sessions."""
-
-    bounded = _read_bounded_messages(path, limit)
-    result = [
-        line
-        for message in bounded.messages
-        for line in _message_lines(message)
-    ]
-    if bounded.marker is not None:
-        result.insert(0, bounded.marker)
-    if result:
-        return result
-    command = repair_command_for_child_path(path)
-    return [f"transcript corrupt; run {command}" if command else "transcript unavailable"]
-
-
-class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
-    """Scrollable child transcript synchronized through a read-only store."""
-
-    _RENDER_BATCH_SIZE = 4
-
-    def __init__(self) -> None:
+class AgentTranscriptControl(UIControl):
+    """Render the shared pager for the focused child view."""
+    def __init__(self, history_pager: Any = None) -> None:
         from .transcript import TranscriptPresenter, TranscriptWidget
-
+        from .transcript.paged_history import PagedTranscriptHistory
+        self._history_pager = (
+            history_pager if history_pager is not None else PagedTranscriptHistory(None)
+        )
         self.transcript = TranscriptWidget(max_lines=None)
         self.presenter = TranscriptPresenter(
             self.transcript,
@@ -543,194 +132,577 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         )
         self._tool_calls: dict[str, ToolCall] = {}
         self._path: Path | None = None
-        self._initialize_transcript_lifetime()
-        self._snapshot: AgentTranscriptSnapshot | None = None
-        self._entry_units: dict[str, list[Any]] = {}
-        self._unit_entries: dict[Any, str] = {}
-        self._sync_task: asyncio.Task[bool] | None = None
+        self._source: Any = None
+        self._load_task: asyncio.Task[None] | None = None
+        self._finder_return_task: asyncio.Task[None] | None = None
+        self.transcript.on_mouse_scroll = self.cancel_finder_return
+        self._source_revision: tuple[tuple[int, int, int, int], bool] | None = None
+        self._load_tasks: set[asyncio.Task[None]] = set()
+        self._closed = False
         self._pending_path: Path | None = None
-        self.on_snapshot: Callable[[Path, AgentTranscriptSnapshot], None] | None = None
+        self._activation_generation = 0
+        self.search_task: asyncio.Task[None] | None = None
+        self.search_results: tuple[Any, ...] = ()
+        self.search_index = 0
+        self.view_path: Path | None = None
+        self._root_path: Path | None = None
+        self._root_source: Any = None
+        self._root_transcript: Any = None
+        self._root_view_state: _InactiveViewState | None = None
+        self._child_view_states: OrderedDict[Path, _InactiveViewState] = OrderedDict()
+        self._prompt_history: Any = None
+        self._composer_buffer: Any = None
+        self._current_path: Callable[[], Path] | None = None
+        self._prepare_path: Callable[[Path], _PreparedNavigation] | None = None
+        self._begin_path: Callable[[int], None] | None = None
+        self._commit_path: Callable[[Path, _PreparedNavigation, int], bool] | None = None
+        self._rollback_path: Callable[[int], None] | None = None
+        self._finish_path: Callable[[int], None] | None = None
+        self._render_active: Callable[[], None] | None = None
+        self._root_endpoint: Callable[[], str | None] | None = None
+        self._invalidate: Callable[[], None] | None = None
+        self.on_history_edge: Callable[[str], None] | None = None
+    @property
+    def history_pager(self) -> Any:
+        return self._history_pager
 
+    @property
+    def loading_path(self) -> Path | None:
+        """The view being opened, until its first page paints (not a refresh)."""
+
+        pending = self._pending_path
+        return pending if pending != self._path else None
+
+    def transition_pending(self) -> bool:
+        """Return whether a view change still owns unpublished work."""
+
+        return self._load_task is not None and not self._load_task.done()
+
+    @property
+    def prompt_history(self) -> Any:
+        return self._prompt_history
     @property
     def offset(self) -> int:
         return self.transcript.scroll_offset
-
-    @property
     def is_focusable(self) -> bool:
         return True
+    def configure_history(
+        self,
+        *,
+        root_path: Path,
+        root_source: Any,
+        root_transcript: Any,
+        prompt_history: Any,
+        current_path: Callable[[], Path],
+        prepare_path: Callable[[Path], _PreparedNavigation],
+        begin_path: Callable[[int], None],
+        commit_path: Callable[[Path, _PreparedNavigation, int], bool],
+        rollback_path: Callable[[int], None],
+        finish_path: Callable[[int], None],
+        render_active: Callable[[], None],
+        root_endpoint: Callable[[], str | None],
+        invalidate: Callable[[], None],
+    ) -> None:
+        self._root_path = root_path
+        self.view_path = root_path
+        self._root_source = root_source
+        self._root_transcript = root_transcript
+        root_transcript.on_mouse_scroll = self.cancel_finder_return
+        self._prompt_history = prompt_history
+        self._current_path = current_path
+        self._prepare_path = prepare_path
+        self._begin_path = begin_path
+        self._commit_path = commit_path
+        self._rollback_path = rollback_path
+        self._finish_path = finish_path
+        self._render_active = render_active
+        self._root_endpoint = root_endpoint
+        self._invalidate = invalidate
+    def start_search(
+        self,
+        query: str,
+        transcript: Any,
+        publish: Callable[[Any, str], None],
+        on_miss: Callable[[], Awaitable[None]],
+    ) -> None:
+        self.search_results = ()
+        self.search_index = 0
+        if self.search_task is not None:
+            self.search_task.cancel()
+        async def reveal_match() -> None:
+            matches = await self._history_pager.search(query) if query else ()
+            if not transcript.finder_active:
+                return
+            if not matches:
+                await on_miss()
+                return
+            self.search_results = matches
+            self.search_index = 0
+            target = matches[0]
+            resident = {
+                unit.entry_id
+                for page in self._history_pager.pages
+                for unit in page.units
+            }
+            if (
+                target.entry_id not in resident
+                and not (await self._history_pager.reveal(target.entry_id)).segments
+            ):
+                # A later reveal or reset owns the view now.
+                return
+            self._render_resident()
+            transcript.restore_durable_scroll_anchor(
+                (target.entry_id, target.unit_ordinal, 0)
+            )
+            publish(target, query)
+        self.search_task = asyncio.create_task(reveal_match())
 
-    async def load(self, path: Path) -> bool:
-        """Load a selected child without doing storage work on the event loop."""
+    def navigate_search(
+        self,
+        delta: int,
+        transcript: Any,
+        publish: Callable[[Any, str], None],
+    ) -> bool:
+        if not self.search_results:
+            return False
+        self.search_index = (self.search_index + delta) % len(self.search_results)
+        target = self.search_results[self.search_index]
 
-        if self._closed:
-            return False
-        if path != self._path:
-            self._reset_rendered(path)
-        if self._source is None or self._source.path != path:
-            try:
-                await self._replace_tracked(path)
-            except (ConversationIntegrityError, OSError, ValueError):
-                return False
-        return await self.sync(path)
+        async def reveal() -> None:
+            # n/N run after the finder closed; the search itself must still be shown.
+            if (
+                not (await self._history_pager.reveal(target.entry_id)).segments
+                or not transcript.search_active
+            ):
+                return
+            query = transcript.search_query
+            self._render_resident()
+            transcript.restore_durable_scroll_anchor(
+                (target.entry_id, target.unit_ordinal, 0)
+            )
+            publish(target, query)
 
-    async def sync(self, path: Path) -> bool:
-        """Apply one active-branch snapshot, yielding between render batches."""
-
-        if self._closed:
-            return False
-        if path != self._path or self._source is None:
-            return await self.load(path)
-        try:
-            tree = await asyncio.to_thread(self._source.refresh)
-        except (ConversationIntegrityError, OSError, ValueError):
-            return False
-        if self._closed:
-            return False
-        snapshot = tree.transcript(path)
-        return False if snapshot is None else await self._apply_snapshot(snapshot, path)
-
-    async def _apply_snapshot(self, snapshot: AgentTranscriptSnapshot, path: Path) -> bool:
-        previous = self._snapshot
-        if snapshot == previous:
-            return False
-        extends = (
-            previous is not None
-            and snapshot.entry_ids[: len(previous.entry_ids)] == previous.entry_ids
-            and snapshot.messages[: len(previous.messages)] == previous.messages
-        )
-        if extends:
-            await self._replay_batches(snapshot.messages[len(previous.messages) :], path)
-        else:
-            await self._rebuild(snapshot, path)
-        if self._closed:
-            return False
-        self._snapshot = snapshot
-        if self.on_snapshot is not None:
-            self.on_snapshot(path, snapshot)
+        if self.search_task is not None:
+            self.search_task.cancel()
+        self.search_task = asyncio.create_task(reveal())
         return True
+    def end_search(self) -> None:
+        # No search outlives its query: a late match would replace the view.
+        if self.search_task is not None:
+            self.search_task.cancel()
+        self.search_results = ()
+        self.search_index = 0
+
+    async def close_search(self) -> None:
+        task, self.search_task = self.search_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.end_search()
+
+    def _render_resident(self) -> None:
+        """Paint the resident pages into the widget of the view being shown."""
+
+        if self._render_active is not None:
+            self._render_active()
+        else:
+            self.render_pages(self._history_pager.pages)
+
+    def _active_transcript(self) -> Any:
+        return self._root_transcript if self._path == self._root_path else self.transcript
+
+    async def _refresh_active(
+        self, path: Path, prepared: _PreparedNavigation, generation: int
+    ) -> None:
+        """Publish fresh navigation and child rows without moving the viewport."""
+
+        if self._commit_path is not None and not self._commit_path(
+            path, prepared, generation
+        ):
+            return
+        if self._finish_path is not None:
+            self._finish_path(generation)
+        source = self._source
+        revision = (
+            (await source.file_revision(), self.transcript.follow_tail)
+            if source is not None
+            else None
+        )
+        # An unchanged log seen from the same place has nothing to publish, and a
+        # page read costs real CPU; reaching the tail must still show appends.
+        if path != self._root_path and source is not None and revision != self._source_revision:
+            anchor = self.transcript.durable_scroll_anchor
+            follow_tail = self.transcript.follow_tail
+            latest = await source.page(None, direction="older")
+            resident = self._history_pager.pages
+            newest = resident[-1] if resident else None
+            # A scrolled window above the tail stays as is: its rows are durable,
+            # newer paging reaches appends, and stale cursors reset in load().
+            stale = newest is None or (
+                latest.repair_generation != newest.repair_generation
+                or (
+                    not self._history_pager.can_load_newer
+                    and latest.endpoint_id != newest.endpoint_id
+                )
+            )
+            if follow_tail:
+                fresh = (latest,)
+            elif stale and anchor is not None:
+                fresh = await _anchored_pages(source, anchor)
+            else:
+                fresh = resident
+            # A scroll made during the reads wins; the next refresh catches up.
+            published = (
+                generation == self._activation_generation
+                and self.transcript.durable_scroll_anchor == anchor
+                and self.transcript.follow_tail == follow_tail
+            )
+            if published and fresh != resident:
+                self.show_pages(fresh, None if follow_tail else anchor)
+            if published and (follow_tail or not stale or anchor is not None):
+                self._source_revision = revision
+        if self._invalidate is not None:
+            self._invalidate()
+
+    def _saved_view(self, path: Path) -> _InactiveViewState | None:
+        if path == self._root_path:
+            return self._root_view_state
+        return self._child_view_states.get(path)
+
+    def _park_active_view(self) -> bool:
+        path = self._path
+        if path is None:
+            return True
+        transcript = self._root_transcript if path == self._root_path else self.transcript
+        anchor = transcript.durable_scroll_anchor if transcript is not None else None
+        state = capture_inactive_view(
+            buffer=self._composer_buffer,
+            prompt_history=self._prompt_history,
+            transcript=transcript,
+            anchor=anchor,
+            search_index=self.search_index,
+        )
+        if state is None:
+            return False
+        if path == self._root_path:
+            self._root_view_state = state
+        else:
+            self._child_view_states[path] = state
+            self._child_view_states.move_to_end(path)
+            while len(self._child_view_states) > 8:
+                self._child_view_states.popitem(last=False)
+        return True
+
+    def start_finder_return(self, restore: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        self.cancel_finder_return()
+        if self.loading_path is None:
+            self._finder_return_task = asyncio.create_task(restore())
+
+    def cancel_finder_return(self) -> asyncio.Task[None] | None:
+        task, self._finder_return_task = self._finder_return_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            return task
+        return None
+
+    def _cancel_transition_work(self) -> tuple[asyncio.Task[Any], ...]:
+        tasks: list[asyncio.Task[Any]] = []
+        if restore := self.cancel_finder_return():
+            tasks.append(restore)
+        if self._load_task is not None and not self._load_task.done():
+            self._load_task.cancel()
+            tasks.append(self._load_task)
+        if self.search_task is not None and not self.search_task.done():
+            self.search_task.cancel()
+            tasks.append(self.search_task)
+        self.search_task = None
+        tasks.extend(self._history_pager.cancel_pending())
+        if self._prompt_history is not None:
+            tasks.extend(self._prompt_history.cancel_pending())
+        return tuple(dict.fromkeys(tasks))
+
+    def _start_transition(
+        self, path: Path, *, refresh: bool
+    ) -> asyncio.Task[None] | None:
+        self._activation_generation += 1
+        generation = self._activation_generation
+        self._pending_path = path
+        if refresh:
+            # A refresh replaces no runtime: page, prompt, and finder reads stay.
+            cancelled = tuple(
+                task
+                for task in (self._load_task,)
+                if task is not None and not task.done()
+            )
+            for task in cancelled:
+                task.cancel()
+        else:
+            cancelled = self._cancel_transition_work()
+        if self._begin_path is not None:
+            self._begin_path(generation)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(self._transition_without_loop(path, generation, refresh, cancelled))
+            self._load_task = None
+            return None
+        task = loop.create_task(
+            self._transition(path, generation, refresh, cancelled)
+        )
+        self._load_task = task
+        self._load_tasks.add(task)
+        task.add_done_callback(self._load_tasks.discard)
+        return task
+
+    def activate(self, path: Path) -> asyncio.Task[None] | None:
+        """Start the single owned transition for a child activation."""
+
+        if self._closed or path == self._pending_path:
+            return None
+        if path == self._path:
+            return self._start_transition(path, refresh=True)
+        if not self._park_active_view():
+            return None
+        return self._start_transition(path, refresh=False)
+
+    async def _transition_without_loop(self, *args: Any) -> None:
+        # The commit starts follow-up work (the todo refresh) on this private
+        # loop; finish it here, or asyncio.run cancels it with its store open.
+        await self._transition(*args)
+        current = asyncio.current_task()
+        while pending := asyncio.all_tasks() - {current}:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def show_pages(
+        self,
+        pages: tuple[Any, ...],
+        anchor: tuple[str, int, int] | None,
+        *,
+        endpoint: str | None = None,
+    ) -> None:
+        """Make `pages` the resident window and paint the active view at `anchor`.
+
+        Transitions and refreshes both end here, so a re-entry and a refresh
+        restore a place the same way (ux r5 M7).
+        """
+
+        self._history_pager.reset(endpoint_id=endpoint)
+        for index, page in enumerate(pages):
+            self._history_pager.adopt(page, direction="newer" if index else "older")
+        if anchor is not None:
+            self._history_pager.set_anchor(*anchor)
+        self._render_resident()
+        transcript = self._active_transcript()
+        if anchor is not None and transcript is not None:
+            self._restore_anchor(transcript, anchor)
+
+    @staticmethod
+    def _restore_anchor(transcript: Any, anchor: tuple[str, int, int]) -> None:
+        if not transcript.restore_durable_scroll_anchor(anchor):
+            transcript.restore_durable_scroll_anchor((anchor[0], 0, 0))
+
+    async def _transition(
+        self,
+        path: Path,
+        generation: int,
+        refresh: bool,
+        cancelled: tuple[asyncio.Task[Any], ...],
+    ) -> None:
+        from .transcript.child_history_source import ChildLogHistorySource
+
+        prepared_source: Any = None
+        committed = False
+        try:
+            if cancelled:
+                await asyncio.gather(*cancelled, return_exceptions=True)
+            if generation != self._activation_generation:
+                return
+            prepared_navigation = (
+                await asyncio.to_thread(self._prepare_path, path)
+                if self._prepare_path is not None
+                else _PreparedNavigation(())
+            )
+            if generation != self._activation_generation:
+                return
+            if refresh:
+                await self._refresh_active(path, prepared_navigation, generation)
+                return
+
+            state = self._saved_view(path)
+            if path == self._root_path:
+                prepared_source = self._root_source
+            else:
+                worker = asyncio.create_task(asyncio.to_thread(ChildLogHistorySource, path))
+                try:
+                    prepared_source = await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    prepared_source = await worker
+                    await prepared_source.close()
+                    raise
+            if generation != self._activation_generation:
+                if prepared_source not in {None, self._root_source}:
+                    await prepared_source.close()
+                return
+
+            prepared_pages: tuple[Any, ...] = ()
+            if prepared_source is not None:
+                prepared_pages = await _anchored_pages(
+                    prepared_source, state.anchor if state is not None else None
+                )
+            if generation != self._activation_generation:
+                if prepared_source not in {None, self._root_source}:
+                    await prepared_source.close()
+                return
+            endpoint = (
+                self._root_endpoint()
+                if prepared_source is self._root_source and self._root_endpoint
+                else None
+            )
+            if prepared_pages and endpoint is not None and not prepared_pages[0].endpoint_id:
+                prepared_pages = (
+                    replace(prepared_pages[0], endpoint_id=endpoint),
+                    *prepared_pages[1:],
+                )
+
+            committed = (
+                self._commit_path(path, prepared_navigation, generation)
+                if self._commit_path is not None
+                else True
+            )
+            if not committed:
+                if prepared_source not in {None, self._root_source}:
+                    await prepared_source.close()
+                return
+
+            previous = self._source
+            previous_path = self._path
+            if previous_path == self._root_path and self._root_transcript is not None:
+                self._root_transcript.clear()
+            elif previous_path is not None:
+                self.presenter.clear()
+                self._tool_calls.clear()
+
+            self._path = path
+            self._source = None if prepared_source is self._root_source else prepared_source
+            self._source_revision = None
+            self._history_pager.source = prepared_source
+            anchor = state.anchor if state is not None else None
+            self.show_pages(prepared_pages, anchor, endpoint=endpoint)
+            restored = state or _InactiveViewState(None, "", 0, None, None, "", 0)
+            if self._prompt_history is not None:
+                self._prompt_history.bind(path, prepared_source, endpoint)
+                self._prompt_history.restore_navigation(
+                    restored.prompt_cursor,
+                    restored.prompt_text,
+                    Document(restored.draft, cursor_position=restored.draft_cursor),
+                )
+            if path != self._root_path:
+                self._child_view_states.pop(path, None)
+            buffer = self._composer_buffer
+            if buffer is not None:
+                displayed = restored.prompt_text or restored.draft
+                cursor = (
+                    len(displayed)
+                    if restored.prompt_text is not None
+                    else restored.draft_cursor
+                )
+                document = Document(displayed, cursor_position=cursor)
+                if self._prompt_history is not None:
+                    self._prompt_history.apply(buffer, document)
+                else:
+                    buffer.set_document(document, bypass_readonly=True)
+            self.search_index = restored.finder_cursor
+            transcript = self._active_transcript()
+            if transcript is not None and restored.finder_query:
+                transcript.open_finder()
+                transcript.finder_set_query(restored.finder_query)
+            if anchor is not None and transcript is not None:
+                self._restore_anchor(transcript, anchor)
+                asyncio.get_running_loop().call_soon(
+                    self._restore_anchor, transcript, anchor
+                )
+            if self._finish_path is not None:
+                self._finish_path(generation)
+            committed = False
+            if self._invalidate is not None:
+                self._invalidate()
+            if previous is not None and previous is not prepared_source:
+                await previous.close()
+        except asyncio.CancelledError:
+            if committed and self._rollback_path is not None:
+                self._rollback_path(generation)
+            if prepared_source not in {None, self._root_source, self._source}:
+                await prepared_source.close()
+            raise
+        except (ConversationIntegrityError, OSError, SessionError, ValueError):
+            if self._rollback_path is not None:
+                self._rollback_path(generation)
+            if prepared_source not in {None, self._root_source, self._source}:
+                await prepared_source.close()
+            if self._invalidate is not None:
+                self._invalidate()
+        except Exception:
+            if self._rollback_path is not None:
+                self._rollback_path(generation)
+            if prepared_source not in {None, self._root_source, self._source}:
+                await prepared_source.close()
+            raise
+        finally:
+            if generation == self._activation_generation and path == self._pending_path:
+                self._pending_path = None
 
     def request_sync(
         self, path: Path, invalidate: Callable[[], None] | None = None
     ) -> bool:
-        """Coalesce a UI refresh onto one asynchronous synchronization task."""
-
-        if self._closed:
+        active_search = self.search_task is not None and not self.search_task.done()
+        prompt_busy = bool(
+            self._prompt_history is not None and self._prompt_history.busy
+        )
+        if self._closed or (
+            path == self._path
+            and (self._pending_path is not None or active_search or prompt_busy)
+        ):
             return False
-        self._pending_path = path
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
-            self._pending_path = None
-            return asyncio.run(self.load(path))
-        if self._sync_task is not None and not self._sync_task.done():
             return False
-
-        async def run_pending() -> bool:
-            changed = False
-            while self._pending_path is not None:
-                requested = self._pending_path
-                self._pending_path = None
-                changed = await self.load(requested) or changed
-            if changed and invalidate is not None:
-                invalidate()
-            return changed
-
-        self._sync_task = loop.create_task(run_pending())
-        return False
-
-    def _reset_rendered(self, path: Path) -> None:
+        task = (
+            self.activate(path)
+            if path != self._path
+            else self._start_transition(path, refresh=True)
+        )
+        if task is not None and invalidate is not None:
+            task.add_done_callback(lambda _task: invalidate())
+        return task is not None
+    def render_pages(self, pages: tuple[Any, ...]) -> None:
+        anchor = self.transcript.durable_scroll_anchor
+        follow_tail = self.transcript.follow_tail
         self.presenter.clear()
         self._tool_calls.clear()
-        self.transcript.set_line_limit_marker(None)
-        self._entry_units.clear()
-        self._unit_entries.clear()
-        self._path = path
-        self._snapshot = None
-
-    async def _rebuild(self, snapshot: AgentTranscriptSnapshot, path: Path) -> None:
-        anchor_id, anchor_unit_index, anchor_offset, follow_tail = self._capture_anchor()
-        old_entry_ids = (
-            self._snapshot.entry_ids if self._snapshot is not None else ()
-        )
-        self.presenter.clear()
-        self._tool_calls.clear()
-        self.transcript.set_line_limit_marker(None)
-        self._entry_units.clear()
-        self._unit_entries.clear()
-        await self._replay_batches(snapshot.messages, path)
-        if self._closed:
-            return
-        if not follow_tail:
-            target = self._nearest_entry(
-                anchor_id, old_entry_ids, snapshot.entry_ids
-            )
-            units = self._entry_units.get(target or "", ())
-            if units:
-                unit_index = min(anchor_unit_index, len(units) - 1)
-                self.transcript.restore_scroll_anchor(units[unit_index], anchor_offset)
-
-    async def _replay_batches(
-        self, messages: list[tuple[str, dict[str, Any]]] | tuple[tuple[str, dict[str, Any]], ...], path: Path
-    ) -> None:
-        provider = session_replay_provider(path)
-        for start in range(0, len(messages), self._RENDER_BATCH_SIZE):
-            if self._closed:
-                return
-            for entry_id, raw_message in messages[start : start + self._RENDER_BATCH_SIZE]:
-                self._replay(entry_id, raw_message, provider)
-            await asyncio.sleep(0.001)
-
-    def _replay(
-        self, entry_id: str, raw_message: dict[str, Any], provider: str | None
-    ) -> None:
-        try:
-            message = Message.from_dict(_bounded_message(raw_message))
-        except (TypeError, ValueError):
-            return
-        unit_start = len(self.transcript._units)
-        render_replayed_message(
-            message,
-            presenter=self.presenter,
-            print_user=self._print_user,
-            print_unit=self.presenter.print_unit,
-            tool_calls=self._tool_calls,
-            include_thoughts=True,
-            replay_tool_results=True,
-            replay_tool_starts=True,
-            provider=provider,
-        )
-        units = self.transcript._units[unit_start:]
-        self._entry_units.setdefault(entry_id, []).extend(units)
-        self._unit_entries.update((unit, entry_id) for unit in units)
-
-    def _capture_anchor(self) -> tuple[str | None, int, int, bool]:
-        unit, offset = self.transcript.scroll_anchor
-        entry_id = self._unit_entries.get(unit)
-        units = self._entry_units.get(entry_id or "", ())
-        unit_index = units.index(unit) if unit in units else 0
-        return entry_id, unit_index, offset, self.transcript.follow_tail
-
-    @staticmethod
-    def _nearest_entry(
-        anchor_id: str | None,
-        old_version: tuple[str, ...],
-        new_version: tuple[str, ...],
-    ) -> str | None:
-        if anchor_id is None:
-            return None
-        if anchor_id in new_version:
-            return anchor_id
-        try:
-            anchor_index = old_version.index(anchor_id)
-        except ValueError:
-            return None
-        new_ids = set(new_version)
-        candidates = (
-            (abs(index - anchor_index), entry_id)
-            for index, entry_id in enumerate(old_version)
-            if entry_id in new_ids
-        )
-        return min(candidates, default=(0, None))[1]
+        provider = self._source.replay_provider if self._source is not None else None
+        for page in pages:
+            for unit in page.units:
+                entry = unit.value
+                if getattr(entry, "type", None) != "message" or entry.message is None:
+                    continue
+                self.transcript.begin_history_entry(unit.entry_id)
+                try:
+                    render_replayed_message(
+                        entry.message,
+                        presenter=self.presenter,
+                        print_user=self._print_user,
+                        print_unit=self.presenter.print_unit,
+                        tool_calls=self._tool_calls,
+                        include_thoughts=True,
+                        replay_tool_results=True,
+                        replay_tool_starts=True,
+                        provider=provider,
+                    )
+                finally:
+                    self.transcript.end_history_entry()
+        if not follow_tail and anchor is not None:
+            self.transcript.restore_durable_scroll_anchor(anchor)
 
     def _print_user(self, message: Message) -> None:
         self.presenter.print_user(
@@ -738,43 +710,89 @@ class AgentTranscriptControl(AgentTranscriptLifetime, UIControl):
         )
 
     def pending_prompts(self, path: Path) -> tuple[str, ...]:
-        """Unconsumed follow-ups in the last applied snapshot of ``path``."""
-
-        if path != self._path or self._snapshot is None:
+        if path != self._path or self._source is None:
             return ()
-        return self._snapshot.pending_prompts
+        return self._source.pending_prompts
+    def capture_root_view(self) -> None:
+        """Park only the root scalars before navigation changes layout focus."""
+
+        if self._path == self._root_path:
+            self._park_active_view()
+
+    async def cancel_activation(self) -> None:
+        generation = self._activation_generation
+        self._activation_generation += 1
+        tasks = self._cancel_transition_work()
+        if self._rollback_path is not None:
+            self._rollback_path(generation)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        remaining = tuple(self._load_tasks)
+        if remaining:
+            await asyncio.gather(*remaining, return_exceptions=True)
+        self._load_tasks.clear()
+        self._load_task = None
+        self._pending_path = None
+    async def close(self, deadline: float | None = None) -> None:
+        del deadline
+        self._closed = True
+        await self.cancel_activation()
+        self._current_path = None
+        self._prepare_path = None
+        self._begin_path = None
+        self._commit_path = None
+        self._rollback_path = None
+        self._finish_path = None
+        self._render_active = None
+        self._root_endpoint = None
+        self._invalidate = None
+        self.on_history_edge = None
+        source, self._source = self._source, None
+        if source is not None:
+            if inspect.iscoroutinefunction(source.close):
+                await source.close()
+            else:
+                await asyncio.to_thread(source.close)
 
     def scroll(self, amount: int) -> None:
+        self.cancel_finder_return()
         self.transcript.scroll_lines(amount)
+        if amount < 0 and self.transcript.at_resident_top and self.on_history_edge:
+            self.on_history_edge("older")
+        elif amount > 0 and self.transcript.follow_tail and self.on_history_edge:
+            self.on_history_edge("newer")
 
     def half_page(self, amount: int) -> None:
-        self.transcript.scroll_lines(
-            amount * max(1, self.transcript._viewport_height // 2)
-        )
+        self.scroll(amount * max(1, self.transcript._viewport_height // 2))
 
     def top(self) -> None:
+        self.cancel_finder_return()
         self.transcript.scroll_to_top()
+        if self.on_history_edge:
+            self.on_history_edge("older")
 
     def bottom(self) -> None:
+        self.cancel_finder_return()
         self.transcript.scroll_to_bottom()
+        if self.on_history_edge:
+            self.on_history_edge("newer")
 
     def toggle_latest_agent(self) -> bool:
         return self.transcript.toggle_latest_agent()
-
     def create_content(self, width: int, height: int | None) -> UIContent:
         return self.transcript.create_content(width, height)
-
     def vertical_scroll(self, window: Window) -> int:
         return self.transcript.vertical_scroll(window)
-
     def mouse_handler(self, mouse_event: MouseEvent):
-        return self.transcript.mouse_handler(mouse_event)
-
-
+        result = self.transcript.mouse_handler(mouse_event)
+        if result is NotImplemented and mouse_event.event_type is MouseEventType.MOUSE_DOWN:
+            get_app().layout.focus(self)
+            return None
+        return result
 class AgentNavigation:
     """Own the current session path, list selection, and child transcript."""
 
-    def __init__(self, store: ConversationStore) -> None:
+    def __init__(self, store: ConversationStore, history_pager: Any = None) -> None:
         self.store = store
         self.root_path = store.session_dir
         self.current_path = self.root_path
@@ -786,7 +804,13 @@ class AgentNavigation:
         self._fork_main_path: Path | None = None
         self._on_return_to_main: Callable[[], None] | None = None
         self.list_control = AgentListControl(self)
-        self.transcript_control = AgentTranscriptControl()
+        self.transcript_control = AgentTranscriptControl(history_pager)
+        self.transcript_control._root_path = self.transcript_control._path = self.root_path
+        self.transcript_control._prepare_path = self._prepare_view_path
+        self.transcript_control._begin_path = self._begin_view_transition
+        self.transcript_control._commit_path = self._commit_view_path
+        self.transcript_control._rollback_path = self._rollback_view_transition
+        self.transcript_control._finish_path = self._finish_view_transition
         self.list_window = Window(
             content=self.list_control,
             height=Dimension(min=1, max=MAX_AGENT_LIST_ROWS),
@@ -818,6 +842,8 @@ class AgentNavigation:
         self._last_refresh_at = float("-inf")
         self._refresh_handle: asyncio.TimerHandle | None = None
         self._invalidate: Callable[[], None] | None = None
+        self._navigation_generation: int | None = None
+        self._navigation_snapshot: _NavigationSnapshot | None = None
         self.refresh(force=True)
 
     def _breadcrumb_fragments(self) -> list[tuple[str, str]]:
@@ -855,6 +881,17 @@ class AgentNavigation:
             return None
         label = self.child_instance_id() or self.current_path.name
         return label, self.transcript_control.pending_prompts(self.current_path)
+
+    async def wait_for_publication(self) -> None:
+        """Wait for the current transcript and todo view to publish."""
+
+        while True:
+            task = self.transcript_control._load_task
+            if task is not None:
+                await asyncio.shield(task)
+            if task is self.transcript_control._load_task:
+                break
+        await self._todo_control.settle()
 
     def todo_snapshot(self) -> TodoSnapshot | None:
         if not self.child_view_active:
@@ -899,6 +936,7 @@ class AgentNavigation:
     ) -> None:
         self._layout = layout
         self._composer_buffer = composer_buffer
+        self.transcript_control._composer_buffer = composer_buffer
         self._invalidate = invalidate
         self._schedule_refresh(_AGENT_REFRESH_INTERVAL_SECONDS)
 
@@ -909,6 +947,7 @@ class AgentNavigation:
         self._invalidate = None
         self._layout = None
         self._composer_buffer = None
+        self.transcript_control._composer_buffer = None
 
     def bind_transcript_layout(self, layout: Any, main_transcript: Any) -> None:
         self._transcript_layout = layout
@@ -934,11 +973,13 @@ class AgentNavigation:
         return self._main_transcript_widget
 
     def show_external_view(self, container: Any, transcript: Any) -> None:
+        self.transcript_control.cancel_finder_return()
         self._external_view_container = container
         self._external_view_transcript = transcript
         self._switch_transcript()
 
     def clear_external_view(self) -> None:
+        self.transcript_control.cancel_finder_return()
         self._external_view_container = None
         self._external_view_transcript = None
         self._switch_transcript()
@@ -1013,9 +1054,10 @@ class AgentNavigation:
             self._resize_list_window()
             return False
         self._last_refresh_at = now
+        owned_refresh = self.transcript_control._root_source is not None
         transcript_changed = (
             self.transcript_control.request_sync(self.current_path, self._invalidate)
-            if self.child_view_active
+            if owned_refresh
             else False
         )
         todo_changed = (
@@ -1023,6 +1065,9 @@ class AgentNavigation:
             if self.child_view_active
             else False
         )
+        if owned_refresh:
+            self._resize_list_window()
+            return transcript_changed or todo_changed
         signature = self._agent_tree_signature()
         if not force and signature == self._refresh_signature:
             return transcript_changed or todo_changed
@@ -1152,51 +1197,36 @@ class AgentNavigation:
         return self._layout is not None and self._layout.has_focus(self.list_window)
 
     def focus_list(self) -> None:
-        self.refresh(force=True)
+        self.transcript_control.capture_root_view()
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
         else:
             self.focus_composer()
+        self.refresh(force=True)
 
     def list_back(self) -> None:
         self.back_to_parent()
 
     def exit_navigation(self, *, preselect_path: Path | None = None) -> None:
-        previous_path = self.current_path
-        self._todo_control.clear(self._invalidate)
-        self.current_path = self.root_path
-        self._path_stack[:] = [self.root_path]
-        self._breadcrumb_labels[:] = ["main"]
-        self.selected_index = 0
-        self.refresh(force=True)
-        target = preselect_path
-        if target is None and previous_path != self.root_path:
-            target = previous_path
-        if target is not None:
-            self.selected_index = next(
-                (
-                    index
-                    for index, entry in enumerate(self.entries)
-                    if entry.path == target
-                ),
-                self.selected_index,
-            )
-        self._switch_transcript()
-        self.focus_composer()
+        del preselect_path
+        if self.current_path == self.root_path:
+            self.focus_composer()
+            return
+        self.transcript_control.activate(self.root_path)
 
     def focus_child_list(self) -> None:
-        self.refresh(force=True)
         if self.list_visible and self._layout is not None:
             self._layout.focus(self.list_window)
+        self.refresh(force=True)
 
     def move_selection(self, amount: int) -> None:
         if not self.entries:
             return
         self.selected_index = (self.selected_index + amount) % len(self.entries)
 
-    def open_selected(self) -> None:
+    def open_selected(self) -> asyncio.Task[None] | None:
         if not self.entries:
-            return
+            return None
         entry = self.entries[self.selected_index]
         if (
             self._fork_main_path is not None
@@ -1204,22 +1234,17 @@ class AgentNavigation:
             and self._on_return_to_main is not None
         ):
             self._on_return_to_main()
-            return
+            return None
         if entry.path == self.root_path:
             if self.child_view_active:
                 self.exit_navigation(preselect_path=self.current_path)
-            return
+            return None
         if entry.path == self.current_path:
-            return
-        self.current_path = entry.path
-        self._todo_control.clear(self._invalidate)
-        self._path_stack.append(entry.path)
-        self._breadcrumb_labels.append(entry.label)
-        self.transcript_control.request_sync(entry.path, self._invalidate)
-        self.refresh(force=True)
-        self._switch_transcript()
-        if self._layout is not None:
-            self._layout.focus(self.transcript_window)
+            return None
+        task = self.transcript_control.activate(entry.path)
+        if task is None:
+            self._todo_control.request(self.current_path, self._invalidate)
+        return task
 
     def back_to_parent(self) -> None:
         if not self.child_view_active:
@@ -1228,27 +1253,139 @@ class AgentNavigation:
         self._leave_current_view()
 
     def _leave_current_view(self) -> None:
-        child_path = self.current_path
-        self._todo_control.clear(self._invalidate)
-        self._path_stack.pop()
-        self.current_path = self._path_stack[-1]
-        self._breadcrumb_labels.pop()
-        self.refresh(force=True)
-        self.selected_index = next(
-            (
-                index
-                for index, entry in enumerate(self.entries)
-                if entry.path == child_path
-            ),
-            0,
+        self.transcript_control.activate(self._path_stack[-2])
+
+    def _begin_view_transition(self, generation: int) -> None:
+        focused = self._layout.current_window if self._layout is not None else None
+        self._navigation_generation = generation
+        self._navigation_snapshot = _NavigationSnapshot(
+            self.current_path,
+            tuple(self._path_stack),
+            tuple(self._breadcrumb_labels),
+            tuple(self.entries),
+            self.selected_index,
+            focused,
         )
-        if self.child_view_active:
-            self.transcript_control.request_sync(self.current_path, self._invalidate)
+
+    def _rollback_view_transition(self, generation: int) -> None:
+        if self._navigation_generation != generation:
+            return
+        snapshot = self._navigation_snapshot
+        self._navigation_generation = None
+        self._navigation_snapshot = None
+        if snapshot is None:
+            return
+        self.current_path = snapshot.current_path
+        self._path_stack = list(snapshot.path_stack)
+        self._breadcrumb_labels = list(snapshot.breadcrumb_labels)
+        self.entries = list(snapshot.entries)
+        self.selected_index = snapshot.selected_index
+        self._resize_list_window()
         self._switch_transcript()
-        if self.child_view_active and self._layout is not None:
+        if self._layout is not None and snapshot.focused is not None:
+            self._layout.focus(snapshot.focused)
+
+    def _finish_view_transition(self, generation: int) -> None:
+        if self._navigation_generation != generation:
+            return
+        snapshot = self._navigation_snapshot
+        self._navigation_generation = None
+        self._navigation_snapshot = None
+        if snapshot is not None and snapshot.current_path != self.current_path:
+            self._todo_control.clear(self._invalidate)
+            if self.child_view_active:
+                self._todo_control.request(self.current_path, self._invalidate)
+
+    def _prepare_view_path(self, path: Path) -> _PreparedNavigation:
+        """Read one target's child discovery and metadata off the TUI loop."""
+
+        fallback = registered_child_markers(path)
+        children = []
+        for child in agent_child_paths(path, None):
+            metadata = _agent_metadata(child, fallback.get(child))
+            entry = AgentEntry(
+                child,
+                str(metadata.get("description") or f"child {child.name}"),
+                str(metadata.get("agent_type") or "child"),
+                str(metadata.get("state") or "running"),
+            )
+            if entry.state not in _TERMINAL_AGENT_STATES:
+                children.append(entry)
+        root_metadata = _agent_metadata(self.root_path)
+        forked = self._fork_title is not None
+        entries = [
+            AgentEntry(
+                self.root_path,
+                f"discussion: {self._fork_title}" if forked else "main",
+                str(
+                    root_metadata.get("agent_type")
+                    or ("discussion" if forked else "main")
+                ),
+                str(root_metadata.get("state") or "running"),
+            )
+        ]
+        if path == self.root_path and self._fork_main_path is not None:
+            entries.append(self._main_entry())
+        entries.extend(children)
+        if path == self.root_path and not children and len(entries) == 1:
+            entries.clear()
+        return _PreparedNavigation(tuple(entries))
+
+    def _commit_view_path(
+        self, path: Path, prepared: _PreparedNavigation, generation: int
+    ) -> bool:
+        """Claim and publish prepared navigation state without filesystem access."""
+
+        if self._navigation_generation != generation:
+            return False
+        previous = self.current_path
+        previous_index = self.selected_index
+        if path in self._path_stack:
+            index = self._path_stack.index(path)
+            self._path_stack = self._path_stack[: index + 1]
+            self._breadcrumb_labels = self._breadcrumb_labels[: index + 1]
+        else:
+            label = next(
+                (entry.label for entry in self.entries if entry.path == path),
+                path.name,
+            )
+            self._path_stack.append(path)
+            self._breadcrumb_labels.append(label)
+        # A refresh keeps the selected row; a return to root selects the child left.
+        selected = (
+            self.entries[previous_index].path
+            if path == previous and previous_index < len(self.entries)
+            else previous
+        )
+        self.current_path = path
+        self.entries = list(prepared.entries)
+        if path == self.root_path or path == previous:
+            self.selected_index = next(
+                (
+                    index
+                    for index, entry in enumerate(self.entries)
+                    if entry.path == selected
+                ),
+                min(previous_index, max(0, len(self.entries) - 1))
+                if path == previous
+                else 0,
+            )
+        else:
+            self.selected_index = min(
+                previous_index, max(0, len(self.entries) - 1)
+            )
+        self._resize_list_window()
+        self._refresh_signature = None
+        self._switch_transcript()
+        if path == previous:
+            # A refresh of the same view keeps the user's focus.
+            if self.list_focused() and not self.entries:
+                self.focus_composer()
+        elif self.child_view_active and self._layout is not None:
             self._layout.focus(self.transcript_window)
         else:
             self.focus_composer()
+        return True
 
     def toggle_latest_agent(self) -> bool:
         if self.child_view_active:

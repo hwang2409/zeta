@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import weakref
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from typing import Any, Protocol
 
 from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.document import Document
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.shortcuts import PromptSession
 
@@ -97,22 +98,37 @@ class FinderRuntimeMixin:
         return finder if finder is not None else self._viewed_transcript()
 
     def _finder_open(self) -> None:
-        self._finder_accept_pending = False
-        self._finder_field.reset(notify=False)
-        self._active_finder = self._viewed_transcript()
-        finder = self._active_finder
-        self._focus_finder_field()
-        request = finder.open_finder()
-        self._start_finder_preparation(request)
+        transcript = self._viewed_transcript()
+        self._open_finder_overlay(transcript, transcript.open_finder)
 
-    def _history_finder_open(self, buffer: Buffer) -> None:
-        self._finder_accept_pending = False
-        self._active_finder = self._history_finder
-        finder = self._history_finder
-        if self._focus_finder_field() is not None:
-            self._finder_field.set_document(buffer.document, notify=False)
-        request = finder.open_finder(buffer)
-        self._start_finder_preparation(request)
+    def _history_finder_open(
+        self, buffer: Buffer, load: Callable[[], Awaitable[Any]] | None = None
+    ) -> None:
+        self._open_finder_overlay(
+            self._history_finder,
+            lambda: self._history_finder.open_finder(buffer),
+            buffer.document,
+            load,
+        )
+
+    def _open_finder_overlay(
+        self,
+        finder: FinderRuntimeTarget,
+        open_finder: Callable[[], Any],
+        document: Document | None = None,
+        load: Callable[[], Awaitable[Any]] | None = None,
+    ) -> None:
+        def show() -> bool:
+            self._finder_accept_pending = False
+            if document is None:
+                self._finder_field.reset(notify=False)
+            self._active_finder = finder
+            if self._focus_finder_field() is not None and document is not None:
+                self._finder_field.set_document(document, notify=False)
+            self._start_finder_preparation(open_finder())
+            return True
+
+        self._open_overlay(show, load, on_loaded=self._finder_accept_when_ready)
 
     def _start_finder_preparation(self, request: Any) -> None:
         if request is None:
@@ -147,6 +163,8 @@ class FinderRuntimeMixin:
         finally:
             if self._finder_prepare_task is task:
                 self._finder_prepare_task = None
+                # An Enter held while this task ran runs now that the rows stand.
+                self._finder_accept_when_ready()
 
     def _finder_input(self, query: str) -> None:
         # A queued Enter belongs to the query it was typed for, not a later one.
@@ -212,7 +230,11 @@ class FinderRuntimeMixin:
         """True while the open finder's rows can still change."""
 
         state = self._finder_target().finder_state()
-        return state is not None and not state.complete
+        return state is not None and (
+            not state.complete
+            or self.overlay_loading
+            or self._finder_prepare_task is not None
+        )
 
     def _finder_accept_when_ready(self) -> None:
         # Run after the calling worker returns: accepting cancels the workers.
@@ -264,6 +286,9 @@ class FinderRuntimeMixin:
         paste_runtime = getattr(self, "_paste_runtime", None)
         if paste_runtime is not None:
             await paste_runtime.reset()
+        voice = getattr(self, "_voice", None)
+        if voice is not None:
+            await voice.cancel()
 
     def _finder_toggle_preview(self) -> None:
         self._finder_target().finder_toggle_preview()

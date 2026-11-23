@@ -36,12 +36,13 @@ from unittest.mock import Mock
 import httpx
 import pytest
 from prompt_toolkit import PromptSession
-from prompt_toolkit.application.current import set_app
+from prompt_toolkit.application.current import create_app_session, set_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.data_structures import Point, Size
 from prompt_toolkit.document import Document
 from prompt_toolkit.enums import EditingMode
 from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.key_binding.key_processor import KeyPress
 from prompt_toolkit.key_binding.vi_state import InputMode
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import HSplit, Layout
@@ -76,7 +77,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import reject_provider_token_exchange
 from tests.support.notification_fixtures import notification_payloads
 from tests.support.owned import await_or_fail, close_owned_app, owned_app
-from tests.support.processes import read_pty_until, reap_process
+from tests.support.processes import open_pty, read_pty_until, reap_process
 from tests.support.tui_render import render_full_screen as _render_full_screen
 from tests.test_agent import CancelledBeforeAnswerBackend, _collect
 from zeta.accounts import (
@@ -125,7 +126,7 @@ from zeta.tui.agent_card import (
 )
 from zeta.tui.app import FullScreenPromptSession, TUIApp, build_backend
 from zeta.tui.bootstrap import background_notice
-from zeta.tui.cards import agent_lifetime, agent_shutdown, agent_sync
+from zeta.tui.cards import agent_shutdown, agent_sync
 from zeta.tui.cards.agent import _read_lifecycle
 from zeta.tui.composer import (
     UndoCandidate,
@@ -868,7 +869,8 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     original_durable_write = ConversationStore._run_committed_mutation
-    ack_committed = threading.Event()
+    loop = asyncio.get_running_loop()
+    ack_committed = asyncio.Event()
     release_ack = threading.Event()
     apps: list[TUIApp] = []
 
@@ -879,8 +881,10 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
             self, command, expected_generation, cancelled_before_write
         )
         if type(command).__name__ == "_AcknowledgeStagedDeliveryCommand":
-            ack_committed.set()
-            assert release_ack.wait(timeout=5)
+            loop.call_soon_threadsafe(ack_committed.set)
+            assert release_ack.wait(timeout=30), (
+                "test did not release the acknowledgement worker"
+            )
         return result
 
     # test-contract: seam pauses after durable acknowledgement commit
@@ -893,14 +897,19 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
             "background_macro",
             "natural_exit_success",
             app_sink=apps.append,
-        )
+        ),
+        name="background completion transcript",
     )
     try:
-        assert await asyncio.to_thread(ack_committed.wait, 5)
+        await await_or_fail(
+            ack_committed.wait(), what="durable delivery acknowledgement"
+        )
         assert len(apps) == 1
         apps[0].request_exit()
         release_ack.set()
-        count, rendered = await await_or_fail(transcript, what="test await")
+        count, rendered = await await_or_fail(
+            transcript, what="background completion transcript"
+        )
         assert count == 1, rendered
         markers = {ref.type for ref in apps[0].loop.store.branch_refs()}
         assert "notification_tui_presented" in markers
@@ -909,7 +918,8 @@ async def test_background_completion_is_rendered_when_exit_overtakes_acknowledge
         if not transcript.done():
             transcript.cancel()
             await await_or_fail(
-                asyncio.gather(transcript, return_exceptions=True), what="test await"
+                asyncio.gather(transcript, return_exceptions=True),
+                what="drain background completion transcript",
             )
 
 
@@ -1707,6 +1717,7 @@ def _tool_contract_events(name: str) -> tuple[StreamEvent, StreamEvent, StreamEv
         {
             "path": "sample.txt",
             "command": "printf sample",
+            "script": "output(\"sample\")",
             "content": "sample",
             "items": [],
             "name": "sample",
@@ -1735,7 +1746,7 @@ def _assert_tool_contract(name: str) -> None:
     assert all(item is not None for item in rendered), name
     plain = [terminal_plain(item).lower() for item in rendered]
     assert name.lower() in plain[0], name
-    assert "sample" in plain[0], name
+    assert ("1 lines" if name == "code" else "sample") in plain[0], name
     assert "contract result" in plain[1] or name.lower() in plain[1], name
     assert "contract error" in plain[2], name
     assert any(marker in plain[2] for marker in ("error", "failed", "denied")), name
@@ -1766,6 +1777,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
     top_level = ToolRegistry(
         tmp_path,
         session_store=stores[0],
+        code_mode_enabled=True,
         skill_catalog=SkillCatalog.empty(),
         project_id="project-1",
         project_registry=SimpleNamespace(),
@@ -1858,7 +1870,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
 async def test_tool_card_registry_only_names_real_or_supported_alias_tools(
     tmp_path: Path,
 ) -> None:
-    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
+    registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty(), code_mode_enabled=True)
     try:
         assert set(TOOL_CARD_REGISTRY) <= registry.registered_names | {
             "exec",
@@ -2032,7 +2044,9 @@ async def test_agent_card_transcript_hides_passive_harness_message(
 
     transcript = read_agent_transcript(store.session_dir)
     control = AgentTranscriptControl()
-    await control.load(store.session_dir)
+    activation = control.activate(store.session_dir)
+    assert activation is not None
+    await await_or_fail(activation, what="child transcript activation")
     rendered = Text.from_ansi(control.transcript.render(120)).plain
 
     assert any("visible prompt" in line for line in transcript)
@@ -2718,6 +2732,39 @@ def test_diff_card_truncates_at_the_shared_line_budget() -> None:
     assert "+line-11" in plain
     assert "+line-12" not in plain
     assert "… +18 diff lines" in plain
+
+
+def test_list_attention_tool_result_renders_owner_and_age() -> None:
+    call = ToolCall("attention-list", "list_attention", {})
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=ToolResult(
+                call.id,
+                "abc [decision, 4m] Choose a path (session-1)",
+                structured_content={
+                    "items": [
+                        {
+                            "id": "abc",
+                            "kind": "decision",
+                            "title": "Choose a path",
+                            "age": "4m",
+                            "created_at": "2026-11-16T12:00:00Z",
+                            "owning_session": "session-1",
+                        }
+                    ],
+                    "total": 1,
+                },
+            ),
+        )
+    )
+
+    assert rendered is not None
+    plain = renderable_plain(rendered)
+    assert "Choose a path" in plain
+    assert "4m" in plain
+    assert "session-1" in plain
 
 
 def test_unknown_tool_keeps_the_generic_fallback_card() -> None:
@@ -5841,6 +5888,22 @@ def test_typed_agent_receipt_keeps_type_on_transcript_replay(tmp_path: Path) -> 
     assert "plan · task research" in rendered
 
 
+def test_tool_approval_origin_does_not_change_tui_rendering() -> None:
+    call = ToolCall("read-1", "read", {"path": "file.txt"})
+    plain = render_event(
+        StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=call)
+    )
+    with_origin = render_event(
+        StreamEvent(
+            StreamEventType.TOOL_EXECUTION_START,
+            tool_call=call,
+            data={"approval_origin": "automatic"},
+        )
+    )
+
+    assert with_origin == plain
+
+
 def test_agent_card_expansion_reads_bounded_child_tail(tmp_path: Path) -> None:
     child = ConversationStore(tmp_path / "agents", session_id="1")
     for index in range(25):
@@ -6425,6 +6488,80 @@ async def test_mcp_notices_suppressed_while_suspended_for_fork_and_rendered_afte
         await asyncio.wait_for(resumed_task, timeout=2)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True], ids=["live", "resume"])
+async def test_code_cell_shortcut_reveals_source(tmp_path: Path, resume: bool) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    script = 'const pointer = await tools.read({path: "pointer"});'
+    outer = ToolCall("cell", "code", {"script": script})
+    steps = (
+        (ToolCall("cell:code:1", "read", {"path": "pointer"}), "target-name"),
+        (ToolCall("cell:code:2", "grep", {"pattern": "needle"}), "matching-line"),
+    )
+    output = ToolResult(outer.id, "done", structured_content={"code_mode": {
+        "version": 1,
+        "state": "completed",
+        "calls": [
+            {"id": call.id, "name": call.name, "summary": content, "state": "completed"}
+            for call, content in steps
+        ],
+    }})
+    if resume:
+        # Approval audit rows retain the full read; the other call is in the projection only.
+        inner, content = steps[0]
+        try:
+            store.append_message(with_message_origin(
+                Message(MessageRole.USER, [TextContent("run code cell")]), MessageOrigin.USER,
+            ))
+            store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(outer)]))
+            store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(inner)]))
+            store.append_message(Message(
+                MessageRole.TOOL_RESULT, tool_result=ToolResult(inner.id, content),
+            ))
+            store.append_message(Message(MessageRole.TOOL_RESULT, tool_result=output))
+        finally:
+            store.close()
+        store = ConversationStore(store.root_dir, session_id=store.session_id)
+
+    app = _test_tui_app(store, StringIO())
+    with create_pipe_input() as pipe, create_app_session(input=pipe, output=DummyOutput()):
+        session = app._make_session()
+        running = asyncio.create_task(app.run(session))
+        try:
+            await wait_until(lambda: app._input_loop_active and app.interaction_ready())
+            if not resume:
+                app._handle_tool_event(
+                    StreamEvent(StreamEventType.TOOL_EXECUTION_START, tool_call=outer)
+                )
+                for index, (inner, content) in enumerate(steps, start=1):
+                    data = {"code_parent_id": outer.id, "code_call_index": index}
+                    app._handle_tool_event(StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_START, tool_call=inner, data=data,
+                    ))
+                    app._handle_tool_event(StreamEvent(
+                        StreamEventType.TOOL_EXECUTION_END, tool_call=inner, data=data,
+                        tool_result=ToolResult(inner.id, content),
+                    ))
+                app._handle_tool_event(StreamEvent(
+                    StreamEventType.TOOL_EXECUTION_END, tool_call=outer, tool_result=output,
+                ))
+            before = Text.from_ansi(app._transcript.render(120)).plain
+            assert "code · 2 calls" in before
+            for label in ("read pointer", "grep", "target-name"):
+                assert label in before
+            assert script not in before, "code cell source must start collapsed"
+            # The following character confirms the key processor consumed the chord.
+            pipe.send_text("\x18\x0fx")
+            await wait_until(lambda: session.default_buffer.text == "x")
+            after = Text.from_ansi(app._transcript.render(120)).plain
+            assert script in after, "Ctrl-X Ctrl-O did not reveal the code cell source"
+            for label in ("read pointer", "grep", "target-name"):
+                assert label in after
+        finally:
+            app.request_exit()
+            await asyncio.wait_for(running, timeout=10)
+
+
 def test_agent_card_binding_preserves_native_ctrl_o_in_both_edit_modes() -> None:
     bindings = build_key_bindings(
         on_history_previous=lambda _buffer: None,
@@ -7002,6 +7139,7 @@ def test_status_card_output_fixture_uses_shared_status_text() -> None:
     assert rendered == (
         "Status\n\0overlay-rule\0\n"
         "session_id: status-fixture\nprovider: codex\nmodel: gpt-5.6-luna\n"
+        "otel: off\n"
         "completion_client_setups: none\n"
         "vim_mode: on\nplan_mode: off\nexplicit_finish: on\nmax_agent_depth: 3\n"
         "retained_tail: 6\ntokens_used_this_session: 150\n"
@@ -7921,6 +8059,7 @@ async def test_queued_panel_follows_the_viewed_session(
     assert _panel_text(app).strip() == "main · 2 queued"
 
     navigation.back_to_parent()
+    await navigation.wait_for_publication()
     assert _panel(app) == QueuedPanel("main", ("main one", "main two"))
     child_store.close()
     await app.close()
@@ -7996,57 +8135,42 @@ async def test_ctrl_d_resets_cursor_before_prompt_toolkit_exit() -> None:
 
 
 def test_main_exits_on_ctrl_d_at_empty_prompt(tmp_path: Path) -> None:
-    master_fd, slave_fd = pty.openpty()
-    env = _fixed_terminal_env(tmp_path / "zeta-home")
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "tests.support.scripted_tui",
-            "--provider",
-            "codex",
-        ],
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env=env,
-        close_fds=True,
-    )
-    os.close(slave_fd)
-    try:
-        output = bytearray()
-        read_pty_until(master_fd, b" \xe2\x80\xba ", process=process, output=output)
+    with open_pty() as (master_fd, slave_fd):
+        env = _fixed_terminal_env(tmp_path / "zeta-home")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tests.support.scripted_tui",
+                "--provider",
+                "codex",
+            ],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            close_fds=True,
+        )
+        try:
+            output = bytearray()
+            read_pty_until(master_fd, b" \xe2\x80\xba ", process=process, output=output)
 
-        os.write(master_fd, b"\x04")
-        read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
-        reap_process(process, timeout=10)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select(
-                [master_fd], [], [], max(0, deadline - time.monotonic())
-            )
-            if not ready:
-                break
-            try:
-                chunk = os.read(master_fd, 4096)
-            except OSError as error:
-                if error.errno == errno.EIO:
-                    break
-                raise
-            if not chunk:
-                break
-            output.extend(chunk)
-        assert process.returncode == 0
-        assert b"\x1b[?1049h" in output
-        assert b"\x1b[?1049l" in output
-        assert b"\x1b[0 q" in output
-        assert output.index(b"\x1b[0 q") < output.index(b"\x1b[?1049l")
-        assert output.count(b"\x1b[?1049h") == 1
-    finally:
-        if process.poll() is None:
-            process.kill()
+            os.write(master_fd, b"\x04")
+            read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
             reap_process(process, timeout=10)
-        os.close(master_fd)
+            # The child has exited, so the rest of its output is already queued.
+            while select.select([master_fd], [], [], 0)[0]:
+                output.extend(os.read(master_fd, 4096))
+            assert process.returncode == 0
+            assert b"\x1b[?1049h" in output
+            assert b"\x1b[?1049l" in output
+            assert b"\x1b[0 q" in output
+            assert output.index(b"\x1b[0 q") < output.index(b"\x1b[?1049l")
+            assert output.count(b"\x1b[?1049h") == 1
+        finally:
+            if process.poll() is None:
+                process.kill()
+                reap_process(process, timeout=10)
 
 
 def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
@@ -8104,45 +8228,39 @@ def test_main_pty_emits_vim_cursor_shapes_and_resets_on_toggle(
 def test_main_pty_normal_command_then_queued_enter_submits(
     tmp_path: Path,
 ) -> None:
-    master_fd, slave_fd = pty.openpty()
-    env = _fixed_terminal_env(tmp_path / "zeta-home")
-    process = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "tests.support.scripted_tui",
-            "--provider",
-            "codex",
-        ],
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env=env,
-        close_fds=True,
-    )
-    os.close(slave_fd)
-    output = bytearray()
+    with open_pty() as (master_fd, slave_fd):
+        env = _fixed_terminal_env(tmp_path / "zeta-home")
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "tests.support.scripted_tui",
+                "--provider",
+                "codex",
+            ],
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=env,
+            close_fds=True,
+        )
+        output = bytearray()
 
-    def read_until(needle: bytes, start: int = 0) -> None:
-        read_pty_until(master_fd, needle, process=process, output=output, start=start)
+        def read_until(needle: bytes, start: int = 0) -> None:
+            read_pty_until(master_fd, needle, process=process, output=output, start=start)
 
-    try:
-        read_until(b" \xe2\x80\xba ")
-        start = len(output)
-        os.write(master_fd, b"abc\x1bx\r")
-        read_until(b"the scripted test backend", start)
-        assert b"you said: ab" in output[start:]
-    finally:
         try:
+            read_until(b" \xe2\x80\xba ")
+            start = len(output)
+            os.write(master_fd, b"abc\x1bx\r")
+            read_until(b"the scripted test backend", start)
+            assert b"you said: ab" in output[start:]
+        finally:
             if process.poll() is None:
                 os.write(master_fd, b"\x04")
-                read_pty_until(
-                    master_fd, b"\x1b[?1049l", process=process, output=output
-                )
+                read_pty_until(master_fd, b"\x1b[?1049l", process=process, output=output)
                 reap_process(process, timeout=10)
             assert process.returncode == 0
-        finally:
-            os.close(master_fd)
 
 
 def test_main_import_compatibility() -> None:
@@ -9422,11 +9540,12 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
     )
     replay_started = asyncio.Event()
     release_replay = asyncio.Event()
+    terminal_restored = asyncio.Event()
 
     async def delayed_replay(*, batch_size: int = 1) -> bool:
         del batch_size
         replay_started.set()
-        await release_replay.wait()
+        await await_or_fail(release_replay.wait(), what="release startup replay")
         return False
 
     monkeypatch.setattr(app, "_rebuild_transcript_async", delayed_replay)
@@ -9439,14 +9558,28 @@ async def test_exit_during_replay_cleans_up_full_screen_session(
         def restore_terminal() -> None:
             restored.append(None)
             original_restore()
+            terminal_restored.set()
 
         monkeypatch.setattr(session, "restore_terminal", restore_terminal)
-        run_task = asyncio.create_task(app.run(session))
-        await replay_started.wait()
-        app.request_exit()
-        release_replay.set()
-        await asyncio.wait_for(run_task, timeout=1)
-        await asyncio.sleep(0)
+        run_task = asyncio.create_task(app.run(session), name="full-screen replay exit")
+        try:
+            await await_or_fail(replay_started.wait(), what="startup replay entry")
+            app.request_exit()
+            release_replay.set()
+            await await_or_fail(
+                terminal_restored.wait(), what="full-screen terminal restore"
+            )
+            await await_or_fail(
+                run_task, what="full-screen session close after terminal restore"
+            )
+            await asyncio.sleep(0)
+        finally:
+            release_replay.set()
+            run_task.cancel()
+            await await_or_fail(
+                asyncio.gather(run_task, return_exceptions=True),
+                what="drain full-screen replay exit task",
+            )
 
     prompt_toolkit_tasks = [
         task
@@ -10895,6 +11028,7 @@ async def test_pruned_agent_list_returns_focus_to_composer(
     child.agent_lifecycle_path.write_text(
         json.dumps({"description": "Explore", "state": "running"})
     )
+    store.append_message(Message(MessageRole.ASSISTANT, [TextContent("root ready")]))
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -10905,8 +11039,10 @@ async def test_pruned_agent_list_returns_focus_to_composer(
     with create_pipe_input() as pipe:
         session = app._make_session()
         session.app.input = pipe
+        session.app.editing_mode = EditingMode.EMACS
         run_task = asyncio.create_task(app.run(session))
         await wait_until(lambda: app._active_session is not None)
+        await wait_until(lambda: bool(app._transcript.units))
         assert app._active_session is session
         navigation = app._agent_navigation
         navigation.focus_list()
@@ -10916,12 +11052,13 @@ async def test_pruned_agent_list_returns_focus_to_composer(
             json.dumps({"description": "Explore", "state": "completed"})
         )
         navigation.refresh(force=True)
+        await navigation.wait_for_publication()
         await wait_until(lambda: session.layout.has_focus(session.default_buffer))
 
-        pipe.send_text("draft")
-        await wait_until(lambda: session.default_buffer.text == "draft")
+        session.default_buffer.insert_text("draft")
+        assert session.default_buffer.text == "draft"
         pipe.send_text("\x04")
-        await run_task
+        await await_or_fail(run_task, what="pruned agent list TUI shutdown")
 
 
 @pytest.mark.parametrize(
@@ -11815,14 +11952,25 @@ async def test_plain_approve_word_with_pending_approval_is_not_an_approval(
         approval_policy=policy,
         console=Console(file=StringIO(), force_terminal=False),
     )
+    app._active_session = app._make_session()
+    app._present_pending_approvals()
+    assert len(app._approval_units) == 1
 
     app._submit_input("approve the plan")
-    # test-contract: latency ui task startup is the product readiness contract
-    await asyncio.sleep(0.05)
-    if app._active_task is not None:
-        await asyncio.wait_for(app._active_task, 10)
+    # The pipeline consumer starts the turn task on its next loop step.
+    await asyncio.sleep(0)
+    assert app._active_task is not None
+    await await_or_fail(app._active_task, what="prompt turn")
 
-    assert [request.key for request in app.pending_approvals] == [call.id]
+    # The words reach the model as a prompt. The new turn closes the open
+    # request of the turn that is over, as an abort, never as an approval.
+    assert store.approval_state_now(call.id) == (call, "abort")
+    assert app.pending_approvals == ()
+    assert app._approval_units == {}
+    assert (
+        "system · approval for pending-call closed: its turn ended before an answer"
+        in [Text.from_ansi(line).plain for line in app._transcript.lines(120)]
+    )
     assert [
         block.text
         for message in branch_messages(store)
@@ -12495,170 +12643,6 @@ def _fd_count() -> int:
 
 
 @pytest.mark.asyncio
-async def test_tui_close_rejects_inflight_transcript_source(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = ConversationStore(store.session_dir / "agents", session_id="1")
-    child.agent_lifecycle_path.write_text(
-        json.dumps(
-            {"description": "Explore", "agent_type": "general", "state": "running"}
-        )
-    )
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
-    child.close()
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-    )
-    baseline = _fd_count()
-    opened = threading.Event()
-    release = threading.Event()
-    sources: list[agent_sync.AgentTranscriptSource] = []
-    original_init = agent_sync.AgentTranscriptSource.__init__
-    original_refresh = agent_sync.AgentTranscriptSource.refresh
-
-    def record_init(source, *args, **kwargs) -> None:
-        original_init(source, *args, **kwargs)
-        sources.append(source)
-
-    def gated_refresh(source, *args, **kwargs):
-        tree = original_refresh(source, *args, **kwargs)
-        opened.set()
-        assert release.wait(5)
-        return tree
-
-    # test-contract: seam Hold the transcript source at its production refresh boundary.
-    monkeypatch.setattr(agent_sync.AgentTranscriptSource, "__init__", record_init)
-    monkeypatch.setattr(agent_sync.AgentTranscriptSource, "refresh", gated_refresh)
-    app._agent_navigation.selected_index = 1
-    app._agent_navigation.open_selected()
-    await wait_until(opened.is_set)
-
-    close_task = asyncio.create_task(app.close())
-    await asyncio.sleep(0)
-    assert not close_task.done()
-    release.set()
-    await close_task
-
-    assert sources and sources[0]._closed
-    assert sources[0]._stores == {}
-    assert app._agent_navigation.transcript_control._source is None
-    assert _fd_count() <= baseline
-
-
-@pytest.mark.asyncio
-async def test_tui_close_hands_off_transcript_blocked_on_refresh_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = ConversationStore(tmp_path / "sessions", session_id="root")
-    child = ConversationStore(store.session_dir / "agents", session_id="1")
-    child.agent_lifecycle_path.write_text(
-        json.dumps(
-            {"description": "Explore", "agent_type": "general", "state": "running"}
-        )
-    )
-    child.append_message(Message(MessageRole.ASSISTANT, [TextContent("child")]))
-    child.close()
-    app = TUIApp(
-        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
-        provider="codex",
-        model="offline",
-    )
-    baseline = _fd_count()
-    navigation = app._agent_navigation
-    navigation.selected_index = 1
-    navigation.open_selected()
-    assert navigation.transcript_control._sync_task is not None
-    # test-contract: seam no public transcript-sync completion event exists
-    await asyncio.wait_for(navigation.transcript_control._sync_task, timeout=10)
-    source = navigation.transcript_control._source
-    assert source is not None
-    previous = navigation.transcript_control._snapshot
-    entered = threading.Event()
-    published = threading.Event()
-    closed = threading.Event()
-    original_refresh = source.refresh
-    original_close = source.close
-
-    def blocked_refresh(*args, **kwargs):
-        entered.set()
-        return original_refresh(*args, **kwargs)
-
-    def close_and_signal() -> None:
-        try:
-            original_close()
-        finally:
-            closed.set()
-
-    # test-contract: seam no public transcript-refresh readiness event exists
-    monkeypatch.setattr(source, "refresh", blocked_refresh)
-    # test-contract: seam no public transcript-source closed event exists
-    monkeypatch.setattr(source, "close", close_and_signal)
-    transcript_handed_off = asyncio.Event()
-    todo_cleanup_release = asyncio.Event()
-    transcript_cleanup_tasks: set[asyncio.Task[None]] = set()
-    finish_transcript_cleanup = agent_lifetime.finish_cleanup_or_handoff
-    finish_todo_cleanup = agent_sync.finish_cleanup_or_handoff
-
-    async def record_transcript_cleanup(tasks, close, *, deadline, label) -> None:
-        before = set(agent_shutdown._LATE_CLEANUP_TASKS)
-        try:
-            await finish_transcript_cleanup(
-                tasks, close, deadline=deadline, label=label
-            )
-            transcript_cleanup_tasks.update(agent_shutdown._LATE_CLEANUP_TASKS - before)
-        finally:
-            transcript_handed_off.set()
-
-    async def block_todo_cleanup(tasks, close, *, deadline, label) -> None:
-        await asyncio.wait_for(transcript_handed_off.wait(), timeout=10)
-        # Keep the empty todo cleanup pending until both owners have handed off.
-        blocker = asyncio.create_task(
-            asyncio.wait_for(todo_cleanup_release.wait(), timeout=10)
-        )
-        await finish_todo_cleanup(
-            (blocker, *tasks), close, deadline=deadline, label=label
-        )
-
-    monkeypatch.setattr(
-        agent_lifetime, "finish_cleanup_or_handoff", record_transcript_cleanup
-    )
-    monkeypatch.setattr(agent_sync, "finish_cleanup_or_handoff", block_todo_cleanup)
-    # test-contract: seam no public shutdown-budget injection exists
-    monkeypatch.setattr(agent_shutdown, "SHUTDOWN_BUDGET_SECONDS", 0)
-    late_cleanup_before = set(agent_shutdown._LATE_CLEANUP_TASKS)
-    # test-contract: seam no public transcript-refresh lock seam exists
-    agent_sync._REFRESH_LOCK.acquire()
-    try:
-        navigation.transcript_control.request_sync(source.path, published.set)
-        assert await asyncio.to_thread(entered.wait, 10)
-        await asyncio.wait_for(app.close(), timeout=10)
-        assert not source._closed
-        # test-contract: durability shutdown retains one late transcript cleanup
-        assert len(transcript_cleanup_tasks) == 1 and transcript_cleanup_tasks <= (
-            agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before
-        )
-    finally:
-        agent_sync._REFRESH_LOCK.release()
-        todo_cleanup_release.set()
-        late_cleanup_tasks = agent_shutdown._LATE_CLEANUP_TASKS - late_cleanup_before
-        if late_cleanup_tasks:
-            await asyncio.wait_for(
-                asyncio.gather(*late_cleanup_tasks, return_exceptions=True), timeout=10
-            )
-
-    assert await asyncio.to_thread(closed.wait, 10)
-    assert source._stores == {}
-    assert navigation.transcript_control._snapshot is previous
-    assert not published.is_set()
-    assert _fd_count() <= baseline
-
-
-@pytest.mark.asyncio
 async def test_tui_close_hands_off_blocked_todo_source(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -12813,11 +12797,13 @@ async def test_repeated_child_navigation_tui_close_restores_fd_count(
     for _ in range(8):
         navigation.selected_index = 1
         navigation.open_selected()
-        assert navigation.transcript_control._sync_task is not None
-        await navigation.transcript_control._sync_task
+        assert app._agent_navigation.transcript_control._load_task is not None
+        await await_or_fail(app._agent_navigation.transcript_control._load_task, what="focused child load")
         navigation.exit_navigation()
+        assert app._agent_navigation.transcript_control._load_task is not None
+        await await_or_fail(app._agent_navigation.transcript_control._load_task, what="root history restore")
 
-    await app.close()
+    await asyncio.wait_for(app.close(), 10)
 
     assert navigation.transcript_control._closed
     assert navigation.transcript_control._source is None
@@ -12935,7 +12921,9 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.transcript_control._path == child.session_dir
-                and navigation.transcript_control._snapshot is not None
+                and "child marker" in Text.from_ansi(
+                    navigation.transcript_control.transcript.render(120)
+                ).plain
             )
         )
         assert session.layout.has_focus(navigation.transcript_window)
@@ -12974,7 +12962,9 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.transcript_control._path == grandchild.session_dir
-                and navigation.transcript_control._snapshot is not None
+                and "grandchild marker" in Text.from_ansi(
+                    navigation.transcript_control.transcript.render(120)
+                ).plain
             )
         )
         assert navigation.list_visible
@@ -12993,7 +12983,9 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(
             lambda: (
                 navigation.transcript_control._path == child.session_dir
-                and navigation.transcript_control._snapshot is not None
+                and "child marker" in Text.from_ansi(
+                    navigation.transcript_control.transcript.render(120)
+                ).plain
             )
         )
         child_text = Text.from_ansi(
@@ -13024,9 +13016,9 @@ async def test_recursive_agent_navigation_keys_drive_real_controls(
         await wait_until(lambda: session.default_buffer.text == "draftjjj")
 
         session.app.exit()
-        await task
+        await await_or_fail(task, what="recursive navigation prompt")
 
-    await navigation.close()
+    await asyncio.wait_for(navigation.close(), 10)
     assert navigation.transcript_control._source is None
     grandchild.close()
     child.close()
@@ -14850,12 +14842,10 @@ async def test_tui_accounts_slash_marks_missing_credentials_unavailable(
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
-    app._presenter.print_unit = rendered.append
     try:
         assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
         output = StringIO()
-        Console(file=output, force_terminal=False, width=80).print(rendered[0])
+        Console(file=output, force_terminal=False, width=80).print(app._picker_card())
         assert (
             "codex:missing  unavailable: credentials missing"
             in Text.from_ansi(output.getvalue()).plain
@@ -14894,8 +14884,6 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
     loop.account_context = resolver
     loop.tool_registry.account_context = resolver
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
-    app._presenter.print_unit = rendered.append
     list_display = AccountStore.list_display
     off_loop_calls: list[str] = []
 
@@ -14909,7 +14897,7 @@ async def test_tui_accounts_open_and_session_switch_run_store_calls_off_loop(
 
     assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     output = StringIO()
-    Console(file=output, force_terminal=False, width=80).print(rendered[0])
+    Console(file=output, force_terminal=False, width=80).print(app._picker_card())
     plain = Text.from_ansi(output.getvalue()).plain
     assert "codex:first" in plain
     assert "current" in plain
@@ -14957,15 +14945,13 @@ async def test_accounts_picker_is_view_only_during_turn_then_switches(
     loop.account_context = context
     loop.tool_registry.account_context = context
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
-    app._presenter.print_unit = rendered.append
     busy = True
     monkeypatch.setattr(TUIApp, "active", property(lambda _app: busy))
 
     assert await app._slash_commands.dispatch_async(app, "/accounts") == ""
     assert app.accounts_picker_active
     output = StringIO()
-    Console(file=output, force_terminal=False, width=80).print(rendered[0])
+    Console(file=output, force_terminal=False, width=80).print(app._picker_card())
     plain = Text.from_ansi(output.getvalue()).plain
     assert "codex:first" in plain
     assert "codex:second" in plain
@@ -15529,11 +15515,6 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
-    app._presenter.print_unit = rendered.append
-    app._transcript.replace = lambda unit, replacement: (
-        rendered.append(replacement) or replacement
-    )
 
     refreshed = False
 
@@ -15549,7 +15530,7 @@ async def test_accounts_panel_renders_usage_and_refresh_results(
         while app._accounts_picker and app._accounts_picker.refreshing:
             await asyncio.sleep(0.01)
         output = StringIO()
-        Console(file=output, force_terminal=False, width=100).print(rendered[-1])
+        Console(file=output, force_terminal=False, width=100).print(app._picker_card())
         plain = Text.from_ansi(output.getvalue()).plain
         local_reset = reset.astimezone().strftime("%b %d %H:%M").lower()
         assert refreshed
@@ -15585,12 +15566,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
     loop.session_metadata = opened.metadata
     loop.account_context = context
     app = TUIApp(loop, provider="claude", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
     refresh_rendered = asyncio.Event()
-    app._presenter.print_unit = lambda panel: rendered.append(panel) or panel
-    app._transcript.replace = lambda unit, replacement: (
-        rendered.append(replacement) or replacement
-    )
     repaint = app._repaint_accounts_picker
 
     def repaint_and_signal() -> None:
@@ -15623,7 +15599,7 @@ async def test_accounts_refresh_renders_busy_lifecycle_lock(
             "account busy; retry after the other account operation finishes"
         )
         output = StringIO()
-        Console(file=output, force_terminal=False, width=100).print(rendered[-1])
+        Console(file=output, force_terminal=False, width=100).print(app._picker_card())
         plain = Text.from_ansi(output.getvalue()).plain
         assert "refresh failed: account busy" in plain
     finally:
@@ -15869,13 +15845,6 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
     loop = AgentLoop(FakeBackend([]), opened.store, skill_catalog=SkillCatalog.empty())
     loop.account_context = context
     app = TUIApp(loop, provider="codex", model="offline", zeta_home=home)
-    rendered: list[Panel] = []
-    app._presenter.print_unit = lambda renderable: (
-        rendered.append(renderable) or renderable
-    )
-    app._transcript.replace = lambda _unit, replacement: (
-        rendered.append(replacement) or replacement
-    )
     logout = AccountStore.logout
     off_loop_calls = 0
 
@@ -15892,7 +15861,7 @@ async def test_tui_accounts_logout_confirms_renders_and_runs_off_loop(
         app.accounts_picker_move(1)
         assert app.accounts_picker_logout() is None
         confirmation = StringIO()
-        Console(file=confirmation, force_terminal=False, width=160).print(rendered[-1])
+        Console(file=confirmation, force_terminal=False, width=160).print(app._picker_card())
         assert (
             "press x again to log out codex:removed"
             in Text.from_ansi(confirmation.getvalue()).plain
@@ -16204,12 +16173,13 @@ async def test_root_history_finder_pages_to_oldest_prompt(tmp_path: Path) -> Non
         )
         assert app._history_finder.finder_accept()
         assert buffer.text == "prompt-0"
-        assert len(app._prompt_history.pages) <= 2
+        assert len(app._agent_navigation.transcript_control.prompt_history.pages) <= 2
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "journey", ("up", "down", "edit", "in-flight", "in-flight-edit")
+    "journey",
+    ("up", "down", "edit", "in-flight", "in-flight-edit", "child-up", "child-down"),
 )
 async def test_cold_prompt_history_keys_follow_owned_navigation(
     tmp_path: Path,
@@ -16217,20 +16187,37 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ConversationStore(tmp_path / journey / "sessions")
-    prompts = ("oldest prompt", "middle prompt", "newest\nprompt")
+    child_journey = journey.startswith("child-")
+    prompts = (
+        tuple(f"child prompt {index}" for index in range(260))
+        if child_journey
+        else ("oldest prompt", "middle prompt", "newest\nprompt")
+    )
+    prompt_store = (
+        ConversationStore(store.session_dir / "agents", session_id="1")
+        if child_journey
+        else store
+    )
     for prompt in prompts:
-        store.append_message(
+        prompt_store.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent(prompt)]),
-                MessageOrigin.USER,
+                (
+                    MessageOrigin.AGENT_PROMPT
+                    if child_journey
+                    else MessageOrigin.USER
+                ),
             )
         )
-        store.append_message(
+        prompt_store.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent("agent notice")]),
                 MessageOrigin.AGENT_SEND,
             )
         )
+    child_path = prompt_store.session_dir if child_journey else None
+    if child_journey:
+        prompt_store.close()
 
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
@@ -16268,32 +16255,64 @@ async def test_cold_prompt_history_keys_follow_owned_navigation(
         async with owned_app(app) as owner:
             prompt_task = owner.task(asyncio.create_task(session.prompt_async()))
             await wait_until(lambda: session.app.is_running)
+            if child_path is not None:
+                navigation = app._agent_navigation
+                navigation.current_path = child_path
+                navigation._path_stack.append(child_path)
+                navigation._breadcrumb_labels.append("long child")
+                navigation.transcript_control.request_sync(
+                    child_path, app._invalidate_prompt
+                )
+                navigation._switch_transcript()
+                child_load = app._agent_navigation.transcript_control._load_task or getattr(
+                    navigation.transcript_control, "_sync_task", None
+                )
+                assert child_load is not None
+                await await_or_fail(
+                    child_load, what="focused child prompt source"
+                )
+                session.app.layout.focus(session.default_buffer)
+                if journey == "child-down":
+                    session.default_buffer.text = "exact child draft"
 
-            if journey in {"up", "down"}:
+            if journey in {"up", "down", "child-up", "child-down"}:
                 for index, expected in enumerate(reversed(prompts)):
                     before = processed_keys
                     pipe.send_text("\x1b[A")
-                    if index == 0:
+                    try:
                         await wait_until(
-                            lambda expected=expected: session.default_buffer.text == expected
+                            lambda expected=expected: (
+                                session.default_buffer.text == expected
+                            )
                         )
-                    else:
-                        await wait_until(
-                            lambda before=before: processed_keys > before
-                        )
+                    except AssertionError as exc:
+                        raise AssertionError(
+                            f"Up did not select prompt {expected!r}"
+                        ) from exc
+                    assert processed_keys > before
                     assert session.default_buffer.text == expected, (
                         f"Up did not select prompt {expected!r}"
                     )
-                if journey == "down":
-                    for expected in (*prompts[1:], ""):
+                if journey in {"down", "child-down"}:
+                    restored_draft = (
+                        "exact child draft" if journey == "child-down" else ""
+                    )
+                    for expected in (*prompts[1:], restored_draft):
                         before = processed_keys
+                        assert session.app.layout.has_focus(session.default_buffer)
                         pipe.send_text("\x1b[B")
-                        await wait_until(
-                            lambda before=before: processed_keys > before
-                        )
-                        assert session.default_buffer.text == expected, (
-                            f"Down did not select prompt {expected!r}"
-                        )
+                        try:
+                            await wait_until(
+                                lambda expected=expected: (
+                                    session.default_buffer.text == expected
+                                )
+                            )
+                        except AssertionError as exc:
+                            raise AssertionError(
+                                f"Down expected {expected!r}, got "
+                                f"{session.default_buffer.text!r}; "
+                                f"index={app._agent_navigation.transcript_control.prompt_history._index}"
+                            ) from exc
             elif journey == "edit":
                 pipe.send_text("\x1b[A")
                 await wait_until(lambda: session.default_buffer.text == prompts[-1])
@@ -16406,15 +16425,15 @@ async def test_root_prompt_history_skips_non_user_pages_in_one_scan(
             monkeypatch.setattr(store, "branch_refs", counted_branch_refs)
             buffer = Buffer()
             app._history_finder_open(buffer)
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task,
+                app._agent_navigation.transcript_control.prompt_history.finder_task,
                 what="initial empty ctrl+r prompt scan",
             )
             app._finder_input("nightly wipe")
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task,
+                app._agent_navigation.transcript_control.prompt_history.finder_task,
                 what="typed ctrl+r prompt scan",
             )
             if app._finder_prepare_task is not None:
@@ -16624,7 +16643,7 @@ def test_finish_and_handoff_cards_do_not_mark_short_detail() -> None:
 
 @pytest.mark.asyncio
 async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path / "sessions")
     store.append_message(
@@ -16656,6 +16675,18 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
             parent_id = entry_id
     store = ConversationStore(store.root_dir, session_id=store.session_id)
+    child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+    child_ids: list[str] = []
+    for index in range(700):
+        entry = child_store.append_message(
+            with_message_origin(
+                Message(MessageRole.USER, [TextContent(f"child-history-{index}")]),
+                MessageOrigin.USER,
+            )
+        )
+        child_ids.append(entry.id)
+    child_path = child_store.session_dir
+    child_store.close()
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -16670,27 +16701,27 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         assert "history-49999" in rendered
         assert "history-0" not in rendered
         assert len(app._transcript.units) <= 4 * 128
-        assert len(app._history_pager.pages) <= 4
-        assert len(app._history_pager.descriptors) <= 4
-        assert len(app._history_pager.scalar_tokens) == 6
+        assert len(app._agent_navigation.transcript_control.history_pager.pages) <= 4
+        assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
+        assert len(app._agent_navigation.transcript_control.history_pager.scalar_tokens) == 6
 
         for page_number in range(5):
             app._transcript.scroll_to_top()
             anchor = app._transcript.durable_scroll_anchor
             app._scroll_history_up()
             await asyncio.sleep(0)
-            reads = tuple(app._history_pager._loads.values())
+            reads = tuple(app._agent_navigation.transcript_control.history_pager._loads.values())
             assert len(reads) == 1
             await await_or_fail(
                 asyncio.gather(*reads),
                 what=f"older transcript page {page_number + 1}",
             )
             assert app._transcript.durable_scroll_anchor == anchor
-            assert len(app._history_pager.descriptors) <= 4
+            assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
 
-        matches = await app._history_pager.search("history-0")
+        matches = await app._agent_navigation.transcript_control.history_pager.search("history-0")
         assert [(match.entry_id, match.unit_ordinal) for match in matches]
-        await app._history_pager.reveal(matches[0].entry_id)
+        await app._agent_navigation.transcript_control.history_pager.reveal(matches[0].entry_id)
         app._render_resident_history()
         assert app._transcript.restore_durable_scroll_anchor(
             (matches[0].entry_id, matches[0].unit_ordinal, 0)
@@ -16701,35 +16732,35 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         app._active_finder = app._transcript
         app._start_finder_preparation(request)
         app._finder_input("history-")
-        assert app._history_search_task is not None
+        assert app._agent_navigation.transcript_control.search_task is not None
         await await_or_fail(
-            app._history_search_task,
+            app._agent_navigation.transcript_control.search_task,
             what="global transcript search",
         )
-        assert len(app._history_search_results) == 200
-        app._history_search_index = len(app._history_search_results) - 1
+        assert len(app._agent_navigation.transcript_control.search_results) == 200
+        app._agent_navigation.transcript_control.search_index = len(app._agent_navigation.transcript_control.search_results) - 1
         assert app._navigate_history_search(1)
-        assert app._history_search_task is not None
-        await await_or_fail(app._history_search_task, what="wrapped next search result")
-        assert app._history_search_index == 0
+        assert app._agent_navigation.transcript_control.search_task is not None
+        await await_or_fail(app._agent_navigation.transcript_control.search_task, what="wrapped next search result")
+        assert app._agent_navigation.transcript_control.search_index == 0
         assert app._navigate_history_search(-1)
-        assert app._history_search_task is not None
+        assert app._agent_navigation.transcript_control.search_task is not None
         await await_or_fail(
-            app._history_search_task,
+            app._agent_navigation.transcript_control.search_task,
             what="wrapped previous search result",
         )
-        assert app._history_search_index == len(app._history_search_results) - 1
+        assert app._agent_navigation.transcript_control.search_index == len(app._agent_navigation.transcript_control.search_results) - 1
 
         app._append_transcript(Text("live-tail"))
         page_number = 0
         async with asyncio.timeout(120):
-            while app._history_pager.can_load_newer:
+            while app._agent_navigation.transcript_control.history_pager.can_load_newer:
                 page_number += 1
                 assert page_number <= 500
                 app._transcript.scroll_to_bottom()
                 app._scroll_history_down()
                 await asyncio.sleep(0)
-                reads = tuple(app._history_pager._loads.values())
+                reads = tuple(app._agent_navigation.transcript_control.history_pager._loads.values())
                 assert len(reads) == 1
                 await await_or_fail(
                     asyncio.gather(*reads),
@@ -16740,6 +16771,70 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         assert "live-tail" in rendered
         assert "history-49999" in rendered
         assert app._transcript.follow_tail
+
+        from zeta.tui import agent_card as agent_card_module
+        from zeta.tui import checkpoints as checkpoints_module
+
+        provider_reads: list[int] = []
+        main_thread = threading.get_ident()
+        original_provider = checkpoints_module.session_replay_provider
+
+        def tracked_provider(path: Path) -> str | None:
+            provider_reads.append(threading.get_ident())
+            return original_provider(path)
+
+        monkeypatch.setattr(
+            checkpoints_module, "session_replay_provider", tracked_provider
+        )
+        monkeypatch.setattr(
+            agent_card_module,
+            "session_replay_provider",
+            tracked_provider,
+            raising=False,
+        )
+        navigation = app._agent_navigation
+        navigation.transcript_control.capture_root_view()
+        child_load = navigation.transcript_control.activate(child_path)
+        assert child_load is not None
+        await await_or_fail(child_load, what="focused child newest page")
+        child_transcript = navigation.transcript_control.transcript
+        rendered = Text.from_ansi(child_transcript.render(120)).plain
+        assert "child-history-699" in rendered
+        assert "child-history-0" not in rendered
+        assert all(
+            unit.entry_id in child_ids
+            or ":dependency:" in unit.entry_id
+            for page in app._agent_navigation.transcript_control.history_pager.pages
+            for unit in page.units
+        )
+        assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
+        app._render_active_resident_history()
+        app._render_active_resident_history()
+        assert len(provider_reads) == 1
+        assert provider_reads[0] != main_thread
+
+        matches = await app._agent_navigation.transcript_control.history_pager.search("child-history-0")
+        assert matches
+        await app._agent_navigation.transcript_control.history_pager.reveal(matches[0].entry_id)
+        app._render_active_resident_history()
+        assert child_transcript.restore_durable_scroll_anchor(
+            (matches[0].entry_id, matches[0].unit_ordinal, 0)
+        )
+        assert "child-history-0" in Text.from_ansi(
+            child_transcript.render(120)
+        ).plain
+        assert len(app._agent_navigation.transcript_control.history_pager.descriptors) <= 4
+        assert len(app._agent_navigation.transcript_control.history_pager.scalar_tokens) == 6
+
+        navigation.exit_navigation()
+        root_load = app._agent_navigation.transcript_control._load_task
+        assert root_load is not None
+        await await_or_fail(root_load, what="return to root history")
+        assert all(
+            unit.entry_id not in child_ids
+            for page in app._agent_navigation.transcript_control.history_pager.pages
+            for unit in page.units
+        )
 
 @pytest.mark.parametrize(
     "journey",
@@ -16754,6 +16849,14 @@ async def test_root_tui_resume_keeps_unresolved_lifecycle_history_bounded(
         "branch-prompt-reset",
         "branch-prompt-stale-fork",
         "branch-prompt-stale-tree",
+        "child-cancel-replace-close",
+        "child-stale-page",
+        "child-live-refresh",
+        "child-switch-mid-refresh",
+        "child-deleted-activation",
+        "child-commit-rollback",
+        "child-old-search",
+        "root-anchor-child-visit",
     ),
 )
 @pytest.mark.asyncio
@@ -16764,7 +16867,7 @@ async def test_root_tui_paging_render_path_table(
     failure_text = "needle-provider-failure"
     checkpoint = None
 
-    if journey == "stale-anchor":
+    if journey in {"stale-anchor", "root-anchor-child-visit"}:
         for index in range(300):
             store.append_message(
                 with_message_origin(
@@ -16865,7 +16968,611 @@ async def test_root_tui_paging_render_path_table(
     async with owned_app(app):
         assert await app._rebuild_transcript_async()
 
-        if journey == "stale-anchor":
+        if journey == "child-old-search":
+            child_store = ConversationStore(
+                store.session_dir / "agents", session_id="1"
+            )
+            old = child_store.append_message(
+                with_message_origin(
+                    Message(
+                        MessageRole.USER,
+                        [TextContent("Henry's old child prompt")],
+                    ),
+                    MessageOrigin.AGENT_PROMPT,
+                )
+            )
+            for index in range(300):
+                child_store.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"child search tail {index}")],
+                    )
+                )
+            child_path = child_store.session_dir
+            child_store.agent_lifecycle_path.write_text(
+                json.dumps({"description": "search child", "state": "running"})
+            )
+            child_store.close()
+            navigation = app._agent_navigation
+            navigation.current_path = child_path
+            navigation._path_stack.append(child_path)
+            navigation._breadcrumb_labels.append("search child")
+            navigation.transcript_control.request_sync(
+                child_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(
+                app._agent_navigation.transcript_control._load_task, what="focused child search activation"
+            )
+            session = app._make_session()
+            app._active_session = session
+            app._install_full_screen_layout(session)
+            navigation._switch_transcript()
+            session.layout.focus(navigation.transcript_window)
+
+            def press(key: Keys | str) -> None:
+                keys = key if isinstance(key, Keys) else tuple(key)
+                if isinstance(keys, Keys):
+                    session.app.key_processor.feed(KeyPress(keys))
+                else:
+                    for character in keys:
+                        session.app.key_processor.feed(
+                            KeyPress(character, data=character)
+                        )
+                session.app.key_processor.process_keys()
+
+            transcript = navigation.transcript_control.transcript
+            with set_app(session.app):
+                press(Keys.ControlF)
+                await wait_until(lambda: app._active_finder.finder_active)
+                press("Henry's old child prompt")
+                await wait_until(lambda: app._agent_navigation.transcript_control.search_task is not None)
+                await await_or_fail(
+                    app._agent_navigation.transcript_control.search_task, what="old focused child search"
+                )
+                try:
+                    await wait_until(
+                        lambda: (
+                            (state := transcript.finder_state()) is not None
+                            and state.complete
+                            and bool(state.rows)
+                        )
+                    )
+                except AssertionError as exc:
+                    raise AssertionError(
+                        "focused-child ctrl+f did not finish with the unloaded match"
+                    ) from exc
+                assert old.id in {
+                    match.entry_id for match in app._agent_navigation.transcript_control.search_results
+                }, "focused-child ctrl+f did not select the unloaded old row"
+                rendered = Text.from_ansi(transcript.render(120)).plain
+                assert "Henry's old child prompt" in rendered, (
+                    "selected old child row did not reach TranscriptWidget render"
+                )
+
+                app._finder_cancel()
+                await wait_until(lambda: transcript.finder_state() is None)
+                press(Keys.ControlF)
+                await wait_until(lambda: app._active_finder.finder_active)
+                previous_search = app._agent_navigation.transcript_control.search_task
+                press("absent-focused-child-query")
+                await wait_until(
+                    lambda: app._agent_navigation.transcript_control.search_task is not previous_search
+                )
+                await await_or_fail(
+                    app._agent_navigation.transcript_control.search_task, what="focused child no-match search"
+                )
+                await wait_until(
+                    lambda: (
+                        (state := transcript.finder_state()) is not None
+                        and state.complete
+                        and not state.rows
+                    )
+                )
+                content = app._finder_control.create_content(80, None)
+                overlay = "\n".join(
+                    "".join(fragment[1] for fragment in content.get_line(row))
+                    for row in range(content.line_count)
+                )
+                assert "no matches" in overlay, (
+                    "focused-child no-match ctrl+f did not render no matches"
+                )
+                session.layout.focus(session.default_buffer)
+        elif journey == "root-anchor-child-visit":
+            from zeta.tui import agent_card as agent_card_module
+
+            discovery_threads: list[int] = []
+            main_thread = threading.get_ident()
+            original_markers = agent_card_module.registered_child_markers
+            original_paths = agent_card_module.agent_child_paths
+            original_metadata = agent_card_module._agent_metadata
+
+            def tracked_markers(path: Path):
+                discovery_threads.append(threading.get_ident())
+                return original_markers(path)
+
+            def tracked_paths(path: Path, candidates):
+                discovery_threads.append(threading.get_ident())
+                return original_paths(path, candidates)
+
+            def tracked_metadata(path: Path, fallback=None):
+                discovery_threads.append(threading.get_ident())
+                return original_metadata(path, fallback)
+
+            monkeypatch.setattr(agent_card_module, "registered_child_markers", tracked_markers)
+            monkeypatch.setattr(agent_card_module, "agent_child_paths", tracked_paths)
+            # test-contract: seam prove navigation filesystem preparation stays off-loop
+            monkeypatch.setattr(agent_card_module, "_agent_metadata", tracked_metadata)
+
+            await app._agent_navigation.transcript_control.history_pager.load("older")
+            app._render_resident_history()
+            app._transcript.scroll_to_top()
+            root_anchor = app._transcript.durable_scroll_anchor
+            assert root_anchor is not None
+            assert Text.from_ansi(app._transcript.render(120)).plain.strip()
+
+            child_store = ConversationStore(
+                store.session_dir / "agents", session_id="1"
+            )
+            for index in range(700):
+                child_store.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"child visit {index}")],
+                    )
+                )
+            child_path = child_store.session_dir
+            child_store.close()
+            navigation = app._agent_navigation
+            activation = navigation.transcript_control.activate(child_path)
+            assert activation is not None
+            await await_or_fail(activation, what="child visit activation")
+            assert "child visit 699" in Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert discovery_threads
+            assert main_thread not in discovery_threads, (
+                "child navigation discovery or metadata read ran on the TUI loop"
+            )
+            await navigation.transcript_control.history_pager.load("older")
+            navigation.transcript_control.render_pages(
+                navigation.transcript_control.history_pager.pages
+            )
+            navigation.transcript_control.transcript.scroll_to_top()
+            child_anchor = navigation.transcript_control.transcript.durable_scroll_anchor
+            assert child_anchor is not None
+
+            session = app._make_session()
+            app._active_session = session
+            app._install_full_screen_layout(session)
+            navigation._switch_transcript()
+            session.layout.focus(navigation.transcript_window)
+            with set_app(session.app):
+                session.app.key_processor.feed(KeyPress("h", data="h"))
+                session.app.key_processor.process_keys()
+                await wait_until(lambda: not navigation.child_view_active)
+                await navigation.wait_for_publication()
+                assert app._transcript.durable_scroll_anchor == root_anchor, (
+                    "returning from child moved the root viewport to the tail"
+                )
+                assert Text.from_ansi(app._transcript.render(120)).plain.strip()
+                owner = navigation.transcript_control
+                retained_pages = len(owner.history_pager.descriptors)
+                assert retained_pages <= 4, (
+                    "root and child retained more than the one global page budget"
+                )
+
+                session.layout.focus(session.default_buffer)
+                session.app.key_processor.feed(KeyPress(Keys.Down))
+                session.app.key_processor.process_keys()
+                await wait_until(navigation.list_focused)
+                while navigation.entries[navigation.selected_index].path != child_path:
+                    session.app.key_processor.feed(KeyPress(Keys.Down))
+                    session.app.key_processor.process_keys()
+                session.app.key_processor.feed(KeyPress(Keys.Enter))
+                session.app.key_processor.process_keys()
+                await wait_until(lambda: navigation.child_view_active)
+                await navigation.wait_for_publication()
+                assert owner.transcript.durable_scroll_anchor == child_anchor, (
+                    "returning to a child lost its parked durable anchor"
+                )
+                assert owner.history_pager.source is owner._source
+                retained_pages = len(owner.history_pager.descriptors)
+                assert retained_pages <= 4, (
+                    "active child retained root descriptors outside the global page budget"
+                )
+                assert not app._transcript.units, (
+                    "active child left rendered units in the inactive root widget"
+                )
+
+                navigation.refresh(force=True)
+                await navigation.wait_for_publication()
+                assert discovery_threads
+                assert main_thread not in discovery_threads, (
+                    "open, return, or refresh discovery ran on the TUI loop thread"
+                )
+                rows = [
+                    int(number)
+                    for number in re.findall(
+                        r"child visit (\d+)",
+                        Text.from_ansi(owner.transcript.render(120)).plain,
+                    )
+                ]
+                assert rows == list(range(rows[0], rows[-1] + 1)), (
+                    "a refresh of a scrolled child dropped rows below the anchor"
+                )
+                assert owner.history_pager.can_load_newer, (
+                    "a refresh of a scrolled child stopped newer paging"
+                )
+                assert owner.transcript.durable_scroll_anchor == child_anchor
+
+                # A refresh tick after every scroll key must not move the view, and
+                # PageUp must keep loading older rows; "k" makes blank lines reach the top.
+                session.layout.focus(navigation.transcript_window)
+
+                def child_view() -> tuple[str, list[int]]:
+                    content = owner.create_content(120, 20)
+                    top_line = "".join(text for _, text in content.get_line(owner.offset))
+                    plain = Text.from_ansi(owner.transcript.render(120)).plain
+                    numbers = [int(n) for n in re.findall(r"child visit (\d+)", plain)]
+                    return top_line, numbers
+
+                top_line, rows = child_view()
+                for press in range(300):
+                    if rows[0] == 0:
+                        break
+                    key = KeyPress("k", data="k") if press % 2 else KeyPress(Keys.PageUp)
+                    session.app.key_processor.feed(key)
+                    session.app.key_processor.process_keys()
+                    if owner.offset == 0 and owner.history_pager.can_load_older:
+                        await wait_until(
+                            lambda top=rows[0]: child_view()[1][0] < top
+                        )
+                    top_line, rows = child_view()
+                    navigation.refresh(force=True)
+                    await navigation.wait_for_publication()
+                    assert child_view() == (top_line, rows), (
+                        "a refresh tick moved or reloaded the scrolled child view"
+                    )
+                assert rows == list(range(rows[-1] + 1)), (
+                    "child page-up stopped loading older rows after refresh ticks"
+                )
+        elif journey == "child-cancel-replace-close":
+            from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+
+            child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+            first_entry = child_store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("first search row")])
+            )
+            replacement_entry = child_store.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("replacement search row")])
+            )
+            child_path = child_store.session_dir
+            child_store.close()
+            source = ChildLogHistorySource(child_path)
+            started = threading.Event()
+            cancel_seen = threading.Event()
+            release = threading.Event()
+            original_search = source._search_sync
+
+            def blocked_search(*args: object):
+                query = args[-3]
+                cancel = args[-1]
+                assert isinstance(cancel, type(threading.Event()))
+                if query == "first":
+                    started.set()
+                    assert cancel.wait(10)
+                    cancel_seen.set()
+                    assert release.wait(10)
+                return original_search(*args)
+
+            # test-contract: seam force cancellation while the observer is open
+            monkeypatch.setattr(source, "_search_sync", blocked_search)
+            first = asyncio.create_task(source.search("first"))
+            assert await asyncio.to_thread(started.wait, 10)
+            first.cancel()
+            replacement = asyncio.create_task(source.search("replacement"))
+            closing = asyncio.create_task(source.close())
+            assert await asyncio.to_thread(cancel_seen.wait, 10)
+            await asyncio.sleep(0)
+            assert not first.done(), (
+                "cancelled search returned before its observer store closed"
+            )
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await await_or_fail(first, what="cancelled child search drain")
+            matches = await await_or_fail(
+                replacement, what="replacement child search"
+            )
+            await await_or_fail(closing, what="child source close")
+            assert [match.entry_id for match in matches] == [replacement_entry.id]
+            assert first_entry.id not in {match.entry_id for match in matches}
+        elif journey == "child-stale-page":
+            from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+            from zeta.tui.transcript.paged_history import PagedTranscriptHistory
+
+            child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+            for index in range(300):
+                child_store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent(f"child row {index}")])
+                )
+            child_path = child_store.session_dir
+            child_store.close()
+            source = ChildLogHistorySource(child_path)
+            pager = PagedTranscriptHistory(source)
+            first_page = await pager.load()
+            anchor_id = first_page.units[0].entry_id
+            pager.set_anchor(anchor_id, 0, 0)
+            replacement = child_path / "conversation.replacement"
+            shutil.copy2(source.path / "conversation.jsonl", replacement)
+            os.replace(replacement, source.path / "conversation.jsonl")
+
+            page = await pager.load("older")
+
+            assert page.units
+            assert len(pager.descriptors) == 1, (
+                "stale child pages were mixed with the replacement log"
+            )
+            assert anchor_id in {unit.entry_id for unit in pager.pages[0].units}
+            await source.close()
+        elif journey == "child-live-refresh":
+            child_store = ConversationStore(store.session_dir / "agents", session_id="1")
+            entry_ids = []
+            for index in range(300):
+                entry_ids.append(
+                    child_store.append_message(
+                        Message(
+                            MessageRole.ASSISTANT,
+                            [TextContent(f"running child row {index}")],
+                        )
+                    ).id
+                )
+            child_path = child_store.session_dir
+            child_store.close()
+            navigation = app._agent_navigation
+            navigation.current_path = child_path
+            navigation._path_stack.append(child_path)
+            navigation._breadcrumb_labels.append("running child")
+            navigation.transcript_control.request_sync(
+                child_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(
+                app._agent_navigation.transcript_control._load_task, what="running child activation"
+            )
+            await app._agent_navigation.transcript_control.history_pager.reveal(entry_ids[0])
+            app._render_active_resident_history()
+            child_transcript = navigation.transcript_control.transcript
+            assert child_transcript.restore_durable_scroll_anchor(
+                (entry_ids[0], 0, 0)
+            )
+            anchor = child_transcript.durable_scroll_anchor
+
+            appended = []
+            for tick in range(3):
+                text = f"running child refresh {tick}"
+                child_store = ConversationStore(
+                    store.session_dir / "agents", session_id="1"
+                )
+                child_store.append_message(
+                    Message(MessageRole.ASSISTANT, [TextContent(text)])
+                )
+                child_store.close()
+                appended.append(text)
+                previous_task = app._agent_navigation.transcript_control._load_task
+                navigation.refresh(force=True)
+                assert app._agent_navigation.transcript_control._load_task is not None
+                await await_or_fail(
+                    app._agent_navigation.transcript_control._load_task,
+                    what=f"running child live refresh {tick}",
+                )
+                assert app._agent_navigation.transcript_control._load_task is not previous_task, (
+                    f"running child refresh {tick} was suppressed"
+                )
+                assert child_transcript.durable_scroll_anchor == anchor, (
+                    f"running child refresh {tick} moved the scrolled-up viewport"
+                )
+
+            child_transcript.scroll_to_bottom()
+            navigation.refresh(force=True)
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(
+                app._agent_navigation.transcript_control._load_task, what="running child return to tail"
+            )
+            navigation.transcript_control.create_content(120, 20)
+            rendered = Text.from_ansi(child_transcript.render(120)).plain
+            assert all(text in rendered for text in appended), (
+                "running child did not publish every refresh batch"
+            )
+        elif journey == "child-switch-mid-refresh":
+            first = ConversationStore(store.session_dir / "agents", session_id="1")
+            first.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("first child row")])
+            )
+            first_path = first.session_dir
+            first.close()
+            second = ConversationStore(store.session_dir / "agents", session_id="2")
+            second.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("second child row")])
+            )
+            second_path = second.session_dir
+            second.close()
+            navigation = app._agent_navigation
+            first_activation = navigation.transcript_control.activate(first_path)
+            assert first_activation is not None
+            await await_or_fail(first_activation, what="first child activation")
+
+            from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+
+            original_page = ChildLogHistorySource.page
+            refresh_started = asyncio.Event()
+            refresh_release = asyncio.Event()
+            held = False
+
+            async def held_page(source, *args, **kwargs):
+                nonlocal held
+                if source.path == first_path and not held:
+                    held = True
+                    refresh_started.set()
+                    await asyncio.wait_for(refresh_release.wait(), 10)
+                return await original_page(source, *args, **kwargs)
+
+            monkeypatch.setattr(ChildLogHistorySource, "page", held_page)
+            navigation.refresh(force=True)
+            first_refresh = app._agent_navigation.transcript_control._load_task
+            assert first_refresh is not None
+            await asyncio.wait_for(refresh_started.wait(), 10)
+            second_activation = navigation.transcript_control.activate(second_path)
+            assert second_activation is not None and second_activation is not first_refresh
+            refresh_release.set()
+            await await_or_fail(second_activation, what="second child activation")
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "second child row" in rendered
+            assert "first child row" not in rendered
+            for tick in range(2):
+                second = ConversationStore(
+                    store.session_dir / "agents", session_id="2"
+                )
+                second.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"second child refresh {tick}")],
+                    )
+                )
+                second.close()
+                previous_task = app._agent_navigation.transcript_control._load_task
+                navigation.refresh(force=True)
+                assert app._agent_navigation.transcript_control._load_task is not None
+                await await_or_fail(
+                    app._agent_navigation.transcript_control._load_task,
+                    what=f"second child refresh after switch {tick}",
+                )
+                assert app._agent_navigation.transcript_control._load_task is not previous_task, (
+                    f"second child refresh {tick} after switch was suppressed"
+                )
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "second child refresh 1" in rendered
+        elif journey == "child-deleted-activation":
+            first = ConversationStore(store.session_dir / "agents", session_id="1")
+            first.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("first child only")])
+            )
+            first_path = first.session_dir
+            first.close()
+            second = ConversationStore(store.session_dir / "agents", session_id="2")
+            second_path = second.session_dir
+            second.close()
+            navigation = app._agent_navigation
+            navigation.current_path = first_path
+            navigation._path_stack.append(first_path)
+            navigation._breadcrumb_labels.append("first child")
+            navigation.transcript_control.request_sync(
+                first_path, app._invalidate_prompt
+            )
+            navigation._switch_transcript()
+            assert app._agent_navigation.transcript_control._load_task is not None
+            await await_or_fail(app._agent_navigation.transcript_control._load_task, what="first child activation")
+            assert "first child only" in Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+
+            shutil.rmtree(second_path)
+            failed_activation = navigation.transcript_control.activate(second_path)
+            assert failed_activation is not None
+            await await_or_fail(
+                failed_activation, what="deleted child activation"
+            )
+            navigation.transcript_control.create_content(120, 20)
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+
+            assert navigation.current_path == first_path
+            assert "first child only" in rendered, (
+                "failed target activation did not restore the leaving child"
+            )
+            assert "transcript unavailable" not in rendered
+
+            retry = ConversationStore(store.session_dir / "agents", session_id="2")
+            retry.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("retry child row")])
+            )
+            retry.close()
+            retry_activation = navigation.transcript_control.activate(second_path)
+            assert retry_activation is not None
+            await await_or_fail(
+                retry_activation, what="retry deleted child activation"
+            )
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "retry child row" in rendered
+            assert "transcript unavailable" not in rendered
+            for tick in range(2):
+                retry = ConversationStore(
+                    store.session_dir / "agents", session_id="2"
+                )
+                retry.append_message(
+                    Message(
+                        MessageRole.ASSISTANT,
+                        [TextContent(f"retry child refresh {tick}")],
+                    )
+                )
+                retry.close()
+                previous_task = app._agent_navigation.transcript_control._load_task
+                navigation.refresh(force=True)
+                assert app._agent_navigation.transcript_control._load_task is not None
+                await await_or_fail(
+                    app._agent_navigation.transcript_control._load_task,
+                    what=f"retry child refresh {tick}",
+                )
+                assert app._agent_navigation.transcript_control._load_task is not previous_task, (
+                    f"retry child refresh {tick} was suppressed"
+                )
+            rendered = Text.from_ansi(
+                navigation.transcript_control.transcript.render(120)
+            ).plain
+            assert "retry child refresh 1" in rendered
+        elif journey == "child-commit-rollback":
+            child = ConversationStore(store.session_dir / "agents", session_id="1")
+            child.append_message(
+                Message(MessageRole.ASSISTANT, [TextContent("rollback child row")])
+            )
+            child_path = child.session_dir
+            child.close()
+            navigation = app._agent_navigation
+            owner = navigation.transcript_control
+            root_entries = tuple(navigation.entries)
+            root_focus = app._active_session.layout.current_control
+            original_commit = owner._commit_path
+            assert original_commit is not None
+
+            def failing_commit(path, prepared, generation):
+                assert original_commit(path, prepared, generation)
+                raise RuntimeError("forced navigation commit failure")
+
+            owner._commit_path = failing_commit
+            activation = owner.activate(child_path)
+            assert activation is not None
+            with pytest.raises(RuntimeError, match="forced navigation commit failure"):
+                await await_or_fail(
+                    activation, what="forced child navigation commit failure"
+                )
+            owner._commit_path = original_commit
+
+            assert navigation.current_path == store.session_dir
+            assert navigation._path_stack == [store.session_dir]
+            assert tuple(navigation.entries) == root_entries
+            assert app._active_session.layout.current_control is root_focus
+            assert owner.history_pager.source is app._history_source
+            assert owner._source is None
+        elif journey == "stale-anchor":
             app._transcript.scroll_to_top()
             original_page = app._history_source.page
             started = asyncio.Event()
@@ -16885,12 +17592,12 @@ async def test_root_tui_paging_render_path_table(
             await await_or_fail(load, what="stale-anchor page read")
             assert app._transcript.durable_scroll_anchor == moved_anchor
         elif journey == "mixed-live-durable":
-            app._history_pager.reset(endpoint_id=durable.id)
-            app._history_pager.append_live(durable.id, Text("live-A"))
-            app._history_pager.append_live("live-B", Text("live-B"))
-            app._history_pager.append_live("live-C", Text("live-C"))
+            app._agent_navigation.transcript_control.history_pager.reset(endpoint_id=durable.id)
+            app._agent_navigation.transcript_control.history_pager.append_live(durable.id, Text("live-A"))
+            app._agent_navigation.transcript_control.history_pager.append_live("live-B", Text("live-B"))
+            app._agent_navigation.transcript_control.history_pager.append_live("live-C", Text("live-C"))
             page = await app._history_source.reveal(durable.id)
-            app._history_pager.adopt(page, direction="newer")
+            app._agent_navigation.transcript_control.history_pager.adopt(page, direction="newer")
             app._render_resident_history()
             rendered = Text.from_ansi(app._transcript.render(120)).plain
             assert "durable-A" in rendered
@@ -16903,8 +17610,8 @@ async def test_root_tui_paging_render_path_table(
             assert app._failed_turn[0] == "retry-target-user"
         elif journey == "tool-result-bound":
             assert sum(
-                len(page.units) for page in app._history_pager.pages
-            ) <= app._history_pager.max_segment_rows
+                len(page.units) for page in app._agent_navigation.transcript_control.history_pager.pages
+            ) <= app._agent_navigation.transcript_control.history_pager.max_segment_rows
             rendered = Text.from_ansi(app._transcript.render(120)).plain
             assert "result-127" in rendered
         elif journey == "close-search":
@@ -16922,8 +17629,8 @@ async def test_root_tui_paging_render_path_table(
                     finished.set()
 
             store.tui_history_search = blocked_search
-            task = asyncio.create_task(app._history_pager.search("search-row"))
-            app._history_search_task = task
+            task = asyncio.create_task(app._agent_navigation.transcript_control.history_pager.search("search-row"))
+            app._agent_navigation.transcript_control.search_task = task
             assert await asyncio.to_thread(started.wait, 10)
             await await_or_fail(
                 app._close_history_search(), what="close during history search"
@@ -16933,10 +17640,10 @@ async def test_root_tui_paging_render_path_table(
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(task, 10)
         elif journey == "unloaded-failed-search":
-            matches = await app._history_pager.search(failure_text)
+            matches = await app._agent_navigation.transcript_control.history_pager.search(failure_text)
             target = next(match for match in matches if match.entry_id == failed.id)
             assert target.unit_ordinal == 1
-            checkpoint_matches = await app._history_pager.search(
+            checkpoint_matches = await app._agent_navigation.transcript_control.history_pager.search(
                 "searchable-checkpoint"
             )
             checkpoint_target = checkpoint_matches[0]
@@ -16948,7 +17655,7 @@ async def test_root_tui_paging_render_path_table(
                 (target, failure_text),
                 (checkpoint_target, "searchable-checkpoint"),
             ):
-                await app._history_pager.reveal(search_target.entry_id)
+                await app._agent_navigation.transcript_control.history_pager.reveal(search_target.entry_id)
                 app._render_resident_history()
                 assert app._transcript.restore_durable_scroll_anchor(
                     (search_target.entry_id, search_target.unit_ordinal, 0)
@@ -16975,15 +17682,15 @@ async def test_root_tui_paging_render_path_table(
             # The reveal also pages in the rows after the failure, so the view
             # agrees with a full replay: later rows close the retry offer.
             assert app._failed_turn is None
-            await app._history_pager.reveal(target.entry_id)
+            await app._agent_navigation.transcript_control.history_pager.reveal(target.entry_id)
             app._render_resident_history()
             assert "retry-target-user" in Text.from_ansi(app._transcript.render(120)).plain
         elif journey == "branch-prompt-reset":
-            app._prompt_history.bind(
+            app._agent_navigation.transcript_control.prompt_history.bind(
                 app._viewed_session_path(), app._history_source
             )
-            await app._prompt_history.load_older()
-            assert "branch-a-prompt" in app._prompt_history.snapshot(
+            await app._agent_navigation.transcript_control.prompt_history.load_older()
+            assert "branch-a-prompt" in app._agent_navigation.transcript_control.prompt_history.snapshot(
                 app._viewed_session_path()
             )
             assert await app.slash_fork("branch-base") == (
@@ -16997,15 +17704,15 @@ async def test_root_tui_paging_render_path_table(
             )
             assert await app._rebuild_transcript_async()
 
-            await app._prompt_history.load_older()
+            await app._agent_navigation.transcript_control.prompt_history.load_older()
             buffer = Buffer()
             app._history_previous(buffer)
             assert buffer.text == "branch-b-prompt"
             finder_buffer = Buffer(document=Document("branch-a-prompt"))
             app._history_finder_open(finder_buffer)
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task, what="branch prompt finder reset"
+                app._agent_navigation.transcript_control.prompt_history.finder_task, what="branch prompt finder reset"
             )
             state = app._history_finder.finder_state()
             assert state is not None
@@ -17051,7 +17758,7 @@ async def test_root_tui_paging_render_path_table(
 
             monkeypatch.setattr(app._history_finder, "set_snapshot", record_snapshot)
             app._history_finder_open(Buffer(document=Document("branch-a-prompt")))
-            scan = getattr(app._prompt_history, "finder_task", None) or getattr(
+            scan = getattr(app._agent_navigation.transcript_control.prompt_history, "finder_task", None) or getattr(
                 app, "_history_prompt_task", None
             )
             assert scan is not None
@@ -17089,7 +17796,7 @@ async def test_root_tui_paging_render_path_table(
             published.clear()
             finder_buffer = Buffer(document=Document("branch-b-prompt"))
             app._history_finder_open(finder_buffer)
-            new_scan = getattr(app._prompt_history, "finder_task", None) or getattr(
+            new_scan = getattr(app._agent_navigation.transcript_control.prompt_history, "finder_task", None) or getattr(
                 app, "_history_prompt_task", None
             )
             assert new_scan is not None
@@ -17099,9 +17806,9 @@ async def test_root_tui_paging_render_path_table(
         else:
             buffer = Buffer(document=Document("oldest-needle"))
             app._history_finder_open(buffer)
-            assert app._prompt_history.finder_task is not None
+            assert app._agent_navigation.transcript_control.prompt_history.finder_task is not None
             await await_or_fail(
-                app._prompt_history.finder_task, what="bounded ctrl+r source scan"
+                app._agent_navigation.transcript_control.prompt_history.finder_task, what="bounded ctrl+r source scan"
             )
             if app._finder_prepare_task is not None:
                 await await_or_fail(
@@ -17115,7 +17822,7 @@ async def test_root_tui_paging_render_path_table(
             assert state is not None
             assert state.total <= 200
             assert any("oldest-needle" in row.excerpt for row in state.rows)
-            assert len(app._prompt_history.pages) <= 2
+            assert len(app._agent_navigation.transcript_control.prompt_history.pages) <= 2
 
 
 @pytest.mark.asyncio
@@ -17161,3 +17868,68 @@ async def test_root_tui_page_uses_nearest_duplicate_tool_call_dependency(
         assert "old.txt" not in rendered
         assert rendered.count("new.txt") == 1
         assert rendered.count("nearest result") == 1
+
+
+@pytest.mark.asyncio
+async def test_child_activation_discards_stale_slow_target_and_returns_to_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    store.append_message(
+        with_message_origin(
+            Message(MessageRole.USER, [TextContent("root owner row")]),
+            MessageOrigin.USER,
+        )
+    )
+    first = ConversationStore(store.session_dir / "agents", session_id="1")
+    first.append_message(Message(MessageRole.ASSISTANT, [TextContent("first row")]))
+    first_path = first.session_dir
+    first.close()
+    second = ConversationStore(store.session_dir / "agents", session_id="2")
+    second.append_message(Message(MessageRole.ASSISTANT, [TextContent("second row")]))
+    second_path = second.session_dir
+    second.close()
+
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        resumed=True,
+    )
+    app._active_session = app._make_session()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    from zeta.tui.transcript.child_history_source import ChildLogHistorySource
+
+    original_page = ChildLogHistorySource.page
+
+    async def held_second_page(self, *args, **kwargs):
+        if self.path == second_path:
+            started.set()
+            await asyncio.wait_for(release.wait(), 10)
+        return await original_page(self, *args, **kwargs)
+
+    monkeypatch.setattr(ChildLogHistorySource, "page", held_second_page)
+    async with owned_app(app):
+        assert await app._rebuild_transcript_async()
+        navigation = app._agent_navigation
+        first_activation = navigation.transcript_control.activate(first_path)
+        assert first_activation is not None
+        await await_or_fail(first_activation, what="first child activation")
+
+        second_activation = navigation.transcript_control.activate(second_path)
+        assert second_activation is not None
+        await asyncio.wait_for(started.wait(), 10)
+        root_activation = navigation.transcript_control.activate(navigation.root_path)
+        assert root_activation is not None
+        release.set()
+        await await_or_fail(root_activation, what="root activation over slow child")
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(second_activation, 10)
+
+        rendered = Text.from_ansi(app._transcript.render(120)).plain
+        assert navigation.current_path == navigation.root_path
+        assert navigation._path_stack == [navigation.root_path]
+        assert navigation.transcript_control._history_pager.source is app._history_source
+        assert "root owner row" in rendered
+        assert "first row" not in rendered and "second row" not in rendered

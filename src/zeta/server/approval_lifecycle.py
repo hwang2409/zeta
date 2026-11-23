@@ -880,6 +880,16 @@ class ApprovalLifecycle:
         self, key: ApprovalKey, reason: str
     ) -> dict[str, str] | None:
         admitted = self._begin_cancel(key, reason)
+        policy = self._policy()
+        # A durable request recovered after a restart has no live record yet;
+        # build it as a decision would, so the abort publishes its end.
+        if (
+            admitted is None
+            and isinstance(key, str)
+            and policy is not None
+            and await self._record_for_decision(key, policy) is not None
+        ):
+            admitted = self._begin_cancel(key, reason)
         if admitted is None:
             return None
         return await asyncio.shield(admitted)

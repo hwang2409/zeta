@@ -51,6 +51,7 @@ from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_session_agents
+from ..telemetry import Telemetry
 from ..tools._shared.background_task_types import BackgroundTaskNotice
 from ..tools._shared.run_work import background_task_row
 from .protocol import EventDescriptor
@@ -236,7 +237,11 @@ class ServerRuntime:
         self._approval_control_binder: ApprovalControlBinder | None = None
         self._memory_notice_sink: MemoryNoticeSink | None = None
         self._run_work_event_sink: RunWorkEventSink | None = None
+        self._work_changed_sink: Callable[[], None] | None = None
         self._setup_reapers: set[asyncio.Task[None]] = set()
+        # process telemetry is owned elsewhere (ZetaServer or the borrowed loop);
+        # the runtime only reads it through this getter
+        self._telemetry_source: Callable[[], Telemetry] = Telemetry.disabled
 
     def backend_for_model(
         self,
@@ -306,6 +311,7 @@ class ServerRuntime:
         runtime.manager = SessionManager(runtime.home, owner_surface="serve")
         runtime._project_registry_probed = True
         runtime._init_sinks()
+        runtime._telemetry_source = lambda: loop.telemetry
         runtime._state = SessionState(
             opened=opened,
             loop=loop,
@@ -313,6 +319,23 @@ class ServerRuntime:
             project_dir=project_dir,
             repo_root=repo_root,
         )
+        return runtime
+
+    def sibling(self) -> ServerRuntime:
+        """An empty runtime with this one's settings and manager; no I/O, so the
+        event loop may call it (the provider is already resolved)."""
+        runtime = type(self).__new__(type(self))
+        for name in (
+            "home", "cwd", "_server_provider", "_server_model", "_server_tools",
+            "_server_disallowed_tools", "_require_tools", "_allow_hooks",
+            "_auto_memory", "_cli_yolo", "_max_turns", "_test_scripted_provider",
+            "backend_factory", "manager", "retention_event_sink", "retention_wake",
+        ):
+            if hasattr(self, name):
+                setattr(runtime, name, getattr(self, name))
+        runtime._project_registry_probed = True
+        runtime._state = None
+        runtime._init_sinks()
         return runtime
 
     @property
@@ -416,6 +439,21 @@ class ServerRuntime:
 
     def set_run_work_event_sink(self, sink: RunWorkEventSink | None) -> None:
         self._run_work_event_sink = sink
+        if self._state is not None:
+            self._bind_background_event_sink(self._state)
+
+    @property
+    def telemetry(self) -> Telemetry:
+        return self._telemetry_source()
+
+    def set_telemetry_source(self, source: Callable[[], Telemetry]) -> None:
+        """Borrow the owner's process telemetry; read live, so a later configure shows."""
+        self._telemetry_source = source
+
+    def set_work_changed_sink(self, sink: Callable[[], None] | None) -> None:
+        """Attach the callback for work that ended without an event (a task exit
+        delivery that settled); it may run on any thread."""
+        self._work_changed_sink = sink
         if self._state is not None:
             self._bind_background_event_sink(self._state)
 
@@ -762,8 +800,6 @@ class ServerRuntime:
             registry.set_notice_sink(task_changed)
 
             def committed_task_changed(notice: BackgroundTaskNotice) -> None:
-                if notice.phase != "stopping":
-                    return
                 task = next((item for item in registry.snapshot() if item.task_id == notice.task_id), None)
                 if task is not None:
                     run_work_sink(
@@ -776,6 +812,7 @@ class ServerRuntime:
             state.opened.store.set_todo_change_sink(
                 lambda todo: run_work_sink(session_id, EventDescriptor.TODO_UPDATED, {"todo": [dict(item) for item in todo]})
             )
+        registry.set_exit_delivery_settled_sink(self._work_changed_sink)
         sink = self._background_event_sink
         wake_sink = self._background_wake_sink
         if sink is None:
@@ -837,6 +874,7 @@ class ServerRuntime:
             auto_project=False,
             project_id=project_id,
             on_plan_mode_change=persist_plan_mode,
+            telemetry=self.telemetry,
             require_selected_account=(
                 self.backend_factory is None and not self._test_scripted_provider
             ),
@@ -857,8 +895,9 @@ class ServerRuntime:
         ollama_base_url: str | None = None,
         token_budget: int | None = None,
         account: AccountId | None = None,
+        use_backend_factory: bool = True,
     ) -> tuple[CompletionBackend, str]:
-        if self.backend_factory is not None:
+        if use_backend_factory and self.backend_factory is not None:
             return self.backend_factory(provider, model, home)
         if self._test_scripted_provider:
             from ..models.catalog import default_model

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import aclosing, contextmanager
@@ -57,16 +58,21 @@ from .protocol import (
     bound_reconnect_approvals,
     bounded,
 )
+from .session_replay.in_flight import InFlightReply
 from .session_replay.rows import RowFacts
 
 if TYPE_CHECKING:
     from ..mcp import MCPServerConfig
+    from .runtime import ServerRuntime
     from .server import ZetaServer
 
 USER_MESSAGE_MAX_BYTES = 262_144
 CONTROLLER_HANDOFF_DEADLINE_SECONDS = 10.0
 
 NotificationSender = Callable[..., Awaitable[bool]]
+
+
+logger = logging.getLogger(__name__)
 
 
 class NotificationPresentation:
@@ -122,9 +128,13 @@ class ServeControl:
     def __init__(
         self,
         server: ZetaServer,
+        runtime: ServerRuntime,
         foreground_event_publisher: ForegroundEventPublisher,
     ) -> None:
         self.server = server
+        self.runtime = runtime
+        # this control's unfinished reply; a join reads the attached control's
+        self.in_flight = InFlightReply()
         self.foreground_event_publisher = foreground_event_publisher
         self._turn_task: asyncio.Task[None] | None = None
         # The scheduled notification turn; a send may preempt it before it starts.
@@ -163,12 +173,12 @@ class ServeControl:
         self._approvals = ApprovalLifecycle(
             admit=lambda *args, **kwargs: self._admit_controller(*args, **kwargs),
             request_turn_failure=self.request_turn_failure,
-            policy=lambda: self.server.runtime.policy,
-            session_id=lambda: self.server.runtime.session_id
-            if self.server.runtime.opened is not None
+            policy=lambda: self.runtime.policy,
+            session_id=lambda: self.runtime.session_id
+            if self.runtime.opened is not None
             else None,
-            parent_store=lambda: self.server.runtime.opened.store
-            if self.server.runtime.opened is not None
+            parent_store=lambda: self.runtime.opened.store
+            if self.runtime.opened is not None
             else None,
             offload=lambda job: self._run_blocking(job),
             is_closing=lambda: self.closing,
@@ -185,7 +195,7 @@ class ServeControl:
         allow_assistant_reset: bool = True,
     ) -> None:
         host_commands = self._active_host_commands
-        loop = self.server.runtime.loop
+        loop = self.runtime.loop
         if (
             self._turn_end_published
             and loop is not None
@@ -206,13 +216,64 @@ class ServeControl:
                 allow_assistant_reset=allow_assistant_reset,
             )
         )
+        self._turn_task.add_done_callback(self._turn_done)
         connections = self.server.connections
-        session_id = self.server.runtime.session_id
+        session_id = self.runtime.session_id
         if connections is not None and session_id is not None:
             connections.close_deferred_replay_when_done(session_id, self._turn_task)
 
     def unhealthy(self) -> bool:
         return self._approvals.state.health is not None
+
+    @property
+    def attached(self) -> bool:
+        """This pair is the client's session; a parked pair sends no frame."""
+        return self.server.control is self
+
+    def pair_state(self) -> str:
+        state = self.runtime.state
+        return (
+            "idle"
+            if self.unhealthy() or state is None
+            else "running" if self.state_change_busy() else state.status
+        )
+
+    def parked_row(self) -> dict[str, object]:
+        """This pair's row in ``status.parked_sessions``."""
+        return {
+            "session_id": self.runtime.session_id,
+            "state": self.pair_state(),
+            "pending_approvals": len(self.pending_approvals_now()),
+        }
+
+    def holds_work(self) -> bool:
+        """Closing this pair now would cut work: a turn, a wake, an approval, a
+        background child or task, or a task exit not yet delivered."""
+        loop = self.runtime.loop
+        if loop is None:
+            return False
+        return (
+            any(
+                task is not None and not task.done()
+                for task in (self._turn_task, self._turn_handoff_task)
+            )
+            or loop.notification_turn_state != "idle"
+            or self.has_pending_approvals()
+            or loop.has_running_work
+            # not ``receipt_pending``: it stays set after a failed delivery, so the
+            # next open recovers the exit; closing the pair is the way to that retry
+            or loop.tool_registry.background_tasks.exit_delivery_pending
+        )
+
+    def _turn_done(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            logger.error("serve turn task failed", exc_info=exc)
+        self._maybe_idle()
+
+    def _maybe_idle(self) -> None:
+        """Ask the server to report this parked pair's state and close it once
+        idle; loop thread only."""
+        self.server.parking.changed(self)
 
     def _reject_if_unhealthy(self) -> None:
         self._approvals.reject_if_unhealthy()
@@ -238,7 +299,7 @@ class ServeControl:
 
     def request_turn_failure(self) -> None:
         """Request whole-session cancellation without joining teardown."""
-        loop = self.server.runtime.loop
+        loop = self.runtime.loop
         if loop is not None:
             loop.abort(steering_drop_reason=None)
         task = self._turn_task
@@ -246,7 +307,7 @@ class ServeControl:
             self._turn_cancel_outcome = TurnOutcome.SESSION_CANCELED
 
     def turn_busy(self) -> bool:
-        loop = self.server.runtime.loop
+        loop = self.runtime.loop
         return (
             self._session_swap_active
             or (
@@ -304,7 +365,7 @@ class ServeControl:
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY, "a turn is already running"
             )
-        state = self.server.runtime.state
+        state = self.runtime.state
         session_id = None if state is None else state.session_id
         self._session_swap_active = True
         self._session_swap_id = session_id
@@ -318,7 +379,7 @@ class ServeControl:
 
     def model_input_registrar(self, features: frozenset[str]):
         return self._model_inputs.registrar(
-            self.server.runtime.session_id,
+            self.runtime.session_id,
             enabled="model_input_ids" in features,
         )
 
@@ -398,14 +459,15 @@ class ServeControl:
         return task
 
     async def controller_claimed(
-        self, *, reconnect: bool = False, require_host_binding: bool = False
+        self, *, reconnect: bool = False, require_host_binding: bool = False,
+        deadline: float | None = None,
     ) -> bool:
+        if deadline is None:
+            deadline = CONTROLLER_HANDOFF_DEADLINE_SECONDS
         release = self._controller_release_task
         if release is not None:
             try:
-                await asyncio.wait_for(
-                    asyncio.shield(release), CONTROLLER_HANDOFF_DEADLINE_SECONDS
-                )
+                await asyncio.wait_for(asyncio.shield(release), deadline)
             except TimeoutError:
                 return False
             if self._controller_release_task is release:
@@ -435,11 +497,9 @@ class ServeControl:
         configs: dict[str, MCPServerConfig],
     ) -> None:
         """Re-bind the active session's released MCP headers for a returning client."""
-        loop = self.server.runtime.loop
+        loop = self.runtime.loop
         assert loop is not None
-        # set_mcp_bindings cancels a running mount, which would kill a wake waiting on it
-        await loop.finish_mcp_mount()
-        await loop.set_mcp_bindings(headers, configs)
+        await loop.rebind_mcp(headers, configs)
         self._end_grace_deadline()
         await loop._ensure_mcp_servers()
         self._active_mcp_bindings = headers
@@ -475,7 +535,7 @@ class ServeControl:
         )
 
         async def clear_mcp() -> None:
-            loop = self.server.runtime.loop
+            loop = self.runtime.loop
             if loop is not None:
                 await loop.clear_mcp_bindings(hold=hold)
         clear_task = asyncio.create_task(clear_mcp()) if had_mcp_bindings else None
@@ -567,7 +627,7 @@ class ServeControl:
 
     async def _disconnect_turn(self) -> None:
         if self._turn_task is not None and not self._turn_task.done():
-            loop = self.server.runtime.loop
+            loop = self.runtime.loop
             if loop is not None:
                 loop.abort(steering_drop_reason=None)
             self._turn_cancel_outcome = TurnOutcome.DISCONNECTED
@@ -619,7 +679,7 @@ class ServeControl:
             event_contract.AUXILIARY_WIRE_EVENTS[
                 event_contract.AuxiliaryEvent.USER_MESSAGE
             ],
-            self.server.runtime.session_id,
+            self.runtime.session_id,
             replay_row=RowFacts(delivery_id=delivery_id)
             if delivery_id is not None
             else RowFacts(seq=self._row_mark(), origin=origin),
@@ -628,7 +688,7 @@ class ServeControl:
 
     def _row_mark(self) -> int | None:
         """The newest resident row seq; a publish-first row installs after it."""
-        opened = self.server.runtime.opened
+        opened = self.runtime.opened
         return None if opened is None else opened.store.active_branch_head_sequence()
 
     def _close_deferred_replay(self, session_id: str | None) -> None:
@@ -636,10 +696,9 @@ class ServeControl:
 
         The turn's unfinished reply ends too: a cancel publishes no agent_end.
         """
+        self.in_flight.end_run()
         connections = self.server.connections
-        if connections is not None:
-            connections.in_flight.end_run()
-        if connections is not None and session_id is not None:
+        if connections is not None and session_id is not None and self.attached:
             connections.release_deferred_replay(session_id, close=True)
 
     async def _run_blocking(self, job: Callable[[], object]) -> object:
@@ -661,8 +720,8 @@ class ServeControl:
     async def resolve_approval(
         self, method: ApprovalDecision, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
-        loop = self.server.runtime.loop
-        policy = self.server.runtime.policy
+        loop = self.runtime.loop
+        policy = self.runtime.policy
         if loop is None or policy is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
         result, core_key = await self._approvals.transition(
@@ -684,15 +743,16 @@ class ServeControl:
             and loop.prepare_resume_pending_tool(state[0])
         ):
             host_commands = self._active_host_commands
-            if self.server.runtime.state is not None:
-                self.server.runtime.state.tool_started()
+            if self.runtime.state is not None:
+                self.runtime.state.tool_started()
             self._turn_task = asyncio.create_task(
                 self._resume_tool(core_key, host_commands, turn_id=uuid.uuid4().hex)
             )
+            self._turn_task.add_done_callback(self._turn_done)
         return result
 
     async def _publish_session_grant(self, tool: str) -> None:
-        policy = self.server.runtime.policy
+        policy = self.runtime.policy
         if policy is not None:
             await self.publish_session_grant_change(
                 session_grant_change(policy, "grant", (tool,))
@@ -700,15 +760,15 @@ class ServeControl:
 
     async def publish_session_grant_change(self, change: SessionGrantChange) -> None:
         connections = self.server.connections
-        session_id = self.server.runtime.session_id
-        if connections is None or session_id is None:
+        session_id = self.runtime.session_id
+        if connections is None or session_id is None or not self.attached:
             return
         await connections.publish_feature_event(
             FEATURE, EVENT, session_id, data=event_data(change, session_id)
         )
 
     async def publish_session_grant_reset(self) -> None:
-        policy = self.server.runtime.policy
+        policy = self.runtime.policy
         if policy is not None:
             await self.publish_session_grant_change(
                 session_grant_change(policy, "reset")
@@ -741,7 +801,7 @@ class ServeControl:
     async def abort(
         self, scope: abort_scope.AbortScope = "session"
     ) -> dict[str, object]:
-        session_id = self.server.runtime.session_id
+        session_id = self.runtime.session_id
         outcome = (
             TurnOutcome.FOREGROUND_CANCELED
             if scope == "foreground"
@@ -756,7 +816,7 @@ class ServeControl:
         aborted = await abort_scope.abort_active_turn(
             turn_task,
             scope=scope,
-            loop=self.server.runtime.loop,
+            loop=self.runtime.loop,
             terminate_approvals=functools.partial(
                 self._terminate_pending_approvals, reason="turn_canceled"
             ),
@@ -788,8 +848,8 @@ class ServeControl:
         turn_id: str,
         allow_assistant_reset: bool = True,
     ) -> None:
-        loop = self.server.runtime.loop
-        state = self.server.runtime.state
+        loop = self.runtime.loop
+        state = self.runtime.state
         if loop is None or state is None:
             return
         session_id = state.session_id
@@ -850,11 +910,8 @@ class ServeControl:
                 terminal_error = None
                 agent_end = None
             self._close_deferred_replay(session_id)
-            await self.deliveries.finalize_turn(
-                session_id,
-                state,
-                turn_id,
-                outcome,
+            outcome = await self.deliveries.finalize_or_fail(
+                session_id, state, turn_id, outcome
             )
         if terminal_error is not None:
             await self._notify(
@@ -875,8 +932,8 @@ class ServeControl:
     def _schedule_background_wake(self, session_id: str) -> None:
         if self.closing or self._session_swap_id == session_id:
             return
-        loop = self.server.runtime.loop
-        state = self.server.runtime.state
+        loop = self.runtime.loop
+        state = self.runtime.state
         if loop is None or state is None or state.session_id != session_id:
             return
         host_commands = self._active_host_commands
@@ -890,6 +947,7 @@ class ServeControl:
                 session_id, host_commands, turn_id=uuid.uuid4().hex
             )
         )
+        self._turn_task.add_done_callback(self._turn_done)
 
     async def _run_notification_turn(
         self,
@@ -898,8 +956,8 @@ class ServeControl:
         *,
         turn_id: str,
     ) -> None:
-        loop = self.server.runtime.loop
-        state = self.server.runtime.state
+        loop = self.runtime.loop
+        state = self.runtime.state
         if loop is None or state is None or state.session_id != session_id:
             return
         outcome = TurnOutcome.FAILED
@@ -933,7 +991,7 @@ class ServeControl:
             # a second change can take the hold before this wake resumes
             while self._state_changes:
                 await self._no_state_change.wait()
-            if self.server.runtime.loop is not loop:
+            if self.runtime.loop is not loop:
                 return  # a session change ran while this wake waited
             self._wake_admitted = True
             success, agent_end = await self.server.turn_contexts.run_notification_turn(
@@ -971,11 +1029,8 @@ class ServeControl:
             self._wake_admitted = False
             if started:
                 self._close_deferred_replay(session_id)
-                await self.deliveries.finalize_turn(
-                    session_id,
-                    state,
-                    turn_id,
-                    outcome,
+                outcome = await self.deliveries.finalize_or_fail(
+                    session_id, state, turn_id, outcome
                 )
         for event in terminal_events:
             await self._event(event, session_id=session_id, turn_id=turn_id)
@@ -985,7 +1040,7 @@ class ServeControl:
             await self.deliveries.continue_after_turn(session_id, state)
 
     async def _attach_pending_notifications(self) -> None:
-        runtime = self.server.runtime
+        runtime = self.runtime
         loop = runtime.loop
         if loop is None or runtime.state is None:
             return
@@ -999,8 +1054,8 @@ class ServeControl:
         *,
         turn_id: str,
     ) -> None:
-        loop = self.server.runtime.loop
-        state = self.server.runtime.state
+        loop = self.runtime.loop
+        state = self.runtime.state
         if loop is None or state is None:
             return
         session_id = state.session_id
@@ -1038,11 +1093,8 @@ class ServeControl:
             if event_tasks:
                 await asyncio.gather(*event_tasks, return_exceptions=True)
             self._close_deferred_replay(session_id)
-            await self.deliveries.finalize_turn(
-                session_id,
-                state,
-                turn_id,
-                outcome,
+            outcome = await self.deliveries.finalize_or_fail(
+                session_id, state, turn_id, outcome
             )
         if agent_end is not None:
             await self._event(agent_end, session_id=session_id, turn_id=turn_id)
@@ -1069,7 +1121,7 @@ class ServeControl:
         background: bool = False,
         turn_id: str | None = None,
     ) -> None:
-        state = self.server.runtime.state
+        state = self.runtime.state
         if session_id is None and not background and state is not None:
             session_id = state.session_id
         foreground = (
@@ -1087,7 +1139,7 @@ class ServeControl:
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
         connections = getattr(self.server, "connections", None)
         # updated in the loop step that publishes, so a join's snapshot is exact
-        in_flight = connections.in_flight if foreground and connections is not None else None
+        in_flight = self.in_flight if foreground else None
         if in_flight is not None:
             if kind is StreamEventType.AGENT_START:
                 in_flight.start_run(session_id)
@@ -1119,7 +1171,7 @@ class ServeControl:
             return
         if kind is StreamEventType.MESSAGE_END:
             if foreground and not event.data.get("truncated"):
-                await model_selection.confirm(self.server.runtime)
+                await model_selection.confirm(self.runtime)
             usage = event.data.get("usage")
             if foreground and isinstance(usage, Mapping) and usage:
                 state.usage.update(usage)
@@ -1168,7 +1220,14 @@ class ServeControl:
             await self._notify(
                 wire_event,
                 session_id,
-                **event_contract.tool_start(event, fidelity=fidelity),
+                **event_contract.tool_start(
+                    event,
+                    fidelity=fidelity,
+                    approval_origin=(
+                        controller is not None
+                        and "tool_approval_origin" in controller.features
+                    ),
+                ),
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_END:
@@ -1213,12 +1272,12 @@ class ServeControl:
             )
             login_provider = None
             if foreground and event.error is not None:
-                failed_provider = self.server.runtime.metadata.provider
+                failed_provider = self.runtime.metadata.provider
                 offers_login = event.error.provider_error and (
                     event.error.code == "auth_error" or event.error.status_code == 401
                 )
                 recovered = await model_selection.recover_async(
-                    self.server.runtime, event.error
+                    self.runtime, event.error
                 )
                 if self._protocol_version() != "1.0":
                     error = recovered
@@ -1260,6 +1319,7 @@ class ServeControl:
 
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
         """Schedule child events from the loop's synchronous sink."""
+        self._maybe_idle()
         if not self.closing:
             asyncio.create_task(
                 self._event(event, session_id=session_id, background=True)
@@ -1270,6 +1330,8 @@ class ServeControl:
         if connections is None:
             return
         def publish() -> None:
+            # the sink may run on a worker thread; check idleness on the loop
+            self._maybe_idle()
             controller = connections.controller_metadata()
             if not self.closing and controller is not None and "run_work" in controller.features:
                 if event is EventDescriptor.BACKGROUND_TASK_UPDATED:
@@ -1302,7 +1364,9 @@ class ServeControl:
         self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> object:
         connections = getattr(self.server, "connections", None)
-        if connections is None:
+        if connections is None or not self.attached:
+            if connections is not None:
+                self._maybe_idle()  # a dropped frame of a parked pair may change its row
             from .connections import Admission
 
             return Admission("no_controller")
@@ -1313,10 +1377,12 @@ class ServeControl:
     ) -> bool:
         if fields.pop("_admitted", False):
             return True
-        if session_id is None and self.server.runtime.opened is not None:
-            session_id = self.server.runtime.session_id
+        if session_id is None and self.runtime.opened is not None:
+            session_id = self.runtime.session_id
         connections = self.server.connections
-        if connections is None:
+        if connections is None or not self.attached:
+            if connections is not None:
+                self._maybe_idle()  # a dropped frame of a parked pair may change its row
             return False
         return await connections.publish_controller(event, session_id, **fields)
 

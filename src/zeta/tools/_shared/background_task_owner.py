@@ -137,7 +137,11 @@ class _BackgroundTaskOwner:
                         "failed to archive background task output for %s",
                         self.record.task_id,
                     )
-            await self._finish_terminal(process.returncode)
+            try:
+                await self._finish_terminal(process.returncode)
+            finally:
+                # delivered, failed, cancelled, or skipped while closing: settled
+                self.registry._end_exit_delivery(self.record.task_id)
 
         try:
             await process.wait()
@@ -263,6 +267,9 @@ class _BackgroundTaskOwner:
         self.state = _OwnerState.TERMINAL
 
     def _publish_terminal(self, candidate: _BackgroundRecord) -> None:
+        if candidate.receipt_pending:
+            # same step as running=False, so an observer never sees neither
+            self.registry._begin_exit_delivery(candidate.task_id)
         self.record.running = candidate.running
         self.record.exit_code = candidate.exit_code
         self.record.ended_at = candidate.ended_at

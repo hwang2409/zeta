@@ -5,11 +5,13 @@ import multiprocessing
 import os
 import threading
 from collections import OrderedDict
+from io import StringIO
 from multiprocessing.connection import Connection
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 
 import zeta.tools.agent as agent_tools
 from tests.support.branch_reads import branch_messages
@@ -812,6 +814,64 @@ async def test_background_notification_carries_structured_stats(tmp_path: Path) 
         "canceled": False,
     }
     assert stats["elapsed"] >= 0
+
+
+def test_receipt_renders_markdown_answer() -> None:
+    call = ToolCall("markdown-receipt", "agent", {"prompt": "inspect", "description": "review"})
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done **bold** [link](https://example.com) `code`",
+            structured_content={"turns_used": 1, "child_session_path": ""},
+        ),
+    )
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=80).print(rendered)
+    assert "**bold**" not in output.getvalue()
+    assert "bold" in output.getvalue()
+
+
+def test_receipt_wraps_long_answer_without_losing_the_end() -> None:
+    call = ToolCall("wrap-receipt", "agent", {"prompt": "inspect", "description": "review"})
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "a " * 60 + "lastword",
+            structured_content={"turns_used": 1, "child_session_path": ""},
+        ),
+    )
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=30).print(rendered)
+    text = output.getvalue()
+    assert "lastword" in text
+    assert len(text.splitlines()) > 2
+
+
+def test_receipt_shows_terminal_stats() -> None:
+    call = ToolCall("stats-receipt", "agent", {"prompt": "inspect", "description": "review"})
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=ToolResult(
+            call.id,
+            "done · 50 turns · 12.3s · 7 tool calls · error=false · canceled=false",
+            structured_content={"turns_used": 50, "child_session_path": ""},
+        ),
+    )
+    rendered = AgentCard.render_receipt(event)
+    assert rendered is not None
+    output = StringIO()
+    Console(file=output, force_terminal=False, width=120).print(rendered)
+    assert "12.3s" in output.getvalue()
+    assert "7 tool calls" in output.getvalue()
 
 
 def test_foreground_receipt_shows_lifecycle_stats(tmp_path: Path) -> None:
@@ -1817,3 +1877,124 @@ async def test_damaged_intermediate_is_unknown_and_healthy_sibling_survives(
     hidden.close()
     damaged.close()
     root.close()
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [("agent_status", {}), ("agent_output", {"handle": "root:1"})],
+)
+@pytest.mark.asyncio
+async def test_visited_child_with_undecodable_payload_still_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tool: str,
+    arguments: dict[str, object],
+) -> None:
+    from zeta.core.checkpoints import ConversationIntegrityError
+    from zeta.tools.agent import subtree
+
+    root = ConversationStore(tmp_path, session_id="root")
+    child = ConversationStore(root.session_dir / "agents", session_id="1")
+    loop = None
+    try:
+        _record_running_child(
+            root,
+            child,
+            call=ToolCall("visited", "agent", {"prompt": "visited"}),
+            handle="root:1",
+            depth=1,
+        )
+        child.append_message(Message(MessageRole.ASSISTANT, [TextContent("x")]))
+        child_dir = child.session_dir.absolute()
+        child.close()
+        original = subtree._open_snapshot
+
+        def open_with_undecodable_payload(path: Path) -> ConversationStore:
+            store = original(path)
+            if path.absolute() == child_dir:
+
+                def undecodable(_ref: object) -> object:
+                    raise ConversationIntegrityError("payload cannot be decoded")
+
+                store.entry = undecodable
+            return store
+
+        # test-contract: seam a payload that fails to decode after a valid open
+        monkeypatch.setattr(subtree, "_open_snapshot", open_with_undecodable_payload)
+        loop = AgentLoop(
+            FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+        )
+        result = await loop.tool_registry.execute(
+            ToolCall("visited-broken", tool, arguments)
+        )
+
+        # A child the walk descends into must not vanish silently.
+        assert result["isError"] is True, result
+        assert "payload cannot be decoded" in result["content"][0]["text"]
+    finally:
+        if loop is not None:
+            await loop.close()
+        child.close()
+        root.close()
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_started_child_with_undecodable_payload_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.core.checkpoints import ConversationIntegrityError
+    from zeta.tools.agent import subtree
+
+    root = ConversationStore(tmp_path, session_id="root")
+    good = ConversationStore(root.session_dir / "agents", session_id="1")
+    broken = ConversationStore(root.session_dir / "agents", session_id="2")
+    loop = None
+    try:
+        _record_running_child(
+            root,
+            good,
+            call=ToolCall("good", "agent", {"prompt": "good"}),
+            handle="root:1",
+            depth=1,
+        )
+        root.append_child_run_started(
+            "root:1", None, "general", "good", "2026-11-08T00:00:00+00:00"
+        )
+        # A started row whose child marker names no agent call of the root.
+        root.append_child_run_started(
+            "root:2", None, "general", "broken", "2026-11-08T00:00:00+00:00"
+        )
+        broken.mark_agent_parent("not-a-root-call")
+        broken.append_message(Message(MessageRole.ASSISTANT, [TextContent("x")]))
+        broken_dir = broken.session_dir.absolute()
+        broken.close()
+        original = subtree._open_snapshot
+
+        def open_with_undecodable_payload(path: Path) -> ConversationStore:
+            store = original(path)
+            if path.absolute() == broken_dir:
+
+                def undecodable(_ref: object) -> object:
+                    raise ConversationIntegrityError("payload cannot be decoded")
+
+                store.entry = undecodable
+            return store
+
+        # test-contract: seam a payload that fails to decode after a valid open
+        monkeypatch.setattr(subtree, "_open_snapshot", open_with_undecodable_payload)
+        loop = AgentLoop(
+            FakeBackend([]), root, max_turns=1, skill_catalog=SkillCatalog.empty()
+        )
+        status = await loop.tool_registry.execute(
+            ToolCall("skip-broken-status", "agent_status", {})
+        )
+
+        assert status.get("isError") is not True, status
+        handles = [row["handle"] for row in status["structuredContent"]["children"]]
+        assert handles == ["root:1"]
+    finally:
+        if loop is not None:
+            await loop.close()
+        good.close()
+        broken.close()
+        root.close()

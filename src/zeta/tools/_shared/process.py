@@ -97,6 +97,9 @@ class BackgroundTaskRegistry:
         self._notification_sink = notification_sink
         self._notification_exists = notification_exists or (lambda _task_id: False)
         self._pending_recovery: dict[str, TaskExitInput] = {}
+        # in memory only: task exits whose delivery has not settled yet
+        self._exit_deliveries: set[str] = set()
+        self._exit_delivery_settled_sink: Callable[[], None] | None = None
         self._records: dict[str, _BackgroundRecord] = {}
         self._owners: dict[str, _BackgroundTaskOwner] = {}
         self._session_dir: Path | None = None
@@ -181,6 +184,27 @@ class BackgroundTaskRegistry:
         """Attach an observer for transitions after their durable commit."""
         self._committed_transition_sink = sink
 
+    def set_exit_delivery_settled_sink(self, sink: Callable[[], None] | None) -> None:
+        """Attach an observer called each time an exit delivery settles, delivered
+        or not; it may run on any thread."""
+        self._exit_delivery_settled_sink = sink
+
+    @property
+    def exit_delivery_pending(self) -> bool:
+        """A task exit is still being delivered; ending the session now would cut it."""
+        return bool(self._exit_deliveries)
+
+    def _begin_exit_delivery(self, task_id: str) -> None:
+        self._exit_deliveries.add(task_id)
+
+    def _end_exit_delivery(self, task_id: str) -> None:
+        if task_id not in self._exit_deliveries:
+            return
+        self._exit_deliveries.discard(task_id)
+        sink = self._exit_delivery_settled_sink
+        if sink is not None:
+            sink()
+
     def set_notification_exists(self, lookup: Callable[[str], bool]) -> None:
         self._notification_exists = lookup
 
@@ -194,17 +218,21 @@ class BackgroundTaskRegistry:
         return tuple(self._pending_recovery.values())
 
     async def deliver_recovered_exit(self, item: TaskExitInput) -> None:
-        await self._notify_exit(
-            item.task_id,
-            item.command,
-            item.exit_code,
-            item.output_tail,
-            item.log_path,
-            item.note,
-            owner=item.owner,
-            phase=item.phase,
-            tui_presented=item.tui_presented,
-        )
+        self._begin_exit_delivery(item.task_id)
+        try:
+            await self._notify_exit(
+                item.task_id,
+                item.command,
+                item.exit_code,
+                item.output_tail,
+                item.log_path,
+                item.note,
+                owner=item.owner,
+                phase=item.phase,
+                tui_presented=item.tui_presented,
+            )
+        finally:
+            self._end_exit_delivery(item.task_id)
 
     def bind_session_dir(
         self,
@@ -959,29 +987,14 @@ class BackgroundTaskRegistry:
         if self._directory_fd is None:
             return
         try:
-            rows = load_session_json(
-                read_session_file(self._directory_fd, "background_tasks.json")
-            )
-        except FileNotFoundError:
-            return
+            rows = read_background_task_records(self._directory_fd)
         except (OSError, ValueError):
             self._persistence_corrupt = True
             return
-        if type(rows) is not list:
-            self._persistence_corrupt = True
-            return
         for row in rows:
-            if type(row) is not dict:
-                continue
-            task_id = row.get("task_id")
-            command = row.get("command")
-            pid = row.get("pid")
-            if (
-                type(task_id) is not str
-                or type(command) is not str
-                or type(pid) is not int
-            ):
-                continue
+            task_id = row["task_id"]
+            command = row["command"]
+            pid = row["pid"]
             was_running = row.get("running") is True
             archived_length = self._archived_lengths.get(task_id, 0)
             note = row.get("note")
@@ -1010,7 +1023,9 @@ class BackgroundTaskRegistry:
                     if type(note) is str
                     else "task exited when the previous session ended"
                 ),
-                receipt_pending=legacy_pending,
+                # a crash after the durable exit notice leaves a stale receipt; only
+                # an undelivered exit is still pending (recovery below clears it)
+                receipt_pending=legacy_pending and notify_on_exit and not delivered,
                 notify_on_exit=notify_on_exit,
                 tui_presented=tui_presented,
                 owner=owner_name if type(owner_name) is str else "run_background",
@@ -1105,6 +1120,23 @@ class BackgroundTaskRegistry:
             delete_ids=(),
             publish=write_session_file,
         )
+
+
+def read_background_task_records(directory_fd: int) -> list[dict[str, object]]:
+    """Read the task catalog without recovering tasks or opening output logs."""
+    try:
+        rows = load_session_json(read_session_file(directory_fd, "background_tasks.json"))
+    except FileNotFoundError:
+        return []
+    if type(rows) is not list:
+        raise ValueError("invalid background task catalog")
+    return [
+        row for row in rows
+        if type(row) is dict
+        and type(row.get("task_id")) is str
+        and type(row.get("command")) is str
+        and type(row.get("pid")) is int
+    ]
 
 
 def background_tasks_for_session(

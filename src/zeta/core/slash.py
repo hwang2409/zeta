@@ -551,6 +551,8 @@ class SlashStatus:
     connection_setup_counts: tuple[Mapping[str, object], ...] = ()
     max_agent_depth: int = 3
     unavailable_accounts: tuple[str, ...] = ()
+    otel_status: str = "off"
+    otel_receiver: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,6 +735,8 @@ def _format_status(status: SlashStatus) -> str:
         f"session_id: {status.session_id}",
         f"provider: {status.provider}",
         f"model: {status.model}",
+        f"otel: {status.otel_status}",
+        *(() if status.otel_receiver is None else (f"otel receiver: {status.otel_receiver}",)),
         "completion_client_setups: "
         + (
             ", ".join(
@@ -951,6 +955,31 @@ def create_slash_registry(
         else discover_project_root(Path.cwd())
     )
     project_root = None if project_eligible is False else private_project_root
+    _register_builtins(
+        registry, effective_home, private_project_root, project_root,
+        project_registry_state, include_tui_only,
+    )
+    _register_custom_commands(registry, effective_home, project_dir or Path.cwd())
+    registry.register_skills(skill_catalog)
+    return registry
+
+
+def home_slash_registry(home: Path) -> SlashCommandRegistry:
+    """Register built-in and home commands only, with no active project."""
+    registry = SlashCommandRegistry(SlashSurface.SERVE)
+    _register_builtins(registry, home, home, None, None, False)
+    _register_custom_commands(registry, home, None)
+    return registry
+
+
+def _register_builtins(
+    registry: SlashCommandRegistry,
+    effective_home: str | Path | None,
+    private_project_root: Path,
+    project_root: Path | None,
+    project_registry_state: ProjectRegistryState | None,
+    include_tui_only: bool,
+) -> None:
     # shortcut: until the worker migration (PR 2) these run on the loop as
     # before; each later moves to SlashCommand.worker or keeps a loop reason.
     pending = "runs on the loop until its worker migration"
@@ -1203,12 +1232,14 @@ def create_slash_registry(
             reason=loop_owned,
         )
     )
-    result = load_custom_commands(
-        home=effective_home,
-        project_dir=project_dir or Path.cwd(),
-    )
+
+
+def _register_custom_commands(
+    registry: SlashCommandRegistry,
+    home: str | Path | None,
+    project_dir: str | Path | None,
+) -> None:
+    result = load_custom_commands(home=home, project_dir=project_dir)
     registry._notices.extend(result.notices)
     for command in result.commands:
         registry.register_custom(command)
-    registry.register_skills(skill_catalog)
-    return registry

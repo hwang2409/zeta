@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from ...agent.turn_limit import project_notification_data, project_tool_result_data
+from ...core.context_parts.code_audit import nested_approval_anchors, nested_call_data
 from ...core.store._client_delivery import CLIENT_DELIVERY_METADATA
 from ...protocol.types import (
     FAILED_TURN_ERROR,
@@ -67,6 +68,8 @@ class HistoryProjection:
     # seq and stable id of the newest active-branch row this projection includes
     frontier: int = 0
     frontier_row_id: str | None = None
+    approval_origins: Mapping[str, object] = MappingProxyType({})
+    nested_anchors: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -84,6 +87,7 @@ _HISTORY_ROW_FEATURES = (
     "content_read",
     "served_turn_end",
     "child_runs",
+    "approval_origin",
 )
 
 
@@ -94,6 +98,7 @@ def _history_feature_key(
     content_read: bool,
     served_turn_end: bool,
     child_runs: bool,
+    approval_origin: bool = False,
 ) -> tuple[bool, ...]:
     values = locals()
     return tuple(values[name] for name in _HISTORY_ROW_FEATURES)
@@ -123,6 +128,7 @@ def _cache(
     content_read: bool,
     served_turn_end: bool,
     child_runs: bool = False,
+    approval_origin: bool = False,
 ) -> _CachedProjection | None:
     cache = getattr(store, "_serve_history_projections", {})
     return cache.get(
@@ -132,6 +138,7 @@ def _cache(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
+            approval_origin=approval_origin,
         )
     )
 
@@ -145,6 +152,7 @@ def _publish_cache(
     served_turn_end: bool,
     cached: _CachedProjection,
     child_runs: bool = False,
+    approval_origin: bool = False,
 ) -> None:
     cache = getattr(store, "_serve_history_projections", None)
     if cache is None:
@@ -157,6 +165,7 @@ def _publish_cache(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
+            approval_origin=approval_origin,
         )
     ] = cached
 
@@ -248,11 +257,25 @@ def _project_history_group(
     return group, _history_group_body_size(codec, group)
 
 
+def _approval_origins(entries: Iterable[object]) -> dict[str, object]:
+    origins: dict[str, object] = {}
+    for entry in entries:
+        if getattr(entry, "type", None) != "message":
+            continue
+        message = entry.data.get("message", {})
+        result = message.get("tool_result")
+        origin = message.get("metadata", {}).get("zeta.approval_origin")
+        if isinstance(result, dict) and origin in {"automatic", "user"}:
+            origins[result["tool_call_id"]] = origin
+    return origins
+
+
 def history_projection_from_groups(
     groups: tuple[tuple[Any, ...], ...],
     approval_calls: Mapping[str, object],
     *,
     served_turn_end: bool,
+    nested_anchors: frozenset[str],
 ) -> HistoryProjection:
     groups = tuple(
         tuple(
@@ -268,6 +291,8 @@ def history_projection_from_groups(
         (*groups, ()),
         MappingProxyType(dict(approval_calls)),
         MappingProxyType(entry_index),
+        approval_origins=MappingProxyType(_approval_origins(entry_index.values())),
+        nested_anchors=nested_anchors,
     )
 
 
@@ -279,6 +304,7 @@ def history_projection(
     content_read: bool = False,
     served_turn_end: bool = False,
     child_runs: bool = False,
+    approval_origin: bool = False,
 ) -> HistoryProjection:
     """Return one immutable wire projection for the store's generation."""
     cached = _cache(
@@ -288,6 +314,7 @@ def history_projection(
         content_read=content_read,
         served_turn_end=served_turn_end,
         child_runs=child_runs,
+        approval_origin=approval_origin,
     )
     generation = _generation(store)
     closed = _closed(store)
@@ -301,6 +328,7 @@ def history_projection(
     stable_generation = generation if generation == _generation(store) else None
 
     approval_calls: dict[str, object] = {}
+    approval_origins = _approval_origins(branch)
     accepted_messages: dict[str, dict[str, object]] = {}
     entries: list[list[Any]] = [[]]
     runs: dict[str, str] = {}
@@ -378,6 +406,8 @@ def history_projection(
         MappingProxyType(entry_index),
         frontier=branch[-1].seq if branch else 0,
         frontier_row_id=branch[-1].id if branch else None,
+        approval_origins=MappingProxyType(approval_origins),
+        nested_anchors=frozenset(nested_approval_anchors(branch)),
     )
     if stable_generation is None or skip_cache:
         return built
@@ -390,6 +420,7 @@ def history_projection(
             content_read=content_read,
             served_turn_end=served_turn_end,
             child_runs=child_runs,
+            approval_origin=approval_origin,
         )
         if cached is None or cached.generation != generation or cached.closed != closed:
             _publish_cache(
@@ -399,6 +430,7 @@ def history_projection(
                 content_read=content_read,
                 served_turn_end=served_turn_end,
                 child_runs=child_runs,
+                approval_origin=approval_origin,
                 cached=_CachedProjection(generation, built, closed),
             )
             return built
@@ -455,10 +487,12 @@ def _transcript_recovery_history_row(entry: object) -> dict[str, object]:
 def _history_entry_rows(
     entry: object,
     approval_calls: Mapping[str, object],
+    approval_origins: Mapping[str, object] = MappingProxyType({}),
     *,
     include_delivery_id: bool = False,
     fidelity: bool = False,
     content_read: bool = False,
+    approval_origin: bool = False,
 ) -> list[dict[str, object]]:
     """Project one durable entry to one atomic group of history rows."""
 
@@ -550,6 +584,11 @@ def _history_entry_rows(
                         "id": call["id"],
                         "name": call["name"],
                         **_project_tool_call_arguments(call, fidelity=fidelity),
+                        **(
+                            {"approval_origin": approval_origins[call["id"]]}
+                            if approval_origin and call["id"] in approval_origins
+                            else {}
+                        ),
                     },
                 }
             )
@@ -643,6 +682,27 @@ def _history_endpoint(projection: HistoryProjection, end: int) -> str | None:
     return None
 
 
+def forward_next_offset(projection: HistoryProjection, cursor: int) -> int | None:
+    """Return the wire ``next_offset`` once every group before ``cursor`` is served.
+
+    The trailing open group (index ``end``) is a real page while it holds
+    entries, so null means only that nothing is left.
+    """
+    end = len(projection.entry_groups) - 1
+    if cursor < end or (cursor == end and projection.entry_groups[end]):
+        return cursor
+    return None
+
+
+def _annotate_nested_history(row: dict[str, object], projection: HistoryProjection) -> dict[str, object]:
+    result = row.get("tool_result")
+    call_id = result.get("tool_call_id") if isinstance(result, dict) else row.get("request_id")
+    if isinstance(call_id, str) and call_id in projection.nested_anchors:
+        parent, _, _ = call_id.rpartition(":code:")
+        return {**row, **nested_call_data(call_id, parent)}
+    return row
+
+
 def _history_group(
     projection: HistoryProjection,
     index: int,
@@ -651,18 +711,21 @@ def _history_group(
     include_delivery_id: bool,
     fidelity: bool,
     content_read: bool,
+    approval_origin: bool,
     backward: bool,
     validator: dict[str, object] | None,
 ) -> tuple[tuple[dict[str, object], ...], int, tuple[dict[str, object], ...], int]:
     raw = [
-        row
+        _annotate_nested_history(row, projection)
         for entry in projection.entry_groups[index]
         for row in _history_entry_rows(
             entry,
             projection.approval_calls,
+            projection.approval_origins,
             include_delivery_id=include_delivery_id,
             fidelity=fidelity,
             content_read=content_read,
+            approval_origin=approval_origin,
         )
     ]
     forward, forward_size = _project_history_group(raw, {"next_offset": end})
@@ -684,7 +747,6 @@ def _history_group_fits(
     body_size: int,
     rows: list[dict[str, object]],
     cursor: int,
-    end: int,
     backward: bool,
     validator: dict[str, object] | None,
     raw_group: tuple[object, ...],
@@ -692,14 +754,13 @@ def _history_group_fits(
     include_delivery_id: bool = False,
     fidelity: bool = False,
     content_read: bool = False,
+    approval_origin: bool = False,
 ) -> tuple[bool, tuple[dict[str, object], ...], int]:
     candidate = body_size + int(bool(rows and group)) + size
     kwargs = (
         {"next_before": cursor or None, "history_validator": validator}
         if backward
-        else {
-            "next_offset": cursor if cursor < end else None,
-        }
+        else {"next_offset": forward_next_offset(projection, cursor)}
     )
     if (
         _history_frame_size(codec, request_id, messages_body_size=candidate, **kwargs)
@@ -710,14 +771,16 @@ def _history_group_fits(
         return False, group, size
     # Alone on its page, the group must still fit this page's real envelope.
     raw = [
-        row
+        _annotate_nested_history(row, projection)
         for entry in raw_group
         for row in _history_entry_rows(
             entry,
             projection.approval_calls,
+            projection.approval_origins,
             include_delivery_id=include_delivery_id,
             fidelity=fidelity,
             content_read=content_read,
+            approval_origin=approval_origin,
         )
     ]
     group, size = _project_history_group(raw, kwargs)

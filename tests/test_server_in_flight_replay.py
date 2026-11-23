@@ -479,3 +479,44 @@ async def test_forced_order_fast_stream_during_history_read_keeps_the_join(
     finally:
         backend.open_all()
         await _close(server, writer2, writer)
+
+
+@pytest.mark.asyncio
+async def test_parallel_group_history_matches_live_tool_ends(tmp_path: Path) -> None:
+    """A parallel group's live tool_end frames and its history rows agree."""
+    for name in ("a.txt", "b.txt"):
+        (tmp_path / name).write_text(f"contents of {name}\n")
+    calls = [
+        ToolUseContent(ToolCall(f"read-{name}", "read", {"path": str(tmp_path / name)}))
+        for name in ("a.txt", "b.txt")
+    ]
+    backend = GatedBackend([
+        ([TextContent("reading")], [TextContent("reading"), *calls]),
+        ([TextContent("read")], [TextContent("read")]),
+    ])
+    server = _server(tmp_path, backend)
+    reader, writer = await _connect(server)
+    try:
+        session_id = await _start(server, reader, writer, approval="allow")
+        frames = await frames_until_event(reader, "agent_end")
+        ended = [
+            (f["params"]["tool_result"]["tool_call_id"], f["params"]["tool_result"]["content"])
+            for f in frames
+            if f.get("params", {}).get("event") == "tool_end"
+        ]
+        history = await _request(reader, writer, 6, "session_history", {
+            "session_id": session_id
+        })
+        rows = [
+            (row["tool_result"]["tool_call_id"], row["tool_result"]["content"])
+            for row in history[-1]["result"]["messages"]
+            if row.get("role") == "tool_result"
+        ]
+        # history lists results in the order serve announced them live
+        assert rows == ended, (rows, ended)
+        assert sorted(rows) == [
+            ("read-a.txt", "contents of a.txt"),
+            ("read-b.txt", "contents of b.txt"),
+        ]
+    finally:
+        await _close(server, writer)

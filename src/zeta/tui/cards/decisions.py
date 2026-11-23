@@ -149,13 +149,14 @@ class DecisionsPanel:
 
     # -- rendering ----------------------------------------------------------
 
-    def render_lines(self) -> list[FragmentLine]:
+    def render_lines(self, *, loading: bool = False) -> list[FragmentLine]:
         lines: list[FragmentLine] = [
             overlay.title("Attention"),
             overlay.rule(),
         ]
-        if not self._items:
-            lines.append([overlay.value("No open attention items.", theme.DIM)])
+        if loading or not self._items:
+            text = "loading…" if loading else "No open attention items."
+            lines.append([overlay.value(text, theme.DIM)])
             lines.append(overlay.rule())
             lines.append(overlay.hint("esc close"))
             return lines

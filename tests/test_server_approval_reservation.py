@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import fcntl
 import inspect
 import json
 import os
@@ -419,6 +420,34 @@ async def test_denied_approval_without_live_turn_resumes_model(tmp_path: Path) -
             and message.tool_result.content == "tool execution denied"
             for message in backend.calls[0][0]
         )
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_next_turn_closes_a_recovered_approval_for_every_client(
+    tmp_path: Path,
+) -> None:
+    # The durable request has no live record, as after a restart: the dead
+    # turn's request is still answerable until the next turn starts.
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server, reader, writer, call = await _approval_server(tmp_path, backend=backend)
+    try:
+        status = (await _request(reader, writer, 3, "status", {}))[-1]["result"]
+        assert [row["request_id"] for row in status["pending_approvals"]] == [call.id]
+
+        await _request(reader, writer, 4, "send", {"text": "continue"})
+        frames = await _frames_until_event(reader, "agent_end")
+
+        ends = _named_events(frames, "approval_end")
+        assert [(end["request_id"], end["data"]["decision"]) for end in ends] == [
+            (call.id, "abort")
+        ]
+        assert ends[0]["data"]["reason"] == "turn_canceled"
+        status = (await _request(reader, writer, 5, "status", {}))[-1]["result"]
+        assert status["pending_approvals"] == []
+        late = await _request(reader, writer, 6, "approve", {"request_id": call.id})
+        assert late[-1].get("result", {}).get("decision") != "allow"
     finally:
         await close_serve(server, writer)
 
@@ -1299,7 +1328,7 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
     old_state = server.runtime.state
     assert old_state is not None
     old_store = old_state.opened.store
-    session_dir = old_store.session_dir
+    session_dir = old_store.session_dir.resolve()
     entered = asyncio.Event()
     release = asyncio.Event()
     completed = asyncio.Event()
@@ -1320,7 +1349,6 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
         )
         await asyncio.wait_for(entered.wait(), TIMEOUT)
         resume.cancel()
-        await asyncio.sleep(0)
         assert server.runtime.state is old_state
         release.set()
         with pytest.raises(asyncio.CancelledError):
@@ -1340,11 +1368,18 @@ async def test_forced_resume_cancel_during_close_finishes_cleanup(
             assert reopened.metadata.session_id == old_state.session_id
         finally:
             await asyncio.to_thread(reopened.store.close)
+        # Retention can take its own session locks after the runtime releases them.
+        if server._retention_owner is not None:
+            await server._retention_owner.stop()
         fd_directory = "/proc/self/fd" if os.path.isdir("/proc/self/fd") else "/dev/fd"
         leaked_targets = []
         for name in os.listdir(fd_directory):
             try:
-                target = os.path.realpath(f"{fd_directory}/{name}")
+                if fd_directory == "/proc/self/fd":
+                    target = os.readlink(f"{fd_directory}/{name}")
+                else:
+                    raw = fcntl.fcntl(int(name), fcntl.F_GETPATH, b"\0" * 1024)
+                    target = os.fsdecode(raw.rstrip(b"\0"))
             except OSError:
                 continue
             if target == str(session_dir) or target.startswith(

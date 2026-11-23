@@ -11,8 +11,19 @@ class ProjectRegistryBusyError(ProjectRegistryError):
     code = "project_registry_busy"
     retryable = True
 
-    def __init__(self) -> None:
-        super().__init__("another process holds the project registry lock; retry")
+    def __init__(
+        self, *, holder_pid: int | None = None, holder_operation: str | None = None
+    ) -> None:
+        detail = ""
+        if holder_pid is not None or holder_operation is not None:
+            detail = f" (holder pid={holder_pid}, operation={holder_operation or 'unknown'})"
+        super().__init__(
+            f"another process holds the project registry lock{detail}; retry"
+        )
+
+
+class MemorySecretError(ProjectRegistryError):
+    """A memory write was refused because its text contains a secret."""
 
 
 class UnsupportedMemoryFormatError(ProjectRegistryError):

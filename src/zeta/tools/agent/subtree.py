@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ...core.store import ConversationStore
+from ...core.store._history_index import HistoryIndexError
 from ...protocol.types import ToolCall
 
 if TYPE_CHECKING:
@@ -81,6 +83,28 @@ def _open_snapshot(path: Path) -> ConversationStore:
     )
 
 
+@dataclass(frozen=True)
+class _Snapshot:
+    """What discovery reads from one session, kept after its store closes."""
+
+    started: tuple[ConversationEntry, ...]
+    calls: dict[str, ToolCall]
+    receipts: tuple[tuple[str, str], ...]
+    children: tuple[Any, ...]
+    parent_marker: object
+
+
+def _read_snapshot(store: ConversationStore) -> _Snapshot:
+    entries = tuple(store.entry(ref) for ref in store.branch_refs())
+    return _Snapshot(
+        started=tuple(entry for entry in entries if entry.type == "child_run_started"),
+        calls=_active_agent_calls(entries),
+        receipts=store.active_agent_receipts(),
+        children=tuple(store.agent_children().values()),
+        parent_marker=getattr(store, "_agent_parent", None),
+    )
+
+
 def _logical_parent(handle: str) -> str:
     return handle.rpartition(":")[0]
 
@@ -128,22 +152,22 @@ class _SubtreeDiscovery:
         self.root_id = self.caller.split(":", 1)[0]
         self.root_path = _root_path(store, self.caller)
         self.found: dict[str, Path] = {}
-        self.opened: dict[str, ConversationStore] = {}
+        # Extracted data only: an open store pins descriptors, so holding one
+        # per child made fds grow with the number of children (EMFILE).
+        self.snapshots: dict[str, _Snapshot | Exception | None] = {}
         self.pending = [self.caller]
 
     def discover(self) -> dict[str, Path]:
         self._validate_request()
-        try:
-            while self.pending:
-                parent = self.pending.pop()
-                parent_store = (
-                    self.store if parent == self.caller else self._snapshot(parent)
-                )
-                if parent_store is not None:
-                    self._visit(parent, parent_store)
-        finally:
-            for opened_store in self.opened.values():
-                opened_store.close()
+        while self.pending:
+            parent = self.pending.pop()
+            snapshot = (
+                _read_snapshot(self.store)
+                if parent == self.caller
+                else self._snapshot(parent)
+            )
+            if snapshot is not None:
+                self._visit(parent, snapshot)
 
         if self.requested_handle is None:
             return self.found
@@ -164,30 +188,40 @@ class _SubtreeDiscovery:
         ):
             raise ValueError("unknown child handle")
 
-    def _snapshot(self, handle: str) -> ConversationStore | None:
-        existing = self.opened.get(handle)
-        if existing is not None:
-            return existing
+    def _snapshot(self, handle: str, *, checking: bool = False) -> _Snapshot | None:
+        """Read one child once; an unreadable child only being checked is skipped."""
+        if handle not in self.snapshots:
+            self.snapshots[handle] = self._read_child(handle)
+        snapshot = self.snapshots[handle]
+        if isinstance(snapshot, Exception):
+            if checking:
+                return None
+            raise snapshot
+        return snapshot
+
+    def _read_child(self, handle: str) -> _Snapshot | Exception | None:
         path = _path_for(self.root_path, self.root_id, handle)
         if path is None:
             return None
         try:
-            snapshot = _open_snapshot(path)
+            store = _open_snapshot(path)
         except (OSError, ValueError):
             return None
-        self.opened[handle] = snapshot
-        return snapshot
+        try:
+            return _read_snapshot(store)
+        except (HistoryIndexError, OSError, ValueError) as exc:
+            return exc
+        finally:
+            store.close()
 
-    def _visit(self, parent: str, parent_store: ConversationStore) -> None:
-        entries = tuple(parent_store.entry(ref) for ref in parent_store.branch_refs())
-        calls = _active_agent_calls(entries)
-        self._add_receipt_edges(parent, parent_store)
-        self._add_started_edges(parent, entries, calls)
-        self._add_marker_edges(parent, parent_store, calls)
+    def _visit(self, parent: str, snapshot: _Snapshot) -> None:
+        self._add_receipt_edges(parent, snapshot)
+        self._add_started_edges(parent, snapshot)
+        self._add_marker_edges(parent, snapshot)
 
-    def _add_receipt_edges(self, parent: str, parent_store: ConversationStore) -> None:
+    def _add_receipt_edges(self, parent: str, parent_snapshot: _Snapshot) -> None:
         parent_path = _path_for(self.root_path, self.root_id, parent)
-        for handle, stored_path in parent_store.active_agent_receipts():
+        for handle, stored_path in parent_snapshot.receipts:
             if _segments(self.root_id, handle) is not None and _direct_child(
                 parent, handle
             ):
@@ -201,52 +235,38 @@ class _SubtreeDiscovery:
             ):
                 self.found[handle] = stored
 
-    def _add_started_edges(
-        self,
-        parent: str,
-        entries: list[ConversationEntry],
-        calls: dict[str, ToolCall],
-    ) -> None:
-        for entry in entries:
+    def _add_started_edges(self, parent: str, parent_snapshot: _Snapshot) -> None:
+        for entry in parent_snapshot.started:
             handle = _started_child_handle(entry, parent=parent)
-            if handle is None:
+            if handle is None or not self._relevant(handle):
                 continue
-            child_store = self._snapshot(handle)
-            marker = (
-                getattr(child_store, "_agent_parent", None) if child_store else None
-            )
-            if not isinstance(marker, dict) or marker.get("tool_call_id") not in calls:
+            child_snapshot = self._snapshot(handle, checking=True)
+            marker = child_snapshot.parent_marker if child_snapshot else None
+            if (
+                not isinstance(marker, dict)
+                or marker.get("tool_call_id") not in parent_snapshot.calls
+            ):
                 continue
             child_path = _path_for(self.root_path, self.root_id, handle)
             if child_path is not None:
                 self._add_edge(handle, str(child_path), parent=parent)
 
-    def _add_marker_edges(
-        self,
-        parent: str,
-        parent_store: ConversationStore,
-        parent_calls: dict[str, ToolCall],
-    ) -> None:
-        for marker in parent_store.agent_children().values():
+    def _add_marker_edges(self, parent: str, parent_snapshot: _Snapshot) -> None:
+        for marker in parent_snapshot.children:
             if not isinstance(marker, dict):
                 continue
             handle = marker.get("child_instance_id")
-            if type(handle) is not str:
+            if type(handle) is not str or not self._relevant(handle):
                 continue
             logical_parent = _logical_parent(handle)
-            logical_store = (
-                parent_store
+            logical_snapshot = (
+                parent_snapshot
                 if logical_parent == parent
                 else self._snapshot(logical_parent)
             )
-            if logical_store is None:
+            if logical_snapshot is None:
                 continue
-            calls = (
-                parent_calls
-                if logical_store is parent_store
-                else _active_agent_calls(tuple(logical_store.entry(ref) for ref in logical_store.branch_refs()))
-            )
-            if _authenticated_marker_call(marker, calls) is not None:
+            if _authenticated_marker_call(marker, logical_snapshot.calls) is not None:
                 self._add_edge(
                     handle,
                     marker.get("child_session_path"),
@@ -259,19 +279,23 @@ class _SubtreeDiscovery:
         path = _path_for(self.root_path, self.root_id, handle)
         if path is None or Path(stored_path).absolute() != path:
             return
-        if not handle.startswith(f"{self.caller}:"):
-            return
-        requested = self.requested_handle
-        if requested is not None and not (
-            requested == handle
-            or requested.startswith(f"{handle}:")
-            or handle.startswith(f"{requested}:")
-        ):
+        if not self._relevant(handle):
             return
         if handle not in self.found:
             self.found[handle] = path
             if _direct_child(parent, handle):
                 self.pending.append(handle)
+
+    def _relevant(self, handle: str) -> bool:
+        """Checked before any child open, so one handle never reads its siblings."""
+        if not handle.startswith(f"{self.caller}:"):
+            return False
+        requested = self.requested_handle
+        return requested is None or (
+            requested == handle
+            or requested.startswith(f"{handle}:")
+            or handle.startswith(f"{requested}:")
+        )
 
 
 def _discover(

@@ -49,6 +49,7 @@ from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import NotificationPresentation
 from zeta.server.event_contract import notification_wire_event
 from zeta.server.protocol import EventDescriptor, FrameCodec
+from zeta.server.session_replay.in_flight import InFlightReply
 from zeta.skills import SkillCatalog
 from zeta.storage_format import open_writer
 from zeta.tools.inbox import _inbox
@@ -305,6 +306,34 @@ def test_send_is_idempotent_and_large_body_spills(tmp_path: Path) -> None:
     assert raw["body"] == {"file": f"bodies/{first}.txt"}
     listed = inbox.list(project_b.project_id)
     assert listed["new"][0]["body"] == body
+
+
+def test_resend_below_delegation_epoch_is_idempotent(tmp_path: Path) -> None:
+    below = storage_format_module.FEATURE_EPOCHS[
+        storage_format_module.StorageFeature.INBOX_DELEGATION
+    ] - 1
+    home, registry, project_a, project_b = _epoch_projects(tmp_path, writer_epoch=below)
+    assert registry.observed_storage_epoch == below
+    inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+    message = {
+        "from_project": project_a.project_id,
+        "from_session": "a" * 32,
+        "to_project": "beta",
+        "kind": "bug_report",
+        "title": "A bug",
+        "body": "body",
+        "message_id": "c" * 32,
+    }
+
+    first = inbox.send_user(**message)
+    second = inbox.send_user(**message)
+
+    new_dir = registry.root / project_b.project_id / "inbox" / "new"
+    assert first == second == "c" * 32
+    assert [path.name for path in new_dir.iterdir()] == [f"{first}.json"]
+    with pytest.raises(project_inbox_module.InboxConflictError):
+        inbox.send_user(**{**message, "body": "changed"})
+    assert [path.name for path in new_dir.iterdir()] == [f"{first}.json"]
 
 
 def test_read_missing_inbox_is_empty_without_creating_storage(tmp_path: Path) -> None:
@@ -3106,7 +3135,7 @@ async def test_p03a_runtime_health_event_reaches_tui_and_serve(tmp_path, monkeyp
         async def close(self) -> None:
             pass
 
-    connections = ConnectionRegistry(asyncio.get_running_loop())
+    connections = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _HealthController()
     connections.register(connection)
     connections.negotiate_role(connection, "controller", "1.2", frozenset())

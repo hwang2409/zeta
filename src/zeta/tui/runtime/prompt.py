@@ -5,11 +5,14 @@ import asyncio
 import weakref
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.filters import to_filter
+from prompt_toolkit.layout.controls import BufferControl
 from rich.text import Text
 
 from ...core.session import env_home
 from ...diagnostics.tui_stalls import start_tui_stall_watchdog
 from .. import theme
+from ..cards.picker_card import PickerCardControl
 from ..composer import FullScreenPromptSession
 from ..fork_session import RuntimeResult
 from ..layout import detach_completion_menus, full_screen_content
@@ -92,17 +95,28 @@ class PromptRuntimeMixin:
                 queued_messages=lambda: app.queued_messages,
                 decisions_answer_window=app._decisions_answer_field.window,
                 overlay_field_windows=(app._finder_field.window,),
+                picker_card=PickerCardControl(lambda: app._picker_card()),
             )
         ]
         self._agent_navigation.bind_layout(
             session.layout, session.default_buffer, self._invalidate_prompt
         )
+        # A click returns to the composer from the agent list or a child transcript.
+        for window in session.layout.find_all_windows():
+            if (
+                isinstance(window.content, BufferControl)
+                and window.content.buffer is session.default_buffer
+            ):
+                window.content.focus_on_click = to_filter(True)
         self._bind_fork_navigation()
 
     def _bind_restart_idle_buffer(self, session: PromptSession[str]) -> None:
         buffer = getattr(getattr(session, "app", None), "current_buffer", None)
         if buffer is not None and id(buffer) not in self._restart_idle_buffers:
-            buffer.on_text_changed += lambda _: self._maybe_restart_when_idle()
+            buffer.on_text_changed += lambda changed: (
+                self._maybe_restart_when_idle(),
+                self._close_picker_for_composer_text(changed),
+            )
             self._restart_idle_buffers.add(id(buffer))
 
     async def run(

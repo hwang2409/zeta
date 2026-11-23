@@ -16,6 +16,7 @@ import weakref
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from enum import Enum, auto
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -42,6 +43,7 @@ from ..protocol.types import (
     ToolSchema,
 )
 from ..runtime.execution import (
+    NestedToolExecutor,
     ToolExecutionContext,
     ToolHandler,
     ToolHandlerResult,
@@ -105,6 +107,7 @@ from .approval_gate import ApprovalGate
 if TYPE_CHECKING:
     from ..runtime.project_registry_state import ProjectRegistryState
     from ..skills.agent_catalog import AgentCatalog
+    from ..telemetry import SpanHandle
 AbortSignal = ToolAbortSignal
 ToolHook = Callable[[str, dict[str, Any]], bool | str | Awaitable[bool | str] | None]
 ToolHandlerFactory = Callable[["ToolRegistry"], ToolHandler]
@@ -136,7 +139,11 @@ def _register_discovered_tools(registry: ToolRegistry) -> None:
                 f"tool module {module_name} has a non-callable register contract"
             )
         try:
-            result = register(registry)
+            registry._discovery_register = getattr(register, "__code__", None)
+            try:
+                result = register(registry)
+            finally:
+                registry._discovery_register = None
             if inspect.isawaitable(result):
                 if inspect.iscoroutine(result):
                     result.close()
@@ -149,6 +156,13 @@ def _validate_unique_tool_call_ids(tool_calls: Sequence[ToolCall]) -> None:
     call_ids = [tool_call.id for tool_call in tool_calls]
     if len(call_ids) != len(set(call_ids)):
         raise ValueError("duplicate tool call id in one execution batch")
+class ToolOrigin(Enum):
+    PACKAGED_BUILTIN = auto()
+    USER = auto()
+    MCP = auto()
+    DYNAMIC = auto()
+
+
 @dataclass(frozen=True, slots=True)
 class ToolDefinition:
     name: str
@@ -158,6 +172,7 @@ class ToolDefinition:
     binding: HandlerBinding
     binding_owner: object | None
     handler_factory: ToolHandlerFactory | None = None
+    origin: ToolOrigin = ToolOrigin.DYNAMIC
     parallel_safe: bool = False
     validate_arguments: bool = True
     requires_approval: bool = True
@@ -222,6 +237,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         project_id: str | None = None,
         project_registry: Any = None,
         inbox_enabled: bool = True,
+        code_mode_enabled: bool = False,
         tool_allow: Sequence[str] | None = None,
         tool_deny: Sequence[str] = (),
         tool_allow_layers: Sequence[Sequence[str]] = (),
@@ -259,6 +275,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         self.project_registry = project_registry
         self.project_registry_state: ProjectRegistryState | None = None
         self.inbox_enabled = inbox_enabled
+        self.code_mode_enabled = code_mode_enabled
         self.inbox_target_ids: frozenset[str] | None = None
         cwd_fd, self._cwd_identity = _open_directory_fd(self.cwd)
         self._cwd_fd = cwd_fd
@@ -278,6 +295,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             self.abort_signal = abort_signal
             self._abort_registry = abort_signal.registry
         self.approval_policy = approval_policy
+        self._approval_origins: dict[str, str] = {}
         self._approval_gate = ApprovalGate(self.approval_policy, self.pre_execute_hook)
         if self.approval_policy is not None and approval_store is not None:
             self.approval_policy.bind_store(approval_store)
@@ -316,6 +334,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         )
         self._cwd_recovery_notices: list[tuple[str, str]] = []
         self._tools: dict[str, ToolDefinition] = {}
+        self._discovery_register = None
         # Set by MCPMount.  It is deliberately copied by clone_for_session so
         # discovery remains available in child sessions without sharing tools.
         self._mcp_mount: Any = None
@@ -396,6 +415,10 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                     continue
                 schema = filtered
             schemas.append(schema)
+        if self.is_code_mode_call():
+            from ..runtime.loop.nested_tools import describe_code
+
+            describe_code(self, schemas)
         return schemas
     @property
     def tool_schemas(self) -> list[ToolSchema]:
@@ -443,6 +466,30 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
 
         return frozenset(
             name for name in self._tools if self.tool_is_allowed_by_policy(name)
+        )
+
+    def is_code_mode_call(self, name: str = "code") -> bool:
+        """Whether this name resolves to the enabled packaged code tool."""
+        if not self.code_mode_enabled:
+            return False
+        definition = self._tools.get(name)
+        if definition is None or definition.origin is not ToolOrigin.PACKAGED_BUILTIN:
+            return False
+        from .code import _code
+
+        return definition.handler is _code
+
+    def _registration_origin(self) -> ToolOrigin:
+        frame = inspect.currentframe()
+        caller = None if frame is None else frame.f_back
+        del frame  # Do not keep a self-referencing frame alive with GC disabled.
+        caller = None if caller is None else caller.f_back
+        if caller is not None and caller.f_code is ToolRegistry.register_session_tool.__code__:
+            caller = caller.f_back
+        return (
+            ToolOrigin.PACKAGED_BUILTIN
+            if caller is not None and caller.f_code is self._discovery_register
+            else ToolOrigin.DYNAMIC
         )
 
     def register(
@@ -524,6 +571,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 raise ValueError(f"{capability} must accept execution_context")
         definition = ToolDefinition(
             name=name,
+            origin=self._registration_origin(),
             description=description,
             parameters=normalized,
             handler=handler,
@@ -620,9 +668,14 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         if not self.tool_is_allowed(name) or name in self._tools:
             return False
         self.register(name, handler, binding="shared", **kwargs)
+        self._tools[name] = replace(self._tools[name], origin=ToolOrigin.MCP)
         self._mcp_hidden.discard(name)
         self._mcp_owned[name] = (owner, generation)
         return True
+
+    def is_mcp_tool(self, name: str) -> bool:
+        """Return whether ``name`` is a mounted MCP tool."""
+        return name in self._mcp_owned
 
     def is_mcp_owned(self, name: str, owner: object, generation: int) -> bool:
         """Return whether an MCP definition has this exact owner and generation."""
@@ -697,6 +750,8 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             clone._cwd_fd = os.dup(self._cwd_fd)
             clone._cwd_finalizer = weakref.finalize(clone, os.close, clone._cwd_fd)
         clone._cleanup_callbacks = []
+        # a child's cwd notice belongs in the child's transcript, not the parent's
+        clone._cwd_recovery_notices = []
         clone.web_clients = SessionWebClients()
         clone._agent_output_cache = OrderedDict()
         clone._agent_output_cache_chars = 0
@@ -905,7 +960,8 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         except (KeyError, UnknownToolAction, InvalidActionArguments, TypeError, ValueError):
             await self.abort_approval(tool_call)
             return None
-        if not capability.requires_approval and not self.enforce_approvals:
+        if (not capability.requires_approval and not self.enforce_approvals
+                or self.is_code_mode_call(tool_call.name)):
             return None
         if definition.validate_arguments:
             try:
@@ -961,16 +1017,28 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         _boundary_signal: ToolAbortSignal | None = None,
         _stream_sink: ToolStreamSink | None = None,
         _lifecycle_sink: ToolLifecycleSink | None = None,
+        _lifecycle_payload_sink: ToolLifecycleSink | None = None,
+        _retain_approval_origin: bool = False,
         _persist_approval: bool = True,
         _log_path: str | Path | None = None,
         _background: bool = False,
         _capture_output: bool = False,
         _skip_approval: bool = False,
         _host_environment: Mapping[str, str] | None = None,
+        _expected_definition: ToolDefinition | None = None,
+        _nested_tool_executor: NestedToolExecutor | None = None,
         _pending_execution_claimed: bool = False,
         _pending_execution_owner: asyncio.Task[object] | None = None,
+        _span: SpanHandle | None = None,
     ) -> StructuredToolResult:
         signal_state = abort_signal or self.abort_signal
+
+        def check_expected() -> None:
+            if (_expected_definition is not None
+                    and self.definition_reference(tool_call.name) is not _expected_definition):
+                raise ValueError(f"tool {tool_call.name!r} is not exposed to code mode: definition changed")
+
+        check_expected()
 
         async def finalize(result: StructuredToolResult) -> StructuredToolResult:
             structured = result.get("structuredContent")
@@ -984,6 +1052,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             output_limit = (
                 max(self.max_output_chars, MIN_AGENT_RECEIPT_BYTES)
                 if terminal_agent
+                else max(self.max_output_chars, 65536) if _nested_tool_executor is not None
                 else self.max_output_chars
             )
             normalized = await _normalize_result_async(
@@ -1037,9 +1106,13 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             )
             if abort_result is not None:
                 return await finalize(abort_result)
-        self.remember_approval_definition(
-            tool_call, capability, persist=_persist_approval
-        )
+        check_expected()
+        nested_code = _nested_tool_executor is not None and self.is_code_mode_call(tool_call.name)
+        if not nested_code:
+            _nested_tool_executor = None
+            self.remember_approval_definition(
+                tool_call, capability, persist=_persist_approval
+            )
         execution_token = uuid.uuid4().hex
         cleanup_binding = (
             self.approval_policy.cleanup_execution_binding
@@ -1047,7 +1120,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             else None
         )
         try:
-            gate_result, execution_signal = await self._approval_gate.run(
+            gate_outcome = await self._approval_gate.run(
                 tool_call,
                 arguments,
                 signal_state,
@@ -1055,15 +1128,19 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
                 _lifecycle_sink,
                 execution_token=execution_token,
                 skip_approval=(
-                    not self.enforce_approvals
-                    and (
+                    nested_code
+                    or not self.enforce_approvals and (
                         _skip_approval
                         or not capability.requires_approval
                     )
                 ),
                 persist_request=_persist_approval,
                 capability=capability,
+                span=_span,
             )
+            gate_result = gate_outcome.result
+            execution_signal = gate_outcome.signal
+            approval_origin = gate_outcome.origin
             approved_execution = None
             if self.approval_policy is not None:
                 approved_execution = self.approval_policy.consume_execution_binding(
@@ -1079,6 +1156,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         finally:
             if cleanup_binding is not None:
                 cleanup_binding(execution_token)
+        check_expected()
         claim_error = self.approval_execution_error(
             tool_call,
             prepared=_pending_execution_claimed,
@@ -1094,11 +1172,19 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         if isinstance(current, dict):
             return await finalize(current)
         definition, capability, arguments = current
+        if nested_code and not self.is_code_mode_call(tool_call.name):
+            return await finalize(_error_result("code tool definition changed", kind="tool_not_allowed"))
         if _scope_signal is not None:
             execution_signal = _scope_signal
             if execution_signal.is_set():
                 return await finalize(_legacy_result(_canceled_result(tool_call.id)))
-        if _lifecycle_sink is not None:
+        if _retain_approval_origin:
+            self._approval_origins[tool_call.id] = approval_origin
+        if _lifecycle_payload_sink is not None:
+            _lifecycle_payload_sink(
+                "execution_start", {"approval_origin": approval_origin}
+            )
+        elif _lifecycle_sink is not None:
             _lifecycle_sink("execution_start")
         stream_publisher = (
             _ToolCallStreamPublisher(tool_call, execution_signal, _stream_sink)
@@ -1111,6 +1197,7 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             _lifecycle_sink,
             approved_execution,
             host_environment={} if _host_environment is None else _host_environment,
+            nested_tool_executor=_nested_tool_executor,
         )
         handler = bind_execution_context(definition.handler, execution_context)
         execution_arguments = build_execution_arguments(
@@ -1161,6 +1248,12 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
             )
         return await finalize(normalized_result)
 
+    def peek_approval_origin(self, tool_call_id: str) -> str | None:
+        return self._approval_origins.get(tool_call_id)
+
+    def take_approval_origin(self, tool_call_id: str) -> str | None:
+        return self._approval_origins.pop(tool_call_id, None)
+
     async def abort_approval(
         self, tool_call: ToolCall
     ) -> ApprovalDecision | None:
@@ -1208,9 +1301,6 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         if self.abort_signal is signal_state:
             self.abort_signal = self._abort_registry.new_generation()
         return self.abort_signal
-
-    def _path(self, raw_path: object) -> Path:
-        return self.policy.resolve(raw_path).absolute
 
     def verify_cwd_identity(self, *, allow_removed: bool = False) -> None:
         """Fail closed if the pathname names a directory other than the captured cwd."""

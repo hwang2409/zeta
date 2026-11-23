@@ -22,6 +22,7 @@ from ..storage_format import StorageFeature, WriterLease, feature_enabled
 
 _READ_RETRIES = 10
 _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS = 1.0
+_IDENTITY_WRITE_LOCK_TIMEOUT_SECONDS = 10.0
 _PROJECT_REGISTRY_LOCK_POLL_SECONDS = 0.05
 _T = TypeVar("_T")
 _ACTIVE_WRITER_LEASE: ContextVar[WriterLease | None] = ContextVar(
@@ -79,7 +80,15 @@ class ProjectLockingMixin:
 
     @staticmethod
     def _acquire_lock(lock_fd: int, mode: int) -> None:
-        deadline = time.monotonic() + _PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS
+        ProjectLockingMixin._acquire_lock_with_timeout(
+            lock_fd, mode, timeout_seconds=_PROJECT_REGISTRY_LOCK_TIMEOUT_SECONDS
+        )
+
+    @staticmethod
+    def _acquire_lock_with_timeout(
+        lock_fd: int, mode: int, *, timeout_seconds: float
+    ) -> None:
+        deadline = time.monotonic() + timeout_seconds
         while True:
             try:
                 fcntl.flock(lock_fd, mode | fcntl.LOCK_NB)
@@ -88,6 +97,28 @@ class ProjectLockingMixin:
                 if time.monotonic() >= deadline:
                     raise ProjectRegistryBusyError() from exc
                 time.sleep(_PROJECT_REGISTRY_LOCK_POLL_SECONDS)
+
+    @staticmethod
+    def _acquire_identity_lock(lock_fd: int) -> None:
+        ProjectLockingMixin._acquire_lock_with_timeout(
+            lock_fd, fcntl.LOCK_EX, timeout_seconds=_IDENTITY_WRITE_LOCK_TIMEOUT_SECONDS
+        )
+
+    @staticmethod
+    def _write_lock_metadata(lock_fd: int, operation: str) -> None:
+        payload = f"pid={os.getpid()}\noperation={operation}\n".encode()
+        os.ftruncate(lock_fd, 0)
+        os.pwrite(lock_fd, payload, 0)
+
+    @staticmethod
+    def _read_lock_metadata(lock_fd: int) -> tuple[int | None, str | None]:
+        try:
+            values = os.pread(lock_fd, 256, 0).decode().splitlines()
+            metadata = dict(line.split("=", 1) for line in values if "=" in line)
+            pid = int(metadata["pid"]) if "pid" in metadata else None
+            return pid, metadata.get("operation")
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None, None
 
     @staticmethod
     def _open_named_lock(directory_fd: int, name: str) -> int:
@@ -179,10 +210,12 @@ class ProjectLockingMixin:
             stack.callback(os.close, root_fd)
             lock_fd = self._open_lock(root_fd, create=True)
             assert lock_fd is not None
+            # Close even when the wait times out; unlock only once acquired.
+            stack.callback(os.close, lock_fd)
             self._acquire_lock(
                 lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
             )
-            stack.callback(self._release_lock, lock_fd)
+            stack.callback(fcntl.flock, lock_fd, fcntl.LOCK_UN)
             project_fds = tuple(
                 self._validated_project_fd(root_fd, project_id)
                 for project_id, _domain in domains
@@ -208,10 +241,11 @@ class ProjectLockingMixin:
                 project_fds.append(project_fd)
                 stack.callback(os.close, project_fd)
                 lock_fd = self._named_lock_fd(project_fd, domain)
+                stack.callback(os.close, lock_fd)
                 self._acquire_lock(
                     lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
                 )
-                stack.callback(self._release_lock, lock_fd)
+                stack.callback(fcntl.flock, lock_fd, fcntl.LOCK_UN)
             yield tuple(project_fds)
 
     @contextmanager
@@ -282,11 +316,11 @@ class ProjectLockingMixin:
         )
 
     @contextmanager
-    def _identity_write(self) -> Iterator[int]:
+    def _identity_write(self, *, operation: str = "identity_write") -> Iterator[int]:
         require_off_loop_lock("project identity authority", ProjectRegistryError)
         with self._lease_context(self._storage_lease):
             self._ensure_root()
-            with identity_lock(), self._locked_home() as root_fd:
+            with identity_lock(), self._locked_home(operation) as root_fd:
                 yield root_fd
 
     @contextmanager
@@ -299,7 +333,7 @@ class ProjectLockingMixin:
             yield project_fds[0]
 
     @contextmanager
-    def _locked_home(self) -> Iterator[int]:
+    def _locked_home(self, operation: str) -> Iterator[int]:
         for attempt in range(_READ_RETRIES):
             root_fd, _ = self._open_root()
             try:
@@ -313,8 +347,18 @@ class ProjectLockingMixin:
                     assert lock_fd is not None
                     try:
                         os.fchmod(lock_fd, 0o600)
-                        self._acquire_lock(lock_fd, fcntl.LOCK_EX)
-                        yield root_fd
+                        try:
+                            self._acquire_identity_lock(lock_fd)
+                        except ProjectRegistryBusyError as exc:
+                            holder_pid, holder_operation = self._read_lock_metadata(lock_fd)
+                            raise ProjectRegistryBusyError(
+                                holder_pid=holder_pid, holder_operation=holder_operation
+                            ) from exc
+                        self._write_lock_metadata(lock_fd, operation)
+                        try:
+                            yield root_fd
+                        finally:
+                            os.ftruncate(lock_fd, 0)
                         return
                     finally:
                         fcntl.flock(lock_fd, fcntl.LOCK_UN)

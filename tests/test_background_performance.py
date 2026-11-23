@@ -9,6 +9,7 @@ import pytest
 from tests.support.owned import await_or_fail
 from zeta.agent.background_lifecycle import _recover_nested_children
 from zeta.agent.background_owner import BackgroundAgentOwner, CancellationRequest
+from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall, ToolResult
 from zeta.storage_format import WRITER_EPOCH
 
@@ -29,12 +30,11 @@ from zeta.storage_format import WRITER_EPOCH
     ids=("flat", "chain"),
 )
 async def test_cancel_all_visits_each_child_once_without_subtree_walks(
-    parent_ids: dict[str, str | None], expected_order: list[str]
+    tmp_path, request, parent_ids: dict[str, str | None], expected_order: list[str]
 ) -> None:
-    owner = BackgroundAgentOwner.__new__(BackgroundAgentOwner)
-    owner._canceling = False
-    owner._cancel_requested = set()
-    owner._cancel_confirmations = {}
+    store = ConversationStore(tmp_path)
+    request.addfinalizer(store.close)
+    owner = BackgroundAgentOwner(store)
     owner._parent_ids = parent_ids
     events: list[tuple[str, str]] = []
     confirmations: dict[str, asyncio.Task[bool]] = {}

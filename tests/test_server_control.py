@@ -49,6 +49,7 @@ from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
 from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.server.server import _Client
+from zeta.server.session_replay.in_flight import InFlightReply
 from zeta.skills import SkillCatalog
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -136,7 +137,7 @@ def _frame(connection: _ControllerConnection, label: str) -> bytes:
 
 @pytest.mark.asyncio
 async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(
@@ -158,7 +159,7 @@ async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() 
 
 @pytest.mark.asyncio
 async def test_protocol_1_2_projection_keeps_negotiated_version_before_hello() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -180,7 +181,7 @@ def test_no_server_caller_branches_on_ready_controller() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_event_emitted_before_hello_is_delivered_after_hello() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -197,7 +198,7 @@ async def test_controller_event_emitted_before_hello_is_delivered_after_hello() 
 
 @pytest.mark.asyncio
 async def test_controller_pre_hello_events_keep_emission_order() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -218,7 +219,7 @@ async def test_controller_pre_hello_events_keep_emission_order() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_concurrent_outputs_keep_admission_order() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -260,7 +261,7 @@ async def test_controller_concurrent_outputs_keep_admission_order() -> None:
 
 @pytest.mark.asyncio
 async def test_observer_concurrent_outputs_keep_admission_order() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(
@@ -299,7 +300,7 @@ async def test_observer_concurrent_outputs_keep_admission_order() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_claim_failure_drops_pre_hello_events() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     first = _ControllerConnection()
     registry.register(first)
     registry.negotiate_role(first, "controller", "1.2", frozenset())
@@ -319,7 +320,7 @@ async def test_controller_claim_failure_drops_pre_hello_events() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -345,7 +346,7 @@ async def _send_hello_and_flush(
 
 @pytest.mark.asyncio
 async def test_cancel_after_physical_write_reports_delivered_once() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -378,7 +379,7 @@ async def test_cancel_after_physical_write_reports_delivered_once() -> None:
 
 @pytest.mark.asyncio
 async def test_release_after_physical_write_reports_delivered() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -400,7 +401,7 @@ async def test_release_after_physical_write_reports_delivered() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_release_fences_queued_frames() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -427,7 +428,7 @@ async def test_controller_release_fences_queued_frames() -> None:
 
 @pytest.mark.asyncio
 async def test_observer_release_matches_base() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(
@@ -463,7 +464,7 @@ async def test_observer_release_matches_base() -> None:
 
 @pytest.mark.asyncio
 async def test_aclose_settles_queued_frames_false() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -1060,6 +1061,8 @@ async def test_state_change_waits_for_wake_in_setup_before_turn_start(
         assert reply.get("error", {}).get("code") == -32004, reply
         assert server.runtime.model == model
         assert server.runtime.opened is opened
+        status = (await _request(reader, writer, "status", "status", {}))[-1]
+        assert status["result"]["state"] == "running", status
 
         release_setup.set()
         await read_until(reader, _is_turn_end(session_id), what="wake turn_end")
@@ -1252,4 +1255,143 @@ async def test_wake_held_across_session_change_does_not_run_on_old_session(
     finally:
         if held:
             hold.__exit__(None, None, None)
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_abort_with_child_approval_cancels_wake_held_at_start_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, reader, writer, session_id = await _serve_after_first_turn(tmp_path)
+    control = server.control
+    in_abort = asyncio.Event()
+    original_abort = control.abort
+
+    async def observed_abort(*args: Any, **kwargs: Any):
+        in_abort.set()
+        return await original_abort(*args, **kwargs)
+
+    # test-contract: seam an open child approval (string key) makes abort wait, not cancel
+    monkeypatch.setattr(control._approvals, "active_keys", lambda: ("child-approval",))
+    # test-contract: seam signal once dispatch holds the start gate for abort
+    monkeypatch.setattr(control, "abort", observed_abort)
+    hold = control.hold_wake_start()
+    hold.__enter__()
+    held = True
+    try:
+        _schedule_wake(server, session_id)
+        wake = control._notification_task
+        assert wake is not None
+        await send(reader, writer, "abort", "abort", {})
+        await await_or_fail(in_abort.wait(), what="abort holds the gate")
+        hold.__exit__(None, None, None)
+        held = False
+        # the abort's own hold keeps the wake at the gate; the abort must not wait for it.
+        reply = (
+            await read_until(
+                reader, lambda frame: frame.get("id") == "abort", what="abort reply"
+            )
+        )[-1]
+        assert reply.get("result") == {"aborted": True}, reply
+        assert wake.cancelled()
+    finally:
+        if held:
+            hold.__exit__(None, None, None)
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_stall_is_visible_while_durable_stage_is_shielded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from io import StringIO
+
+    from rich.console import Console
+
+    import zeta.core.store._async_writes as writes
+    import zeta.runtime.loop.agent as agent_module
+    from tests.support.completion import ManualDeadlineClock
+    from tests.test_agent import RunBackend
+    from zeta.tui.render import render_event
+
+    backend = RunBackend()
+    backend.release_child.set()
+    clock = ManualDeadlineClock()
+    monkeypatch.setattr(agent_module, "MonotonicDeadlineClock", lambda: clock, raising=False)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    child_store = None
+    stage = ConversationStore.stage_delivery_request
+
+    async def stage_with_blocked_install(store, *args, **kwargs):
+        nonlocal child_store
+        if child_store is None and (store.agent_lifecycle() or {}).get("depth") == 1:
+            child_store = store
+
+            async def block_install():
+                entered.set()
+                await await_or_fail(release.wait(), what="release durable stage installation")
+
+            store._before_committed_install = block_install
+            try:
+                return await stage(store, *args, **kwargs)
+            finally:
+                del store._before_committed_install
+        return await stage(store, *args, **kwargs)
+
+    monkeypatch.setattr(ConversationStore, "stage_delivery_request", stage_with_blocked_install)
+    # test-contract: durability observe cancellation before releasing the real committed write
+    monkeypatch.setattr(writes, "_mutation_cancellation_observed", lambda _policy: cancelled.set())
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await _request(reader, writer, 2, "new_session", {})
+        root_loop = server.runtime.loop
+        assert root_loop is not None
+        events = []
+        sink = root_loop._background_event_sink
+        assert sink is not None
+
+        def capture_and_publish(event):
+            events.append(event)
+            sink(event)
+
+        root_loop.set_background_event_sink(capture_and_publish)
+        await _request(reader, writer, 3, "send", {"text": "start"})
+        await await_or_fail(entered.wait(), what="child delivery committed before install")
+        assert child_store is not None
+        assert child_store.agent_lifecycle()["current_step"] == "turn 1: admitting request"
+        clock.advance(15 * 60)
+        await await_or_fail(cancelled.wait(), what="watchdog cancelled durable stage")
+        step = "turn 1: stalled 15m in request admission, cancelling"
+        assert child_store.agent_lifecycle()["current_step"] == step
+        assert backend.child_prompts == []
+        assert not release.is_set()
+
+        frames = await read_until(
+            reader,
+            lambda frame: frame.get("params", {}).get("event") == "child_idle",
+            what="parent stall notice while the durable operation is still blocked",
+        )
+        notice = frames[-1]["params"]["data"]
+        assert notice["text"] == (
+            "turn stalled for 15 min while admitting request (stage: request admission)"
+        )
+        assert any(
+            frame.get("params", {}).get("data", {}).get("step") == step
+            for frame in frames
+        )
+        event = next(event for event in events if event.data.get("step") == step)
+        output = StringIO()
+        Console(file=output, width=140).print(render_event(event))
+        assert step in output.getvalue()
+    finally:
+        release.set()
         await close_serve(server, writer)

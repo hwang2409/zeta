@@ -35,6 +35,7 @@ from .client import (
     resource_content_from_result,
     resources_from_result,
     tools_from_result,
+    traced_params,
     translate_call_result,
 )
 from .config import MCPServerConfig, mcp_log_path
@@ -381,7 +382,7 @@ class StdioMCPClient(MCPClient):
             "jsonrpc": "2.0",
             "id": request_id,
             "method": method,
-            "params": dict(params),
+            "params": traced_params(method, params, request_id, self.protocol_version),
         }
         try:
             await self._write_request(process, request, response, request_id)

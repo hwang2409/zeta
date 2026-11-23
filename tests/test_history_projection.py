@@ -11,6 +11,7 @@ from zeta.core.store import ConversationStore
 from zeta.server.connections import ConnectionRegistry
 from zeta.server.handlers import history, history_projection
 from zeta.server.protocol import MAX_FRAME_BYTES, MAX_REQUEST_ID_BYTES, FrameCodec
+from zeta.server.session_replay.in_flight import InFlightReply
 
 
 def _entry(number: int, text: str = "text") -> SimpleNamespace:
@@ -520,7 +521,7 @@ async def test_session_history_projection_constructed_once_off_event_loop() -> N
             return tuple(_entry(i) for i in range(300))
 
     runtime = _runtime(Store())
-    registry = ConnectionRegistry(asyncio.get_running_loop())
+    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
     try:
         offset = 0
         while True:

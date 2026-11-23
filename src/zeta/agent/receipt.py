@@ -725,6 +725,30 @@ class _ReceiptLoop(Protocol):
     ) -> ToolResult: ...
 
 
+def _append_tool_result(
+    owner: _ReceiptLoop, call: ToolCall, result: ToolResult
+) -> Any:
+    registry = getattr(owner, "tool_registry", None)
+    approval_origin = (
+        registry.peek_approval_origin(call.id) if registry is not None else None
+    )
+    receipt = owner.store.append_message(
+        Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent(result.content)],
+            tool_result=result,
+            metadata=(
+                {"zeta.approval_origin": approval_origin}
+                if approval_origin is not None
+                else {}
+            ),
+        )
+    )
+    if registry is not None:
+        registry.take_approval_origin(call.id)
+    return receipt
+
+
 def finalize_agent_results(
     owner: _ReceiptLoop,
     calls: Sequence[ToolCall],
@@ -737,9 +761,22 @@ def finalize_agent_results(
         stored_result = result
         child_store = owner._agent_child_stores.get(call.id)
         candidate = result if result is not None else slot
+        reuse_canonical_result = False
+        if child_store is not None and candidate is not None:
+            lifecycle = child_store.agent_lifecycle() or {}
+            projection = candidate.lifecycle_projection or {}
+            persisted_result = lifecycle.get("final_result")
+            # Reuse only the exact persisted receipt; newer candidates still win.
+            reuse_canonical_result = (
+                projection.get("state") != "turn_limit"
+                and lifecycle.get("final_result_is_receipt") is True
+                and type(persisted_result) is str
+                and candidate.content == persisted_result
+            )
         if (
             call.name.casefold() == "agent"
             and candidate is not None
+            and not reuse_canonical_result
             and not (
                 candidate.structured_content is not None
                 and candidate.structured_content.get("status") == "running"
@@ -842,13 +879,7 @@ def finalize_agent_results(
         if foreground_child is not None and result.is_canceled:
             # the lifecycle is final before the parent installs the receipt
             foreground_child.mark_agent_canceled(call.id)
-        receipt = owner.store.append_message(
-            Message(
-                MessageRole.TOOL_RESULT,
-                [TextContent(result.content)],
-                tool_result=result,
-            )
-        )
+        receipt = _append_tool_result(owner, call, result)
         if foreground_child is not None:
             handle = foreground_child.agent_handle()
             if handle is not None:

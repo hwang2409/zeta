@@ -216,7 +216,8 @@ async def test_held_child_reports_rate_limited_until_and_stays_running(
 
 async def _serve_mapping(event: StreamEvent) -> list[tuple[str, dict[str, object]]]:
     control = object.__new__(ServeControl)
-    control.server = SimpleNamespace(runtime=SimpleNamespace(state=None))
+    control.server = SimpleNamespace()
+    control.runtime = SimpleNamespace(state=None)
     frames: list[tuple[str, dict[str, object]]] = []
 
     async def notify(name: object, session_id: str | None, **fields: object) -> None:

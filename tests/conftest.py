@@ -23,7 +23,6 @@ from tempfile import TemporaryDirectory
 
 import httpx
 import pytest
-from rich.console import Console
 
 from zeta.server.approval_settlement.owner import TaskOwner
 
@@ -51,6 +50,14 @@ run_path(_TEST_SITE_PACKAGES / "sitecustomize.py")
 _OWNER_COUNTS = None
 _OWNER_COUNT_GROUPS = []
 _OWNER_LEAK_BASELINE = _TEST_SITE_PACKAGES / "owner_leak_ratchet.txt"
+
+
+@pytest.fixture(autouse=True)
+def reset_process_update_monitor(monkeypatch: pytest.MonkeyPatch) -> None:
+    from zeta.runtime import update_notice
+
+    # test-contract: seam Reset process-global update state between tests.
+    monkeypatch.setattr(update_notice, "_process_monitor", None)
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -1180,36 +1187,6 @@ def approval_settlement_tasks_do_not_leak(
         "approval settlement tasks ended with unretrieved exceptions: "
         f"{unretrieved!r}"
     )
-
-
-@pytest.fixture(autouse=True)
-def stable_terminal_defaults(
-    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
-) -> Generator[None, None, None]:
-    """Keep Rich output stable unless a test explicitly probes the environment."""
-    if request.node.get_closest_marker("environment_sensitive") is not None:
-        yield
-        return
-
-    monkeypatch.setenv("TERM", "xterm-256color")
-    monkeypatch.setenv("COLORTERM", "truecolor")
-    assert os.environ["TERM"] == "xterm-256color"
-    assert os.environ["COLORTERM"] == "truecolor"
-
-    original_init = Console.__init__
-
-    def init_with_stable_defaults(
-        self: Console, *args: object, **kwargs: object
-    ) -> None:
-        if kwargs.get("force_terminal") is not False:
-            kwargs.setdefault("force_terminal", True)
-            kwargs.setdefault("color_system", "truecolor")
-            kwargs.setdefault("no_color", False)
-        original_init(self, *args, **kwargs)
-
-    monkeypatch.setattr(Console, "__init__", init_with_stable_defaults)
-
-    yield
 
 
 @pytest.fixture(autouse=True)

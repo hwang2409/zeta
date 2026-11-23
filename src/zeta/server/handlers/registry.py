@@ -8,6 +8,7 @@ from ...mcp import MCPManagementError, MCPToolRefreshError
 from .. import abort_scope, accounts, model_selection, slash_commands
 from .. import control as session_grants
 from ..protocol import (
+    APPROVAL_SCOPES,
     Access,
     ApprovalDecision,
     ErrorDescriptor,
@@ -17,8 +18,44 @@ from ..protocol import (
     protocol_error,
 )
 from ..session_replay import join_history_and_subscribe
-from . import child_runs, lifecycle, path_completion, session, settings, validation
+from . import (
+    child_runs,
+    lifecycle,
+    path_completion,
+    session,
+    settings,
+    validation,
+)
 from .run_work import cancel_background_task, list_run_work
+from .settings import home_settings_get, home_settings_update
+from .state import (
+    state_accounts,
+    state_agents,
+    state_attention,
+    state_background_tasks,
+    state_catalog,
+    state_inbox,
+    state_inbox_detail,
+    state_memory,
+    state_memory_detail,
+    state_projects,
+    state_retention,
+    state_session,
+    state_sessions,
+    state_settings,
+    state_storage,
+)
+from .telemetry import (
+    telemetry_agent_tree,
+    telemetry_errors,
+    telemetry_models,
+    telemetry_overview,
+    telemetry_series,
+    telemetry_sessions,
+    telemetry_status,
+    telemetry_tools,
+    telemetry_trace,
+)
 
 Handler = Callable[[object, str | int, dict[str, Any]], Awaitable[object]]
 
@@ -54,7 +91,7 @@ async def steer(client, request_id, params):
 
 async def _resolve_approval(client, params, decision):
     scope = params.get("scope", "once")
-    if not isinstance(scope, str) or scope not in {"once", "always_tool"}:
+    if not isinstance(scope, str) or scope not in APPROVAL_SCOPES:
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS, "scope must be 'once' or 'always_tool'"
         )
@@ -196,7 +233,9 @@ async def session_settings(client, request_id, params):
     if client.role == "observer":
         return await client.connections.read_settings(client, params)
     validation.active(client.server.runtime, params)
-    return settings.settings(client.server.runtime, include_plan_mode=True)
+    return settings.settings(
+        client.server.runtime, include_plan_mode=True, telemetry=settings.telemetry(client)
+    )
 
 
 async def set_settings(client, request_id, params):
@@ -205,7 +244,7 @@ async def set_settings(client, request_id, params):
     mode = validation.required_string(params, "approval_mode")
     model_selection.validate(model, mode)
     await model_selection.apply_rpc(runtime, model, mode)
-    return settings.settings(runtime)
+    return settings.settings(runtime, telemetry=settings.telemetry(client))
 
 
 async def set_compaction(client, request_id, params):
@@ -272,20 +311,20 @@ async def account_list(client, request_id, params):
 async def account_logout(client, request_id, params):
     validation.active(client.server.runtime, params)
     return await accounts.logout(
-        client.server.runtime, client.server.control.require_idle, params
+        client.server.runtime, client.server.require_all_idle, params
     )
 
 
 async def account_refresh(client, request_id, params):
     validation.active(client.server.runtime, params)
-    await client.server.control.require_idle()
+    await client.server.require_all_idle()
     return await accounts.refresh(client.server.runtime)
 
 
 async def account_switch(client, request_id, params):
     validation.active(client.server.runtime, params)
     operation = accounts.switch(
-        client.server.runtime, client.server.control.require_idle, params
+        client.server.runtime, client.server.require_all_idle, params
     )
     return await accounts.run_owned_switch(client, operation)
 
@@ -462,9 +501,47 @@ HANDLERS: dict[MethodDescriptor, Handler] = {
     MethodDescriptor.CHILD_RUN_LIST: child_run_list,
     MethodDescriptor.CHILD_RUN_SEND: child_run_send,
     MethodDescriptor.MCP_REFRESH_TOOLS: mcp_refresh_tools,
+    MethodDescriptor.STATE_SESSIONS: state_sessions,
+    MethodDescriptor.STATE_SESSION: state_session,
+    MethodDescriptor.STATE_AGENTS: state_agents,
+    MethodDescriptor.STATE_BACKGROUND_TASKS: state_background_tasks,
+    MethodDescriptor.STATE_CATALOG: state_catalog,
+    MethodDescriptor.STATE_PROJECTS: state_projects,
+    MethodDescriptor.STATE_MEMORY: state_memory,
+    MethodDescriptor.STATE_MEMORY_DETAIL: state_memory_detail,
+    MethodDescriptor.STATE_INBOX: state_inbox,
+    MethodDescriptor.STATE_INBOX_DETAIL: state_inbox_detail,
+    MethodDescriptor.STATE_ATTENTION: state_attention,
+    MethodDescriptor.STATE_SETTINGS: state_settings,
+    MethodDescriptor.STATE_ACCOUNTS: state_accounts,
+    MethodDescriptor.STATE_STORAGE: state_storage,
+    MethodDescriptor.STATE_RETENTION: state_retention,
+    MethodDescriptor.TELEMETRY_STATUS: telemetry_status,
+    MethodDescriptor.TELEMETRY_SESSIONS: telemetry_sessions,
+    MethodDescriptor.TELEMETRY_TRACE: telemetry_trace,
+    MethodDescriptor.TELEMETRY_OVERVIEW: telemetry_overview,
+    MethodDescriptor.TELEMETRY_MODELS: telemetry_models,
+    MethodDescriptor.TELEMETRY_TOOLS: telemetry_tools,
+    MethodDescriptor.TELEMETRY_ERRORS: telemetry_errors,
+    MethodDescriptor.TELEMETRY_SERIES: telemetry_series,
+    MethodDescriptor.TELEMETRY_AGENT_TREE: telemetry_agent_tree,
+    MethodDescriptor.HOME_SETTINGS_GET: home_settings_get,
+    MethodDescriptor.HOME_SETTINGS_UPDATE: home_settings_update,
 }
 if HANDLERS.keys() != set(MethodDescriptor):
     raise RuntimeError("serve method handlers are not exhaustive")
+
+
+# Keep the complete v1 contract explicit: missing descriptors or handlers must not negotiate.
+STATE_READ_V1 = frozenset({
+    "state_projects", "state_memory", "state_memory_detail", "state_inbox", "state_inbox_detail",
+    "state_sessions", "state_session", "state_agents", "state_background_tasks", "state_attention",
+    "state_catalog", "state_settings", "state_accounts", "state_storage", "state_retention",
+})
+
+
+def state_read_available() -> bool:
+    return STATE_READ_V1 == {method.wire for method in HANDLERS if method.feature == "state_read_v1"}
 
 
 def _require_attached_session(runtime: Any, params: dict[str, Any]) -> None:

@@ -17,7 +17,8 @@ _COMPLETED_APPROVAL_EXECUTION = object()
 
 @dataclass(slots=True)
 class _PendingApprovalExecution:
-    definition: tuple[str, str | None]
+    # None: reserved by a restart resume; the resume binds it after MCP mounts.
+    definition: tuple[str, str | None] | None
     owner: object | None = None
     completed: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -249,17 +250,21 @@ class ApprovalHistoryStoreMixin:
         record.owner = owner
         return "claimed"
 
-    def prepare_pending_approval_execution(
-        self, request_id: str, definition: tuple[str, str | None]
-    ) -> bool:
-        record = self._pending_approval_executions.get(request_id)
-        if record is None:
-            self.remember_pending_approval_execution(request_id, definition)
-            record = self._pending_approval_executions[request_id]
+    def prepare_pending_approval_execution(self, request_id: str) -> bool:
+        record = self._pending_approval_executions.setdefault(
+            request_id, _PendingApprovalExecution(None)
+        )
         if record.owner is not None:
             return False
         record.owner = _PREPARED_APPROVAL_EXECUTION
         return True
+
+    def bind_pending_approval_definition(
+        self, request_id: str, definition: tuple[str, str | None]
+    ) -> None:
+        record = self._pending_approval_executions.get(request_id)
+        if record is not None and record.definition is None:
+            record.definition = definition
 
     async def wait_pending_approval_execution(self, request_id: str) -> None:
         record = self._pending_approval_executions.get(request_id)

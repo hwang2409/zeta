@@ -95,6 +95,22 @@ def test_project_retention_days_is_ignored_with_warning(tmp_path: Path) -> None:
     assert any("retention" in warning for warning in loaded.warnings)
 
 
+def test_project_voice_is_ignored_with_warning(tmp_path: Path) -> None:
+    _write(tmp_path / "project", '[voice]\nmodel = "evil.bin"\n')
+    loaded = load_settings(home=tmp_path / "home", project_dir=tmp_path / "project")
+    assert loaded.settings.voice_model == "small.en"
+    assert any("ignoring voice" in warning for warning in loaded.warnings)
+
+
+@pytest.mark.parametrize(
+    "body", ["voice = 1", "[voice]\nengine = 3", '[voice]\nmodel = "tiny"', '[voice]\nspeed = "fast"']
+)
+def test_global_voice_rejects_wrong_types_and_values(tmp_path: Path, body: str) -> None:
+    _write(tmp_path / "home", body + "\n")
+    with pytest.raises(SettingsError, match="voice"):
+        load_settings(home=tmp_path / "home")
+
+
 def test_project_settings_can_only_lower_limits(tmp_path: Path) -> None:
     home = tmp_path / "home"
     project = tmp_path / "project"
@@ -824,3 +840,47 @@ def test_project_cannot_enable_explicit_finish(tmp_path: Path) -> None:
     loaded = load_settings(home=home, project_dir=project)
     assert loaded.settings.agents_explicit_finish is None
     assert any("agents" in warning and "project" in warning for warning in loaded.warnings)
+
+
+_OTEL_ENDPOINT_ERROR = "otel.endpoint must be an http(s) URL with a literal loopback host"
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "accepted"),
+    [
+        ('"http://127.0.0.1:4318/v1/traces"', True),
+        ('"https://[::1]:4318/v1/traces"', True),
+        ('"http://example.com/v1/traces"', False),
+        ('"http://localhost:4318/v1/traces"', False),
+        ('"http://10.0.0.1:4318/v1/traces"', False),
+        ('"ftp://127.0.0.1/v1/traces"', False),
+        ('"http://user@127.0.0.1:4318/v1/traces"', False),
+        ('"http://127.0.0.1:99999/v1/traces"', False),
+        ("4318", False),
+    ],
+    ids=["ipv4", "ipv6", "dns", "localhost", "private", "scheme", "userinfo", "port", "integer"],
+)
+def test_global_otel_endpoint_is_validated_as_a_settings_error(
+    tmp_path: Path, endpoint: str, accepted: bool
+) -> None:
+    home = tmp_path / "home"
+    _write(home, f"[otel]\nendpoint = {endpoint}\n")
+
+    if accepted:
+        assert load_settings(home=home).settings.otel_endpoint == endpoint.strip('"')
+        return
+    # SettingsError is what every startup surface prints as a clean error, not a crash.
+    with pytest.raises(SettingsError) as error:
+        load_settings(home=home)
+    assert str(error.value) == _OTEL_ENDPOINT_ERROR
+
+
+def test_project_otel_fails_instead_of_being_ignored(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "repo" / ".zeta"
+    _write(home, "")
+    path = _write(project, '[otel]\nendpoint = "http://127.0.0.1:4318/v1/traces"\n')
+
+    with pytest.raises(SettingsError) as error:
+        load_settings(home=home, project_dir=project)
+    assert str(error.value) == f"[otel] is global-only; remove it from {path}"

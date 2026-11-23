@@ -8,7 +8,8 @@ import logging
 import os
 import socket
 import stat
-from collections.abc import Awaitable, Callable
+import time
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -26,18 +27,26 @@ from ..storage_format import (
     feature_enabled,
     pending_releases,
 )
+from ..telemetry import Telemetry, TelemetryError
 from . import (
     accounts,
     login,
 )
+from . import control as control_module
 from .connections import ConnectionRegistry
-from .control import NotificationPresentation, ServeControl
+from .control import (
+    NotificationPresentation,
+    ServeControl,
+)
+from .diagnostics import capture_peer_identity, log_stuck_holder
 from .handlers.projects import (
     PROJECT_REQUEST_EXCEPTIONS,
     ProjectRequests,
     project_request_error,
 )
 from .handlers.registry import dispatch as _dispatch_request
+from .handlers.registry import state_read_available
+from .parking import ParkedPairs
 from .protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,
     FEATURES,
@@ -205,6 +214,7 @@ class ZetaServer:
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         max_role: str = "controller",
         prebound_socket: socket.socket | None = None,
+        telemetry: Telemetry | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
             raise ValueError("choose socket_path or port, not both")
@@ -226,8 +236,15 @@ class ZetaServer:
         )
         self.port = port
         self.approval_reconnect_grace = approval_reconnect_grace
+        # deadlines for a controller connection lost mid-request (tests override).
+        # drain this long once another controller contends, then cancel the holder.
+        self.lost_request_contended_drain = 5.0
+        # after the cancel, log the stuck-holder task dump at this interval.
+        self.lost_request_cancel_bound = 1.0
         self._borrowed = runtime is not None
-        self.runtime = runtime or ServerRuntime(
+        # a borrowed server shows its host's telemetry; an owning server configures its own in start()
+        self.telemetry = telemetry or Telemetry.disabled()
+        runtime = runtime or ServerRuntime(
             self.home,
             cwd=cwd,
             provider=provider,
@@ -274,7 +291,7 @@ class ZetaServer:
         self._retention_owner = (
             make_retention_owner(
                 self.home,
-                self.runtime.manager._storage_lease,
+                runtime.manager._storage_lease,
                 lambda: (
                     0
                     if self.runtime.opened is None
@@ -285,7 +302,7 @@ class ZetaServer:
             if (
                 not self._borrowed
                 and feature_enabled(
-                    self.runtime.manager._storage_lease.observed_epoch,
+                    runtime.manager._storage_lease.observed_epoch,
                     StorageFeature.SESSION_RETENTION_ACTIVATION,
                 )
             )
@@ -299,13 +316,59 @@ class ZetaServer:
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.foreground_event_publisher = foreground_event_publisher or ForegroundEventPublisher()
-        self.control = ServeControl(self, self.foreground_event_publisher)
+        self.control = ServeControl(self, runtime, self.foreground_event_publisher)
+        self._bind_pair(self.control)
+        self.parking = ParkedPairs(lambda: self.connections)
+
+    @property
+    def runtime(self) -> ServerRuntime:
+        return self.control.runtime
+
+    def controls(self) -> Iterator[ServeControl]:
+        """The attached pair, then every parked pair."""
+        yield self.control
+        yield from self.parking.pairs()
+
+    def new_pair(self) -> ServeControl:
+        """An empty pair beside the attached one; it shares the session manager."""
+        self.parking.require_room()
+        control = ServeControl(
+            self, self.runtime.sibling(), self.foreground_event_publisher
+        )
+        self._bind_pair(control)
+        return control
+
+    def attach(self, incoming: ServeControl) -> None:
+        """Make ``incoming`` the attached pair in one step (no await): park the
+        outgoing pair while it holds work, else start its close."""
+        outgoing = self.control
+        if not self.parking.unpark(incoming):
+            # a new pair takes over the controller slot state of the pair it replaces
+            incoming._controller_attached = outgoing._controller_attached
+        self.control = incoming
+        assert self.connections is not None
+        self.connections.replay_session_replaced()
+        if outgoing.runtime.opened is not None:
+            self.parking.leave(outgoing)
+
+    async def require_all_idle(self) -> None:
+        for control in self.controls():
+            await control.require_idle()
+
+    def _bind_pair(self, control: ServeControl) -> None:
+        """Point the runtime's sinks at its control; a borrowed runtime keeps its owner's."""
         if not self._borrowed:
-            self.runtime.set_approval_control_binder(self.control.bind_policy)
-            self.runtime.set_background_event_sink(self.control._publish_background_event)
-            self.runtime.set_memory_notice_sink(self.control._publish_memory_notice)
-            self.runtime.set_run_work_event_sink(self.control._publish_run_work_event)
-            self.runtime.set_background_wake_sink(self.control._schedule_background_wake)
+            runtime = control.runtime
+            # every pair's sessions trace through this server's process telemetry
+            runtime.set_telemetry_source(lambda: self.telemetry)
+            runtime.set_approval_control_binder(control.bind_policy)
+            runtime.set_background_event_sink(control._publish_background_event)
+            runtime.set_memory_notice_sink(control._publish_memory_notice)
+            runtime.set_run_work_event_sink(control._publish_run_work_event)
+            runtime.set_background_wake_sink(control._schedule_background_wake)
+            runtime.set_work_changed_sink(
+                lambda: self.parking.changed_from_any_thread(control)
+            )
 
     async def _publish_foreground_events(self) -> None:
         assert self._foreground_subscription is not None
@@ -343,10 +406,19 @@ class ZetaServer:
         return str(self.socket_path)
 
     async def start(self) -> None:
+        if not self._borrowed and not self.telemetry.enabled():
+            try:
+                self.telemetry = await asyncio.to_thread(
+                    lambda: Telemetry.configure(load_settings(home=self.home).settings, self.home)
+                )
+            except TelemetryError as exc:
+                raise SessionError(str(exc)) from None
         if not self._borrowed:
             await self.runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
-        self.connections = ConnectionRegistry(asyncio.get_running_loop())
+        self.connections = ConnectionRegistry(
+            asyncio.get_running_loop(), lambda: self.control.in_flight
+        )
         if self.port is None:
             if self._prebound_socket is not None:
                 self._server = await asyncio.start_unix_server(
@@ -409,6 +481,7 @@ class ZetaServer:
         finally:
             self._client = None
             self._client_active = False
+            self.parking.close_all(approval_settlement_timeout)
             try:
                 try:
                     await self.control.close()
@@ -418,9 +491,14 @@ class ZetaServer:
                     if not self._borrowed:
                         await self.runtime.close()
                 finally:
-                    await self.control.wait_for_approval_settlement(
-                        approval_settlement_timeout
-                    )
+                    try:
+                        await self.control.wait_for_approval_settlement(
+                            approval_settlement_timeout
+                        )
+                    finally:
+                        await asyncio.gather(
+                            *self.parking.closing_tasks(), return_exceptions=True
+                        )
             finally:
                 if self.connections is not None:
                     await self.connections.aclose()
@@ -437,6 +515,9 @@ class ZetaServer:
                 finally:
                     self._server = None
                     self._unix_listener = None
+                    if not self._borrowed:
+                        # last, so every close step can still export; idempotent for a second close
+                        await asyncio.to_thread(self.telemetry.shutdown)
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -471,7 +552,9 @@ class _Client:
         self.reader = reader
         self.writer = writer
         if server.connections is None:
-            server.connections = ConnectionRegistry(asyncio.get_running_loop())
+            server.connections = ConnectionRegistry(
+                asyncio.get_running_loop(), lambda: server.control.in_flight
+            )
             server.connections.register(self)
         self.connections = server.connections
         self.logins = login.Logins(server.home)
@@ -484,9 +567,22 @@ class _Client:
         self._close_lock = asyncio.Lock()
         self._closed = False
         self._local_close = False
-        self._controller_release: asyncio.Task[None] | None = None
+        self._controller_release: asyncio.Future[object] | None = None
         self._transport_failed = False
         self._read_buffer = bytearray()
+        # the request this connection runs now (method, id, monotonic start), its
+        # handler task, and the one pending socket read; used to detect loss
+        # while a handler runs and to dump a stuck holder. A contended-slot
+        # refusal log also reads these plus the peer facts captured once at
+        # accept and the connect/last-frame clocks to name and age both the
+        # holder and the refused connection (no behavior change).
+        self._request: tuple[str, str | int, float] | None = None
+        self._run_task: asyncio.Task[object] | None = None
+        self._chunk_read: asyncio.Task[bytes] | None = None
+        self._peer = capture_peer_identity(reader, writer)
+        self._connected_at = time.monotonic()
+        self._last_frame_at = self._connected_at
+        self._client_version: str | None = None
         self.codec = FrameCodec()
         self.projects = ProjectRequests.for_runtime(
             home=server.home, runtime=server.runtime, codec=self.codec
@@ -501,7 +597,7 @@ class _Client:
                     self._release_dead_connection()
                     graceful = False
                     break
-                await self.connections.wait_until_settled(self)
+                self._last_frame_at = time.monotonic()
                 try:
                     request = self.codec.parse_request(line)
                 except ProtocolError as exc:
@@ -513,100 +609,219 @@ class _Client:
                     if not self.handshaken:
                         break
                     continue
-                request_id = request["id"]
-                try:
-                    result = await self._dispatch(
-                        request_id, request["method"], request["params"]
-                    )
-                except ProtocolError as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            exc.request_id
-                            if exc.request_id is not None
-                            else request_id,
-                            exc.descriptor,
-                            exc.message,
-                            exc.data,
-                        )
-                    )
-                    if not self.handshaken:
-                        self.connections.release(self)
-                except PROJECT_REQUEST_EXCEPTIONS as exc:
-                    descriptor, message, data = project_request_error(exc)
-                    await self._write(
-                        self.codec.error_response(request_id, descriptor, message, data)
-                    )
-                except ProjectRegistryBusyError as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id,
-                            ErrorDescriptor.PROJECT_REGISTRY_BUSY,
-                            str(exc),
-                            {"retryable": exc.retryable},
-                        )
-                    )
-                except TranscriptRepairRequiresUpgrade as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id,
-                            ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
-                            str(exc),
-                            {
-                                "home_epoch": exc.home_epoch,
-                                "required_epoch": exc.required_epoch,
-                            },
-                        )
-                    )
-                except TranscriptLoadError as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id,
-                            ErrorDescriptor.CORRUPT_TRANSCRIPT,
-                            str(exc),
-                            exc.protocol_data(),
-                        )
-                    )
-                except ConversationIntegrityError as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
-                        )
-                    )
-                except (SessionError, ValueError) as exc:
-                    await self._write(
-                        self.codec.error_response(
-                            request_id, ErrorDescriptor.INVALID_PARAMS, str(exc)
-                        )
-                    )
-                except Exception as exc:  # noqa: BLE001 - keep the socket alive
-                    await self._write(
-                        self.codec.error_response(
-                            request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
-                        )
-                    )
-                else:
-                    if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
-                        baseline_builder = (
-                            self.connections.child_runs.with_baseline
-                            if request["method"] in {"session_history_and_subscribe", "child_run_events"}
-                            else None
-                        )
-                        written = await self.connections.admit_join_response(
-                            self, request_id, result, baseline_builder
-                        )
-                    else:
-                        written = await self._write(self.codec.response(request_id, result))
-                    if (
-                        written
-                        and request["method"] == "hello"
-                        and self.role == "controller"
-                        and "approval_reconnect" in self.features
-                    ):
-                        await self.server.control.controller_ready(reconnect=True)
+                handling = asyncio.create_task(self._handle(request))
+                self._run_task = handling
+                if await self._run_request(handling):
+                    await self._handle_loss(handling)
+                    graceful = False
+                    break
+                self._run_task = None
                 if not self.handshaken:
                     break
         finally:
+            # a cancel of the connection task (server teardown) must also stop an
+            # in-flight handler; the EOF-loss path already awaited it to done.
+            handler = self._run_task
+            if handler is not None and not handler.done():
+                handler.cancel()
+                with contextlib.suppress(BaseException):
+                    await handler
+            self._cancel_pending_read()
             await self.close(graceful=graceful and not self._transport_failed)
+
+    async def _run_request(self, handling: asyncio.Task[None]) -> bool:
+        """Run one request to completion while reading the socket ahead.
+
+        Dispatch stays serial: the next request is not parsed until this one
+        ends. Only the socket read runs concurrently so a peer that closes mid
+        request is seen at once. Return ``True`` if the peer closed (EOF).
+        """
+        while not handling.done():
+            if len(self._read_buffer) > MAX_FRAME_BYTES:
+                # read-ahead bound reached (one max frame); wait for the handler.
+                await asyncio.wait({handling})
+                break
+            chunk = self._ensure_chunk_read()
+            await asyncio.wait({handling, chunk}, return_when=asyncio.FIRST_COMPLETED)
+            if chunk.done():
+                self._chunk_read = None
+                data = chunk.result()
+                if not data:
+                    return True
+                self._read_buffer.extend(data)
+        await handling
+        return False
+
+    async def _handle_loss(self, handling: asyncio.Task[None]) -> None:
+        """Peer EOF while a request runs: start no new request, hold the slot
+        until the handler ends, and cancel it only once another controller
+        contends for the slot."""
+        if self._local_close:
+            # a local server close cancels the handler at once and releases via
+            # close(); no remote hello waits on it.
+            handling.cancel()
+            with contextlib.suppress(BaseException):
+                await handling
+            return
+        contended = self.connections.mark_lost(self)
+        if contended is None:
+            with contextlib.suppress(BaseException):
+                await handling
+            return
+        contended_wait = asyncio.create_task(contended.wait())
+        try:
+            await asyncio.wait(
+                {handling, contended_wait}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if not handling.done():
+                # a controller hello is waiting: drain briefly so a handler that
+                # is about to finish keeps its side effects, then cancel.
+                await asyncio.wait(
+                    {handling}, timeout=self.server.lost_request_contended_drain
+                )
+                if not handling.done():
+                    handling.cancel()
+                    await self._await_handler_held(handling)
+        finally:
+            contended_wait.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await contended_wait
+        with contextlib.suppress(BaseException):
+            await handling
+        self._release_dead_connection()
+
+    async def _await_handler_held(self, handling: asyncio.Task[None]) -> None:
+        """Hold the slot until the cancelled handler ends; dump the stuck holder
+        at each cancel-bound interval so a swallowed cancel stays visible."""
+        while True:
+            done, _ = await asyncio.wait(
+                {handling}, timeout=self.server.lost_request_cancel_bound
+            )
+            if done:
+                return
+            log_stuck_holder(
+                self,
+                self.connections.output_state(self),
+                reason="controller slot held; lost holder's request did not end after cancel",
+            )
+
+    async def _handle(self, request: dict[str, Any]) -> None:
+        request_id = request["id"]
+        self._request = (request["method"], request_id, time.monotonic())
+        await self.connections.wait_until_settled(self)
+        try:
+            with self._traced(request):
+                result = await self._dispatch(
+                    request_id, request["method"], request["params"]
+                )
+        except ProtocolError as exc:
+            await self._write(
+                self.codec.error_response(
+                    exc.request_id
+                    if exc.request_id is not None
+                    else request_id,
+                    exc.descriptor,
+                    exc.message,
+                    exc.data,
+                )
+            )
+            if not self.handshaken:
+                self.connections.release(self)
+        except PROJECT_REQUEST_EXCEPTIONS as exc:
+            descriptor, message, data = project_request_error(exc)
+            await self._write(
+                self.codec.error_response(request_id, descriptor, message, data)
+            )
+        except ProjectRegistryBusyError as exc:
+            await self._write(
+                self.codec.error_response(
+                    request_id,
+                    ErrorDescriptor.PROJECT_REGISTRY_BUSY,
+                    str(exc),
+                    {"retryable": exc.retryable},
+                )
+            )
+        except TranscriptRepairRequiresUpgrade as exc:
+            await self._write(
+                self.codec.error_response(
+                    request_id,
+                    ErrorDescriptor.TRANSCRIPT_REPAIR_REQUIRES_UPGRADE,
+                    str(exc),
+                    {
+                        "home_epoch": exc.home_epoch,
+                        "required_epoch": exc.required_epoch,
+                    },
+                )
+            )
+        except TranscriptLoadError as exc:
+            await self._write(
+                self.codec.error_response(
+                    request_id,
+                    ErrorDescriptor.CORRUPT_TRANSCRIPT,
+                    str(exc),
+                    exc.protocol_data(),
+                )
+            )
+        except ConversationIntegrityError as exc:
+            await self._write(
+                self.codec.error_response(
+                    request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
+                )
+            )
+        except (SessionError, ValueError) as exc:
+            await self._write(
+                self.codec.error_response(
+                    request_id, ErrorDescriptor.INVALID_PARAMS, str(exc)
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the socket alive
+            await self._write(
+                self.codec.error_response(
+                    request_id, ErrorDescriptor.INTERNAL_ERROR, str(exc)
+                )
+            )
+        else:
+            if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
+                baseline_builder = (
+                    self.connections.child_runs.with_baseline
+                    if request["method"] in {"session_history_and_subscribe", "child_run_events"}
+                    else None
+                )
+                written = await self.connections.admit_join_response(
+                    self, request_id, result, baseline_builder
+                )
+            else:
+                written = await self._write(self.codec.response(request_id, result))
+            if (
+                written
+                and request["method"] == "hello"
+                and self.role == "controller"
+                and "approval_reconnect" in self.features
+            ):
+                for control in self.server.controls():
+                    await control.controller_ready(reconnect=True)
+        self._request = None
+
+    @contextlib.contextmanager
+    def _traced(self, request: dict[str, Any]) -> Iterator[None]:
+        """Serve span for one request, under the client's W3C parent once it negotiated `otel`.
+
+        Tasks the handler starts (a send's turn) copy this context. A malformed
+        carrier is ignored whole and leaves only a value-free event on the span.
+        """
+        telemetry = self.server.telemetry
+        # hello itself is never parented: features are still empty while it runs
+        received = request["trace_context"] if "otel" in self.features else {}
+        carrier = {key: value for key, value in received.items() if type(value) is str}
+        accepted = telemetry.extract(carrier)
+        malformed = any(key not in accepted for key in received)
+        with (
+            telemetry.use_trace_context({} if malformed else accepted),
+            telemetry.serve_span(request["method"]) as span,
+        ):
+            if malformed:
+                span.invalid_propagation()
+            yield
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
@@ -634,12 +849,42 @@ class _Client:
                 return line
             self._read_buffer.extend(chunk)
 
-    async def _read_chunk(self) -> bytes:
+    def _ensure_chunk_read(self) -> asyncio.Task[bytes]:
+        """One pending socket read, shared by the run loop and read-ahead so a
+        single reader never has two concurrent reads."""
+        if self._chunk_read is None:
+            self._chunk_read = asyncio.create_task(self._read_raw())
+        return self._chunk_read
+
+    async def _read_raw(self) -> bytes:
         try:
             return await self.reader.read(65_536)
         except ConnectionError:
             # A failed write to a gone peer stores its error in the reader; that is EOF.
             return b""
+
+    async def _read_chunk(self) -> bytes:
+        chunk = self._ensure_chunk_read()
+        data = await chunk
+        if self._chunk_read is chunk:
+            self._chunk_read = None
+        return data
+
+    def _cancel_pending_read(self) -> None:
+        if self._chunk_read is not None:
+            self._chunk_read.cancel()
+            self._chunk_read = None
+
+    def peer_closed(self) -> bool:
+        """Best-effort: has this connection's peer gone away (EOF / transport lost)?
+
+        A heuristic for diagnostics; a buffered unread frame can hide EOF on a
+        unix socket, which is acceptable here.
+        """
+        reader_peer_closed = getattr(self.reader, "peer_closed", None)
+        if reader_peer_closed is not None:  # WebSocketConnection adapter
+            return bool(reader_peer_closed())
+        return self.reader.at_eof() or self.writer.is_closing()
 
     async def _discard_oversized_frame(self, prefix: bytes) -> bytes:
         """Discard an oversized line and preserve any complete later frames."""
@@ -653,14 +898,17 @@ class _Client:
             self._read_buffer.extend(chunk[newline + 1 :])
             return prefix + b"\n"
 
-    def _begin_controller_release(self) -> asyncio.Task[None] | None:
+    def _begin_controller_release(self) -> asyncio.Future[object] | None:
         if self._controller_release is not None:
             return self._controller_release
         if self.role == "controller" and self.connections.is_controller(self):
-            self._controller_release = self.server.control.begin_controller_release(
-                reconnect="approval_reconnect" in self.features,
-                keep_turn="turn_reconnect" in self.features,
-            )
+            self._controller_release = asyncio.gather(*(
+                control.begin_controller_release(
+                    reconnect="approval_reconnect" in self.features,
+                    keep_turn="turn_reconnect" in self.features,
+                )
+                for control in self.server.controls()
+            ))
         return self._controller_release
 
     def _release_dead_connection(self) -> None:
@@ -691,6 +939,14 @@ class _Client:
         self, request_id: str | int, method: str, params: dict[str, Any]
     ) -> tuple[bool, object]:
         if method == "hello":
+            # a controller hello waits up to one shared handoff deadline for a
+            # lost holder to release the slot, then passes the time that is left
+            # to controller_claimed so the total wait never exceeds one deadline.
+            deadline = control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS
+            if params.get("role", "controller") == "controller":
+                start = time.monotonic()
+                await self.connections.wait_for_lost_controller(deadline)
+                deadline = max(0.0, deadline - (time.monotonic() - start))
             result = self._hello(params)
             reconnect_bindings = None
             if "mcp_bindings" in params:
@@ -704,16 +960,35 @@ class _Client:
                 reconnect_bindings = await reconnect_mcp_bindings(self, params)
             if self.role == "controller":
                 reconnect = "approval_reconnect" in self.features
-                claimed = await self.server.control.controller_claimed(
-                    reconnect=reconnect,
-                    require_host_binding="session_host_commands" in self.features,
-                )
+                require_host_binding = "session_host_commands" in self.features
+
+                async def claim() -> bool:
+                    return await self.server.control.controller_claimed(
+                        reconnect=reconnect,
+                        require_host_binding=require_host_binding,
+                        deadline=deadline,
+                    )
+
+                # shield the claim so a cancel of the hello does not leave the
+                # approvals lifecycle half-moved; it waits for the bounded claim.
+                claim_task = asyncio.ensure_future(claim())
+                try:
+                    claimed = await asyncio.shield(claim_task)
+                except asyncio.CancelledError:
+                    with contextlib.suppress(Exception):
+                        await claim_task
+                    raise
                 if not claimed:
                     self.handshaken = False
                     raise ProtocolError(
                         ErrorDescriptor.CONNECTION_CAPACITY,
                         "another client is already connected",
                     )
+                await self.server.parking.claim(
+                    "session_park" in self.features,
+                    reconnect=reconnect,
+                    require_host_binding=require_host_binding,
+                )
                 if reconnect_bindings is not None:
                     await self.server.control.reattach_mcp_bindings(
                         *reconnect_bindings
@@ -722,7 +997,8 @@ class _Client:
                 self.server._client = self
                 self.connections.activate_controller(self)
                 if not reconnect:
-                    await self.server.control.controller_ready()
+                    for control in self.server.controls():
+                        await control.controller_ready()
             return True, result
         if not self.handshaken:
             raise ProtocolError(
@@ -739,6 +1015,8 @@ class _Client:
             )
         version = params.get("protocol_version")
         client_version = params.get("client_version")
+        if isinstance(client_version, str):
+            self._client_version = client_version
         self.protocol_version = negotiate_protocol_version(version, client_version)
         requested = params.get("features")
         if requested is not None and (
@@ -752,6 +1030,8 @@ class _Client:
         accepted = (
             [item for item in FEATURES if item in (requested or ())] if extended else []
         )
+        if "state_read_v1" in accepted and not state_read_available():
+            accepted.remove("state_read_v1")
         accepted = self.server.runtime.available_project_features(accepted)
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
@@ -759,6 +1039,11 @@ class _Client:
             accepted.remove("turn_reconnect")
         if "in_flight_replay" in accepted and "session_replay_seq" not in accepted:
             accepted.remove("in_flight_replay")
+        # a borrowed runtime cannot make a second pair
+        if "session_park" in accepted and (
+            "resume_attach" not in accepted or self.server._borrowed
+        ):
+            accepted.remove("session_park")
         if (
             "child_run_events" in accepted
             and not CHILD_RUN_EVENTS_PREREQUISITES <= set(accepted)

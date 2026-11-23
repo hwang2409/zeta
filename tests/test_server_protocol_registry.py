@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
 from pathlib import Path
 
@@ -1132,6 +1133,101 @@ STRUCTURED_ERROR_FIXTURES = (
         {"home_epoch": 2, "required_epoch": 4},
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32013,"message":"transcript repair needs the stored-format upgrade (home epoch 2, needs 4)","data":{"code":"transcript_repair_requires_upgrade","home_epoch":2,"required_epoch":4}}}\n',
     ),
+    (
+        ErrorDescriptor.INVALID_TELEMETRY_PARAMS,
+        "invalid params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
+    ),
+    (
+        ErrorDescriptor.INVALID_STATE_PARAMS,
+        "invalid params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
+    ),
+    (
+        ErrorDescriptor.STATE_READ_UNAVAILABLE,
+        "state unavailable",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32005,"message":"state unavailable","data":{"code":"state_unavailable","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.CORRUPT_STATE,
+        "stored state is invalid",
+        {"resource": "storage-format.json"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"stored state is invalid","data":{"code":"corrupt_state","resource":"storage-format.json"}}}\n',
+    ),
+    (
+        ErrorDescriptor.STALE_STATE_SNAPSHOT,
+        "snapshot changed; retry",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"snapshot changed; retry","data":{"code":"stale_state_snapshot","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.TRACE_NOT_FOUND,
+        "resource not found",
+        {"id": "00112233445566778899aabbccddeeff"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"resource not found","data":{"code":"trace_not_found","id":"00112233445566778899aabbccddeeff"}}}\n',
+    ),
+    (
+        ErrorDescriptor.TELEMETRY_OFF,
+        "state unavailable",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32005,"message":"state unavailable","data":{"code":"telemetry_off","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.TELEMETRY_SCHEMA_MISMATCH,
+        "telemetry schema is unsupported",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"telemetry schema is unsupported","data":{"code":"telemetry_schema_mismatch"}}}\n',
+    ),
+    (
+        ErrorDescriptor.RESULT_TOO_LARGE,
+        "result exceeds frame limit",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}}\n',
+    ),    (
+        ErrorDescriptor.INVALID_HOME_SETTINGS_PARAMS,
+        "invalid params",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
+    ),
+    (
+        ErrorDescriptor.CUSTOM_HOME_SETTING,
+        "the setting has a custom value that serve does not change",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}}\n',
+    ),
+    (
+        ErrorDescriptor.STALE_REVISION,
+        "settings.toml changed since the given revision",
+        {"current_revision": "sha256:" + "0" * 64},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}}}\n',
+    ),
+    (
+        ErrorDescriptor.SETTINGS_BUSY,
+        "another zeta process is writing settings.toml",
+        {"retryable": True},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32009,"message":"another zeta process is writing settings.toml","data":{"code":"settings_busy","retryable":true}}}\n',
+    ),
+    (
+        ErrorDescriptor.SETTINGS_MALFORMED,
+        "settings.toml does not parse or validate",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"settings.toml does not parse or validate","data":{"code":"settings_malformed"}}}\n',
+    ),
+    (
+        ErrorDescriptor.SETTINGS_UNSAFE,
+        "settings.toml is a link or not a regular, unshared file",
+        None,
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"settings.toml is a link or not a regular, unshared file","data":{"code":"settings_unsafe"}}}\n',
+    ),
+    (
+        ErrorDescriptor.TELEMETRY_UNAVAILABLE,
+        "telemetry cannot start in this zeta install or environment",
+        {"detail": "OpenTelemetry support is not installed; install zeta[otel]"},
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"telemetry cannot start in this zeta install or environment","data":{"code":"telemetry_unavailable","detail":"OpenTelemetry support is not installed; install zeta[otel]"}}}\n',
+    ),
 )
 
 
@@ -1213,3 +1309,69 @@ def test_registered_protocol_values_match_pinned_bytes() -> None:
         )
         == b'{"jsonrpc":"2.0","id":7,"result":{"kind":"output","text":"credential error","credential_store_error":{"code":"mcp_credential_store","reason":"invalid_json","server":"live","credential_file":"/home/.zeta/mcp-oauth.json","operation":"load","recovery":"move_aside_then_auth","text":"credential error"}}}\n'
     )
+
+
+_TELEMETRY_HEALTHY = {"enabled": True, "state": "healthy", "reason": None}
+_TELEMETRY_OFF = {"enabled": False, "state": "off", "reason": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "negotiated", "telemetry"),
+    [
+        (False, False, None),
+        (True, False, None),
+        (False, True, _TELEMETRY_OFF),
+        (True, True, _TELEMETRY_HEALTHY),
+    ],
+    ids=["off-plain", "on-plain", "off-otel", "on-otel"],
+)
+async def test_session_settings_telemetry_is_negotiated_on_every_reply(
+    tmp_path: Path, configured: bool, negotiated: bool, telemetry: dict | None
+) -> None:
+    if configured:
+        (tmp_path / "home").mkdir()
+        # nothing listens here, and slice 1 records no span, so the exporter stays healthy
+        (tmp_path / "home" / "settings.toml").write_text(
+            '[otel]\nendpoint = "http://127.0.0.1:9/v1/traces"\n'
+        )
+    features = ["serve_observers", *(["otel"] if negotiated else [])]
+    contract = await ServeContract.start(tmp_path, "unix")
+    try:
+        controller = await contract.connect("controller")
+        await controller.request(
+            "hello", "hello", {"protocol_version": "1.2", "features": features}
+        )
+        created = await controller.request("new", "new_session", {"provider": "codex"})
+        session_id = created["result"]["session"]["session_id"]
+        observer = await contract.connect("observer")
+        await observer.request(
+            "hello",
+            "hello",
+            {"protocol_version": "1.2", "role": "observer", "features": features},
+        )
+        raw = [
+            await controller.request_raw("get", "session_settings", {"session_id": session_id}),
+            await controller.request_raw(
+                "set",
+                "set_settings",
+                {"session_id": session_id, "model": "gpt-5.6-luna", "approval_mode": "ask"},
+            ),
+            await observer.request_raw("observe", "session_settings"),
+        ]
+    finally:
+        await contract.close()
+
+    extra = {} if telemetry is None else {"telemetry": telemetry}
+    assert [json.loads(reply)["result"] for reply in raw] == [
+        {"model": "gpt-5.6-luna", "approval_mode": "ask", **extra, "plan_mode": False},
+        {"model": "gpt-5.6-luna", "approval_mode": "ask", **extra},
+        {"model": "gpt-5.6-luna", "approval_mode": "ask", **extra},
+    ]
+    if not negotiated:
+        # the exact bytes the pre-otel server sent, whether or not telemetry is configured
+        assert raw == [
+            '{"jsonrpc":"2.0","id":"get","result":{"model":"gpt-5.6-luna","approval_mode":"ask","plan_mode":false}}\n',
+            '{"jsonrpc":"2.0","id":"set","result":{"model":"gpt-5.6-luna","approval_mode":"ask"}}\n',
+            '{"jsonrpc":"2.0","id":"observe","result":{"model":"gpt-5.6-luna","approval_mode":"ask"}}\n',
+        ]

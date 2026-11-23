@@ -24,6 +24,8 @@ from rich.padding import Padding
 from rich.text import Text
 
 from ..config.settings import (
+    DEFAULT_VOICE_ENGINE,
+    DEFAULT_VOICE_MODEL,
     load_settings,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_settings
 )
 from ..core.approval import ApprovalPolicy
@@ -32,11 +34,12 @@ from ..core.project_context import (
     load_project_context,  # noqa: F401 — monkey-patched by tests via zeta.tui.app.load_project_context
     project_instructions_editor_command,
 )
-from ..core.session import SessionMetadata
+from ..core.session import SessionMetadata, env_home
 from ..core.slash import (
     SlashStatus,
     UsageTracker,
     _format_status,
+    build_slash_status,
     create_slash_registry,
 )
 from ..protocol.types import (
@@ -46,6 +49,7 @@ from ..runtime.foreground_events import ForegroundEventPublisher
 from ..runtime.loop import AgentLoop
 from ..runtime.loop.persistence import DraftPersistence
 from ..submission.pipeline import SubmissionPipeline
+from ..telemetry import Telemetry
 from ..tools._shared.user_discovery import ExternalToolDiscovery
 from . import overlay, theme
 from .agent_card import (
@@ -76,8 +80,10 @@ from .models import MODEL_CATALOGS
 from .models import load_model_catalog as _load_model_catalog
 from .overlay import OverlayControl
 from .paste_runtime import PasteRuntime
+from .runtime.overlay_opener import OverlayOpenerMixin
 from .runtime.prompt import PromptRuntimeMixin
 from .runtime.stream import StreamEventMixin
+from .runtime.voice import VoiceInputMixin
 from .runtime_close import RuntimeCloseMixin
 from .session_prompt_history import SessionPromptHistory
 from .slash_handlers import SlashHandlerMixin
@@ -98,7 +104,7 @@ from .transcript import (
 from .transcript.finder_runtime import FinderRuntimeMixin
 from .transcript.history_finder import HistoryFinder
 from .transcript.paged_history import PagedTranscriptHistory
-from .transcript.root_history_source import RootTUIHistorySource
+from .transcript.root_history_source import RootTUIHistorySource, owning_entry_id
 from .user import displayed_user_text
 
 
@@ -121,10 +127,15 @@ def _wrap_status_line(line: str, width: int) -> list[overlay.FragmentLine]:
     ]
 
 
+# Bare commands that open a picker; the other panel commands only show information.
+_PICKER_COMMANDS = frozenset({"/model", "/accounts", "/remote"})
+
+
 def _status_card_lines(
-    status: SlashStatus, width: int | None = None
+    status: SlashStatus | None, width: int | None = None
 ) -> list[overlay.FragmentLine]:
-    formatted = _format_status(status).splitlines()
+    # None: the card is open while its status is built.
+    formatted = ["loading…"] if status is None else _format_status(status).splitlines()
     body = (
         [[overlay.value(line)] for line in formatted]
         if width is None
@@ -167,8 +178,10 @@ class TUIApp(
     RuntimeCloseMixin,
     AgentRunCommandMixin,
     FinderRuntimeMixin,
+    OverlayOpenerMixin,
     StreamEventMixin,
     PromptRuntimeMixin,
+    VoiceInputMixin,
 ):
     """Full-screen transcript, persistent composer, and follow-up queue."""
 
@@ -205,6 +218,10 @@ class TUIApp(
         on_session_close: Callable[[], Awaitable[None]] | None = None,
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         observer_host: Any | None = None,
+        telemetry: Telemetry | None = None,
+        otel_endpoint: str | None = None,
+        voice_engine: str = DEFAULT_VOICE_ENGINE,
+        voice_model: str = DEFAULT_VOICE_MODEL,
     ) -> None:
         app = weakref.proxy(self)
         self.loop = loop
@@ -212,6 +229,8 @@ class TUIApp(
             foreground_event_publisher or ForegroundEventPublisher()
         )
         self.observer_host = observer_host
+        self.telemetry = telemetry or Telemetry.disabled()
+        self._otel_endpoint = otel_endpoint
         self._workspace_snapshot_cap = workspace_snapshot_cap
         self.loop.tool_registry.background_tasks.set_notice_sink(
             lambda message: app._handle_background_notice(message)
@@ -271,20 +290,17 @@ class TUIApp(
             self.loop.store,
             replay_provider_loader=lambda: session_replay_provider(session_dir),
         )
-        self._history_pager = PagedTranscriptHistory(self._history_source)
-        self._history_search_task: asyncio.Task[None] | None = None
+        history_pager = PagedTranscriptHistory(self._history_source)
         self._user_nav_presses: deque[str] = deque()
         self._user_nav_task: asyncio.Task[None] | None = None
         # Root view from before the finder opened: (follow tail, top row, pages).
         self._finder_return: tuple[bool, Any, tuple[str, ...]] | None = None
-        self._history_search_results: tuple[Any, ...] = ()
-        self._history_search_index = 0
         self._history_marker_tasks: set[asyncio.Task[None]] = set()
         self._rendering_history = False
         self._live_sequence = 0
         self._live_entry_id: str | None = None
         self._live_unit_ordinal = 0
-        self._prompt_history = SessionPromptHistory(self._history_source)
+        prompt_history = SessionPromptHistory(self._history_source)
         storage_lease = self.loop.store._storage_lease if draft_path is None else None
         self._draft = DraftPersistence(
             draft_path or self.loop.store.session_dir / "draft",
@@ -305,15 +321,20 @@ class TUIApp(
         self._model_catalog: frozenset[str] | None = MODEL_CATALOGS.get(provider)
         self._model_catalog_loaded = self._model_catalog is not None
         self._model_catalog_task: asyncio.Task[None] | None = None
+        self._model_catalog_refresh_requested = False
+        self._model_catalog_load_finished = asyncio.Event()
+        if self._model_catalog_loaded:
+            self._model_catalog_load_finished.set()
         self._model_picker: ModelPicker | None = None
-        self._model_picker_unit: Any = None
         self._accounts_picker: AccountsPicker | None = None
-        self._accounts_picker_unit: Any = None
+        self._picker_loading: asyncio.Future[Any] | None = None
+        self._picker_loading_name = ""
         self._account_switch_task: asyncio.Task[None] | None = None
         self._account_switch_pending = False
         self._account_switch_finished = asyncio.Event()
         self._account_switch_finished.set()
         self._zeta_home = Path(zeta_home).resolve() if zeta_home is not None else None
+        self._init_voice(self._zeta_home or env_home(), voice_engine, voice_model)
         if project_dir is None:
             discovery = discover_project(self.loop.store.cwd)
             repo_root = discovery.primary_root or discovery.cwd
@@ -341,7 +362,9 @@ class TUIApp(
         self._transcript = TranscriptWidget()
         self._init_remote_view()
         self._history_finder = HistoryFinder(
-            lambda: app._prompt_history.snapshot(app._viewed_session_path()),
+            lambda: app._agent_navigation.transcript_control.prompt_history.snapshot(
+                app._viewed_session_path()
+            ),
             on_accept=lambda: app._clear_pending_attachments(),
         )
         self._active_finder = self._transcript
@@ -359,11 +382,26 @@ class TUIApp(
         self._mcp_manager = MCPManager(self.loop._mcp_management)
         self._status_restore_text = ""
         self._status_restore_cursor = 0
-        self._agent_navigation = AgentNavigation(self.loop.store)
+        self._agent_navigation = AgentNavigation(self.loop.store, history_pager)
         self._agent_navigation._main_transcript_widget = self._transcript
         self._agent_navigation._on_view_change = lambda: app._viewed_session_changed()
-        self._agent_navigation.transcript_control.on_snapshot = (
-            lambda path, snapshot: app._prompt_history.replace(path, snapshot.typed_prompts)
+        self._agent_navigation.transcript_control.configure_history(
+            root_path=self.loop.store.session_dir,
+            root_source=self._history_source,
+            root_transcript=self._transcript,
+            prompt_history=prompt_history,
+            current_path=lambda: app._viewed_session_path(),
+            prepare_path=self._agent_navigation._prepare_view_path,
+            begin_path=self._agent_navigation._begin_view_transition,
+            commit_path=self._agent_navigation._commit_view_path,
+            rollback_path=self._agent_navigation._rollback_view_transition,
+            finish_path=self._agent_navigation._finish_view_transition,
+            render_active=lambda: app._render_active_resident_history(),
+            root_endpoint=lambda: self.loop.store.active_branch_head_id(),
+            invalidate=lambda: app._invalidate_prompt(),
+        )
+        self._agent_navigation.transcript_control.on_history_edge = (
+            lambda direction: app._request_history_edge(direction)
         )
         self._init_fork_view()
         self._todo_widget = TodoWidget(
@@ -422,11 +460,14 @@ class TUIApp(
 
     def _start_model_catalog_load(self) -> None:
         if self._model_catalog_task is not None:
+            self._model_catalog_refresh_requested = True
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+        self._model_catalog_loaded = False
+        self._model_catalog_load_finished.clear()
         self._model_catalog_task = loop.create_task(
             self._load_model_catalog_in_background()
         )
@@ -443,7 +484,12 @@ class TUIApp(
         finally:
             self._model_catalog_loaded = True
             self._model_catalog_task = None
-            self.refresh_model_picker()
+            self._model_catalog_load_finished.set()
+            if not (self._closing or self._closed):
+                self.refresh_model_picker()
+                if self._model_catalog_refresh_requested:
+                    self._model_catalog_refresh_requested = False
+                    self._start_model_catalog_load()
 
     def _prompt_style(self) -> Style:
         focused = get_app().current_buffer.name == "DEFAULT_BUFFER"
@@ -504,6 +550,9 @@ class TUIApp(
             on_exit=lambda: app.request_exit(),
             on_submit=lambda value: app._submit_input(value),
             on_paste=lambda event: app._paste_from_keybinding(event),
+            on_voice_toggle=lambda: app._toggle_voice(),
+            on_voice_cancel=lambda: app._cancel_voice(),
+            voice_active=lambda: app.voice_active,
             on_status_close=lambda: app.close_status_card(),
             status_active=lambda: app.status_card_active,
             on_status_scroll=lambda amount: app._status_move(amount),
@@ -523,8 +572,8 @@ class TUIApp(
             on_history_finder_open=lambda buffer: app._history_finder_open(buffer),
             on_history_previous=lambda buffer: app._history_previous(buffer),
             on_history_next=lambda buffer: app._history_next(buffer),
-            history_navigation_active=lambda: app._prompt_history.navigating,
-            on_history_detach=lambda: app._prompt_history.detach(),
+            history_navigation_active=lambda: app._agent_navigation.transcript_control.prompt_history.navigating,
+            on_history_detach=lambda: app._agent_navigation.transcript_control.prompt_history.detach(),
             finder_active=lambda: app._active_finder.finder_active,
             history_finder_active=lambda: app._history_finder.finder_active,
             on_finder_move=lambda delta: app._finder_move(delta),
@@ -561,6 +610,7 @@ class TUIApp(
             on_picker_rename=lambda: app.accounts_picker_rename(),
             on_picker_refresh=lambda: app.accounts_picker_refresh(),
             picker_active=lambda: app._picker_active,
+            picker_loading=lambda: app._picker_loading is not None,
             on_agent_list_down=lambda: app._focus_agent_list(),
             agent_list_active=lambda: app._agent_navigation.list_focused(),
             on_agent_list_move=lambda delta: (
@@ -586,9 +636,9 @@ class TUIApp(
             on_child_view_top=lambda: app._agent_navigation.child_top(),
             on_child_view_bottom=lambda: app._agent_navigation.child_bottom(),
             composer_agent_navigation_ready=lambda: (
-                app._composer_can_focus_agent_list()
+                app.composer_can_focus_agent_list()
             ),
-            interaction_ready=lambda: not app._startup_replay_active,
+            interaction_ready=lambda: app.interaction_ready(),
             key_remap=self._key_remap,
         )
         session = FullScreenPromptSession(
@@ -638,18 +688,55 @@ class TUIApp(
     def _viewed_transcript(self) -> TranscriptWidget:
         return self._agent_navigation.viewed_transcript
     def _viewed_session_changed(self) -> None:
-        self._prompt_history.reset_navigation()
+        path = self._viewed_session_path()
+        owner = self._agent_navigation.transcript_control
+        if path == owner.view_path:
+            return
+        owner.view_path = path
+        self._cancel_voice()  # a late transcript must not reach another session
+        self._agent_navigation.transcript_control.prompt_history.reset_navigation()
         finder = self._active_finder
         if finder.finder_active:
-            self._finder_cancel()
-            return
-        self._cancel_finder_workers()
+            self._finder_return = None
+            FinderRuntimeMixin._finder_cancel(self)
+        else:
+            self._cancel_finder_workers()
         self._active_finder = self._viewed_transcript()
 
-    def _move_history(self, direction: str, move: Callable[[], None]) -> None:
-        """Own root scrolling: move the view and load the page at the edge it meets."""
+    def _render_active_resident_history(self) -> None:
+        if self._agent_navigation.child_view_active:
+            self._agent_navigation.transcript_control.render_pages(
+                self._agent_navigation.transcript_control.history_pager.pages
+            )
+        else:
+            self._render_resident_history()
+            if self._loop_state == "approval":
+                self._approval_units.clear()
+                self._present_pending_approvals()
+        # The redraw replaced the units an open finder's rows point at.
+        transcript = self._viewed_transcript()
+        if self._active_finder is transcript and transcript.finder_active:
+            self._publish_history_search_target(transcript, None, self._finder_field.text)
 
-        transcript, pager = self._transcript, self._history_pager
+    def _request_history_edge(self, direction: str) -> None:
+        """Load the page at the edge the viewed transcript met."""
+
+        transcript = self._viewed_transcript()
+        pager = self._agent_navigation.transcript_control.history_pager
+        if direction == "older":
+            if not pager.can_load_older or not transcript.at_resident_top:
+                return
+        elif not pager.can_load_newer or not transcript.follow_tail:
+            return
+        asyncio.create_task(self._load_transcript_page(direction=direction))
+
+    def _move_history(self, direction: str, move: Callable[[], None]) -> None:
+        """Own scrolling: move the view and load the page at the edge it meets."""
+
+        owner = self._agent_navigation.transcript_control
+        owner.cancel_finder_return()
+        transcript = self._viewed_transcript()
+        pager = owner.history_pager
         if direction == "newer":
             if transcript.follow_tail and pager.can_load_newer:
                 # The resident tail is not the session tail: load first so this
@@ -661,29 +748,30 @@ class TUIApp(
             move()
             return
         move()
-        if pager.can_load_older and transcript.scroll_offset == 0:
+        if pager.can_load_older and transcript.at_resident_top:
             asyncio.create_task(self._load_transcript_page(direction="older"))
 
     def _page_history_up(self) -> None:
-        self._move_history("older", self._transcript.page_up)
+        self._move_history("older", lambda: self._viewed_transcript().page_up())
 
     def _scroll_history_up(self) -> None:
-        self._move_history("older", self._transcript.scroll_up)
+        self._move_history("older", lambda: self._viewed_transcript().scroll_up())
 
     def _page_history_down(self) -> None:
-        self._move_history("newer", self._transcript.page_down)
+        self._move_history("newer", lambda: self._viewed_transcript().page_down())
 
     def _scroll_history_down(self) -> None:
-        self._move_history("newer", self._transcript.scroll_down)
+        self._move_history("newer", lambda: self._viewed_transcript().scroll_down())
 
     def _navigate_history_user(self, direction: str) -> None:
+        self._agent_navigation.transcript_control.cancel_finder_return()
         # Presses wait for the reveal before them, so each moves one prompt.
         self._user_nav_presses.append(direction)
         if self._user_nav_task is None or self._user_nav_task.done():
             self._user_nav_task = asyncio.create_task(self._run_user_nav_presses())
 
     async def _run_user_nav_presses(self) -> None:
-        transcript = self._transcript
+        transcript = self._viewed_transcript()
         while self._user_nav_presses:
             direction = self._user_nav_presses.popleft()
             moved = (
@@ -697,7 +785,8 @@ class TUIApp(
     async def _reveal_adjacent_user(self, direction: str) -> None:
         """Page to the adjacent prompt the resident rows cannot put on the top row."""
 
-        pager, transcript = self._history_pager, self._transcript
+        pager = self._agent_navigation.transcript_control.history_pager
+        transcript = self._viewed_transcript()
         if direction == "newer" and not pager.can_load_newer:
             # The session tail is resident, so the next prompt is too close to
             # the end to reach the top row: show the end instead.
@@ -714,14 +803,14 @@ class TUIApp(
                 unit.entry_id
                 for page in pager.pages
                 for unit in page.units
-                if ":dependency:" not in unit.entry_id
+                if owning_entry_id(unit.entry_id) == unit.entry_id
             ]
             if durable:
                 target = await pager.navigate_user(
                     durable[0 if direction == "older" else -1], direction
                 )
         if target is not None:
-            self._render_resident_history()
+            self._render_active_resident_history()
             if transcript.restore_durable_scroll_anchor((target, 0, 0)):
                 self._invalidate_prompt()
                 return
@@ -731,17 +820,22 @@ class TUIApp(
             self._invalidate_prompt()
 
     def _resident_page_keys(self) -> tuple[str, ...]:
-        return tuple(descriptor.key for descriptor in self._history_pager.descriptors)
+        pager = self._agent_navigation.transcript_control.history_pager
+        return tuple(descriptor.key for descriptor in pager.descriptors)
 
     def _finder_open(self) -> None:
-        transcript = self._transcript
+        navigation = getattr(self, "_agent_navigation", None)
+        if navigation is not None:
+            navigation.transcript_control.cancel_finder_return()
+        transcript = self._viewed_transcript()
         if transcript.search_active:
             # A new search replaces the accepted one and its match keys.
             self._end_history_search()
+        # The view the finder opened on, root or child: Esc and a query whose
+        # search finds nothing return to it.
         self._finder_return = (
             None
-            if getattr(self, "_history_pager", None) is None
-            or self._agent_navigation.child_view_active
+            if navigation is None
             else (
                 transcript.follow_tail,
                 transcript.durable_scroll_anchor,
@@ -754,143 +848,151 @@ class TUIApp(
         saved, self._finder_return = getattr(self, "_finder_return", None), None
         FinderRuntimeMixin._finder_cancel(self)
         # A search or reveal still in flight must not move the view after Esc.
-        if getattr(self, "_history_search_task", None) is not None:
-            self._history_search_task.cancel()
+        navigation = getattr(self, "_agent_navigation", None)
+        if navigation is None:
+            return
+        owner = navigation.transcript_control
+        if owner.search_task is not None:
+            owner.search_task.cancel()
         if saved is not None and saved[2] != self._resident_page_keys():
             # A durable preview replaced the pages: the line index no longer
             # points at the old rows, so load them back.
-            asyncio.create_task(self._return_to_view(saved[0], saved[1]))
+            owner.start_finder_return(
+                lambda: self._return_to_view(saved[0], saved[1])
+            )
 
     async def _return_to_view(self, follow_tail: bool, anchor: Any) -> None:
-        if follow_tail or anchor is None:
-            await self._load_transcript_page(reset=True)
-            self._transcript.scroll_to_bottom()
+        transcript = self._viewed_transcript()
+        tail = follow_tail or anchor is None
+        pager = self._agent_navigation.transcript_control.history_pager
+        if not (await pager.reveal(None if tail else anchor[0])).segments:
+            return
+        self._render_active_resident_history()
+        if tail:
+            transcript.scroll_to_bottom()
         else:
-            if not (await self._history_pager.reveal(anchor[0])).segments:
-                return
-            self._render_resident_history()
-            self._transcript.restore_durable_scroll_anchor(anchor)
+            transcript.restore_durable_scroll_anchor(anchor)
+        self._invalidate_prompt()
+
+    def _publish_history_search_target(
+        self, transcript: TranscriptWidget, target: Any, query: str
+    ) -> None:
+        self._cancel_finder_workers()
+        self._active_finder = transcript
+        self._start_finder_preparation(transcript.restart_finder())
+        transcript.finder_set_query(query)
         self._invalidate_prompt()
 
     def _finder_input(self, query: str) -> None:
-        self._history_search_results = ()
-        self._history_search_index = 0
+        owner = self._agent_navigation.transcript_control
+        owner.end_search()
         FinderRuntimeMixin._finder_input(self, query)
-        prompt_history = getattr(self, "_prompt_history", None)
+        prompt_history = owner.prompt_history
         if (
             prompt_history is not None
             and self._active_finder is getattr(self, "_history_finder", None)
-            and not self._agent_navigation.child_view_active
         ):
-            prompt_history.start_finder_scan(
-                query, self._publish_prompt_history_snapshot
+            self._hold_overlay_keys(
+                self._scan_prompt_history(query), self._finder_accept_when_ready
             )
-        history_pager = getattr(self, "_history_pager", None)
-        if history_pager is None:
+        transcript = self._viewed_transcript()
+        if self._active_finder is not transcript:
             return
-        history_search_task = getattr(self, "_history_search_task", None)
-        if history_search_task is not None:
-            history_search_task.cancel()
-        if (
-            not query
-            or self._agent_navigation.child_view_active
-            or self._active_finder is not self._transcript
-        ):
-            return
-
-        async def reveal_match() -> None:
-            matches = await history_pager.search(query)
-            if not matches or not self._transcript.finder_active:
-                return
-            self._history_search_results = matches
-            self._history_search_index = 0
-            target = matches[0]
-            resident = {
-                unit.entry_id
-                for page in history_pager.pages
-                for unit in page.units
-            }
-            if (
-                target.entry_id not in resident
-                and not (await history_pager.reveal(target.entry_id)).segments
-            ):
-                return
-            self._show_history_search_target(target, query)
-
-        self._history_search_task = asyncio.create_task(reveal_match())
-        self._history_search_task.add_done_callback(
-            lambda _task: self._finder_accept_when_ready()
+        owner.start_search(
+            query,
+            transcript,
+            lambda target, value: self._publish_history_search_target(
+                transcript, target, value
+            ),
+            lambda: self._return_finder_to_its_view(transcript, query),
         )
+        if owner.search_task is not None:
+            owner.search_task.add_done_callback(self._history_search_ended)
+
+    async def _return_finder_to_its_view(
+        self, transcript: TranscriptWidget, query: str
+    ) -> None:
+        # Pages an earlier query's search revealed do not belong to this query:
+        # rank it over the view the finder opened on, as a burst of keys would.
+        saved = getattr(self, "_finder_return", None)
+        if saved is None or saved[2] == self._resident_page_keys():
+            return
+        await self._return_to_view(saved[0], saved[1])
+        self._publish_history_search_target(transcript, None, query)
 
     def _navigate_history_search(self, delta: int) -> bool:
-        if not self._history_search_results:
-            viewed = self._viewed_transcript()
+        transcript = self._viewed_transcript()
+        owner = self._agent_navigation.transcript_control
+        if not owner.search_results:
             return (
-                viewed.next_search_match()
+                transcript.next_search_match()
                 if delta > 0
-                else viewed.previous_search_match()
+                else transcript.previous_search_match()
             )
-        self._history_search_index = (
-            self._history_search_index + delta
-        ) % len(self._history_search_results)
-        target = self._history_search_results[self._history_search_index]
-
-        async def reveal() -> None:
-            if (
-                not (await self._history_pager.reveal(target.entry_id)).segments
-                or not self._transcript.finder_active
-            ):
-                return
-            self._show_history_search_target(target, self._transcript.search_query)
-
-        self._history_search_task = asyncio.create_task(reveal())
+        if not owner.navigate_search(
+            delta,
+            transcript,
+            lambda target, query: self._publish_history_search_target(
+                transcript, target, query
+            ),
+        ):
+            return False
+        owner.search_task.add_done_callback(self._history_search_ended)
         return True
 
-    def _show_history_search_target(self, target: Any, query: str) -> None:
-        """Paint the revealed match and rebuild the open finder's rows from it."""
-
-        self._render_resident_history()
-        self._transcript.restore_durable_scroll_anchor(
-            (target.entry_id, target.unit_ordinal, 0)
-        )
-        self._cancel_finder_workers()
-        self._active_finder = self._transcript
-        self._start_finder_preparation(self._transcript.restart_finder())
-        self._transcript.finder_set_query(query)
+    def _history_search_ended(self, _task: asyncio.Task[None]) -> None:
+        # The finder reads "searching…" until this task ends; redraw without a key.
         self._invalidate_prompt()
+        self._finder_accept_when_ready()
 
     def _finder_loading(self) -> bool:
-        task = getattr(self, "_history_search_task", None)
-        return FinderRuntimeMixin._finder_loading(self) or (
-            task is not None
-            and not task.done()
-            and self._active_finder is self._transcript
+        navigation = getattr(self, "_agent_navigation", None)
+        if navigation is None or self._active_finder is not self._viewed_transcript():
+            return FinderRuntimeMixin._finder_loading(self)
+        control = navigation.transcript_control
+        task = control.search_task
+        return (
+            FinderRuntimeMixin._finder_loading(self)
+            or (task is not None and not task.done())
+            # Startup has not drawn the first history page: its rows are coming.
+            or (self._startup_replay_active and not self._history_pages_resident())
         )
 
     def _end_history_search(self) -> None:
-        self._history_search_results = ()
-        self._history_search_index = 0
+        self._agent_navigation.transcript_control.end_search()
         self._viewed_transcript().end_search()
 
     async def _close_history_search(self) -> None:
-        if self._history_search_task is not None:
-            self._history_search_task.cancel()
-        self._history_search_task = None
-        self._history_search_results = ()
-        self._history_search_index = 0
+        await self._agent_navigation.transcript_control.close_search()
+
+    async def _close_history_view(self) -> None:
+        await self._agent_navigation.transcript_control.cancel_activation()
 
     async def _close_history_markers(self) -> None:
         tasks = tuple(self._history_marker_tasks)
         if tasks:
             await asyncio.gather(*tasks)
 
-    def _publish_prompt_history_snapshot(
-        self, snapshot: tuple[str, ...], buffer: Any | None = None
-    ) -> None:
+    async def _close_history_pager(self) -> None:
+        transcript = self._viewed_transcript()
+        self._closed_history_snapshot = (
+            (transcript, transcript.units)
+            if self._terminal_restored
+            else None
+        )
+        await self._agent_navigation.transcript_control.history_pager.close()
+
+    def _restore_closed_history(self) -> None:
+        snapshot = getattr(self, "_closed_history_snapshot", None)
+        if snapshot is not None:
+            transcript, units = snapshot
+            transcript.clear()
+            transcript.adopt_units(units)
+        self._closed_history_snapshot = None
+
+    def _publish_prompt_history_snapshot(self, snapshot: tuple[str, ...]) -> None:
         request = self._history_finder.set_snapshot(snapshot)
         if request is None:
-            if buffer is not None:
-                FinderRuntimeMixin._history_finder_open(self, buffer)
             return
         if self._finder_prepare_task is not None:
             self._finder_prepare_task.cancel()
@@ -898,66 +1000,73 @@ class TUIApp(
             self._finder_rank_task.cancel()
         self._start_finder_preparation(request)
 
+    def _scan_prompt_history(self, query: str) -> asyncio.Task[None]:
+        """Read prompt history for ``query``; Enter waits for it."""
+
+        prompt_history = self._agent_navigation.transcript_control.prompt_history
+        prompt_history.start_finder_scan(query, self._publish_prompt_history_snapshot)
+        return prompt_history.finder_task
+
     def _history_finder_open(self, buffer: Any) -> None:
-        prompt_history = getattr(self, "_prompt_history", None)
-        if self._agent_navigation.child_view_active or prompt_history is None:
+        prompt_history = self._agent_navigation.transcript_control.prompt_history
+        if prompt_history is None:
             FinderRuntimeMixin._history_finder_open(self, buffer)
             return
-        prompt_history.bind(self._viewed_session_path(), self._history_source)
-
-        def publish(snapshot: tuple[str, ...]) -> None:
-            self._publish_prompt_history_snapshot(snapshot, buffer)
-
-        prompt_history.start_finder_scan(buffer.text, publish)
+        prompt_history.bind(
+            self._viewed_session_path(), self._agent_navigation.transcript_control.history_pager.source
+        )
+        FinderRuntimeMixin._history_finder_open(
+            self, buffer, lambda: self._scan_prompt_history(buffer.text)
+        )
 
     def _history_previous(self, buffer: Any) -> None:
         path = self._viewed_session_path()
-        document = self._prompt_history.older(path, buffer.document)
+        document = self._agent_navigation.transcript_control.prompt_history.older(path, buffer.document)
         if document is not None:
-            self._prompt_history.apply(buffer, document)
+            self._agent_navigation.transcript_control.prompt_history.apply(buffer, document)
             return
 
-        navigation_revision = self._prompt_history.navigation_revision
+        navigation_revision = self._agent_navigation.transcript_control.prompt_history.navigation_revision
 
         async def load() -> None:
-            await self._prompt_history.load_older()
+            await self._agent_navigation.transcript_control.prompt_history.load_older()
             if (
                 path != self._viewed_session_path()
-                or not self._prompt_history.navigation_is_current(navigation_revision)
+                or not self._agent_navigation.transcript_control.prompt_history.navigation_is_current(navigation_revision)
             ):
                 return
-            document = self._prompt_history.older(path, buffer.document)
+            document = self._agent_navigation.transcript_control.prompt_history.older(path, buffer.document)
             if document is not None:
-                self._prompt_history.apply(buffer, document)
+                self._agent_navigation.transcript_control.prompt_history.apply(buffer, document)
                 self._invalidate_prompt()
 
         asyncio.create_task(load())
 
     def _history_next(self, buffer: Any) -> None:
         path = self._viewed_session_path()
-        document = self._prompt_history.newer(path)
+        document = self._agent_navigation.transcript_control.prompt_history.newer(path)
         if document is not None:
-            self._prompt_history.apply(buffer, document)
+            self._agent_navigation.transcript_control.prompt_history.apply(buffer, document)
             return
 
-        navigation_revision = self._prompt_history.navigation_revision
+        navigation_revision = self._agent_navigation.transcript_control.prompt_history.navigation_revision
 
         async def load() -> None:
-            await self._prompt_history.load_newer()
+            await self._agent_navigation.transcript_control.prompt_history.load_newer()
             if (
                 path != self._viewed_session_path()
-                or not self._prompt_history.navigation_is_current(navigation_revision)
+                or not self._agent_navigation.transcript_control.prompt_history.navigation_is_current(navigation_revision)
             ):
                 return
-            document = self._prompt_history.newer(path)
+            document = self._agent_navigation.transcript_control.prompt_history.newer(path)
             if document is not None:
-                self._prompt_history.apply(buffer, document)
+                self._agent_navigation.transcript_control.prompt_history.apply(buffer, document)
                 self._invalidate_prompt()
 
         asyncio.create_task(load())
 
     def _record_prompt(self, value: str, draft_revision: int | None = None) -> None:
-        self._prompt_history.append(self._viewed_session_path(), value)
+        self._agent_navigation.transcript_control.prompt_history.append(self._viewed_session_path(), value)
         if draft_revision is None:
             self._draft.clear()
         else:
@@ -978,17 +1087,83 @@ class TUIApp(
             self._submit_input(f"/{verb} {key}", internal=True)
 
     def _submit_input(self, value: str, *, internal: bool = False) -> bool:
+        if not internal and self._open_panel_command(value):
+            return True
         if self._startup_replay_active and self._input_loop_active:
             self._startup_submissions.append((value, internal))
             return True
         action = value.strip().split(maxsplit=1)[0] if value.strip() else "submission"
         if self._reject_during_startup_replay(action):
             return False
+        # A prompt is never sent with a picker on screen. Typed text closes a
+        # picker first; this catches a prompt queued before the picker opened.
+        prompt = not internal and value.strip() and not value.lstrip().startswith(("/", "!"))
+        if prompt and self._picker_active:
+            self._picker_cancel()
         if self._agent_navigation.child_view_active and not value.lstrip().startswith("/"):
             return self._send_to_child(value)
         self._paste_runtime.advance_buffer_generation()
         super()._submit_input(value, internal=internal)
         return True
+
+    def _open_panel_command(self, value: str) -> bool:
+        """Open a bare panel command's overlay from the Enter that submits it.
+
+        Through the pipeline (or the startup queue) the panel would open a loop
+        step later, after keys typed in the same read reached the composer, and
+        one more Enter would send them as a prompt.
+        """
+
+        command = value.strip()
+        open_panel = {
+            "/tasks": self.open_tasks_panel,
+            "/status": self._open_status_panel,
+            "/mcp": self.open_mcp_manager,
+            "/decisions": self.open_decisions_panel,
+            "/model": lambda: (
+                self._start_model_catalog_load(),
+                self._open_model_picker(self.model_choices(), query=""),
+            ),
+            "/accounts": lambda: self._open_loading_picker(
+                "accounts", lambda: self._slash_commands.dispatch_async(self, command)
+            ),
+            "/remote": lambda: self._open_loading_picker(
+                "remote", lambda: self._slash_commands.dispatch_async(self, command)
+            ),
+        }.get(command)
+        if (
+            open_panel is None
+            or not self._full_screen_active()
+            # A remote view is read only; /remote still picks another session.
+            or (self._remote_view is not None and command != "/remote")
+            # A picker behind a running slash command waits its turn; a panel
+            # only shows information and opens at once.
+            or (self.slash_lock.holder is not None and command in _PICKER_COMMANDS)
+            # /model answers that it cannot change the model now.
+            or (command == "/model" and (self.active or self.pending_approvals))
+        ):
+            return False
+        self._dismiss_model_picker()
+        self._paste_runtime.advance_buffer_generation()
+        self._consume_overlay_submission()
+        self._record_prompt(command)
+        open_panel()
+        return True
+
+    def _open_status_panel(self) -> None:
+        snapshot = self._status_snapshot()
+
+        async def load() -> None:
+            # Counting compactions can read the whole transcript: off the loop.
+            status = await asyncio.to_thread(build_slash_status, snapshot)
+            if self._status_card_open and not self._mcp_manager_open:
+                self._set_status_card(status)
+
+        def show() -> bool:
+            self.open_status_card(None)
+            return self._status_card_open
+
+        self._open_overlay(show, load)
 
     def _status_toolbar(self) -> list[tuple[str, str]]:
         return status_toolbar(self, get_app().output.get_size().columns)
@@ -1003,19 +1178,23 @@ class TUIApp(
     def status_card_active(self) -> bool:
         return self._status_card_open and self._full_screen_active()
 
-    def open_status_card(self, status: SlashStatus) -> None:
+    def open_status_card(self, status: SlashStatus | None) -> None:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return
         buffer = session.default_buffer
         self._status_restore_text = buffer.text
         self._status_restore_cursor = buffer.cursor_position
+        self._set_status_card(status)
+        self._status_card_open = True
+        session.layout.focus(self._status_card_window)
+        self._invalidate_prompt()
+
+    def _set_status_card(self, status: SlashStatus | None) -> None:
         self._status_card.set_lines(
             _status_card_lines(status),
             line_factory=lambda width: _status_card_lines(status, width),
         )
-        self._status_card_open = True
-        session.layout.focus(self._status_card_window)
         self._invalidate_prompt()
 
     def close_status_card(self) -> None:
@@ -1034,13 +1213,17 @@ class TUIApp(
     def _full_screen_active(self) -> bool:
         return isinstance(self._active_session, FullScreenPromptSession)
 
-    def _composer_can_focus_agent_list(self) -> bool:
+    def interaction_ready(self) -> bool:
+        return not self._startup_replay_active
+
+    def composer_can_focus_agent_list(self) -> bool:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession):
             return False
         buffer = session.default_buffer
         return (
-            self._agent_navigation.list_visible
+            not self._agent_navigation.transcript_control.prompt_history.navigating
+            and self._agent_navigation.list_visible
             and buffer.document.cursor_position_row >= buffer.document.line_count - 1
         )
 
@@ -1048,11 +1231,12 @@ class TUIApp(
         self._agent_navigation.focus_list()
 
     def _append_transcript(self, renderable: RenderableType | None) -> None:
-        if renderable is not None:
+        # The shared pager holds the child's pages; root reloads from its anchor on return.
+        if renderable is not None and not self._agent_navigation.child_view_active:
             self._transcript.append(renderable)
             if not self._rendering_history:
                 entry_id = self.loop.store.active_branch_head_id()
-                if entry_id is None or entry_id == self._history_pager.endpoint_id:
+                if entry_id is None or entry_id == self._agent_navigation.transcript_control.history_pager.endpoint_id:
                     self._live_sequence += 1
                     entry_id = f"live:{self._live_sequence}"
                     unit_ordinal = 0
@@ -1062,7 +1246,7 @@ class TUIApp(
                         self._live_unit_ordinal = 0
                     unit_ordinal = self._live_unit_ordinal
                     self._live_unit_ordinal += 1
-                self._history_pager.append_live(
+                self._agent_navigation.transcript_control.history_pager.append_live(
                     entry_id, renderable, unit_ordinal=unit_ordinal
                 )
 

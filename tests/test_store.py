@@ -514,6 +514,7 @@ def test_history_index_rejects_a_repaired_transcript_snapshot(tmp_path: Path) ->
             source_facts,
             strict_reopen=lambda: None,
             memory_review_required=False,
+            tail_evidence=True,
         )
     repaired = ConversationStore(root, session_id="history-repair")
     try:
@@ -2943,6 +2944,7 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
     store.append_message(
         with_message_origin(message(MessageRole.USER, "kept"), MessageOrigin.USER)
     )
+    retained = store.path.read_bytes()
     with store.path.open("ab") as handle:
         handle.write(b'{"seq": 3, "id": "torn"')
     damaged = store.path.read_bytes()
@@ -2958,7 +2960,7 @@ def test_torn_tail_is_dropped_with_warning_entry(tmp_path: Path) -> None:
         reopened.path.with_name(
             f"conversation.quarantine.{quarantine_id}.jsonl"
         ).read_bytes()
-        == damaged
+        == damaged[len(retained) :]
     )
     warning_id = resident_entries(reopened)[-1].id
     warning_seq = resident_entries(reopened)[-1].seq
@@ -4197,71 +4199,47 @@ async def test_approval_resolution_never_mutates_resident_store_off_owner(
 
 
 def test_pending_approvals_delivers_foreign_append_after_flock(tmp_path: Path) -> None:
-    script = tmp_path / "pending_approval_reentry.py"
-    script.write_text(
-        '''
-import json
-import subprocess
-import sys
-from pathlib import Path
+    session_id = "pending-approval-reentry"
+    with ConversationStore(tmp_path, session_id=session_id):
+        pass
+    resident = ConversationStore(tmp_path, session_id=session_id, _read_only=True)
+    with ConversationStore(tmp_path, session_id=session_id) as foreign:
+        call = ToolCall("call-1", "echo", {"value": "approved"})
+        foreign.append_message_with_approval_requests(
+            Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
+        )
+    observed: list[object] = []
+    lock_free_in_callback: list[bool] = []
 
-from zeta.core.store import ConversationStore
-from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall, ToolUseContent
+    def installed(delta) -> None:
+        observed.append("reset" if delta == "reset" else [row.id for row in delta])
+        resident.on_entries_installed = None
+        # Probe the session flock without waiting: a callback that still ran
+        # under it would make the nested writer below block forever.
+        with open(resident.lock_path, "r+") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock_free_in_callback.append(False)
+                return
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        lock_free_in_callback.append(True)
+        with ConversationStore(tmp_path, session_id=session_id) as writer:
+            writer.append_message(Message(MessageRole.ASSISTANT, [TextContent("inner")]))
 
-root = Path(sys.argv[1])
-session_id = "pending-approval-reentry"
-with ConversationStore(root, session_id=session_id):
-    pass
-resident = ConversationStore(root, session_id=session_id, _read_only=True)
-foreign = """
-from pathlib import Path
-import sys
-from zeta.core.store import ConversationStore
-from zeta.protocol.types import Message, MessageRole, ToolCall, ToolUseContent
+    resident.on_entries_installed = installed
+    try:
+        pending = asyncio.run(resident.pending_approval_page())
+        resident.refresh()
+        last = resident.entry(resident.branch_refs()[-1]).data["message"]
+    finally:
+        resident.close()
 
-store = ConversationStore(Path(sys.argv[1]), session_id=sys.argv[2])
-call = ToolCall("call-1", "echo", {"value": "approved"})
-store.append_message_with_approval_requests(
-    Message(MessageRole.ASSISTANT, [ToolUseContent(call)]), [(call.id, call)]
-)
-"""
-subprocess.run([sys.executable, "-c", foreign, str(root), session_id], check=True)
-observed = []
-
-
-def installed(delta):
-    observed.append("reset" if delta == "reset" else [row.id for row in delta])
-    resident.on_entries_installed = None
-    with ConversationStore(root, session_id=session_id) as writer:
-        writer.append_message(Message(MessageRole.ASSISTANT, [TextContent("inner")]))
-
-
-resident.on_entries_installed = installed
-import asyncio
-pending = asyncio.run(resident.pending_approval_page())
-resident.refresh()
-print(json.dumps({
-    "observed": observed,
-    "pending": [item[0] for item in pending.items],
-    "last_text": Message.from_dict(resident.entry(resident.branch_refs()[-1]).data["message"]).content[0].text,
-}))
-'''.strip()
-    )
-
-    completed = subprocess.run(
-        [sys.executable, str(script), str(tmp_path)],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    assert completed.returncode == 0, completed.stderr
-
-    result = json.loads(completed.stdout)
-    assert result["pending"] == ["call-1"]
-    assert len(result["observed"]) == 1
-    assert len(result["observed"][0]) == 1
-    assert result["last_text"] == "inner"
+    assert lock_free_in_callback == [True]
+    assert [item[0] for item in pending.items] == ["call-1"]
+    assert len(observed) == 1
+    assert len(observed[0]) == 1
+    assert Message.from_dict(last).content[0].text == "inner"
 
 
 def test_live_store_tail_syncs_subprocess_append(tmp_path: Path) -> None:

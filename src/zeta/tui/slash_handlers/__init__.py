@@ -9,9 +9,14 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import time
+from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from prompt_toolkit.enums import EditingMode
+from rich.console import RenderableType
+from rich.text import Text
 
 from ...accounts import (
     AccountError,
@@ -52,6 +57,7 @@ from ...session_retention import (
     retention_status,
 )
 from ...session_retention.pin import set_retention_pin
+from ...telemetry.receiver.process import OTLP_URL
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -163,7 +169,29 @@ class SlashHandlerMixin:
                 viewed_health.summary if viewed_health is not None else None
             ),
             transcript_session_id=viewed_path.name,
+            otel_status=self._otel_status(),
+            otel_receiver=self._otel_receiver(),
         )
+
+    def _otel_status(self) -> str:
+        # TUI-only text: the endpoint stays local and never reaches serve.
+        status = self.telemetry.status()
+        if status.state == "healthy" and self._otel_endpoint is not None:
+            return f"healthy ({urlsplit(self._otel_endpoint).netloc})"
+        if status.reason is not None:
+            return f"{status.state} ({status.reason.replace('_', ' ')})"
+        return status.state
+
+    def _otel_receiver(self) -> str | None:
+        receiver = self.telemetry.receiver()
+        if receiver is None:
+            return None
+        state = receiver.state if receiver.error is None else f"{receiver.state} ({receiver.error})"
+        exported = self.telemetry.status()
+        if exported.last_export_ns is None:
+            return f"{OTLP_URL} {state}, no export yet"
+        age = max(0, (time.time_ns() - exported.last_export_ns) // 1_000_000_000)
+        return f"{OTLP_URL} {state}, last export {exported.last_export} {age}s ago"
 
     def model_choices(self) -> tuple[str, ...]:
         """Models the picker and the composer completer offer for this provider."""
@@ -172,9 +200,77 @@ class SlashHandlerMixin:
 
     @property
     def _picker_active(self) -> bool:
-        return self.accounts_picker_active or self.model_picker_active or self.remote_picker_active
+        return (
+            self._picker_loading is not None
+            or self.accounts_picker_active
+            or self.model_picker_active
+            or self.remote_picker_active
+        )
+
+    def _open_loading_picker(
+        self, name: str, load: Callable[[], Awaitable[Any]]
+    ) -> None:
+        """Own the picker keys from the Enter on, while the picker's rows load.
+
+        Until the rows show, Esc stops the load and other picker keys do
+        nothing: Enter would act on a row nobody has seen (switch an account,
+        attach a session). ``load`` runs the command through the slash registry,
+        under the slash lock, as the pipeline did.
+        """
+
+        # A second picker command replaces a load still running.
+        self._stop_picker_load()
+        self._picker_loading_name = name
+
+        async def run() -> None:
+            try:
+                output = await load()
+            except Exception as exc:  # reported as the pipeline reports a slash failure
+                output = f"submission failed: {exc}"
+            finally:
+                self._end_picker_load(asyncio.current_task())
+            if isinstance(output, str):
+                self._handle_slash_output(output)
+
+        self._picker_loading = self._open_overlay(lambda: True, run)
+
+    def _stop_picker_load(self) -> None:
+        task = self._picker_loading
+        # An attach that started finishes: cancelling it would leave the
+        # client half attached. The picker closes when it ends.
+        if task is None or self._remote_attaching:
+            return
+        task.cancel()
+        # The card goes now, also for a load cancelled before it started.
+        self._end_picker_load(task)
+
+    def _end_picker_load(self, task: object) -> None:
+        if self._picker_loading is not task:
+            return
+        self._picker_loading = None
+        self._invalidate_prompt()
+
+    def _picker_card(self) -> RenderableType | None:
+        """The open picker's card, drawn above the composer on every paint."""
+
+        if self._picker_loading is not None:
+            return Text(f"{self._picker_loading_name} · loading…", style=_theme.CHROME)
+        picker = self._accounts_picker or self._model_picker or self._remote_picker
+        return None if picker is None else picker.render()
+
+    def _close_picker_for_composer_text(self, buffer: Any) -> None:
+        """Text typed or pasted into the composer closes a shown picker.
+
+        A picker takes its keys only while the composer is empty; with text in
+        it, Enter sends a prompt, which must never go with a picker on screen.
+        """
+
+        if buffer.text and self._picker_loading is None and self._picker_active:
+            self._picker_cancel()
 
     def _picker_move(self, delta: int) -> None:
+        if self._picker_loading is not None:
+            return
         if self.accounts_picker_active:
             self.accounts_picker_move(delta)
         elif self.model_picker_active:
@@ -183,6 +279,8 @@ class SlashHandlerMixin:
             self.remote_picker_move(delta)
 
     def _picker_select(self) -> None:
+        if self._picker_loading is not None:
+            return
         if self.accounts_picker_active:
             self.accounts_picker_select()
         elif self.model_picker_active:
@@ -191,6 +289,9 @@ class SlashHandlerMixin:
             self.remote_picker_select()
 
     def _picker_cancel(self) -> None:
+        if self._picker_loading is not None:
+            self._stop_picker_load()
+            return
         if self.accounts_picker_active:
             self.accounts_picker_cancel()
         elif self.model_picker_active:
@@ -217,7 +318,6 @@ class SlashHandlerMixin:
             background_notice=self._accounts_background_notice(),
         )
         self._accounts_picker = picker
-        self._accounts_picker_unit = self._presenter.print_unit(picker.render())
         self._invalidate_prompt()
         return ""
 
@@ -327,9 +427,6 @@ class SlashHandlerMixin:
             return
         picker.switching_unavailable = self._accounts_switching_unavailable()
         picker.background_notice = self._accounts_background_notice()
-        unit = self._accounts_picker_unit
-        if unit is not None:
-            self._accounts_picker_unit = self._transcript.replace(unit, picker.render())
         self._invalidate_prompt()
 
     def accounts_picker_refresh(self) -> None:
@@ -545,11 +642,7 @@ class SlashHandlerMixin:
         self._invalidate_prompt()
 
     def _dismiss_accounts_picker(self) -> None:
-        unit = self._accounts_picker_unit
         self._accounts_picker = None
-        self._accounts_picker_unit = None
-        if unit is not None:
-            self._transcript.remove(unit, leading_blank=True)
 
     async def slash_pin(self, args: str) -> str:
         if args.strip():
@@ -633,32 +726,18 @@ class SlashHandlerMixin:
         self._dismiss_model_picker()
         picker = ModelPicker(self.provider, choices, self.model, query)
         self._model_picker = picker
-        self._model_picker_unit = self._presenter.print_unit(picker.render())
         self._invalidate_prompt()
         return ""
 
-    def _repaint_model_picker(self) -> None:
-        picker = self._model_picker
-        if picker is None:
-            return
-        unit = self._model_picker_unit
-        if unit is not None:
-            self._model_picker_unit = self._transcript.replace(unit, picker.render())
-        self._invalidate_prompt()
-
     def _dismiss_model_picker(self) -> None:
-        unit = self._model_picker_unit
         self._model_picker = None
-        self._model_picker_unit = None
-        if unit is not None:
-            self._transcript.remove(unit, leading_blank=True)
 
     def model_picker_move(self, delta: int) -> None:
         picker = self._model_picker
         if picker is None:
             return
         picker.move(delta)
-        self._repaint_model_picker()
+        self._invalidate_prompt()
 
     def model_picker_select(self) -> None:
         """Run the highlighted choice through the normal ``/model`` path."""
@@ -688,7 +767,7 @@ class SlashHandlerMixin:
         if not choices or choices == picker.choices:
             return
         self._model_picker = picker.with_choices(choices)
-        self._repaint_model_picker()
+        self._invalidate_prompt()
 
     async def _switch_model(self, model: str) -> str:
         try:
@@ -821,10 +900,7 @@ class SlashHandlerMixin:
 
     @property
     def restart_has_running_work(self) -> bool:
-        return (
-            self.loop.background_children_running
-            or self.loop.tool_registry.background_tasks.running_count > 0
-        )
+        return self.loop.has_running_work
 
     @property
     def composer_empty(self) -> bool:

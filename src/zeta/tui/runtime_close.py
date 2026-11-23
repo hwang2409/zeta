@@ -17,6 +17,7 @@ class RuntimeCloseMixin:
 
     def _init_runtime_close(self) -> None:
         self._closed = False
+        self._closing = False
         self._close_task: asyncio.Task[None] | None = None
 
     async def close(self) -> None:
@@ -33,7 +34,18 @@ class RuntimeCloseMixin:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
+    async def _cancel_model_catalog_load(self) -> None:
+        self._model_catalog_refresh_requested = False
+        task = getattr(self, "_model_catalog_task", None)
+        if task is None or task.done():
+            return
+        task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(task, return_exceptions=True), timeout=10
+        )
+
     async def _close_runtime(self) -> None:
+        self._closing = True
         first_error: BaseException | None = None
 
         def attempt(action: Callable[[], object]) -> object | None:
@@ -59,6 +71,10 @@ class RuntimeCloseMixin:
             attempt(self._cancel_background_invalidation)
             await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)
+            await attempt_async(self._cancel_model_catalog_load)
+            close_voice = getattr(self, "_close_voice", None)
+            if close_voice is not None:
+                await attempt_async(close_voice)
             prepare_ui_session_change = getattr(
                 self, "_prepare_ui_session_change", None
             )
@@ -71,12 +87,12 @@ class RuntimeCloseMixin:
             close_history_markers = getattr(self, "_close_history_markers", None)
             if close_history_markers is not None:
                 await attempt_async(close_history_markers)
-            history_pager = getattr(self, "_history_pager", None)
-            if history_pager is not None:
-                await attempt_async(history_pager.close)
-            prompt_history = getattr(self, "_prompt_history", None)
-            if prompt_history is not None:
-                await attempt_async(prompt_history.close)
+            close_history_view = getattr(self, "_close_history_view", None)
+            if close_history_view is not None:
+                await attempt_async(close_history_view)
+            close_history_pager = getattr(self, "_close_history_pager", None)
+            if close_history_pager is not None:
+                await attempt_async(close_history_pager)
             await attempt_async(self._close_approval_labels)
             pending = attempt(
                 lambda: (
@@ -138,6 +154,11 @@ class RuntimeCloseMixin:
             self._draft_session = None
             self._session = None
             self._closed = True
+            # last, so every close step above can still export; off the loop, idempotent
+            await attempt_async(lambda: asyncio.to_thread(self.telemetry.shutdown))
+        restore_closed_history = getattr(self, "_restore_closed_history", None)
+        if restore_closed_history is not None:
+            attempt(restore_closed_history)
         if first_error is not None:
             raise first_error
 

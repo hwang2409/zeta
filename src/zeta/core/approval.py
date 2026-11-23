@@ -30,6 +30,9 @@ def child_instance_in_subtree(candidate: str, root: str) -> bool:
     return candidate == root or candidate.startswith(f"{root}:")
 
 
+ApprovalOrigin = Literal["automatic", "user"]
+
+
 class ApprovalDecision(StrEnum):
     ALLOW = "allow"
     DENY = "deny"
@@ -1011,6 +1014,35 @@ class ApprovalPolicy(ApprovalAbortPolicy):
         if state[1] != "abort":
             return {"request_id": raw_id, "decision": state[1]}
         return await store.approval_resolution(raw_id)
+
+    async def abort_open_requests(self, reason: str = "turn_canceled") -> list[ToolCall]:
+        """Close this session's durable requests that are still open.
+
+        Called as a turn starts: only one turn runs at a time, so an open
+        request belongs to a turn that ended without an answer (the process
+        died). Serve settles it through its approval lifecycle, which publishes
+        ``approval_end``. Returns the calls that this abort closed.
+        """
+        store = self._store
+        if store is None:
+            return []
+        closed: list[ToolCall] = []
+        after_seq = 0
+        while True:
+            # Resident read: no thread hop on the common path with nothing open.
+            page = store.pending_approval_page_now(after_seq)
+            for request_id, tool_call in page.items:
+                gate = self._request_serve_abort(request_id, reason=reason)
+                if gate is not None:
+                    await gate
+                else:
+                    await store.resolve_approval_async(request_id, "abort", reason=reason)
+                state = store.approval_state_now(request_id)
+                if state is not None and state[1] == "abort":
+                    closed.append(ToolCall.from_dict(dict(tool_call)))
+            if page.next_seq is None:
+                return closed
+            after_seq = page.next_seq
 
     async def durable_decision(
         self,

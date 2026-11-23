@@ -24,6 +24,7 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 from websockets.datastructures import MultipleValuesError
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
+from websockets.protocol import State
 
 from .protocol import MAX_FRAME_BYTES
 
@@ -210,6 +211,16 @@ class WebSocketConnection:
         self._close_task: asyncio.Task[None] | None = None
         self.transport = connection.transport
         self.max_role = getattr(connection, "max_role", "controller")
+        # Diagnostics captured once at accept (no behavior change): the remote
+        # address and the request User-Agent, so a refusal log can name the page.
+        request = getattr(connection, "request", None)
+        headers = getattr(request, "headers", None)
+        try:
+            self.user_agent = headers.get("User-Agent") if headers is not None else None
+        except MultipleValuesError:
+            self.user_agent = None
+        remote = getattr(connection, "remote_address", None)
+        self.remote_address = f"{remote[0]}:{remote[1]}" if remote else None
 
     async def read(self, _size: int) -> bytes:
         try:
@@ -220,6 +231,9 @@ class WebSocketConnection:
             await self._connection.close(1003)
             return b""
         return message.encode("utf-8") + b"\n"
+
+    def peer_closed(self) -> bool:
+        return self._connection.state in (State.CLOSING, State.CLOSED)
 
     def write(self, payload: bytes) -> None:
         if self._pending is not None:
@@ -258,16 +272,19 @@ async def run_server(server: ZetaServer) -> None:
         except (NotImplementedError, RuntimeError):
             continue
         installed.append(signum)
-    await server.start()
-    monitor.start()
-    serving = asyncio.create_task(server.serve_forever())
+    serving: asyncio.Task[None] | None = None
     try:
+        await server.start()
+        monitor.start()
+        serving = asyncio.create_task(server.serve_forever())
         await stopped.wait()
     finally:
         unsubscribe()
+        # close also owns a failed start: it is the one shutdown point for telemetry
         await server.close()
-        serving.cancel()
-        await asyncio.gather(serving, return_exceptions=True)
+        if serving is not None:
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)
         await monitor.close()
         for signum in installed:
             loop.remove_signal_handler(signum)

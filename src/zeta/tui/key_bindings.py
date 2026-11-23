@@ -65,6 +65,7 @@ DEFAULTS: Final[Mapping[str, tuple[str, ...]]] = {
     # handles terminal state around the round-trip. Works in both vi and
     # emacs editing modes; the vi ``v``-in-normal shortcut still applies.
     "open-editor": ("c-x", "c-e"),
+    "voice-toggle": ("c-x", "c-v"),
     # Opens the attention-decisions popup. The default c-t shadows the Emacs
     # transpose-char editing chord; remap it (``open-decisions = "c-b"`` etc.)
     # to keep transpose. ``/decisions`` opens the same popup regardless.
@@ -343,6 +344,9 @@ def build_key_bindings(
     on_previous_user: Callable[[], None] | None = None,
     on_next_user: Callable[[], None] | None = None,
     on_toggle_agent: Callable[[], None] | None = None,
+    on_voice_toggle: Callable[[], None] | None = None,
+    on_voice_cancel: Callable[[], None] | None = None,
+    voice_active: Callable[[], bool] | None = None,
     on_retry: Callable[[], None] | None = None,
     retry_available: Callable[[], bool] | None = None,
     on_undo: Callable[[], None] | None = None,
@@ -362,6 +366,7 @@ def build_key_bindings(
     on_picker_rename: Callable[[], None] | None = None,
     on_picker_refresh: Callable[[], None] | None = None,
     picker_active: Callable[[], bool] | None = None,
+    picker_loading: Callable[[], bool] | None = None,
     on_agent_list_down: Callable[[], None] | None = None,
     agent_list_active: Callable[[], bool] | None = None,
     on_agent_list_move: Callable[[int], None] | None = None,
@@ -456,9 +461,10 @@ def build_key_bindings(
 
     @Condition
     def finder_mode() -> bool:
+        # Not gated on startup: ctrl+f and ctrl+r open it then, and while it is
+        # open Enter must stay its own, never the composer's submit.
         return (
-            interactions_enabled()
-            and full_screen_mode()
+            full_screen_mode()
             and finder_active is not None
             and finder_active()
         )
@@ -716,7 +722,7 @@ def build_key_bindings(
 
         @bindings.add(
             *resolved_keys["open-decisions"],
-            filter=full_screen_mode & ~panel_mode & interactions_enabled,
+            filter=full_screen_mode & ~panel_mode,
             eager=True,
         )
         def open_decisions(event: KeyPressEvent) -> None:
@@ -934,9 +940,12 @@ def build_key_bindings(
         navigating = (
             history_navigation_active is not None and history_navigation_active()
         )
-        if not navigating and buffer.text:
-            if buffer.document.cursor_position_row > 0:
-                buffer.auto_up()
+        if (
+            not navigating
+            and buffer.text
+            and buffer.document.cursor_position_row > 0
+        ):
+            buffer.auto_up()
             return
         on_history_previous(buffer)
 
@@ -1091,6 +1100,21 @@ def build_key_bindings(
             del event
             on_toggle_agent()
 
+    if on_voice_toggle is not None:
+
+        @bindings.add(*resolved_keys["voice-toggle"], filter=~panel_mode, eager=True)
+        def toggle_voice(event: KeyPressEvent) -> None:
+            del event
+            on_voice_toggle()
+
+    if on_voice_cancel is not None and voice_active is not None:
+
+        # added after the general escape handler so it wins while voice is busy
+        @bindings.add("escape", filter=Condition(voice_active) & ~panel_mode, eager=True)
+        def cancel_voice(event: KeyPressEvent) -> None:
+            del event
+            on_voice_cancel()
+
     if on_approve is not None and on_deny is not None:
 
         @Condition
@@ -1126,10 +1150,11 @@ def build_key_bindings(
         @Condition
         def picker_open() -> bool:
             # Only while the composer is empty: a typed message or a full
-            # "/model <name>" keeps its own enter and arrow keys.
+            # "/model <name>" keeps its own enter and arrow keys. Not gated on
+            # startup: /model opens the picker then, and its keys must not
+            # reach the composer.
             return (
-                interactions_enabled()
-                and picker_active is not None
+                picker_active is not None
                 and picker_active()
                 and not get_app().current_buffer.text
             )
@@ -1157,6 +1182,22 @@ def build_key_bindings(
         def picker_cancel(event: KeyPressEvent) -> None:
             del event
             on_picker_cancel()
+
+        if picker_loading is not None:
+            loading = Condition(picker_loading) & ~panel_mode
+
+            # A picker whose rows load owns every key: a typed letter or a paste
+            # would wait in the composer and an Enter would send it as a prompt.
+            # Esc stops the load (its own eager binding is more specific).
+            @bindings.add(Keys.Any, filter=loading, eager=True)
+            @bindings.add(Keys.BracketedPaste, filter=loading, eager=True)
+            def picker_loading_drop(event: KeyPressEvent) -> None:
+                del event
+
+            # Interrupt and exit still act: eager and more specific than the drop.
+            bindings.add(Keys.SIGINT, filter=loading, eager=True)(interrupt)
+            bindings.add(*resolved_keys["interrupt"], filter=loading, eager=True)(interrupt)
+            bindings.add(*resolved_keys["exit"], filter=loading, eager=True)(exit_prompt)
 
         picker_actions = (
             ("d", on_picker_default),

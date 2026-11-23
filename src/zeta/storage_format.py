@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, open_created, shape_lock
 
-WRITER_EPOCH: Final = 11
+WRITER_EPOCH: Final = 12
 P06_FEATURE_EPOCH: Final = 6
 
 
@@ -39,6 +39,7 @@ class StorageFeature(StrEnum):
     SESSION_RETENTION = "session_retention"
     SESSION_RETENTION_ACTIVATION = "session_retention_activation"
     INBOX_DURABLE_INTENT = "inbox_durable_intent"
+    TRANSCRIPT_TAIL_EVIDENCE = "transcript_tail_evidence"
 
 
 FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
@@ -50,6 +51,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.INBOX_DELEGATION: 7,
     StorageFeature.SESSION_RETENTION: 8,
     StorageFeature.SESSION_RETENTION_ACTIVATION: 11,
+    StorageFeature.TRANSCRIPT_TAIL_EVIDENCE: 12,
     # APPROVAL_RESTART_REASON and INBOX_DURABLE_INTENT must be fixed int literals
     # (test_storage_feature_epochs forbids referencing WRITER_EPOCH here).
     # Recheck main+1 at the final merge.
@@ -299,7 +301,9 @@ CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "sent_message_ledger.reported_status": frozenset({"claimed", "done"}),
     "sent_message_ledger.schema_version": frozenset({1, 2}),
     "sent_message_ledger.publication": frozenset({"pending", "published"}),
-    "transcript_recovery.evidence_schema": frozenset({"zeta.transcript-quarantine.v1"}),
+    "transcript_recovery.evidence_schema": frozenset(
+        {"zeta.transcript-quarantine.v1", "zeta.transcript-quarantine.v2"}
+    ),
     "transcript_recovery.state_schema": frozenset({"zeta.transcript-recovery.v1"}),
     "transcript_recovery.state": frozenset({"pending", "committed", "abandoned"}),
     "transcript_recovery.memory_step": frozenset(
@@ -324,6 +328,10 @@ _LOCK = ".storage-format.lock"
 
 class StorageFormatError(ValueError):
     """Raised when a home cannot be accessed by this stored-format version."""
+
+
+class MissingManifest(StorageFormatError):
+    """The home has no storage manifest to validate."""
 
 
 def reject_unknown_keys(payload: Mapping[str, object], shape: str) -> None:
@@ -750,8 +758,8 @@ def _open_lock(home: Path) -> int:
     return fd
 
 
-def _missing_manifest_error(home: Path) -> StorageFormatError:
-    return StorageFormatError(
+def _missing_manifest_error(home: Path) -> MissingManifest:
+    return MissingManifest(
         f"stored-format manifest is missing at {home}; run "
         "zeta storage-format advance --expected-epoch 0 "
         f"--target-epoch {WRITER_EPOCH}"
@@ -775,7 +783,7 @@ def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:
         epoch = value["writer_epoch"]
         if type(epoch) is not int or epoch < 0:
             raise ValueError
-    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+    except (UnicodeError, ValueError, KeyError) as exc:
         raise StorageFormatError(
             f"stored-format manifest is invalid at {home}"
         ) from exc
@@ -821,6 +829,17 @@ def _bootstrap_empty_home(fd: int, home: Path) -> None:
             _read_manifest(home)
         _publish_manifest(home, WRITER_EPOCH)
     fcntl.flock(fd, fcntl.LOCK_SH)
+
+
+@contextmanager
+def open_reader(home: str | Path) -> Iterator[int]:
+    """Validate an existing home without a lease, bootstrapping, or writes."""
+    epoch = _read_manifest(_canonical_home(home))
+    if epoch > WRITER_EPOCH:
+        raise StorageFormatError(
+            f"stored format {epoch} is newer than reader capability {WRITER_EPOCH}"
+        )
+    yield epoch
 
 
 def open_writer(home: str | Path, *, capability: int | None = None) -> WriterLease:

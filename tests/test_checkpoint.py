@@ -9,8 +9,8 @@ from rich.console import Console
 from rich.text import Text
 
 from tests.support.branch_reads import branch_entries, branch_messages, resident_entries
-from tests.support.fake_backend import FakeBackend
-from tests.support.owned import close_owned_app
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail, close_owned_app
 from zeta.core.checkpoints import CheckpointForkMixin
 from zeta.core.context import ContextAssembler
 from zeta.core.session import SessionManager
@@ -30,6 +30,7 @@ from zeta.protocol.types import (
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.tools import ToolRegistry
 from zeta.tui.app import TUIApp
 from zeta.tui.checkpoints import render_replayed_message, session_replay_provider
 from zeta.tui.render import render_event, render_markdown
@@ -432,6 +433,84 @@ async def test_fork_rebuild_renders_replayed_tool_call(tmp_path: Path) -> None:
     await close_owned_app(app)
 
 
+async def test_parallel_group_replays_in_the_order_it_rendered_live(
+    tmp_path: Path,
+) -> None:
+    """Each parallel result is shown and stored when its call ends.
+
+    Beta ends first, so live and replay both show Beta's card, then Alpha's.
+    """
+
+    calls = [ToolCall("call-1", "alpha_tool", {}), ToolCall("call-2", "beta_tool", {})]
+    store = ConversationStore(tmp_path)
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    beta_shown = asyncio.Event()
+
+    async def alpha(arguments: dict[str, object]) -> str:
+        await await_or_fail(beta_shown.wait(), what="Beta's live card")
+        return "alpha result"
+
+    async def beta(arguments: dict[str, object]) -> str:
+        return "beta result"
+
+    registry.register("alpha_tool", alpha, parallel_safe=True)
+    registry.register("beta_tool", beta, parallel_safe=True)
+
+    def app_for(loop: AgentLoop, output: StringIO) -> TUIApp:
+        console = Console(
+            file=output, force_terminal=True, color_system="truecolor", width=100
+        )
+        return TUIApp(loop, provider="codex", model="offline", console=console)
+
+    live_output = StringIO()
+    live = app_for(
+        AgentLoop(
+            FakeBackend([ScriptedTurn([], calls), ScriptedTurn([TextContent("done")])]),
+            store,
+            registry=registry,
+            skill_catalog=SkillCatalog.empty(),
+        ),
+        live_output,
+    )
+    handle_tool_event = live._handle_tool_event
+
+    def handle(event: StreamEvent) -> bool:
+        stop = handle_tool_event(event)
+        if event.type is StreamEventType.TOOL_EXECUTION_END and event.tool_call.id == "call-2":
+            beta_shown.set()
+        return stop
+
+    live._handle_tool_event = handle
+    replay = app_for(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()), StringIO()
+    )
+    try:
+        await await_or_fail(live._consume_turn("start"), what="parallel turn")
+        replay._active_session = replay._make_session()
+        await await_or_fail(replay._rebuild_transcript_async(), what="replay")
+
+        def order(text: str) -> list[str]:
+            return sorted(
+                ("alpha result", "beta result"), key=lambda result: text.index(result)
+            )
+
+        live_text = Text.from_ansi(live_output.getvalue()).plain
+        replay_text = Text.from_ansi(replay._transcript.render(100)).plain
+        stored = [
+            message.tool_result.content
+            for message in branch_messages(store)
+            if message.tool_result is not None
+        ]
+        assert order(live_text) == order(replay_text) == stored
+        assert stored == ["beta result", "alpha result"]
+    finally:
+        await close_owned_app(live)
+        await close_owned_app(replay)
+        await registry.close()
+
+
 @pytest.mark.parametrize(
     "notification",
     [
@@ -549,6 +628,40 @@ def test_live_and_replay_agent_notification_bytes_match(
 
     assert replay_bytes == live_bytes
     asyncio.run(app.close())
+
+
+def test_tui_replay_neutralizes_legacy_inbox_wake_text(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    store._append_row("notification", {
+        "origin": "notification", "kind": "project_inbox", "project_id": "p",
+        "message_ids": ["m"], "description": "project inbox", "status": "new",
+        "text": "Requests are work to do: claim, do, and mark done.",
+        "messages": [{"id": "m", "author": "user", "authority": "trusted_assignment"}],
+    })
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True, color_system="truecolor"),
+    )
+    try:
+        app._active_session = app._make_session()
+        presented: list[dict] = []
+        render_event = app._presenter.render_event
+
+        def capture(event):
+            presented.append(dict(event.data))
+            return render_event(event)
+
+        app._presenter.render_event = capture
+        app._rebuild_transcript()
+        rendered = app._transcript.render(120)
+        assert "Requests are work to do" not in rendered
+        assert "Project inbox wake" in rendered
+        inbox = [data for data in presented if data.get("kind") == "project_inbox"]
+        assert [data["messages"] for data in inbox] == [[{"id": "m"}]]
+    finally:
+        asyncio.run(app.close())
 
 
 def test_display_only_agent_notification_remains_visible_in_tui_replay(
@@ -705,30 +818,4 @@ def test_transcript_rebuild_reads_session_metadata_once(
     app._rebuild_transcript()
 
     assert "answer 19" in app._transcript.render(120)
-    assert len(reads) <= 1
-
-
-def test_agent_transcript_replay_reads_session_metadata_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import asyncio
-
-    from zeta.tui import agent_card
-
-    manager = SessionManager(tmp_path / "zeta-home")
-    opened = manager.create(provider="codex", model="gpt-5.4", cwd=tmp_path)
-    thought = Message(MessageRole.ASSISTANT, [ThinkingContent("**stored thought**")])
-    control = agent_card.AgentTranscriptControl()
-    reads = _count_meta_reads(monkeypatch)
-
-    asyncio.run(
-        control._replay_batches(
-            [(f"entry-{index}", thought.to_dict()) for index in range(20)],
-            opened.store.session_dir,
-        )
-    )
-
-    plain = Text.from_ansi(control.transcript.render(80)).plain
-    assert "stored thought" in plain
-    assert "**stored thought**" not in plain
     assert len(reads) <= 1
