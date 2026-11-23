@@ -227,6 +227,10 @@ class ConnectionRegistry(ReplayOutput):
     def _primary_controller(self) -> _Connection | None:
         return self._controllers[0] if self._controllers else None
 
+    def clients(self) -> tuple[Any, ...]:
+        """The physical clients currently owned by this registry."""
+        return tuple(state.connection for state in self._connections.values())
+
     def register(self, connection: Any) -> None:
         if self._closed:
             raise RuntimeError("connection registry is closed")
@@ -586,9 +590,10 @@ class ConnectionRegistry(ReplayOutput):
                 self._publish_observer(state, frame)
 
     def release(self, connection: Any) -> None:
+        """Release physical role/output state, retaining the client until close."""
         self.invalidate_replay_connection(connection)
-        state = self._connections.pop(connection, None)
-        if state is None:
+        state = self._connections.get(connection)
+        if state is None or state.role is None:
             return
         state.released.set()
         if state in self._controllers:
@@ -599,6 +604,11 @@ class ConnectionRegistry(ReplayOutput):
         output = state.output
         if output is not None:
             self._release_output(output, state.role)
+        state.role = None
+
+    def unregister(self, connection: Any) -> None:
+        """Remove a physically closed client from shutdown enumeration."""
+        self._connections.pop(connection, None)
 
     async def send(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)
@@ -788,7 +798,7 @@ class ConnectionRegistry(ReplayOutput):
     async def _complete_output_phase(
         self, state: _Connection, output: _OutputState
     ) -> bool:
-        if output.released:
+        if output.released or output.phase == "closed":
             return True
         if output.phase == "flushing":
             output.phase = "ready"
@@ -994,10 +1004,10 @@ class ConnectionRegistry(ReplayOutput):
         writer_task.cancel()
 
     def _settle_output(self, output: _OutputState) -> None:
-        while output.queue:
-            item = output.queue.popleft()
-            self._finish_frame_accounting(output, item)
-            self._finish_future(item.future, False)
+        # A physical write can consume cancellation while reporting its outcome.
+        # Close admission before joining the writer, and don't let it wait again.
+        output.phase = "closed"
+        self._clear_output(output, result=False)
         if output.writer_task is not None:
             output.writer_task.cancel()
         self._cancel_overflow_deadline(output)
@@ -1256,22 +1266,50 @@ class ConnectionRegistry(ReplayOutput):
         """Refuse every later connection; server shutdown calls this first."""
         self._closed = True
 
-    async def aclose(self) -> None:
+    async def stop_workers(self) -> None:
+        """Stop registry-owned work without owning physical client lifetime."""
+        first: BaseException | None = None
         self._closed = True
-        self._unregister_child_run_sink()
+        try:
+            self._unregister_child_run_sink()
+        except BaseException as exc:  # noqa: BLE001
+            first = exc
+        try:
+            await asyncio.to_thread(self.close_child_reader)
+        except BaseException as exc:  # noqa: BLE001
+            if first is None:
+                first = exc
+        try:
+            self.state_reader.close()
+        except BaseException as exc:  # noqa: BLE001
+            if first is None:
+                first = exc
+        try:
+            self._reads.close()
+        except BaseException as exc:  # noqa: BLE001
+            if first is None:
+                first = exc
         states = tuple(self._connections.values())
-        await asyncio.to_thread(self.close_child_reader)
-        self.state_reader.close()
-        self._reads.close()
         for state in states:
             if state.output is not None:
-                self._settle_output(state.output)
+                try:
+                    self._settle_output(state.output)
+                except BaseException as exc:  # noqa: BLE001
+                    if first is None:
+                        first = exc
         await asyncio.gather(
-            *(state.connection.close() for state in states), return_exceptions=True
+            *(state.output.writer_task for state in states
+              if state.output is not None and state.output.writer_task is not None),
+            return_exceptions=True,
         )
-        self._connections.clear()
         self._observers.clear()
         self._controllers.clear()
+        if first is not None:
+            raise first
+
+    async def aclose(self) -> None:
+        """Stop registry workers; physical clients unregister themselves."""
+        await self.stop_workers()
 
 
 def perform_child_history_read(

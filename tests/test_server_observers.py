@@ -873,8 +873,8 @@ async def test_controller_close_never_writes_after_registry_release(
     reader, writer = await _connect(server)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
     await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-    assert server._client is not None and server.connections is not None
-    client = server._client
+    assert next(iter(server.connections.clients()), None) is not None and server.connections is not None
+    client = next(iter(server.connections.clients()), None)
     runtime_sink = server.controllers.attached().runtime._background_event_sink
     assert runtime_sink is not None
     close_entered = asyncio.Event()

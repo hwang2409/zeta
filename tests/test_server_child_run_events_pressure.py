@@ -369,10 +369,10 @@ async def test_byte_pressure_invalidates_before_the_record_cap_at_exact_codec_by
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     async with _serve(tmp_path, transport) as (server, client, session_id, _stores):
-        assert server.connections is not None and server._client is not None
+        assert server.connections is not None and next(iter(server.connections.clients()), None) is not None
         replay = server.connections.replay
         scope = ReplayScopeId.top(session_id)
-        codec = server._client.codec
+        codec = next(iter(server.connections.clients()), None).codec
         encoded: list[int] = []
         original = codec.notification
 
@@ -411,8 +411,8 @@ async def test_byte_pressure_invalidates_before_the_record_cap_at_exact_codec_by
         # bytes bound first: far below the record cap, and nothing kept a charge or seq
         assert len(encoded) == admitted + 1 < SCOPE_RECORDS
         assert scope not in replay._scopes
-        assert not replay.is_pending(server._client)
-        assert replay.stream_id(server._client) is None
+        assert not replay.is_pending(next(iter(server.connections.clients()), None))
+        assert replay.stream_id(next(iter(server.connections.clients()), None)) is None
 
 
 MAX_LIFECYCLE_FRAME_BYTES = 16_000

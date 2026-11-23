@@ -566,8 +566,8 @@ async def _replace_registry_controller(
     server: ZetaServer,
 ) -> tuple[_Client, _RecordingWriter]:
     assert server.connections is not None
-    assert server._client is not None
-    old_client = server._client
+    assert next(iter(server.connections.clients()), None) is not None
+    old_client = next(iter(server.connections.clients()), None)
     server.connections.release(old_client)
     writer = _RecordingWriter()
     replacement = _Client(server, asyncio.StreamReader(), writer)
@@ -909,11 +909,11 @@ async def test_post_turn_wake_runs_without_controller(tmp_path: Path) -> None:
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        assert server.connections is not None and server._client is not None
+        assert server.connections is not None and next(iter(server.connections.clients()), None) is not None
         await _request(reader, writer, 3, "send", {"text": "finish"})
         await asyncio.wait_for(backend.finalization_entered.wait(), TIMEOUT)
-        server.connections.release(server._client)
-        await server._client.close()
+        server.connections.release(next(iter(server.connections.clients()), None))
+        await next(iter(server.connections.clients()), None).close()
         server.controllers.attached().runtime.opened.store.append_agent_notification(
             "first",
             child_session_path="/tmp/first",
@@ -953,7 +953,7 @@ async def test_closed_client_cannot_clear_serve_control_state(tmp_path: Path) ->
     )
     reader, writer = await _connect(server)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.0"})
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None and server.connections is not None
     reference = weakref.ref(client)
     cleanup_finished = asyncio.Event()

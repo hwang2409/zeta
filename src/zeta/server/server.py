@@ -301,8 +301,6 @@ class ZetaServer:
             if ws_port is not None
             else None
         )
-        self._client_active = False
-        self._client: _Client | None = None
         self.connections: ConnectionRegistry | None = None
         self._retention_owner = (
             make_retention_owner(
@@ -329,6 +327,7 @@ class ZetaServer:
         self._prebound_socket = prebound_socket
         self._frame_writes = FrameWriteOwner()
         self._idle_drain: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self.notification_presentations = NotificationPresentation()
         self.turn_contexts = PendingTurnContexts()
         self.foreground_event_publisher = foreground_event_publisher or ForegroundEventPublisher()
@@ -344,12 +343,14 @@ class ZetaServer:
         yield self.controllers.attached().control
         yield from self.parking.pairs()
 
-    def new_pair(self) -> SessionUse:
-        """An empty pair beside the attached one, reserved by the returned use
-        until its setup ends; it shares the session manager."""
+    def new_pair(self, owner: SessionUse | SessionController | None = None) -> SessionUse:
+        """Create a pair beside the owner's record, sharing its manager."""
         self.parking.require_room()
+        source = owner.record if isinstance(owner, SessionUse) else owner
+        if source is None:
+            source = self.controllers.attached()
         control = ServeControl(
-            self, self.controllers.attached().runtime.sibling(), self.foreground_event_publisher
+            self, source.runtime.sibling(), self.foreground_event_publisher
         )
         self._bind_pair(control)
         return self.controllers.register(control)
@@ -486,49 +487,98 @@ class ZetaServer:
             await self._server.serve_forever()
 
     async def close(self, *, approval_settlement_timeout: float | None = None) -> None:
-        if self.connections is not None:
-            # no new connection from here on; the records drain below
-            self.connections.stop_admission()
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_all(approval_settlement_timeout)
+            )
+        elif self._close_task.done():
+            return
+        # Waiting must not cancel the one coordinator, even on repeated cancels.
+        cancelled: asyncio.CancelledError | None = None
+        while not self._close_task.done():
+            try:
+                await asyncio.wait((self._close_task,))
+            except asyncio.CancelledError as exc:
+                cancelled = cancelled or exc
+        if cancelled is not None:
+            if not self._close_task.cancelled():
+                self._close_task.exception()
+            raise cancelled
+        self._close_task.result()
+
+    async def _close_all(self, approval_settlement_timeout: float | None) -> None:
+        first: BaseException | None = None
+
+        async def attempt(operation: Awaitable[object]) -> None:
+            nonlocal first
+            try:
+                await operation
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
+
+        registry = self.connections
+        if registry is not None:
+            registry.stop_admission()
         if self._retention_owner is not None:
-            await self._retention_owner.stop()
+            await attempt(self._retention_owner.stop())
         if self._idle_drain is not None:
             self._idle_drain.cancel()
-            await asyncio.wait([self._idle_drain])
+            await asyncio.gather(self._idle_drain, return_exceptions=True)
             self._idle_drain = None
-        try:
-            if self._client is not None:
-                handler = self._client._run_task
-                if handler is not None and not handler.done():
-                    handler.cancel()
-                await self._client.close(graceful=True)
-        finally:
-            self._client = None
-            self._client_active = False
-            await self._mcp_auth.aclose()
-            self.parking.close_all(approval_settlement_timeout)
+
+        clients = () if registry is None else registry.clients()
+        handlers = tuple(
+            client._run_task
+            for client in clients
+            if client._run_task is not None and not client._run_task.done()
+        )
+        for client in clients:
             try:
-                await self.controllers.close(
-                    approval_settlement_timeout, self._close_foreground_events
-                )
-            finally:
-                if self.connections is not None:
-                    await self.connections.aclose()
-                    self.connections = None
-                await self._frame_writes.aclose()
-                try:
-                    if self._websocket is not None:
-                        await self._websocket.close()
-                    if self._unix_listener is not None:
-                        await self._unix_listener.close()
-                    elif self._server is not None:
-                        self._server.close()
-                        await self._server.wait_closed()
-                finally:
-                    self._server = None
-                    self._unix_listener = None
-                    if not self._borrowed:
-                        # last, so every close step can still export; idempotent for a second close
-                        await asyncio.to_thread(self.telemetry.shutdown)
+                release = client._begin_controller_release()
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
+                continue
+            if release is not None:
+                await attempt(release)
+        if registry is not None:
+            for client in clients:
+                await attempt(registry.flush(client))
+            await attempt(registry.stop_workers())
+        for handler in handlers:
+            handler.cancel()
+        await attempt(asyncio.gather(*handlers, return_exceptions=True))
+        for client in clients:
+            await attempt(client.close())
+        await attempt(self._mcp_auth.aclose())
+        try:
+            self.parking.close_all(approval_settlement_timeout)
+        except BaseException as exc:  # noqa: BLE001
+            if first is None:
+                first = exc
+        await attempt(self.controllers.close(
+            approval_settlement_timeout, self._close_foreground_events
+        ))
+        if registry is not None:
+            self.connections = None
+        await attempt(self._frame_writes.aclose())
+        try:
+            if self._websocket is not None:
+                await attempt(self._websocket.close())
+            if self._unix_listener is not None:
+                await attempt(self._unix_listener.close())
+            elif self._server is not None:
+                self._server.close()
+                await attempt(self._server.wait_closed())
+        finally:
+            self._server = None
+            self._unix_listener = None
+            if not self._borrowed:
+                # Keep telemetry available through all other shutdown steps.
+                await attempt(asyncio.to_thread(self.telemetry.shutdown))
+        if first is not None:
+            raise first
 
     async def _accept(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -546,10 +596,8 @@ class ZetaServer:
         try:
             await client.run()
         finally:
-            if self._client is client:
-                self._client = None
-                self._client_active = False
-            registry.release(client)
+            if self.connections is not None:
+                self.connections.unregister(client)
 
 
 @dataclass(frozen=True)
@@ -822,8 +870,14 @@ class _Client:
                 and self.role == "controller"
                 and "approval_reconnect" in self.features
             ):
-                for control in self.server.controls():
-                    await control.controller_ready(reconnect=True)
+                record = self.server.controllers.controller_for(self)
+                if self.server.controllers.controller_mode == "multi":
+                    if record is None:
+                        raise RuntimeError("multi controller has no session owner")
+                    await record.control.controller_ready(reconnect=True)
+                else:
+                    for control in self.server.controls():
+                        await control.controller_ready(reconnect=True)
         self._request = None
 
     @contextlib.contextmanager
@@ -930,13 +984,21 @@ class _Client:
             and self._hello_admission is not None
             and self.connections.is_controller(self)
         ):
-            self._controller_release = asyncio.gather(*(
-                control.begin_controller_release(
-                    reconnect="approval_reconnect" in self.features,
-                    keep_turn="turn_reconnect" in self.features,
+            reconnect = "approval_reconnect" in self.features
+            keep_turn = "turn_reconnect" in self.features
+            if self.server.controllers.controller_mode == "multi":
+                self._controller_release = asyncio.ensure_future(
+                    self.server.controllers.begin_controller_release(
+                        self, reconnect=reconnect, keep_turn=keep_turn
+                    )
                 )
-                for control in self.server.controls()
-            ))
+            else:
+                self._controller_release = asyncio.gather(*(
+                    control.begin_controller_release(
+                        reconnect=reconnect, keep_turn=keep_turn
+                    )
+                    for control in self.server.controls()
+                ))
         return self._controller_release
 
     def _release_dead_connection(self) -> None:
@@ -950,20 +1012,66 @@ class _Client:
         async with self._close_lock:
             if self._closed:
                 return
-            release = self._begin_controller_release()
+            first: BaseException | None = None
+
+            async def attempt(operation: Awaitable[object]) -> None:
+                nonlocal first
+                try:
+                    await operation
+                except BaseException as exc:  # noqa: BLE001
+                    if first is None:
+                        first = exc
+
+            had_physical_controller = self.connections.is_controller(self)
+            try:
+                release = self._begin_controller_release()
+            except BaseException as exc:  # noqa: BLE001
+                release = None
+                first = exc
             if release is not None:
-                await asyncio.shield(release)
-            await accounts.cancel_owned_switch(self)
-            await self.logins.close()
+                await attempt(asyncio.shield(release))
+            await attempt(accounts.cancel_owned_switch(self))
+            await attempt(self.logins.close())
             if graceful:
-                await self.connections.flush(self)
+                await attempt(self.connections.flush(self))
             self._local_close = True
-            self.writer.close()
-            with contextlib.suppress(Exception):
-                await self.writer.wait_closed()
-            self.server.controllers.release_connection(self)
-            self.connections.release(self)
+            close = getattr(self.writer, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass  # The peer already closed the transport.
+                except BaseException as exc:  # noqa: BLE001
+                    if first is None:
+                        first = exc
+            wait_closed = getattr(self.writer, "wait_closed", None)
+            if wait_closed is not None:
+                try:
+                    await wait_closed()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    pass  # asyncio can report the same peer loss on wait_closed().
+                except BaseException as exc:  # noqa: BLE001
+                    if first is None:
+                        first = exc
+            if had_physical_controller or self.server.controllers.is_controller(self):
+                try:
+                    self.server.controllers.release_connection(self)
+                except BaseException as exc:  # noqa: BLE001
+                    if first is None:
+                        first = exc
+            try:
+                self.connections.release(self)
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
+            try:
+                self.connections.unregister(self)
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
             self._closed = True
+            if first is not None:
+                raise first
 
     async def _route_hello(self, params: dict[str, Any]) -> tuple[bool, object]:
         deadline = control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS
@@ -977,6 +1085,7 @@ class _Client:
         self._client_version = hello.client_version
         self.features = frozenset(hello.features)
         admission = None
+        acquisition = None
         try:
             role, admission = self._claim_hello_role(hello, params)
             result = self._hello_result(hello, role)
@@ -986,12 +1095,29 @@ class _Client:
                     "mcp_bindings require a controller connection",
                 )
             if role == "controller":
-                with self.server.controllers.owned(self) as controller:
+                requested_session_id = params.get("session_id")
+                session_id = (
+                    requested_session_id
+                    if (
+                        self.server.controllers.controller_mode == "multi"
+                        and isinstance(requested_session_id, str)
+                    )
+                    else None
+                )
+                with self.server.controllers.owned(self, session_id) as controller:
+                    acquisition = controller.acquisition
                     await self._setup_controller_hello(params, deadline, controller)
             if admission is not None:
                 self.server.controllers.commit_hello(admission)
+            if acquisition is not None:
+                self.server.controllers.commit_session(acquisition).release()
+                self.server.parking.forget(acquisition.target)
             self.handshaken = True
         except BaseException:
+            if acquisition is not None:
+                closed = self.server.controllers.abort_session(acquisition)
+                if closed is not None:
+                    await asyncio.shield(closed)
             await self._rollback_hello(admission)
             raise
         return True, result
@@ -1078,19 +1204,21 @@ class _Client:
                 ErrorDescriptor.CONNECTION_CAPACITY,
                 "another client is already connected",
             )
-        await self.server.parking.claim(
-            "session_park" in self.features,
-            reconnect=reconnect,
-            require_host_binding=require_host_binding,
-        )
+        if self.server.controllers.controller_mode == "legacy":
+            await self.server.parking.claim(
+                "session_park" in self.features,
+                reconnect=reconnect,
+                require_host_binding=require_host_binding,
+            )
         if reconnect_bindings is not None:
             await controller.control.reattach_mcp_bindings(*reconnect_bindings)
-        self.server._client_active = True
-        self.server._client = self
         self.connections.activate_controller(self)
         if not reconnect:
-            for control in self.server.controls():
-                await control.controller_ready()
+            if self.server.controllers.controller_mode == "multi":
+                await controller.control.controller_ready()
+            else:
+                for control in self.server.controls():
+                    await control.controller_ready()
 
 
     async def _route_request(
