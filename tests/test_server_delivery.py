@@ -23,6 +23,7 @@ from tests.support.server_client import event as _event
 from tests.support.server_client import frames_until_event as _frames_until_event
 from tests.support.server_client import request as _request
 from tests.support.sockets import short_socket_path as _socket_path
+from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     ErrorInfo,
@@ -568,6 +569,53 @@ async def test_steer_committed_at_turn_finalization_starts_next_turn(
     finally:
         resume_publish.set()
         backend.release_first.set()
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_send_with_delivery_id_after_warm_resume(tmp_path: Path) -> None:
+    def seed_session() -> str:
+        opened = SessionManager(tmp_path).create(
+            provider="codex", model="offline", cwd=tmp_path
+        )
+        with opened.store as store:
+            store.append_message(
+                with_message_origin(
+                    Message(MessageRole.USER, [TextContent("earlier")]), MessageOrigin.USER
+                )
+            )
+            return store.session_id
+
+    session_id = await await_or_fail(
+        asyncio.to_thread(seed_session), what="seed indexed session"
+    )
+    backend = FakeBackend([ScriptedTurn([TextContent("done")])])
+    server = ZetaServer(
+        provider="codex",
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(
+            reader,
+            writer,
+            1,
+            "hello",
+            {"protocol_version": "1.1", "features": ["delivery_id"]},
+        )
+        resumed = await _request(reader, writer, 2, "resume", {"session_id": session_id})
+        assert "result" in resumed[-1], resumed[-1]
+        params = {"text": "continue", "delivery_id": "first-delivery"}
+        sent = await _request(reader, writer, 3, "send", params)
+        assert "error" not in sent[-1], sent[-1]
+        assert sent[-1]["result"]["accepted"] is True
+        await _event(reader, "agent_end")
+        duplicate = await _request(reader, writer, 4, "send", params)
+        assert duplicate[-1]["result"]["duplicate"] is True
+        assert len(backend.calls) == 1
+    finally:
         await close_serve(server, writer)
 
 
