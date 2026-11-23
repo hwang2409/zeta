@@ -753,9 +753,13 @@ class _RawFrameBypassVisitor(ast.NodeVisitor):
             self._add(node, "descriptor data owns the structured error code")
 
     def _check_event_call(self, node: ast.Call, name: str | None) -> None:
-        if name not in {"notification", "publish_controller", "_notify"}:
+        if name in {"publish_session", "publish_session_event", "publish_connection"}:
+            position = 1
+        elif name in {"notification", "publish_global", "_notify"}:
+            position = 0
+        else:
             return
-        event = _call_argument(node, 0, "event")
+        event = _call_argument(node, position, "event")
         valid = (
             _event_descriptor_expression(event)
             or isinstance(event, ast.Starred)

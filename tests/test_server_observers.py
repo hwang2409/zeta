@@ -875,7 +875,9 @@ async def test_controller_close_never_writes_after_registry_release(
     await _request(reader, writer, 2, "new_session", {"provider": "codex"})
     assert next(iter(server.connections.clients()), None) is not None and server.connections is not None
     client = next(iter(server.connections.clients()), None)
-    runtime_sink = server.controllers.attached().runtime._background_event_sink
+    runtime = server.controllers.attached().runtime
+    runtime_sink = runtime._background_event_sink
+    assert runtime.retention_event_sink is not None
     assert runtime_sink is not None
     close_entered = asyncio.Event()
     close_release = asyncio.Event()
@@ -905,12 +907,17 @@ async def test_controller_close_never_writes_after_registry_release(
     monkeypatch.setattr(server.connections, "release", registry_release)
     publication_done = asyncio.Event()
     publication_results: list[bool] = []
+    retention_projection = {"mode": "none", "errors": ["test planner error"]}
     original_notify = server.controllers.attached().control._notify
 
     async def record_notification(*args: Any, **kwargs: Any) -> bool:
         result = await original_notify(*args, **kwargs)
-        publication_results.append(result)
-        publication_done.set()
+        data = kwargs.get("data", {})
+        if data is retention_projection:
+            assert "release" in order and result is False
+        if data.get("notification_id") == "late-close-test":
+            publication_results.append(result)
+            publication_done.set()
         return result
 
     # test-contract: seam patches the attached pair's private hook
@@ -920,11 +927,13 @@ async def test_controller_close_never_writes_after_registry_release(
     try:
         await asyncio.wait_for(close_entered.wait(), TIMEOUT)
         assert server.controllers.attached().runtime._background_event_sink is runtime_sink
+        # The independent planner can publish while the old connection closes.
+        await runtime.retention_event_sink(retention_projection)
         runtime_sink(
             server.controllers.attached().runtime.session_id,
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
-                data={"kind": "agent_completion", "text": "late"},
+                data={"kind": "agent_completion", "text": "late", "notification_id": "late-close-test"},
             ),
         )
         close_release.set()

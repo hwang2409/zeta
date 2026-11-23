@@ -9,7 +9,6 @@ import pytest
 
 from tests.support.owned import await_or_fail
 from zeta.server.connections import ConnectionRegistry
-from zeta.server.session_replay.in_flight import InFlightReply
 
 ROWS = (
     "success",
@@ -33,7 +32,7 @@ async def test_read_owner_settles_every_read(
 ) -> None:
     errors: list[BaseException] = []
     monkeypatch.setattr(threading, "excepthook", lambda args: errors.append(args.exc_value))
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     release = threading.Event()
     workers: list[threading.Thread] = []
     queued_ran = threading.Event()

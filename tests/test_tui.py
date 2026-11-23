@@ -11755,6 +11755,9 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(
             ScriptedTurn(content=[TextContent("finished")]),
         ]
     )
+    from zeta.runtime.foreground_events import ForegroundEventPublisher
+
+    publisher = ForegroundEventPublisher()
     output = StringIO()
     app = TUIApp(
         AgentLoop(
@@ -11766,13 +11769,23 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(
             },
             skill_catalog=SkillCatalog.empty(),
         ),
+        foreground_event_publisher=publisher,
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False, width=72),
     )
 
     app._print_user("inspect the session")
-    await app._consume_turn("inspect the session")
+    subscription = publisher.subscribe()
+    try:
+        await app._consume_turn("inspect the session")
+        async with asyncio.timeout(10):
+            async for event in subscription:
+                assert isinstance(event, StreamEvent)
+                if event.type is StreamEventType.AGENT_END:
+                    break
+    finally:
+        publisher.unsubscribe(subscription)
     snapshot = "\n".join(
         line.rstrip() for line in output.getvalue().splitlines()
     ).strip()

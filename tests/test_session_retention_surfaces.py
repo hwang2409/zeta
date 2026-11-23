@@ -10,9 +10,12 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
+from tests.support.sockets import short_socket_path
 from tests.support.storage_homes import initialize_storage_home
 from tests.test_server import _connect, _event, _request
+from tests.test_server_in_flight_replay import HOLD, GatedBackend
 from zeta.cli import main as cli_main_module
 from zeta.core.session import SessionManager
 from zeta.locking import RETENTION_HOME_ID, domain_lock_name
@@ -131,6 +134,63 @@ async def test_real_serve_retention_event_filters_and_has_exact_projection_keys(
         assert isinstance(event["data"]["errors"], list)
     finally:
         await close_serve(server, controller_writer, observer_writer)
+
+
+@pytest.mark.asyncio
+async def test_legacy_observer_receives_planner_retention_after_park(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    await await_or_fail(_seed_preview_async(home), what="seed retention preview")
+    backend = GatedBackend([([HOLD], [TextContent("done")])])
+    server = ZetaServer(
+        home=home, cwd=tmp_path, socket_path=short_socket_path(tmp_path),
+        provider="codex", backend_factory=lambda *_: (backend, "offline"),
+    )
+    reader, writer = await _connect(server)
+    observer_writer = None
+
+    def arm() -> None:
+        with open_writer(home) as lease:
+            result = retention_authority(home, lease, days=lambda: 30)
+            assert result.projection["mode"] == "armed"
+
+    try:
+        controller = await _hello(reader, writer, 1, features=["resume_attach", "session_park"])
+        assert "session_park" in controller["capabilities"]["features"]
+        observer_reader, observer_writer = await await_or_fail(
+            asyncio.open_unix_connection(str(server.socket_path)), what="connect legacy observer",
+        )
+        await _hello(
+            observer_reader, observer_writer, 2,
+            features=["session_retention", "serve_observers"], role="observer",
+        )
+        first = (await _request(reader, writer, 3, "new_session", {}))[-1]["result"]["session"]
+        await _request(reader, writer, 4, "send", {"text": "hold the turn"})
+        await await_or_fail(backend.held[0].wait(), what="first turn running")
+        second = (await _request(reader, writer, 5, "new_session", {}))[-1]["result"]["session"]
+        status = (await _request(reader, writer, 6, "status", {}))[-1]["result"]
+        assert [row["session_id"] for row in status["parked_sessions"]] == [first["session_id"]]
+        assert second["session_id"] != first["session_id"]
+
+        # Arm out of band so only the planner, not a slash response, can emit the event.
+        await await_or_fail(asyncio.to_thread(arm), what="arm retention out of band")
+        assert server._retention_owner is not None
+        server._retention_owner.wake()
+
+        async def armed_event() -> dict:
+            while True:
+                event = await _event(observer_reader, "session_retention")
+                if event["data"]["mode"] == "armed":
+                    return event
+
+        try:
+            event = await asyncio.wait_for(armed_event(), 10)
+        except TimeoutError:
+            pytest.fail("legacy observer received no armed planner retention after park")
+        assert event["session_id"] == second["session_id"]
+    finally:
+        backend.open_all()
+        writers = (writer,) if observer_writer is None else (writer, observer_writer)
+        await close_serve(server, *writers)
 
 
 @pytest.mark.asyncio

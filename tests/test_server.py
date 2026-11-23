@@ -937,14 +937,15 @@ async def test_protocol_1_1_client_receives_sub_agent_receipt_for_known_kinds(
             await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         )[-1]["result"]
         assert hello["protocol_version"] == "1.1"
-        assert next(iter(server.connections.clients()), None) is not None
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = server.controllers.attached().runtime.session_id
         for kind in NOTIFICATION_KINDS:
             await server.controllers.attached().control._event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={"kind": kind},
                 ),
-                session_id="session",
+                session_id=session_id,
             )
         events = [(await _read(reader))["params"]["event"] for _ in NOTIFICATION_KINDS]
 
@@ -964,7 +965,8 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
             await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         )[-1]["result"]
         assert hello["protocol_version"] == "1.2"
-        assert next(iter(server.connections.clients()), None) is not None
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = server.controllers.attached().runtime.session_id
         for kind in (*NOTIFICATION_KINDS, "future_kind"):
             data = {"kind": kind}
             if kind == "child_question":
@@ -974,7 +976,7 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
                     StreamEventType.AGENT_NOTIFICATION,
                     data=data,
                 ),
-                session_id="session",
+                session_id=session_id,
             )
         notifications = [
             (await _read(reader))["params"]
@@ -999,19 +1001,20 @@ async def test_child_message_delivered_event_maps_from_background_run(
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
-        assert next(iter(server.connections.clients()), None) is not None
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = server.controllers.attached().runtime.session_id
         await server.controllers.attached().control._event(
             StreamEvent(
                 StreamEventType.CHILD_MESSAGE_DELIVERED,
                 data={"child_label": "worker", "preview": "check the retry"},
             ),
-            session_id="parent",
+            session_id=session_id,
         )
 
         notification = await _read(reader)
         assert notification["params"] == {
             "event": "child_message_delivered",
-            "session_id": "parent",
+            "session_id": session_id,
             "data": {"child_label": "worker", "preview": "check the retry"},
         }
     finally:
@@ -2009,21 +2012,16 @@ async def test_session_history_records_controller_disconnect_approval_abort(
     )
     reader, writer, session_id = await _ready_extensions(server)
     await _request(reader, writer, 3, "send", {"text": "read it"})
-    await _event(reader, "approval_request")
-    writer.close()
-    await writer.wait_closed()
     try:
-        # The approval aborts first; the old controller releases only after
-        # its turn is canceled. Reconnect after the release, as a client must.
-        for _ in range(500):
-            if not (server.connections is not None and next(iter(server.connections.clients()), None) is not None):
-                break
-            await asyncio.sleep(0.01)
-        else:
-            pytest.fail("controller was not released after disconnect")
-        assert server.controllers.attached().runtime.policy is not None
-        assert not (await server.controllers.attached().runtime.policy.pending_requests())
+        await _event(reader, "approval_request")
+        assert server.connections is not None
+        holder = server.connections.legacy_controller_holder
+        assert holder is not None
+        writer.close()
+        await writer.wait_closed()
+        await await_or_fail(holder.released.wait(), what="old controller slot release")
 
+        # The slot can release before approval cleanup; hello waits for both.
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         hello = await _request(
             reader,
@@ -2033,6 +2031,8 @@ async def test_session_history_records_controller_disconnect_approval_abort(
             {"protocol_version": "1.0", "client_version": "1.1"},
         )
         assert hello[-1]["result"]["protocol_version"] == "1.1"
+        assert server.controllers.attached().runtime.policy is not None
+        assert not (await server.controllers.attached().runtime.policy.pending_requests())
         history = (
             await _request(
                 reader,
@@ -3324,7 +3324,7 @@ async def test_lifecycle_prunes_ended_approvals(
     )
     reader, writer = await _ready(server)
     tool_end_written = asyncio.Event()
-    controller = server.connections.controller_metadata().connection
+    controller = server.connections.legacy_controller_holder.connection
     original_send = server.connections.send
     original_write = controller._write_physical
 
@@ -3791,7 +3791,9 @@ async def test_foreground_abort_only_ends_foreground_approval(
             child_instance_id="background-child",
         )
         assert server.controllers.attached().runtime.loop is not None
-        child_task = asyncio.create_task(asyncio.sleep(60))
+        child_task = asyncio.create_task(
+            asyncio.wait_for(asyncio.Event().wait(), 60)
+        )
         server.controllers.attached().runtime.loop._background_owner.register(
             "background-child", child_task.cancel, child_task
         )
@@ -4644,7 +4646,7 @@ async def test_late_approval_after_disconnect_abort_is_rejected(
     )
     reader, writer = await _ready(server)
     assert server.connections is not None
-    controller = server.connections.controller_metadata()
+    controller = server.connections.legacy_controller_holder
     assert controller is not None
     first_client_released = asyncio.Event()
     release = server.connections.release
@@ -5067,11 +5069,10 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
 
     client._run_blocking = run_blocking
     notifications: list[tuple[str, dict[str, object]]] = []
-    original_admit = client._admit_controller
 
     def admit(event: str, session_id: str | None, **fields: object) -> Admission:
         notifications.append((event, fields))
-        return original_admit(event, session_id, **fields)
+        return Admission("no_controller")
 
     # test-contract: seam observe approval admission through the single publication route
     monkeypatch.setattr(client, "_admit_controller", admit)
@@ -13697,7 +13698,8 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
     parent_tool_ended = asyncio.Event()
     release_parent_turn = asyncio.Event()
     parent_session_id = server.controllers.attached().runtime.session_id
-    publish_controller = server.connections.publish_controller
+    control = server.controllers.attached().control
+    notify = control._notify
 
     async def force_parent_tool_end_first(event, session_id, **fields):
         if failure == "cancelled" and event == "approval_end":
@@ -13709,7 +13711,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             and parent_tool_ended.is_set()
         ):
             await asyncio.wait_for(release_parent_turn.wait(), timeout=10)
-        published = await publish_controller(event, session_id, **fields)
+        published = await notify(event, session_id, **fields)
         tool_call = fields.get("tool_call") or {}
         if event == "tool_end" and tool_call.get("id") == agent.id:
             parent_tool_ended.set()
@@ -13717,7 +13719,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
 
     # test-contract: seam no public event exposes controller admission order
     monkeypatch.setattr(
-        server.connections, "publish_controller", force_parent_tool_end_first
+        control, "_notify", force_parent_tool_end_first
     )
     frames: list[dict[str, Any]] = []
     try:
@@ -13848,7 +13850,7 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     reader, writer = await _ready(server)
     write_started = asyncio.Event()
     release_write = asyncio.Event()
-    controller = server.connections.controller_metadata()
+    controller = server.connections.legacy_controller_holder
     assert controller is not None
     connection = controller.connection
     original_write = connection._write_physical

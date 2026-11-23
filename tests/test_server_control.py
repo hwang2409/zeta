@@ -49,7 +49,6 @@ from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
 from zeta.server.protocol import EventDescriptor, FrameCodec
 from zeta.server.server import _Client
-from zeta.server.session_replay.in_flight import InFlightReply
 from zeta.skills import SkillCatalog
 
 pytest_plugins = ("tests.support.socket_fixtures",)
@@ -137,7 +136,7 @@ def _frame(connection: _ControllerConnection, label: str) -> bytes:
 
 @pytest.mark.asyncio
 async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(
@@ -148,7 +147,7 @@ async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() 
         connections=registry, controllers=SimpleNamespace(is_closing=lambda _control: False)
     )
     control._notify = lambda event, session_id=None, **fields: (
-        registry.publish_controller(event, session_id, **fields)
+        registry.publish_session(connection, event, session_id, wait_for_write=True, **fields).delivered()
     )
     control._publish_memory_notice("session", "updated")
     await asyncio.sleep(0)
@@ -160,12 +159,15 @@ async def test_memory_updated_during_pre_hello_claim_is_delivered_after_hello() 
 
 @pytest.mark.asyncio
 async def test_protocol_1_2_projection_keeps_negotiated_version_before_hello() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     control = object.__new__(ServeControl)
-    control.server = SimpleNamespace(connections=registry)
+    connection.protocol_version = "1.2"
+    control.runtime = SimpleNamespace(opened=None)
+    control.event_source = lambda _: None
+    control.server = SimpleNamespace(controllers=SimpleNamespace(event_owner=lambda _: connection))
     assert control._protocol_version() == "1.2"
     registry.release(connection)
     await registry.aclose()
@@ -182,13 +184,14 @@ def test_no_server_caller_branches_on_ready_controller() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_event_emitted_before_hello_is_delivered_after_hello() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
-    await registry.publish_controller(
-        EventDescriptor.ASSISTANT_DELTA, "session", delta="x"
-    )
+    await registry.publish_session(connection,
+        EventDescriptor.ASSISTANT_DELTA, "session", delta="x",
+        wait_for_write=True,
+    ).delivered()
     assert await registry.send(connection, _frame(connection, "hello"))
     assert (
         json.loads(connection.frames[1])["params"]["event"]
@@ -199,14 +202,15 @@ async def test_controller_event_emitted_before_hello_is_delivered_after_hello() 
 
 @pytest.mark.asyncio
 async def test_controller_pre_hello_events_keep_emission_order() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     for value in ("a", "b", "c"):
-        await registry.publish_controller(
-            EventDescriptor.ASSISTANT_DELTA, "session", delta=value
-        )
+        await registry.publish_session(connection,
+            EventDescriptor.ASSISTANT_DELTA, "session", delta=value,
+            wait_for_write=True,
+        ).delivered()
     assert await registry.send(connection, _frame(connection, "hello"))
     assert [
         json.loads(frame)["params"]["delta"] for frame in connection.frames[1:]
@@ -220,7 +224,7 @@ async def test_controller_pre_hello_events_keep_emission_order() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_concurrent_outputs_keep_admission_order() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -239,15 +243,17 @@ async def test_controller_concurrent_outputs_keep_admission_order() -> None:
 
     connection._write_physical = gated_write  # type: ignore[method-assign]
     first = asyncio.create_task(
-        registry.publish_controller(
-            EventDescriptor.ASSISTANT_DELTA, "session", delta="first"
-        )
+        registry.publish_session(connection,
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="first",
+            wait_for_write=True,
+        ).delivered()
     )
     await asyncio.wait_for(first_started.wait(), 10)
     second = asyncio.create_task(
-        registry.publish_controller(
-            EventDescriptor.ASSISTANT_DELTA, "session", delta="second"
-        )
+        registry.publish_session(connection,
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="second",
+            wait_for_write=True,
+        ).delivered()
     )
     await asyncio.sleep(0)
     assert connection.frames == []
@@ -262,7 +268,7 @@ async def test_controller_concurrent_outputs_keep_admission_order() -> None:
 
 @pytest.mark.asyncio
 async def test_observer_concurrent_outputs_keep_admission_order() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(
@@ -301,13 +307,14 @@ async def test_observer_concurrent_outputs_keep_admission_order() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_claim_failure_drops_pre_hello_events() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     first = _ControllerConnection()
     registry.register(first)
     registry.negotiate_role(first, "controller", "1.2", frozenset())
-    await registry.publish_controller(
-        EventDescriptor.ASSISTANT_DELTA, "session", delta="old"
-    )
+    await registry.publish_session(first,
+        EventDescriptor.ASSISTANT_DELTA, "session", delta="old",
+        wait_for_write=True,
+    ).delivered()
     registry.release(first)
     second = _ControllerConnection()
     registry.register(second)
@@ -321,14 +328,15 @@ async def test_controller_claim_failure_drops_pre_hello_events() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_pre_hello_buffer_bound_uses_overflow_contract() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
     for _ in range(257):
-        await registry.publish_controller(
-            EventDescriptor.ASSISTANT_DELTA, "session", delta="x"
-        )
+        await registry.publish_session(connection,
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="x",
+            wait_for_write=True,
+        ).delivered()
     assert not await registry.send(connection, _frame(connection, "hello"))
     assert json.loads(connection.frames[1])["error"]["code"] == -32011
     registry.release(connection)
@@ -347,7 +355,7 @@ async def _send_hello_and_flush(
 
 @pytest.mark.asyncio
 async def test_cancel_after_physical_write_reports_delivered_once() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -362,16 +370,18 @@ async def test_cancel_after_physical_write_reports_delivered_once() -> None:
 
     connection._write_physical = write_then_cancel  # type: ignore[method-assign]
     publisher = asyncio.create_task(
-        registry.publish_controller(
-            EventDescriptor.ASSISTANT_DELTA, "session", delta="once"
-        )
+        registry.publish_session(connection,
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="once",
+            wait_for_write=True,
+        ).delivered()
     )
     try:
         delivered = await asyncio.wait_for(publisher, 10)
     except asyncio.CancelledError:
-        delivered = await registry.publish_controller(
-            EventDescriptor.ASSISTANT_DELTA, "session", delta="once"
-        )
+        delivered = await registry.publish_session(connection,
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="once",
+            wait_for_write=True,
+        ).delivered()
 
     assert delivered
     assert len(connection.frames) == 1
@@ -380,7 +390,7 @@ async def test_cancel_after_physical_write_reports_delivered_once() -> None:
 
 @pytest.mark.asyncio
 async def test_release_after_physical_write_reports_delivered() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -402,7 +412,7 @@ async def test_release_after_physical_write_reports_delivered() -> None:
 
 @pytest.mark.asyncio
 async def test_controller_release_fences_queued_frames() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -429,7 +439,7 @@ async def test_controller_release_fences_queued_frames() -> None:
 
 @pytest.mark.asyncio
 async def test_observer_release_matches_base() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(
@@ -465,7 +475,7 @@ async def test_observer_release_matches_base() -> None:
 
 @pytest.mark.asyncio
 async def test_aclose_settles_queued_frames_false() -> None:
-    registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+    registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
     connection = _ControllerConnection()
     registry.register(connection)
     registry.negotiate_role(connection, "controller", "1.2", frozenset())
@@ -569,6 +579,7 @@ async def _replace_registry_controller(
     assert next(iter(server.connections.clients()), None) is not None
     old_client = next(iter(server.connections.clients()), None)
     server.connections.release(old_client)
+    server.controllers.release_connection(old_client)
     writer = _RecordingWriter()
     replacement = _Client(server, asyncio.StreamReader(), writer)
     server.connections.register(replacement)
@@ -580,6 +591,8 @@ async def _replace_registry_controller(
         replacement.protocol_version,
         replacement.features,
     )
+    admission = server.controllers.admit_hello(replacement, negotiated_multi=False)
+    server.controllers.commit_hello(admission)
     replacement.handshaken = True
     server.connections.activate_controller(replacement)
     frame = replacement.codec.notification(

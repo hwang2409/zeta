@@ -228,8 +228,8 @@ async def test_output_writer_failure_closes_connection_and_releases_slot(
     monkeypatch.setattr(connections, "_enqueue", watch_enqueue)
     async with _closing(server, client, resume):
         # a live event: the writer sends it with no caller waiting on it
-        connections._publish_observer(
-            connections._connections[owner], owner.codec.response(99, {})
+        connections._publish_local(
+            connections._connections[owner], output, owner.codec.response(99, {}), wait_for_write=False,
         )
         await await_or_fail(entered.wait(), what="held frame write started")
         # the request loop's reply waits in the queue behind the held frame
@@ -281,8 +281,8 @@ async def test_reply_after_writer_failure_fails_at_once_and_releases_slot(
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
         await await_or_fail(reading.wait(), what="join handler is reading history")
         # a live event trips the guard while the join handler is mid-way
-        connections._publish_observer(
-            connections._connections[owner], owner.codec.response(99, {})
+        connections._publish_local(
+            connections._connections[owner], output, owner.codec.response(99, {}), wait_for_write=False,
         )
         writer = output.writer_task
         assert writer is not None

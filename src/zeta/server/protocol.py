@@ -946,7 +946,7 @@ class FrameCodec:
             logger.error("refusing unregistered event descriptor: %r", event)
             return None
         params: dict[str, object] = {"event": event.value}
-        if session_id is not None:
+        if session_id is not None or event is EventDescriptor.ZETA_UPDATED:
             params["session_id"] = session_id
         params.update(fields)
         value = {"jsonrpc": "2.0", "method": "event", "params": params}

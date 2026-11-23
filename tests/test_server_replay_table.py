@@ -53,7 +53,7 @@ def test_feature_tables_only_name_negotiable_features() -> None:
     would gate an event behind a feature no client can ever hold."""
     valid = set(FEATURES)
     for event, required in connection_module.EVENT_FEATURES.items():
-        unknown = sorted(required - valid)
+        unknown = sorted(required.features - valid)
         assert not unknown, f"{event.value} requires unknown features {unknown}"
     for (event, field), required in connection_module.OPTIONAL_FIELD_FEATURES.items():
         assert isinstance(event, EventDescriptor), f"{event!r}.{field} is not an event"
@@ -111,11 +111,11 @@ def _backend_factory(provider: str, model: str | None, home: Path) -> tuple[Fake
     return FakeBackend([]), model or "offline"
 
 
-async def _started(tmp_path: Path, transport: Transport) -> tuple[ZetaServer, ReplayClient, str]:
+async def _started(tmp_path: Path, transport: Transport, *, extra: tuple[str, ...] = ()) -> tuple[ZetaServer, ReplayClient, str]:
     server = replay_server(tmp_path, transport, _backend_factory)
     await server.start()
     client = await connect_replay(server, transport)
-    hello = await negotiate(client)
+    hello = await negotiate(client, extra=extra)
     assert "session_history_and_subscribe" in hello["result"]["capabilities"]["requests"]
     created = await client.request(2, "new_session", {"provider": "codex"})
     return server, client, created["result"]["session"]["session_id"]
@@ -807,7 +807,7 @@ async def _publication_routes(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     del monkeypatch
-    server, client, session_id = await _started(tmp_path, transport)
+    server, client, session_id = await _started(tmp_path, transport, extra=("session_grants",))
     joined = await _join(client, session_id)
     stream_id = joined["result"]["replay"]["stream_id"]
     ordinary = (
@@ -831,22 +831,24 @@ async def _publication_routes(
         )
         observed.append(await client.event(descriptor.value))
     assert server.connections is not None
-    admitted = server.connections.try_admit_controller(
+    admitted = server.controllers.attached().control._admit_controller(
         EventDescriptor.APPROVAL_END, session_id, data={"route": "settlement"}
     )
     assert admitted.kind == "admitted"
     observed.append(await client.event(EventDescriptor.APPROVAL_END.value))
-    assert await server.connections.publish_controller(
+    assert await server.controllers.attached().control._notify(
         EventDescriptor.DELIVERY_STATUS, session_id, data={"route": "direct"}
     )
     observed.append(await client.event(EventDescriptor.DELIVERY_STATUS.value))
-    await server.connections.publish_feature_event(
-        "session_replay_seq",
+    await server.controllers.attached().control._notify(
         EventDescriptor.SESSION_GRANTS_CHANGED,
         session_id,
         data={"route": "grants"},
     )
-    observed.append(await client.event(EventDescriptor.SESSION_GRANTS_CHANGED.value))
+    grant = await client.event(EventDescriptor.SESSION_GRANTS_CHANGED.value)
+    while grant.get("data") != {"route": "grants"}:
+        grant = await client.event(EventDescriptor.SESSION_GRANTS_CHANGED.value)
+    observed.append(grant)
     assert [event.get("stream_id") for event in observed] == [stream_id] * len(observed)
     assert [event["seq"] for event in observed] == list(range(1, len(observed) + 1))
     await client.close()
@@ -914,7 +916,7 @@ async def _observer_without_join(
         stream_id = (await _join(controller, session_id))["result"]["replay"]["stream_id"]
         await _publish(server, session_id)
         assert server.connections is not None
-        assert await server.connections.publish_controller(
+        assert await server.controllers.attached().control._notify(
             EventDescriptor.APPROVAL_REQUEST,
             session_id,
             data={"arguments": {"command": "secret"}},
@@ -1130,7 +1132,7 @@ async def _observer_settlement(
         await negotiate(observer, observer=True)
         stream_id = (await _join(observer, session_id))["result"]["replay"]["stream_id"]
         assert server.connections is not None
-        admitted = server.connections.try_admit_controller(
+        admitted = server.controllers.attached().control._admit_controller(
             EventDescriptor.APPROVAL_END, session_id, data={"route": "settlement"}
         )
         assert admitted.kind == "admitted"

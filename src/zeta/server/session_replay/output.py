@@ -40,7 +40,7 @@ class _OutputFrame:
 class ReplayOutput:
     """ConnectionRegistry's replay transitions: reserve, evict, admit, discard, release."""
 
-    def _publish_observer_replay(
+    def _publish_replay_subscribers(
         self,
         event: EventDescriptor,
         session_id: str | None,
@@ -49,21 +49,28 @@ class ReplayOutput:
         covers: rows.Covers,
         replay_row: rows.RowFacts | None = None,
         *,
+        exclude: Any = None,
+        scope: ReplayScopeId | None = None,
+        legacy_observers: bool = False,
         feature_fields: event_contract.FeatureFields | None = None,
     ) -> None:
-        """Send an event to observers that joined its replay scope."""
-        if EVENT_ACCESS.get(event, Access.READ) is not Access.READ:
+        replay_allowed = EVENT_ACCESS.get(event, Access.READ) is Access.READ
+        if not replay_allowed and not legacy_observers:
             return
-        for observer in tuple(self._observers):
-            if not self._feature_rejected(observer, event, required_feature, fields):
-                self._publish_replay(
-                    observer,
-                    event,
-                    session_id,
-                    self._fields_for_connection(observer, event, fields, feature_fields=feature_fields),
-                    covers,
-                    replay_row=replay_row,
-                )
+        for state in tuple(self._connections.values()):
+            connection = state.connection
+            if (connection is exclude or state.paused or state.role is None
+                    or self._feature_rejected(state, event, required_feature, fields)):
+                continue
+            shaped = self._fields_for_connection(state, event, fields, feature_fields=feature_fields)
+            if self.replay.scope_for(connection) is not None and self._publish_replay(
+                state, event, session_id, shaped, covers, scope=scope, replay_row=replay_row,
+            ):
+                continue
+            if legacy_observers and state.role == "observer" and state.output is not None:
+                frame = connection.codec.notification(event, session_id, **shaped)
+                if frame is not None and state.output.phase == "ready":
+                    self._publish_local(state, state.output, frame, wait_for_write=False)
 
     def _replay_covers(
         self,
@@ -174,21 +181,9 @@ class ReplayOutput:
 
     def _admit_deferred(self, record: DeferredFrame, covers: rows.Covers) -> None:
         """Send one deferred copy to every replay stream of its scope."""
-        for state in (self._primary_controller, *self._observers):
-            if state is None or (
-                state is self._primary_controller and self._controller_output_paused
-            ):
-                continue
-            if not self._feature_rejected(
-                state, record.event, record.required_feature, record.fields
-            ):
-                self._publish_replay(
-                    state,
-                    record.event,
-                    record.session_id,
-                    self._fields_for_connection(state, record.event, record.fields),
-                    covers,
-                )
+        self._publish_replay_subscribers(
+            record.event, record.session_id, record.required_feature, record.fields, covers,
+        )
 
     def _replay_store(self, scope: ReplayScopeId) -> Any:
         """The scope's store while a replay stream or join needs it, else None."""
@@ -249,7 +244,7 @@ class ReplayOutput:
         """
         state = self._connections[connection]
         stream_id = self.replay.pending_stream_id(connection)
-        for event, fields in self.in_flight().frames(scope.value):
+        for event, fields in self.replay.controller_for(connection).control.in_flight.frames(scope.value):
             shaped = self._fields_for_connection(state, event, fields)
             # the largest seq bounds the frame size the stream sends
             frame = connection.codec.notification(
@@ -335,17 +330,10 @@ class ReplayOutput:
         Callers discard the stream's queued frames first, so the event follows every
         frame already written or in flight and precedes any later frame.
         """
-        state = self._connections.get(connection)
-        if state is None:
-            return
-        frame = connection.codec.notification(
-            EventDescriptor.REPLAY_STREAM_ENDED,
-            ended.scope.value,
-            stream_id=ended.stream_id,
-            reason=reason,
+        self.publish_connection(
+            connection, EventDescriptor.REPLAY_STREAM_ENDED, ended.scope.value,
+            stream_id=ended.stream_id, reason=reason,
         )
-        if frame is not None:
-            self._publish_observer(state, frame)
 
     def replay_session_replaced(self) -> None:
         for scope in self.replay.scopes():
@@ -419,6 +407,8 @@ class ReplayOutput:
             scope = self._member_scope(connection, session_id, fields, replay_row)
             if scope is None:
                 return False
+        if self.replay.scope_for(connection) != scope:
+            return False
         if event is EventDescriptor.CHILD_PROGRESS and self.replay.is_pending(connection):
             return True
         if covers is not None and not self._frontier_holds(connection, scope):
@@ -439,7 +429,7 @@ class ReplayOutput:
             prepared.seq is None
             and scope.kind == "top"
             and "in_flight_replay" in state.features
-            and self.in_flight().owns(event, fields)
+            and self.replay.controller_for(connection).control.in_flight.owns(event, fields)
         ):
             # the join's in-flight frames carry it, so holding it only costs room
             return True
@@ -559,14 +549,6 @@ class ReplayOutput:
         # fail closed: a failed connection cannot reliably get an end event; it rejoins
         self.invalidate_replay_connection(state.connection)
         state.connection.writer.close()
-
-    def publish_child_lifecycle(self, event, scope, session_id, fields, covers=None):
-        for state in (self._primary_controller, *self._observers):
-            if state is None or "child_run_events" not in state.features:
-                continue
-            if self.replay.scope_for(state.connection) != scope:
-                continue
-            self._publish_replay(state, event, session_id, fields, covers, scope=scope)
 
     async def read_replay_history(
         self,

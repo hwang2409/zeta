@@ -38,7 +38,6 @@ from zeta.runtime.composition import RuntimeComposition, compose_runtime
 from zeta.server.connections import ConnectionRegistry
 from zeta.server.control import ServeControl
 from zeta.server.protocol import EventDescriptor, FrameCodec
-from zeta.server.session_replay.in_flight import InFlightReply
 from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.transcript_search.index import TranscriptIndex
@@ -406,7 +405,7 @@ async def test_login_required_notice_is_delivered_to_serve_client(
 
 async def test_serve_memory_event_requires_negotiated_feature() -> None:
     """The one owner of the feature gate is the connection: _publish_memory_notice
-    always routes through publish_controller, which drops memory_updated for a
+    always routes through session publication, which drops memory_updated for a
     controller that did not negotiate the feature. Assert that on the wire."""
 
     class _Controller:
@@ -425,7 +424,7 @@ async def test_serve_memory_event_requires_negotiated_feature() -> None:
             pass
 
     async def _memory_frames(features: frozenset[str]) -> list[dict[str, object]]:
-        registry = ConnectionRegistry(asyncio.get_running_loop(), InFlightReply)
+        registry = ConnectionRegistry(asyncio.get_running_loop(), lambda *_: None)
         connection = _Controller()
         registry.register(connection)
         registry.negotiate_role(connection, "controller", "1.2", features)
@@ -434,7 +433,7 @@ async def test_serve_memory_event_requires_negotiated_feature() -> None:
             connections=registry, controllers=SimpleNamespace(is_closing=lambda _control: False)
         )
         control._notify = lambda event, session_id=None, **fields: (
-            registry.publish_controller(event, session_id, **fields)
+            registry.publish_session(connection, event, session_id, wait_for_write=True, **fields).delivered()
         )
         try:
             control._publish_memory_notice(

@@ -20,7 +20,11 @@ from ..core.store import ConversationIntegrityError, TranscriptLoadError
 from ..core.transcript_recovery.runtime import TranscriptRepairRequiresUpgrade
 from ..locking import socket_lock
 from ..project_errors import ProjectRegistryBusyError
-from ..runtime.foreground_events import ForegroundEventPublisher
+from ..runtime.foreground_events import (
+    ForegroundEventPublisher,
+    ServeEvent,
+    SessionEventSource,
+)
 from ..session_retention.activation import make_retention_owner
 from ..storage_format import (
     StorageFeature,
@@ -34,7 +38,7 @@ from . import (
     login,
 )
 from . import control as control_module
-from .connections import ConnectionRegistry
+from .connections import Admission, ConnectionRegistry
 from .control import (
     NotificationPresentation,
     ServeControl,
@@ -71,6 +75,7 @@ from .session_controllers import (
     SessionControllers,
     SessionUse,
 )
+from .session_replay import ReplayScopeId
 from .transport import WebSocketServer
 from .turn_context import PendingTurnContexts
 
@@ -334,7 +339,11 @@ class ZetaServer:
         control = ServeControl(self, runtime, self.foreground_event_publisher)
         # every pair shares this manager; sessionless reads use it with no record
         self.manager = runtime.manager
-        self.controllers = SessionControllers(control, owns_runtime=not self._borrowed)
+        self.controllers = SessionControllers(
+            control, owns_runtime=not self._borrowed, retention_owner=self._retention_owner,
+        )
+        self._borrowed_source = (control.event_source(runtime.session_id if runtime.opened is not None else None)
+                                 if foreground_event_publisher is not None else None)
         self._bind_pair(control)
         self.parking = ParkedPairs(lambda: self.connections, self.controllers)
 
@@ -358,15 +367,17 @@ class ZetaServer:
     def attach(self, incoming: SessionController) -> SessionController:
         """Make ``incoming`` the attached pair in one step (no await): park the
         outgoing pair while it holds work, else start its close."""
-        outgoing = self.controllers.attached().control
+        previous = self.controllers.attached()
+        outgoing = previous.control
         if not self.parking.unpark(incoming.control):
             # a new pair takes over the controller slot state of the pair it replaces
             incoming.control._controller_attached = outgoing._controller_attached
+        parked_by = self.controllers.legacy_event_owner(previous)
         self.controllers.attach(incoming)
         assert self.connections is not None
         self.connections.replay_session_replaced()
         if outgoing.runtime.opened is not None:
-            self.parking.leave(outgoing)
+            self.parking.leave(outgoing, parked_by)
         return incoming
 
     async def require_all_idle(self) -> None:
@@ -387,13 +398,55 @@ class ZetaServer:
             runtime.set_work_changed_sink(
                 lambda: self.parking.changed_from_any_thread(control)
             )
+            if self._retention_owner is not None:
+                async def publish_retention(projection: dict[str, object]) -> None:
+                    if projection.get("mode") == "none" and not projection.get("errors"):
+                        return
+                    if runtime.opened is not None:
+                        await control._notify(
+                            EventDescriptor.SESSION_RETENTION, runtime.session_id, data=projection,
+                        )
+
+                runtime.retention_event_sink = publish_retention
+                runtime.retention_wake = self._retention_owner.wake
+
+    async def route_serve_event(self, envelope: ServeEvent, *, turn_id: str | None = None) -> None:
+        record = self.controllers.event_record(envelope.source)
+        if record is not None:
+            await record.control._event(
+                envelope.event, session_id=envelope.source.session_id, turn_id=turn_id,
+            )
+
+    def publish_session_event(
+        self, source: SessionEventSource, event: EventDescriptor, **fields: Any,
+    ) -> Admission:
+        if self.connections is None:
+            return Admission("no_controller")
+        return self.connections.publish_session(
+            self.controllers.event_owner(source), event, source.session_id,
+            legacy_observers=self.controllers.legacy_observers_of(source), **fields,
+        )
+
+    def _publish_child_lifecycle(
+        self, event: EventDescriptor, scope: ReplayScopeId, session_id: str,
+        fields: dict[str, object], covers: int | None,
+    ) -> None:
+        if self.connections is None:
+            return
+        owner = None
+        # Legacy child lifecycle remains a replay-only feed.
+        if self.controllers.controller_mode == "multi":
+            record = self.controllers.resident(session_id)
+            if record is not None:
+                owner = self.controllers.event_owner(record.control.event_source(session_id))
+        self.connections.publish_session(
+            owner, event, session_id, replay_scope=scope, covers=covers, **fields,
+        )
 
     async def _publish_foreground_events(self) -> None:
-        assert self._foreground_subscription is not None
+        assert self._foreground_subscription is not None and self._borrowed_source is not None
         async for event in self._foreground_subscription:
-            await self.controllers.attached().control._event(
-                event, session_id=self.controllers.attached().runtime.session_id, turn_id=None
-            )
+            await self.route_serve_event(ServeEvent(self._borrowed_source, event))
 
     async def _close_foreground_events(self) -> None:
         # a borrowed publisher belongs to the TUI and outlives this server
@@ -410,10 +463,8 @@ class ZetaServer:
 
     async def publish_update(self, old_revision: str, new_revision: str) -> None:
         if self.connections is not None:
-            await self.connections.publish_feature_event(
-                "zeta_updated",
-                EventDescriptor.ZETA_UPDATED,
-                self.controllers.attached().runtime.session_id if self.controllers.attached().runtime.opened is not None else None,
+            await self.connections.publish_global(
+                EventDescriptor.ZETA_UPDATED, required_feature="zeta_updated",
                 data={"old_revision": old_revision, "new_revision": new_revision},
             )
 
@@ -435,7 +486,7 @@ class ZetaServer:
             await self.controllers.attached().runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
         self.connections = ConnectionRegistry(
-            asyncio.get_running_loop(), lambda: self.controllers.attached().control.in_flight
+            asyncio.get_running_loop(), self._publish_child_lifecycle
         )
         if self.port is None:
             if self._prebound_socket is not None:
@@ -464,20 +515,7 @@ class ZetaServer:
         if self._foreground_event_publisher is not None:
             self._foreground_subscription = self._foreground_event_publisher.subscribe()
             self._foreground_task = asyncio.create_task(self._publish_foreground_events())
-        if self._retention_owner is not None:
-            async def publish_retention(projection: dict[str, object]) -> None:
-                if projection.get("mode") == "none" and not projection.get("errors"):
-                    return
-                if self.connections is None or self.controllers.attached().runtime.opened is None:
-                    return
-                await self.connections.publish_feature_event(
-                    "session_retention", EventDescriptor.SESSION_RETENTION,
-                    self.controllers.attached().runtime.opened.metadata.session_id, data=projection,
-                )
-
-            self.controllers.attached().runtime.retention_event_sink = publish_retention
-            self.controllers.attached().runtime.retention_wake = self._retention_owner.wake
-            self._retention_owner.set_publish(publish_retention)
+        self.controllers.bind_retention_planner()
 
     async def serve_forever(self) -> None:
         if self._server is None:
@@ -622,7 +660,7 @@ class _Client:
         self.writer = writer
         if server.connections is None:
             server.connections = ConnectionRegistry(
-                asyncio.get_running_loop(), lambda: server.controllers.attached().control.in_flight
+                asyncio.get_running_loop(), server._publish_child_lifecycle
             )
             server.connections.register(self)
         self.connections = server.connections

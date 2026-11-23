@@ -216,7 +216,7 @@ async def test_resume_runs_tools_in_the_session_cwd(
     try:
         await _legacy_hello(reader, writer)
         tool_end_written = asyncio.Event()
-        controller = server.connections.controller_metadata().connection
+        controller = server.connections.legacy_controller_holder.connection
         original_send = server.connections.send
         original_write = controller._write_physical
 
@@ -1844,7 +1844,7 @@ async def test_session_host_commands_reject_client_turn_before_resume(
         writer.close()
         await writer.wait_closed()
         for _ in range(100):
-            if server.connections.controller_metadata() is None:
+            if server.connections.legacy_controller_holder is None:
                 break
             await asyncio.sleep(0)
         else:
@@ -1896,7 +1896,7 @@ async def test_legacy_session_still_accepts_send_after_reconnect(tmp_path: Path)
         writer.close()
         await writer.wait_closed()
         for _ in range(100):
-            if server.connections.controller_metadata() is None:
+            if server.connections.legacy_controller_holder is None:
                 break
             await asyncio.sleep(0)
         else:
@@ -1945,7 +1945,7 @@ async def test_detached_session_returns_existing_duplicate_delivery(
         writer.close()
         await writer.wait_closed()
         for _ in range(100):
-            if server.connections.controller_metadata() is None:
+            if server.connections.legacy_controller_holder is None:
                 break
             await asyncio.sleep(0)
         else:
@@ -2019,7 +2019,7 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
         for _ in range(100):
             if (
                 server.connections is not None
-                and server.connections.controller_metadata() is None
+                and server.connections.legacy_controller_holder is None
             ):
                 break
             await asyncio.sleep(0)
@@ -2059,7 +2059,7 @@ async def test_session_host_commands_notification_after_release_has_no_binding(
         for _ in range(100):
             if (
                 server.connections is not None
-                and server.connections.controller_metadata() is None
+                and server.connections.legacy_controller_holder is None
             ):
                 break
             await asyncio.sleep(0)
@@ -2165,7 +2165,7 @@ async def test_session_host_commands_live_approval_before_resume_keeps_original_
         for _ in range(100):
             if (
                 server.connections is not None
-                and server.connections.controller_metadata() is None
+                and server.connections.legacy_controller_holder is None
             ):
                 break
             await asyncio.sleep(0)
@@ -2287,7 +2287,7 @@ async def test_session_host_commands_durable_approval_before_resume_uses_none_sn
         for _ in range(100):
             if (
                 server.connections is not None
-                and server.connections.controller_metadata() is None
+                and server.connections.legacy_controller_holder is None
             ):
                 break
             await asyncio.sleep(0)

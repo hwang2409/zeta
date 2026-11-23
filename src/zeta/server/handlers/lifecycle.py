@@ -146,7 +146,7 @@ async def _release_previous(
     if previous is None or previous is acquisition.target:
         return
     cancelled = await _settle_controller_release(self, previous.control)
-    self.server.parking.leave(previous.control)
+    self.server.parking.leave(previous.control, self)
     if cancelled:
         raise asyncio.CancelledError
 

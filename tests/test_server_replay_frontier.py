@@ -142,17 +142,13 @@ async def _serve(tmp_path: Path, transport: Transport, backend: Any) -> Serve:
             serve.published.append((event, dict(fields), replay_row or rows.RowFacts(), covers))
         return covers
 
-    publish_child_lifecycle = server.connections.publish_child_lifecycle
+    publish_session = server.connections.publish_session
 
-    def recorded_child_lifecycle(
-        event: EventDescriptor,
-        scope: Any,
-        session_id: str,
-        fields: dict[str, Any],
-        covers: int | None,
-    ) -> None:
-        serve.published.append((event, dict(fields), rows.RowFacts(), covers))
-        publish_child_lifecycle(event, scope, session_id, fields, covers)
+    def recorded_session(owner: Any, event: EventDescriptor, session_id: str | None, **fields: Any):
+        if fields.get("replay_scope") is not None:
+            payload = {key: value for key, value in fields.items() if key not in {"replay_scope", "covers"}}
+            serve.published.append((event, payload, rows.RowFacts(), fields.get("covers")))
+        return publish_session(owner, event, session_id, **fields)
 
     admit_deferred = server.connections._admit_deferred
 
@@ -163,7 +159,7 @@ async def _serve(tmp_path: Path, transport: Transport, backend: Any) -> Serve:
     # test-contract: seam observe each publication's internal covers before the wire strips it
     server.connections._replay_covers = recorded  # type: ignore[method-assign]
     # test-contract: seam observe child lifecycle publication at its scope router
-    server.connections.publish_child_lifecycle = recorded_child_lifecycle  # type: ignore[method-assign]
+    server.connections.publish_session = recorded_session  # type: ignore[method-assign]
     # test-contract: seam observe each deferred copy's covers when its row is found
     server.connections._admit_deferred = recorded_deferred  # type: ignore[method-assign]
     return serve
