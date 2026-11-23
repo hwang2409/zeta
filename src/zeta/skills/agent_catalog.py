@@ -183,9 +183,11 @@ def build_agent(
         except ValueError:
             notice = warn_discovery(
                 document.path,
-                "unknown model; agent will inherit the parent model",
+                f"unknown model {model!r}; agent will inherit the parent model",
                 "agent",
             )
+            # Structured readers (the serve library catalog) get fixed text without the model value.
+            notice.error = "unknown model; agent will inherit the parent model"
             if notices is not None:
                 notices.append(notice)
             model = None
