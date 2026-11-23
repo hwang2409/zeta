@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from ..core.checkpoints import ConversationEntry
 from ..project_inbox_sent.notifications import project_inbox_notification
 from ..protocol.types import Message, TextContent, harness_notice
+from .receipt import agent_output_pointer
 
 if TYPE_CHECKING:
     from ..core.store import ConversationStore
@@ -71,7 +72,7 @@ def _notification_digest(entry: ConversationEntry) -> dict[str, JSONValue]:
         "source_sha256": hashlib.sha256(canonical).hexdigest(),
     }
     if child_id:
-        result["full_output"] = f"agent action=output handle={child_id}"
+        result["full_output"] = agent_output_pointer(child_id)
     if child_path:
         result["child_transcript"] = child_path
     pr_number = report_data.get("pr_number", data.get("pr_number"))

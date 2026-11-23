@@ -11,7 +11,11 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
-from ...agent.receipt import has_agent_receipt_suffix, terminal_state
+from ...agent.receipt import (
+    finish_report_truncation_note,
+    has_agent_receipt_suffix,
+    terminal_state,
+)
 from ...protocol.types import StreamEvent, ToolCall
 from .. import theme
 from .agent import AGENT_TOOL_NAME
@@ -632,7 +636,14 @@ def _render_child_completion(
         if state == "turn_limit" and isinstance(handoff_path, str):
             lines.append(f"handoff: {handoff_path}")
         body = "\n".join(lines) or None
-    return render_agent_message(header, body=body, state=state)
+    note = None
+    handle = event.data.get("child_instance_id")
+    if body and isinstance(handle, str) and event.data.get("report_status"):
+        truncation = finish_report_truncation_note(handle)
+        if body.endswith(truncation):
+            body = body.removesuffix(truncation).rstrip()
+            note = truncation
+    return render_agent_message(header, body=body, result=note, state=state)
 
 
 def render_agent_message(
