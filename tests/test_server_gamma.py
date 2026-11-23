@@ -483,6 +483,9 @@ async def test_slash_requests_reuse_session_repo_root_and_build_once(
     server = _server(tmp_path, None, _launch(tmp_path))
     reader, writer = await _connect(server)
     try:
+        # Startup discovers its own cwd before any session or slash request.
+        startup_discovery_commands = discovery_commands
+        assert startup_discovery_commands == 1, "serve did not discover its launch cwd exactly once"
         await _hello(reader, writer, ["session_cwd"])
         observed = []
         for index, (cwd, expected) in enumerate(
@@ -555,7 +558,9 @@ async def test_slash_requests_reuse_session_repo_root_and_build_once(
             ("non-repository", True),
         ]
         assert busy_registry_builds == 3, "busy slash_run rebuilt its registry"
-        assert discovery_commands == 3, "session setup repeated Git discovery"
+        assert discovery_commands - startup_discovery_commands == 3, (
+            "session setup repeated Git discovery"
+        )
         assert registry_builds == 6, "slash requests did not build exactly once"
     finally:
         await close_serve(server, writer)
