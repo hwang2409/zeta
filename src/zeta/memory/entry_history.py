@@ -47,7 +47,7 @@ from zeta.memory.version_store import (
     publish_version,
     require_memory_format,
 )
-from zeta.project_errors import ProjectRegistryError
+from zeta.project_errors import ProjectRegistryError, require_memory_digest
 from zeta.storage_format import reject_unknown_keys
 
 _CURRENT = "memory-current.json"
@@ -449,8 +449,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         directory_fd = os.dup(project_fd)
         try:
             current = self._entry_snapshot_locked(directory_fd)
-            if current.digest != expected_digest:
-                raise ProjectRegistryError("project memory digest mismatch")
+            require_memory_digest(current.digest, expected_digest)
             actual_changed = tuple(
                 sorted(
                     entry_id
@@ -873,8 +872,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
-                if current.digest != expected_digest:
-                    raise ProjectRegistryError("project memory digest mismatch")
+                require_memory_digest(current.digest, expected_digest)
                 return self._publish_entry_version(
                     directory_fd,
                     state=state,
@@ -966,8 +964,7 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                             self._entry_receipts(duplicate),
                         )
                 current = self._entry_snapshot_locked(directory_fd)
-                if current.digest != expected_digest:
-                    raise ProjectRegistryError("project memory digest mismatch")
+                require_memory_digest(current.digest, expected_digest)
                 if operations:
                     state, receipts = apply_operations(
                         current.state,
@@ -1000,11 +997,14 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
             finally:
                 os.close(directory_fd)
 
-    def _accept_memory_entry(self, project_id: str, entry_id: str) -> EntryCASResult:
+    def _accept_memory_entry(
+        self, project_id: str, entry_id: str, *, expected_digest: str | None = None
+    ) -> EntryCASResult:
         with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
+                require_memory_digest(current.digest, expected_digest)
                 state, receipt = accept_entry(current.state, entry_id)
                 published = self._publish_entry_version(
                     directory_fd,
@@ -1029,11 +1029,13 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         entry_ids: tuple[str, ...],
         *,
         reason: str = "resolved by user",
+        expected_digest: str | None = None,
     ) -> EntryCASResult:
         with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
+                require_memory_digest(current.digest, expected_digest)
                 state, receipt = resolve_entries(
                     current.state, entry_ids, reason=reason
                 )
@@ -1055,13 +1057,14 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
                 os.close(directory_fd)
 
     def _replace_entry_kind(
-        self, project_id: str, kind: str, content: str
+        self, project_id: str, kind: str, content: str, *, expected_digest: str | None = None
     ) -> EntryCASResult:
         """Replace one kind with an accepted legacy-document entry."""
         with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
+                require_memory_digest(current.digest, expected_digest)
                 active_ids = tuple(
                     entry.id
                     for entry in current.state.entries.values()
@@ -1113,13 +1116,14 @@ class EntryMemoryHistoryMixin(EntryMemoryViewMixin):
         return self._undo_entry_transaction(project_id, entry_id)
 
     def _undo_entry_transaction(
-        self, project_id: str, target_id: str | None = None
+        self, project_id: str, target_id: str | None = None, *, expected_digest: str | None = None
     ) -> EntryCASResult:
         """Undo the latest, entry-matching, or exact retained transaction."""
         with self._project_lock(project_id, "memory", exclusive=True) as project_fd:
             directory_fd = os.dup(project_fd)
             try:
                 current = self._entry_snapshot_locked(directory_fd)
+                require_memory_digest(current.digest, expected_digest)
                 pointer = self._pointer(directory_fd)
                 assert pointer is not None
                 root, blobs_fd, versions_fd = self._version_handles(

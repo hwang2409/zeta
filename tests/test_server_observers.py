@@ -7,6 +7,7 @@ import json
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -31,9 +32,11 @@ from zeta.protocol.types import (
     ToolUseContent,
     with_message_origin,
 )
-from zeta.server import ZetaServer, approval_settlement
+from zeta.server import ZetaServer, approval_settlement, protocol
 from zeta.server.handlers import history as history_module
+from zeta.server.handlers.resources import agent_catalog
 from zeta.server.protocol import EventDescriptor
+from zeta.server.resource_protocol import Access, collect_families
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -195,20 +198,39 @@ async def test_observer_catalog_does_not_wait_for_controller_history(
 
 @pytest.mark.asyncio
 async def test_observer_project_and_account_requests_are_read_only(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Exercise a controller-only resource read without changing any shipped method's access.
+    (read,) = agent_catalog.METHODS
+    monkeypatch.setattr(agent_catalog, "METHODS", (replace(read, access=Access.CONTROLLER_READ),))
+    resources = collect_families()
+    # test-contract: seam replace the import-time table to exercise access for a collected resource
+    monkeypatch.setattr(protocol, "_SERVED_METHODS", (*protocol.MethodDescriptor, *resources))
+    for descriptor in resources:
+        monkeypatch.setitem(protocol._METHODS_BY_WIRE, descriptor.wire, descriptor)
+
     server = ZetaServer(
         home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
     )
     controller_reader, controller_writer = await _connect(server)
-    await _request(
-        controller_reader, controller_writer, 1, "hello", {"protocol_version": "1.2"}
-    )
-    await _request(
-        controller_reader, controller_writer, 2, "new_session", {"provider": "codex"}
-    )
-    reader, writer = await _observer(server)
+    writer = None
     try:
+        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT)
+        version = {"protocol_version": "1.2", "features": [agent_catalog.FEATURE]}
+        controller_hello = (await _request(controller_reader, controller_writer, 1, "hello", version))[-1]
+        assert read.wire in controller_hello["result"]["capabilities"]["requests"]
+        await _request(
+            controller_reader, controller_writer, 2, "new_session", {"provider": "codex"}
+        )
+        observer_hello = (await _request(reader, writer, 1, "hello", {
+            **version, "role": "observer", "features": ["serve_observers", agent_catalog.FEATURE],
+        }))[-1]
+        assert read.wire not in observer_hello["result"]["capabilities"]["requests"]
+        refused = (await _request(reader, writer, 2, read.wire))[-1]["error"]
+        assert refused["code"] == -32008
+        assert refused["data"] == {
+            "code": "observer_read_only", "method": read.wire, "reason": "observer_read_only",
+        }
         methods = [
             ("list_projects", {}),
             ("project_show", {"project_id": "p"}),
@@ -228,8 +250,9 @@ async def test_observer_project_and_account_requests_are_read_only(
         assert (await _request(reader, writer, 99, "status"))[-1]["result"]["session"]
     finally:
         await close_serve(server, controller_writer)
-        writer.close()
-        await writer.wait_closed()
+        if writer is not None:
+            writer.close()
+            await writer.wait_closed()
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ _DURABILITY_CALLBACKS = {
     ("project_registry.py", "publish", "atomic_publish_file"),
     ("project_registry.py", "_backup_session_records", "write_session_file_if_absent"),
     ("core/agent_state.py", "ensure_turn_limit_handoff", "write_session_file_if_absent"),
+    ("skills/resource_store.py", "write", "write_session_file_if_absent"),
     ("project_inbox_sent/__init__.py", "publish", "atomic_publish_file"),
     ("project_inbox_sent/__init__.py", "_write_spill", "atomic_publish_file"),
     ("project_inbox.py", "_publish_record", "atomic_publish_file"),

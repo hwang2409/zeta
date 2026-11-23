@@ -84,6 +84,14 @@ class InboxBusyError(InboxError):
     retryable = True
 
 
+class InboxInvalidError(InboxError):
+    """A send was rejected by validation; resending the same input fails again."""
+
+
+class InboxDeliveryPendingError(InboxError):
+    """The message is saved as a durable intent and is re-published later; do not resend."""
+
+
 class _InboxNotFound(FileNotFoundError):
     """The optional top-level inbox directory does not exist."""
 
@@ -483,20 +491,23 @@ class ProjectInbox:
         to_session: str | None = None,
         origin: str = AGENT_ORIGIN,
     ) -> tuple[str, str, str, str | None, str, dict[str, Any]]:
-        sender = self._resolve_project(from_project)
-        target = self._resolve_project(to_project)
-        session = _id(from_session, "session id")
         try:
-            require_closed_variant("inbox.kind", kind)
-        except ValueError as exc:
-            raise InboxError(f"unknown message kind: {kind}") from exc
-        title = _text(title, "title")
-        body = _text(body, "body", empty=True)
-        if in_reply_to is not None:
-            in_reply_to = _id(in_reply_to, "in_reply_to")
-        message_id = _id(message_id or uuid.uuid4().hex)
-        if to_session is not None:
-            to_session = _id(to_session, "target session id")
+            sender = self._resolve_project(from_project)
+            target = self._resolve_project(to_project)
+            session = _id(from_session, "session id")
+            try:
+                require_closed_variant("inbox.kind", kind)
+            except ValueError as exc:
+                raise InboxError(f"unknown message kind: {kind}") from exc
+            title = _text(title, "title")
+            body = _text(body, "body", empty=True)
+            if in_reply_to is not None:
+                in_reply_to = _id(in_reply_to, "in_reply_to")
+            message_id = _id(message_id or uuid.uuid4().hex)
+            if to_session is not None:
+                to_session = _id(to_session, "target session id")
+        except InboxError as exc:
+            raise InboxInvalidError(str(exc)) from exc
         record: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "id": message_id,

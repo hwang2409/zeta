@@ -49,6 +49,7 @@ _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
     ("zeta.server.control", "revoke", "rpc params"),
     ("zeta.server.handlers.history", "_validate_history_params", "rpc params"),
     ("zeta.server.handlers.projects", "_only", "rpc params"),
+    ("zeta.server.handlers.resources.project_writes", "_memory_write", "rpc params"),
     ("zeta.server.handlers.registry", "child_run_events", "rpc params"),
     ("zeta.server.handlers.registry", "mcp_refresh_tools", "rpc params"),
     ("zeta.server.host_commands.__init__", "parse", "rpc params"),
@@ -56,6 +57,7 @@ _KEY_SET_CHECK_ALLOWLIST: tuple[tuple[str, str, str], ...] = (
     ("zeta.server.read_catalog", "catalog", "rpc params"),
     ("zeta.server.read_home_state", "_page", "rpc params"),
     ("zeta.server.read_sessions", "_parse", "rpc params"),
+    ("zeta.server.resource_protocol", "require_params", "rpc params"),
 
     ("zeta.server.session_replay.__init__", "join_history_and_subscribe", "rpc params"),
     ("zeta.telemetry.receiver.reader", "_only", "rpc params"),

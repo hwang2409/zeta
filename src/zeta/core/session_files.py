@@ -391,6 +391,20 @@ def require_off_loop_lock(
     raise error(f"{kind} lock requested on an asyncio event-loop thread")
 
 
+def flock_with_deadline(fd: int, seconds: float = 0.25, poll: float = 0.01) -> bool:
+    """Take an exclusive flock on ``fd``, polling for at most ``seconds``; False when it stays held."""
+
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(poll)
+
+
 @contextmanager
 def session_directory(
     root: Path,

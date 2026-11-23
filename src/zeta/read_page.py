@@ -84,14 +84,36 @@ def page_result(
     total: int | None,
     fits: Callable[[dict[str, Any]], bool],
     shape: Callable[[list[Any], str | None], dict[str, Any]],
+    scan_end: Sequence[object] | None = None,
 ) -> dict[str, Any]:
-    """Return the largest fitting prefix, with a cursor after its last item."""
+    """Return the largest fitting prefix; a full page may resume after a bounded scan."""
     def result(count: int) -> dict[str, Any]:
         cursor = None
         if (more or count < len(items)) and (total is None or start.emitted + count < total):
-            cursor = _encode(start, position(count - 1), start.emitted + count)
+            key = scan_end if scan_end is not None and count == len(items) else position(count - 1)
+            cursor = _encode(start, key, start.emitted + count)
         return shape(items[:count], cursor)
 
+    return _fit_prefix(items, result, fits, shape)
+
+
+def offset_page(
+    items: list[Any], offset: int, limit: int, *,
+    project: Callable[[Any], Any],
+    fits: Callable[[dict[str, Any]], bool],
+    shape: Callable[[list[Any], int | None], dict[str, Any]],
+) -> dict[str, Any]:
+    """Fit an offset page of an already ordered collection to the response frame."""
+    page = [project(item) for item in items[offset:offset + limit]]
+
+    def result(count: int) -> dict[str, Any]:
+        end = offset + count
+        return shape(page[:count], end if end < len(items) else None)
+
+    return _fit_prefix(page, result, fits, shape)
+
+
+def _fit_prefix(items, result, fits, shape):
     size = len(items)
     if fits(full := result(size)):
         return full

@@ -1,4 +1,4 @@
-"""The one writer of the home ``settings.toml``: safe reads, compare-and-set updates, restart discovery.
+"""The one writer of the home ``settings.toml``: safe reads and compare-and-set updates.
 
 A client sees an allowlisted projection plus ``revision``, the SHA-256 of the exact file bytes
 (an absent file hashes as empty bytes). An update names that revision; it takes the sibling
@@ -10,27 +10,25 @@ candidate is published only after ``load_settings``'s own validation accepts it.
 turns telemetry on first runs the telemetry start preflight, so it never writes a setting that
 would stop the next start.
 
-Every function blocks (file locks, fsync, a directory scan); call it off the event loop.
+Every function blocks (file locks and fsync); call it off the event loop.
+The serve adapter adds the restart report (``resource_protocol.restart_report``).
 """
 
 from __future__ import annotations
 
 import errno
-import fcntl
 import hashlib
 import os
 import re
-import time
 from pathlib import Path
 from typing import Any
 
 import tomlkit
 from tomlkit.exceptions import TOMLKitError
 
-from ..core.session_execution import execution_owner_state
 from ..core.session_files import (
     SessionError,
-    child_directory,
+    flock_with_deadline,
     open_session_file,
     require_off_loop_lock,
     write_session_file,
@@ -40,8 +38,6 @@ from .settings import SETTINGS_FILENAME, Settings, validate_home_settings
 
 LOCK_NAME = f"{SETTINGS_FILENAME}.lock"
 LOCK_SECONDS = 0.25
-LOCK_POLL_SECONDS = 0.01
-RESTART_SCAN_SECONDS = 1.0
 _REVISION = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _HEADER = re.compile(rb"[ \t]*\[")  # a table or array-of-tables header line
 _OTEL_HEADER = re.compile(rb"""[ \t]*\[[ \t]*(?:otel|"otel"|'otel')[ \t]*\][ \t]*(?:#[^\r\n]*)?\r?\n?\Z""")
@@ -71,7 +67,7 @@ def get(home: Path) -> dict[str, Any]:
 
 
 def update(home: Path, expected_revision: object, changes: object) -> dict[str, Any]:
-    """Apply ``changes`` if the file still has ``expected_revision``; report what must restart."""
+    """Apply ``changes`` if the file still has ``expected_revision``."""
     enabled = _parse_changes(expected_revision, changes)
     if enabled:
         _require_telemetry_can_start()
@@ -80,7 +76,8 @@ def update(home: Path, expected_revision: object, changes: object) -> dict[str, 
     try:
         lock_fd = _open_file(home_fd, LOCK_NAME, os.O_RDWR | os.O_CREAT)
         try:
-            _lock(lock_fd)
+            if not flock_with_deadline(lock_fd, LOCK_SECONDS):
+                raise HomeSettingsError("settings_busy", retryable=True)
             raw = _read(home_fd)
             if _revision(raw) != expected_revision:
                 raise HomeSettingsError("stale_revision", current_revision=_revision(raw))
@@ -94,9 +91,7 @@ def update(home: Path, expected_revision: object, changes: object) -> dict[str, 
             raw = _read(home_fd)
         finally:
             os.close(lock_fd)  # closing the descriptor releases the lock
-        result = {"revision": _revision(raw), "settings": _project(raw, home)}
-        result["restart"] = _restart(home_fd)
-        return result
+        return {"revision": _revision(raw), "settings": _project(raw, home)}
     finally:
         os.close(home_fd)
 
@@ -153,18 +148,6 @@ def _read(home_fd: int) -> bytes:
         return b""
     with os.fdopen(fd, "rb") as handle:
         return handle.read()
-
-
-def _lock(fd: int) -> None:
-    deadline = time.monotonic() + LOCK_SECONDS
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return
-        except BlockingIOError:
-            if time.monotonic() >= deadline:
-                raise HomeSettingsError("settings_busy", retryable=True) from None
-            time.sleep(LOCK_POLL_SECONDS)
 
 
 def _read_home(home: Path) -> bytes:
@@ -262,34 +245,3 @@ def _document(raw: bytes, enabled: bool | None = None) -> dict[str, Any]:
         del document["otel"]
     return document
 
-
-def _restart(home_fd: int) -> dict[str, Any]:
-    """Every top-level session a live process owns, by the kernel lease lock; never by a pid hint.
-
-    No row cap and no recency filter; a scan that hits its deadline or an unreadable directory
-    reports ``complete: false`` with the owners it confirmed. ``serve`` is always true: the
-    accepting process configured telemetry once, at startup.
-    """
-    deadline = time.monotonic() + RESTART_SCAN_SECONDS
-    sessions: list[str] = []
-    complete = True
-    try:
-        with child_directory(home_fd, "sessions") as root_fd:
-            for name in os.listdir(root_fd):
-                if time.monotonic() >= deadline:
-                    complete = False
-                    break
-                try:
-                    with child_directory(root_fd, name) as session_fd:
-                        if execution_owner_state(session_fd) is not None:
-                            sessions.append(name)
-                except OSError as exc:
-                    if exc.errno not in (errno.ENOTDIR, errno.ELOOP, errno.ENOENT):
-                        complete = False
-                except SessionError:
-                    complete = False
-    except FileNotFoundError:
-        pass
-    except OSError:
-        complete = False
-    return {"serve": True, "sessions": sorted(sessions), "complete": complete}

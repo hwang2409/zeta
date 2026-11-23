@@ -860,6 +860,10 @@ class ErrorInfo:
     provider_error: bool = False
     retryable: bool = field(default=False, compare=False, repr=False)
 
+    @property
+    def provider_auth_failure(self) -> bool:
+        return self.provider_error and (self.code == "auth_error" or self.status_code == 401)
+
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {"code": self.code, "message": self.message}
         if self.status_code is not None:
@@ -890,6 +894,8 @@ class StreamEvent:
     data: dict[str, Any] = field(default_factory=dict)
     # seq of the committed history row this event presents; serve-internal, never sent
     row_seq: int | None = None
+    # Live-only projection from the credential adapter, never persisted.
+    auth_account: dict[str, str] | None = None
 
     @property
     def kind(self) -> StreamEventType:

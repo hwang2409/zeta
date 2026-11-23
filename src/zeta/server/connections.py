@@ -376,6 +376,7 @@ class ConnectionRegistry(ReplayOutput):
         *,
         required_feature: str | None,
         fields: dict[str, object],
+        feature_fields: event_contract.FeatureFields | None = None,
     ) -> tuple[Admission, _Frame | None, _OutputState | None]:
         if state is None:
             return Admission("no_controller"), None, None
@@ -383,7 +384,7 @@ class ConnectionRegistry(ReplayOutput):
             return Admission("not_writable"), None, None
         if self._feature_rejected(state, event, required_feature, fields):
             return Admission("feature_rejected"), None, None
-        fields = self._fields_for_connection(state, event, fields)
+        fields = self._fields_for_connection(state, event, fields, feature_fields=feature_fields)
         frame = state.connection.codec.notification(event, session_id, **fields)
         if frame is None:
             return Admission("codec_rejected"), None, None
@@ -420,9 +421,13 @@ class ConnectionRegistry(ReplayOutput):
 
     @staticmethod
     def _fields_for_connection(
-        state: _Connection, event: EventDescriptor, fields: dict[str, object]
+        state: _Connection, event: EventDescriptor, fields: dict[str, object], *,
+        feature_fields: event_contract.FeatureFields | None = None,
     ) -> dict[str, object]:
         shaped = dict(fields)
+        for feature, overrides in (feature_fields or {}).items():
+            if feature in state.features:
+                shaped.update(overrides)
         for (field_event, name), required in OPTIONAL_FIELD_FEATURES.items():
             if field_event is event and name in shaped and not required <= history_features(
                 state.features
@@ -498,6 +503,7 @@ class ConnectionRegistry(ReplayOutput):
         *,
         required_feature: str | None = None,
         replay_row: RowFacts | None = None,
+        feature_fields: event_contract.FeatureFields | None = None,
         **fields: object,
     ) -> bool:
         covers = self._replay_covers(
@@ -505,7 +511,8 @@ class ConnectionRegistry(ReplayOutput):
         )
         if not isinstance(covers, DeferredFrame):
             self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers, replay_row
+                event, session_id, required_feature, fields, covers, replay_row,
+                feature_fields=feature_fields,
             )
         outcome, frame, output = self._controller_preflight(
             self._controller,
@@ -513,6 +520,7 @@ class ConnectionRegistry(ReplayOutput):
             session_id,
             required_feature=required_feature,
             fields=fields,
+            feature_fields=feature_fields,
         )
         if outcome.kind != "admitted" or frame is None or output is None:
             return False
@@ -524,7 +532,7 @@ class ConnectionRegistry(ReplayOutput):
             state,
             event,
             session_id,
-            self._fields_for_connection(state, event, fields),
+            self._fields_for_connection(state, event, fields, feature_fields=feature_fields),
             covers,
             replay_row=replay_row,
         ):

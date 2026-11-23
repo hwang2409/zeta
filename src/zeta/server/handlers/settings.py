@@ -1,56 +1,9 @@
-"""Serve model catalog, session settings views, and ``home_settings_v1``."""
+"""Serve model catalog and session settings views."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Callable
-from typing import Any
-
-from ...config import home_settings
 from ...models.catalog import PROVIDER_MODELS, known_model_names
-from ..protocol import ErrorDescriptor, ProtocolError
 from ..runtime import ServerRuntime
-
-
-async def home_settings_get(client, request_id, params):
-    if params:
-        raise ProtocolError(ErrorDescriptor.INVALID_HOME_SETTINGS_PARAMS, "invalid params")
-    home = client.server.home
-    return await client.connections.run_read(client, lambda: _home_settings(lambda: home_settings.get(home)))
-
-
-async def home_settings_update(client, request_id, params):
-    """The handler never touches settings.toml; ``home_settings`` is its only writer."""
-    if params.keys() != {"expected_revision", "changes"}:
-        raise ProtocolError(ErrorDescriptor.INVALID_HOME_SETTINGS_PARAMS, "invalid params")
-    home = client.server.home
-    return await asyncio.to_thread(
-        _home_settings, lambda: home_settings.update(home, params["expected_revision"], params["changes"])
-    )
-
-
-def _home_settings(call: Callable[[], dict[str, Any]]) -> dict[str, Any]:
-    try:
-        return call()
-    except home_settings.HomeSettingsError as exc:
-        match exc.code:
-            case "invalid_params":
-                raise ProtocolError(ErrorDescriptor.INVALID_HOME_SETTINGS_PARAMS, "invalid params") from None
-            case "custom_home_setting":
-                descriptor = ErrorDescriptor.CUSTOM_HOME_SETTING
-            case "stale_revision":
-                descriptor = ErrorDescriptor.STALE_REVISION
-            case "settings_busy":
-                descriptor = ErrorDescriptor.SETTINGS_BUSY
-            case "settings_malformed":
-                descriptor = ErrorDescriptor.SETTINGS_MALFORMED
-            case "telemetry_unavailable":
-                descriptor = ErrorDescriptor.TELEMETRY_UNAVAILABLE
-            case _:
-                descriptor = ErrorDescriptor.SETTINGS_UNSAFE
-        raise ProtocolError(descriptor, descriptor.meaning, exc.data or None) from None
-    except Exception:  # noqa: BLE001 - an OSError names the home path; no detail leaves this process
-        raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, ErrorDescriptor.INTERNAL_ERROR.meaning) from None
 
 
 def telemetry(client) -> dict | None:

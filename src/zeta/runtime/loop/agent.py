@@ -17,6 +17,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
+from ...accounts import AccountCredentials
 from ...agent import recovery_lease
 from ...agent.background_owner import BackgroundAgentOwner
 from ...agent.budget import (
@@ -860,6 +861,7 @@ class AgentLoop(
             provider_error: ErrorInfo | None = None
             provider_error_source: BaseException | ErrorInfo | None = None
             provider_error_data: dict[str, Any] = {}
+            attempt_credentials = None
             provider_retry_usage: dict[str, Any] | None = None
             incomplete_tool_name: str | None = None
             provider_started = False
@@ -991,6 +993,7 @@ class AgentLoop(
                         stream=True,
                         conversation_id=self.conversation_id,
                     ))
+                    attempt_credentials = getattr(self.backend, "token_store", None)
                     completion = self.context_assembler.dispatch_admitted_request(
                         self.backend,
                         admitted_request,
@@ -1160,10 +1163,19 @@ class AgentLoop(
                 self._persist_partial_with_cancelled_tools(
                     partial_blocks, assistant_message, failure=provider_error
                 )
+                auth_account = None
+                if provider_error.provider_auth_failure and isinstance(attempt_credentials, AccountCredentials):
+                    try:
+                        auth_account = await asyncio.to_thread(
+                            attempt_credentials.store.public_identity, attempt_credentials.account
+                        )
+                    except Exception:  # noqa: BLE001, S110 - the label is optional; the original auth error still applies
+                        pass
                 yield StreamEvent(
                     StreamEventType.ERROR,
                     error=provider_error,
                     data=provider_error_data,
+                    auth_account=auth_account,
                 )
                 if self.agent_instance_id is None:
                     await step_delivery.admit_terminal("foreground_end")

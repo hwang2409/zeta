@@ -223,8 +223,6 @@ feature. Observer connections receive only methods with `read` access.
 | `telemetry_errors` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_series` | `1.0` | `telemetry_read_v1` | `read` |
 | `telemetry_agent_tree` | `1.0` | `telemetry_read_v1` | `read` |
-| `home_settings_get` | `1.0` | `home_settings_v1` | `read` |
-| `home_settings_update` | `1.0` | `home_settings_v1` | `controller_write` |
 
 ## common JSON-RPC shapes
 
@@ -1106,94 +1104,6 @@ for unavailable state, `-32000` / `corrupt_state` for invalid stored format or
 settings, `-32009` / `stale_state_snapshot` after a failed snapshot retry, and
 `-32007` / `result_too_large` when a complete item does not fit.
 
-### home settings (`home_settings_v1` feature)
-
-`home_settings_get` and `home_settings_update` read and change the home
-`$ZETA_HOME/settings.toml`. Only an allowlisted projection crosses the wire;
-endpoints, paths, environment values, and other keys are never returned or
-accepted. The only key in v1 is `telemetry.enabled`. Controllers and observers
-may call `home_settings_get`; `home_settings_update` is controller-only, and an
-observer receives `-32008` `observer_read_only`. Both run off the event loop.
-Serve sends no event and the TUI shows nothing for these methods; a client
-reads the result.
-
-`revision` is `sha256:` plus the SHA-256 of the exact file bytes; a missing
-file hashes as empty bytes and projects defaults. `telemetry.source` is
-`builtin` (endpoint `http://127.0.0.1:4323/v1/traces`, `enabled: true`),
-`off` (no `[otel].endpoint`, `enabled: false`), or `custom` (any other valid
-endpoint, `enabled: true`, `editable: false`).
-
-```json
-{"jsonrpc":"2.0","id":1,"method":"home_settings_get","params":{}}
-{"jsonrpc":"2.0","id":1,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"settings_malformed":false}}
-```
-
-A file that does not parse or that zeta would refuse at startup projects as
-`{"telemetry":{"source":"unknown","editable":false}}` with
-`settings_malformed: true`.
-
-`home_settings_update` params are exactly `expected_revision` and `changes`,
-a list with one `{"key":"telemetry.enabled","value":true|false}`. The update
-changes only the built-in endpoint line and never adds or removes an `[otel]`
-header. If the file has an `[otel]` table, `true` inserts
-`endpoint = "http://127.0.0.1:4323/v1/traces"` under its header and `false`
-removes that line. If it has none, `true` inserts the top-level line
-`otel.endpoint = "http://127.0.0.1:4323/v1/traces"` before the first table (or
-at the end) and `false` removes it. Every other byte is kept, with the file's
-line endings (LF or CRLF) and its trailing-newline state, so on then off
-returns the exact original bytes. An update that must edit a layout neither
-form can express (an `otel` inline table, a line inside a multiline string)
-is refused as `custom_home_setting`; an update that changes nothing succeeds
-without a write. Under the sibling lock
-`settings.toml.lock` the server rereads the file, compares its revision,
-validates the changed file as zeta's startup does, and only then replaces the
-file atomically (mode `0600`, file and directory fsync). The lock serializes
-zeta writers only; an editor that writes after that reread is not detected.
-
-```json
-{"jsonrpc":"2.0","id":2,"method":"home_settings_update","params":{"expected_revision":"sha256:<64 hex>","changes":[{"key":"telemetry.enabled","value":true}]}}
-{"jsonrpc":"2.0","id":2,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"restart":{"serve":true,"sessions":["<session id>"],"complete":true}}}
-```
-
-The result has the settings read back from the file after the write. A
-process reads `[otel]` once at startup, so `restart` lists what must restart
-to use the change: `serve` is always `true` (this process), and `sessions` are
-the sorted ids of every top-level session a live process owns, found through
-the kernel lock on each session's `runtime.lease` (never a stored pid).
-Child agents restart with their top-level session. The scan has no row cap
-and a 1 second deadline; `complete` is `false` when the deadline or an
-unreadable directory stopped it, and `sessions` then has the owners found so
-far.
-
-Errors:
-
-- unknown, duplicate, or extra keys, a non-boolean value, or a malformed
-  revision: `{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}`
-- a custom endpoint or custom dotted `otel` value is set; the file is not
-  changed:
-  `{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}`
-  The built-in dotted `otel.endpoint` is an on no-op and is removed when
-  disabling telemetry. An `otel` inline table remains custom.
-- the file changed since `expected_revision`:
-  `{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:<64 hex>"}}`
-- another zeta writer held the lock for 250 ms:
-  `{"code":-32009,"message":"another zeta process is writing settings.toml","data":{"code":"settings_busy","retryable":true}}`
-- turning telemetry on when it could not start: `zeta[otel]` is not installed,
-  an `OTEL_EXPORTER_OTLP*` or `OTEL_PYTHON_EXPORTER_OTLP*` variable is set, or
-  `OTEL_SDK_DISABLED=true` is set in the server's environment. The server runs
-  the same check zeta runs at startup, before it takes the lock, so nothing is
-  written; `detail` is the startup error text. Turning telemetry off is never
-  refused for this reason:
-  `{"code":-32602,"message":"telemetry cannot start in this zeta install or environment","data":{"code":"telemetry_unavailable","detail":"OpenTelemetry support is not installed; install zeta[otel]"}}`
-- the file does not parse or validate (update only; nothing is written):
-  `{"code":-32000,"message":"settings.toml does not parse or validate","data":{"code":"settings_malformed"}}`
-- `settings.toml` is a symbolic link or not a regular, unshared file (get and
-  update; it is never followed or replaced):
-  `{"code":-32000,"message":"settings.toml is a link or not a regular, unshared file","data":{"code":"settings_unsafe"}}`
-- any other failure, such as a missing or moved home directory (get and
-  update): `{"code":-32000,"message":"unexpected server or storage failure"}`;
-  the reply never carries a path or the underlying error text
-
 ### `send`
 
 Params: exactly one of `text` or `input_id`. `text` is a non-empty direct user
@@ -1963,6 +1873,582 @@ failures, then returns to `idle`.
 {"jsonrpc":"2.0","method":"event","params":{"event":"error","session_id":"abc123","error":{"code":"backend_error","message":"provider failed"},"data":{}}}
 ```
 
+## resource families
+
+Each resource family has its own negotiated feature and method table below.
+Controllers can write; observers can only read. A resource write from an
+observer returns `-32008` with `data.code` and `data.reason` both set to
+`observer_read_only` and `data.method` set to the method name. Resource
+calls run off the event loop and never return storage paths or exception text.
+Every family returns `-32000` with the fixed message
+`"unexpected server or storage failure"` and no `data` for unexpected failures.
+
+### child run control (`child_run_control_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `child_run_spawn` | `1.0` | `child_run_control_v1` | `controller_write` |
+| `child_run_cancel` | `1.0` | `child_run_control_v1` | `controller_write` |
+
+`child_run_spawn {session_id, agent_type, task, cwd?, background?}` starts a
+background child in the attached session when its parent is idle. `agent_type`
+is a session preset name (up to 256 UTF-8 bytes). `task` is nonblank and at most
+64 KiB of UTF-8. If supplied, `cwd` is an existing absolute directory (up to
+4096 UTF-8 bytes) and `background` must be `true`. No model or tool overrides
+are accepted. The response is `{data: {accepted: true, run_id}}`. `run_id` is
+the same handle as in `child_run_list`; the existing `child_started`,
+`child_progress`, and `child_ended` events describe the run when negotiated.
+
+`child_run_cancel {session_id, run_id, reason?}` accepts only `"user_cancelled"`
+for `reason`. It returns `{data: {accepted: true, run_id, state}}`, with
+`state: "cancelling"` when cancellation is admitted. A terminal run is unchanged
+and returns `"completed"`, `"failed"`, or `"canceled"`. No revision is required
+for either command.
+
+Unknown fields or invalid input (including an unknown preset or invalid `cwd`)
+return `-32602` with `data.code: "invalid_params"`. Other command errors include
+`-32003 no_active_session` or `session_mismatch`, `-32004 operation_busy`,
+`-32005 state_unavailable` when the child-run owner reports unavailable state,
+and `-32012 child_run_not_found`; these errors set
+both `data.code` and `data.reason` to the named reason. A detached controller
+cannot spawn. Without `child_run_control_v1`, the methods return `-32601`.
+
+### home settings (`home_settings_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `home_settings_get` | `1.0` | `home_settings_v1` | `read` |
+| `home_settings_update` | `1.0` | `home_settings_v1` | `controller_write` |
+
+The shared resource error shapes (`data.reason`, `-32009 stale_<family>_revision`,
+`-32004 operation_busy`) apply to the newer resource families, not to
+`home_settings_v1`: its replies are exactly the ones below.
+
+`home_settings_get` and `home_settings_update` read and change the home
+`$ZETA_HOME/settings.toml`. Only an allowlisted projection crosses the wire;
+endpoints, paths, environment values, and other keys are never returned or
+accepted. The only key in v1 is `telemetry.enabled`. Controllers and observers
+may call `home_settings_get`; `home_settings_update` is controller-only, and an
+observer receives `-32008` `observer_read_only`. Both run off the event loop.
+Serve sends no event and the TUI shows nothing for these methods; a client
+reads the result.
+
+`revision` is `sha256:` plus the SHA-256 of the exact file bytes; a missing
+file hashes as empty bytes and projects defaults. `telemetry.source` is
+`builtin` (endpoint `http://127.0.0.1:4323/v1/traces`, `enabled: true`),
+`off` (no `[otel].endpoint`, `enabled: false`), or `custom` (any other valid
+endpoint, `enabled: true`, `editable: false`).
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"home_settings_get","params":{}}
+{"jsonrpc":"2.0","id":1,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"settings_malformed":false}}
+```
+
+A file that does not parse or that zeta would refuse at startup projects as
+`{"telemetry":{"source":"unknown","editable":false}}` with
+`settings_malformed: true`.
+
+`home_settings_update` params are exactly `expected_revision` and `changes`,
+a list with one `{"key":"telemetry.enabled","value":true|false}`. The update
+changes only the built-in endpoint line and never adds or removes an `[otel]`
+header. If the file has an `[otel]` table, `true` inserts
+`endpoint = "http://127.0.0.1:4323/v1/traces"` under its header and `false`
+removes that line. If it has none, `true` inserts the top-level line
+`otel.endpoint = "http://127.0.0.1:4323/v1/traces"` before the first table (or
+at the end) and `false` removes it. Every other byte is kept, with the file's
+line endings (LF or CRLF) and its trailing-newline state, so on then off
+returns the exact original bytes. An update that must edit a layout neither
+form can express (an `otel` inline table, a line inside a multiline string)
+is refused as `custom_home_setting`; an update that changes nothing succeeds
+without a write. Under the sibling lock
+`settings.toml.lock` the server rereads the file, compares its revision,
+validates the changed file as zeta's startup does, and only then replaces the
+file atomically (mode `0600`, file and directory fsync). The lock serializes
+zeta writers only; an editor that writes after that reread is not detected.
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"home_settings_update","params":{"expected_revision":"sha256:<64 hex>","changes":[{"key":"telemetry.enabled","value":true}]}}
+{"jsonrpc":"2.0","id":2,"result":{"revision":"sha256:<64 hex>","settings":{"telemetry":{"enabled":true,"source":"builtin","editable":true}},"restart":{"serve":true,"sessions":["<session id>"],"complete":true}}}
+```
+
+The result has the settings read back from the file after the write. A
+process reads `[otel]` once at startup, so `restart` lists what must restart
+to use the change: `serve` is always `true` (this process), and `sessions` are
+the sorted ids of every top-level session a live process owns, found through
+the kernel lock on each session's `runtime.lease` (never a stored pid).
+Child agents restart with their top-level session. The scan has no row cap
+and a 1 second deadline; `complete` is `false` when the deadline or an
+unreadable directory stopped it, and `sessions` then has the owners found so
+far.
+
+Errors:
+
+- unknown, duplicate, or extra keys, a non-boolean value, or a malformed
+  revision: `{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}`
+- a custom endpoint or custom dotted `otel` value is set; the file is not
+  changed:
+  `{"code":-32602,"message":"the setting has a custom value that serve does not change","data":{"code":"custom_home_setting"}}`
+  The built-in dotted `otel.endpoint` is an on no-op and is removed when
+  disabling telemetry. An `otel` inline table remains custom.
+- the file changed since `expected_revision`:
+  `{"code":-32009,"message":"settings.toml changed since the given revision","data":{"code":"stale_revision","current_revision":"sha256:<64 hex>"}}`
+- another zeta writer held the lock for 250 ms:
+  `{"code":-32009,"message":"another zeta process is writing settings.toml","data":{"code":"settings_busy","retryable":true}}`
+- turning telemetry on when it could not start: `zeta[otel]` is not installed,
+  an `OTEL_EXPORTER_OTLP*` or `OTEL_PYTHON_EXPORTER_OTLP*` variable is set, or
+  `OTEL_SDK_DISABLED=true` is set in the server's environment. The server runs
+  the same check zeta runs at startup, before it takes the lock, so nothing is
+  written; `detail` is the startup error text. Turning telemetry off is never
+  refused for this reason:
+  `{"code":-32602,"message":"telemetry cannot start in this zeta install or environment","data":{"code":"telemetry_unavailable","detail":"OpenTelemetry support is not installed; install zeta[otel]"}}`
+- the file does not parse or validate (update only; nothing is written):
+  `{"code":-32000,"message":"settings.toml does not parse or validate","data":{"code":"settings_malformed"}}`
+- `settings.toml` is a symbolic link or not a regular, unshared file (get and
+  update; it is never followed or replaced):
+  `{"code":-32000,"message":"settings.toml is a link or not a regular, unshared file","data":{"code":"settings_unsafe"}}`
+- any other failure, such as a missing or moved home directory (get and
+  update): `{"code":-32000,"message":"unexpected server or storage failure"}`;
+  the reply never carries a path or the underlying error text
+
+### agent run catalog (`agent_run_catalog_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `agent_run_catalog` | `1.0` | `agent_run_catalog_v1` | `read` |
+
+`agent_run_catalog` works without an attached session. All fields are optional:
+`limit` (integer 1–100, default 50), `state` (`running`, `idle`, `finishing`,
+`completed`, `failed`, or `canceled`), `root_session_id` (exact top-level session
+id), and `cursor` (the opaque `next_cursor` from the previous response with
+identical filters). There is no offset or update event.
+
+The result is `{revision,data:{items,next_cursor?}}`. `revision` is a lowercase
+SHA-256 of the returned page data, not a snapshot or a write token. `items`
+uses the `child_run_list` row shape, including `run_id`, `session_id` (root),
+`parent_run_id` (null for direct children), `description`, `agent_type`,
+`status`, `accepts_follow_ups`, `turns_used`, `tool_count`, `current_step`,
+`started_at`, `finished_at`, and `elapsed_seconds`. The read uses durable
+lifecycle metadata, never transcripts, and omits final results.
+
+Roots sort by session directory mtime descending, then id ascending. Within
+one root, runs sort depth first by lexicographic slot name. Unreadable or
+invalid child records are skipped independently. Metadata processing stops
+after 128 candidate roots/runs or a full page. A short or empty page with a
+`next_cursor` is not the end; follow it until it is absent. This is a live
+view: ordering and contents can change between pages if sessions change.
+
+Invalid params or mismatched cursors return `-32602` (`invalid_params`). An
+unavailable store returns `-32005` (`state_unavailable`). If not even one row
+fits the frame, the method returns `-32007` (`result_too_large`). An
+unnegotiated method returns `-32601`.
+
+### MCP management (`mcp_management_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `mcp_server_list` | `1.0` | `mcp_management_v1` | `read` |
+| `mcp_server_add` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_server_remove` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_server_set_enabled` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_server_set_trusted` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_server_test` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_auth_start` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_auth_status` | `1.0` | `mcp_management_v1` | `read` |
+| `mcp_auth_cancel` | `1.0` | `mcp_management_v1` | `controller_write` |
+| `mcp_auth_logout` | `1.0` | `mcp_management_v1` | `controller_write` |
+
+`mcp_server_list` accepts `{scope?}` and returns `{revision,data:{items}}`.
+Scope is `user`, `project`, or `effective` (default). The active session's
+project is used when attached, otherwise the serve working directory. In the
+effective view a project definition shadows a user definition with the same
+name. Items are sorted by name and contain `name`, `scope`, `enabled`,
+`trusted`, `status`, `auth`, `tool_count`, and a redacted `config`. This is a
+disk view, not a live connection or credential probe. Command/argument, URL,
+environment/header values, and OAuth client secrets are not returned.
+
+Each write accepts `{revision,mutation}`. Use the opaque 64-character hex
+revision from a list or successful write in the same project context. It covers
+both config files and the trust file, regardless of list scope, and is compared
+under the same locks used by the CLI/TUI owner. Mutation fields:
+
+- Add: `{name,scope,command?,args?,url?,env?,headers?,oauth?,enabled?,client_id?,client_secret?}`.
+  Scope is `user` or `project`. Supply exactly one of `command` and `url`.
+  `args` is an array of strings (stdio only); `env` and `headers` are maps of
+  strings (`headers` is HTTP only). `enabled` defaults to true and `oauth`
+  defaults to false. Client credentials require HTTP OAuth; a client secret
+  requires a client ID.
+- Remove: `{name,scope}`.
+- Set enabled: `{name,scope,enabled}` with boolean `enabled`.
+- Set trusted: `{name,trusted}` with boolean `trusted`; selects the project definition.
+
+Writes return `{revision,data:{items},restart:{serve,sessions,complete}}`,
+with rows from the changed scope. `restart.serve` is false; `restart.sessions`
+contains the sorted top-level session IDs whose leases are held at the time
+of the scan (a conservative set of potential consumers). A partial scan sets
+`restart.complete` to false. A no-op returns an empty restart list. A write
+does not connect or reconcile an existing mount. New sessions read the new
+configuration without restarting serve.
+
+Errors: `-32602 invalid_params` (including unknown or duplicate names),
+`-32009 stale_mcp_revision` (`data.code` and `data.reason`; re-list),
+`-32004 operation_busy` (lock timeout), `-32005 state_unavailable` (such as
+missing project or unreadable configuration). Observers attempting a write
+receive `-32008` with code
+and reason `observer_read_only`, plus the method, before parameter validation.
+Unnegotiated methods return `-32601`.
+
+`mcp_server_test`, `mcp_auth_start`, and `mcp_auth_logout` accept
+`{name,scope?}`, with the same scopes as list. `mcp_server_test` performs a
+bounded connection and lists tools without calling them or returning tool
+names, descriptions, or stdio stderr. It returns `{data:{status,tool_count}}`.
+One MCP call deadline covers initialization and listing. On timeout, the probe
+closes the transport, reaps any stdio child, and returns
+`{data:{status:"failed",tool_count:0}}`.
+Only the controller can run a test. A project stdio definition must be trusted.
+
+`mcp_auth_start` starts one headless HTTP OAuth attempt per serve process.
+It returns `{data:{state:"pending",authorization_url}}` after opening the
+loopback callback listener. The `authorization_url` field is an opaque,
+one-use launch URL on that same `127.0.0.1` listener, not the provider's URL.
+Open it with a browser that can reach the serve host's loopback address; do
+not log or persist it. The first GET redirects the browser to the provider
+with HTTP 302. Reuse returns 404 while the listener is open. Cancel and the
+OAuth callback timeout end the listener and invalidate the launch URL.
+Serve does not return the provider URL in any RPC response.
+
+OAuth uses the exact resource identifier advertised by protected-resource
+metadata, including any path. If discovery falls back to the configured MCP
+URL, that URL is used as the resource, not returned over serve. Headless mode
+still does not forward configured extra authorization parameters.
+
+`mcp_auth_status` and `mcp_auth_cancel` accept `{name}` and return
+`{data:{state}}` (`idle`, `pending`, `succeeded`, `failed`, or `cancelled`).
+Start also returns `failed` if discovery fails before the URL is available.
+Cancel waits for cleanup; a credential commit already in progress is allowed
+to finish. Status is safe for observers and performs no I/O. The attempt state
+is local to the current serve process, not a durable credential status.
+`mcp_auth_logout` cancels a local pending attempt and deletes the named
+credential, returning `{data:{state:"unauthorized"}}`. A concurrent logout
+fences earlier OAuth attempts even across serve processes. Only the controller
+can start, cancel, or log out. Another pending start returns `-32004
+operation_busy`.
+
+### accounts
+
+With protocol 1.1 or later and `account_list_idle_v1`, the controller can call
+`account_list` with `{}` even before a session is active. The result is
+`{"revision":"<64 lowercase hex digits>","data":{"accounts":[...]}}`. Rows have
+`account`, `label`, `detail`, `available`, `current`, `default`, and `usage`.
+`detail` is always null on this version: credential metadata is not projected.
+`current` is false without an active session; otherwise it reflects the active
+session's selection. `default` reflects the stored provider default. The revision
+identifies stored public catalog content, not the active session's selection or
+wall-clock usage freshness.
+
+An empty catalog returns an empty array. Bad or missing credentials make only
+that account unavailable. The read uses the account registry lock and does not
+migrate, recover credentials, or call a provider. An unavailable catalog returns
+`-32005` with `data.code: "state_unavailable"`. Unknown params return `-32602`
+with `data.code: "invalid_params"`. This read remains controller-only; observers
+receive `-32008` with `data.code` and `data.reason` set to `observer_read_only`
+and `data.method: "account_list"`.
+
+The same feature extends the controller-only `login_start` request to
+`{provider, account?}`. `provider` is `claude` or `codex`. `account` is a named
+account's short name, label, or qualified ID (for example `anthropic:work` for
+`claude`). Omit `account` to keep the legacy login target. Without the feature,
+`account` is ignored as before. The pending, failure, status and cancel shapes
+are unchanged. With the feature, a pending login on this connection or a
+provider lock held by another connection or TUI returns `-32005` with
+`data.code: "login_in_progress"`. An already pending local login takes
+precedence over account lookup. Without the feature, shared provider lock
+contention still returns `state: "failed"` with `error.code: "login_failed"`.
+A malformed or unknown account, unsupported provider or unknown param returns
+`-32602` with
+`data.code: "invalid_params"`. An unavailable account registry returns `-32005`
+with `data.code: "state_unavailable"`. An observer receives `-32008` with
+`data.code` and `data.reason` set to `observer_read_only` and
+`data.method: "login_start"` before params are validated.
+
+When a named subscription account fails authentication, the live `error`
+event adds `params.data.auth_account: {account, label, provider}` for each
+connection that negotiated this feature, including observers subscribed to the
+session's replay stream. `account` is the qualified ID, `label` is the public
+account label, and `provider` uses the login provider spelling (`claude` or
+`codex`). The event uses `params.error: {code: "auth_error", message:
+"Account sign-in required."}` instead of the provider's raw error text. The
+existing `data.login_provider` hint remains when applicable. API-key failures
+have no named account. This is a live-only addition; legacy event and history
+shapes are unchanged.
+
+Unexpected errors that reach the negotiated resource handler's error boundary
+return `-32000` with the fixed message `unexpected server or storage failure`.
+The unnegotiated methods keep legacy error handling.
+
+### skills and agent profiles (`library_read_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `skill_catalog` | `1.0` | `library_read_v1` | `read` |
+| `skill_read` | `1.0` | `library_read_v1` | `read` |
+| `agent_profile_catalog` | `1.0` | `library_read_v1` | `read` |
+| `agent_profile_read` | `1.0` | `library_read_v1` | `read` |
+
+All four methods are read-only and available to observers who negotiate the
+feature in `hello`. No events are emitted. This is a serve-only surface; the
+TUI already shows skills and agent profiles.
+
+Catalog requests accept `{scope?,offset?,limit?}`. `scope` is `effective`
+(default), `home`, or `project`. `offset` starts at zero; `limit` is an integer
+from 1 through 100 (default 50). Catalogs return
+`{revision,data:{items,diagnostics,next_offset?}}`. Items are sorted by name. Use the
+returned `next_offset` to continue; omission means the end. The revision is a
+SHA-256 of the canonical JSON of the returned page data, not a document
+revision. Catalog pages are live and may change between requests.
+
+- Skill items: `{name,description,keywords,source,scope,filename,editable,diagnostics}`.
+- Agent profile items: `{name,description,tools,model,allow_delegation,accepts_follow_ups,explicit_finish,max_turns,source,scope,filename,editable,diagnostics}`.
+  `tools`, `model`, and `max_turns` can be null.
+
+`source` is `packaged`, `home`, or `project`. The item `scope` is the selector
+for a detail request: `effective` for packaged items, otherwise its source.
+`filename` is relative to the catalog root, or null for a built-in agent
+profile. Packaged items are not editable.
+
+`diagnostics` carries the load warnings that the TUI prints at startup, as
+`[{source,file,reason}]`. `file` is relative to the `source` catalog root
+(`.` for the root directory itself); `reason` is the loader's message with
+catalog root paths made relative, the user's home directory shown as `~`, and
+the shared secret redactor applied. A warning about a listed item (for example
+an unknown profile model, or the agent "custom definition overrides packaged
+preset" warning, which goes on the overriding item) is in that item's
+`diagnostics`. Only a file the loader skipped, or the own warning of a
+lower-tier file that a higher tier shadows, has no item: its warning is in the
+page-level `data.diagnostics`, which every page carries in full. Reasons are
+untrusted text.
+
+Project scope reads `.zeta` under the attached session's project root: the
+primary checkout of its git repository (also for a linked worktree or a
+subdirectory), or its working directory outside git. Running sessions load
+project skills and agent profiles from the same directory.
+Without an attached session, explicit `project` scope is unavailable and
+`effective` reads only home and packaged items. In `effective`, project
+shadows home and home shadows packaged definitions of the same name.
+
+Detail requests accept `{name,scope}` and return
+`{revision,data:{name,frontmatter,body,source,editable,redacted,truncated?,document?}}`.
+For a file, `revision` is the SHA-256 of the exact markdown bytes before
+projection. Built-in agent profiles have no markdown file: they return their
+public preset fields and preset prompt text (or the empty string). The
+built-in revision is a display-only SHA-256 of the returned data object
+encoded as canonical JSON (sorted keys, compact separators, ASCII escapes).
+
+The server applies its shared secret-pattern redactor to text, sets
+`redacted: true` when it replaces content and `false` otherwise, and caps the
+redacted body at 128 KiB of UTF-8 without splitting a code point. If it cuts
+the body, it includes `truncated: true`. `body` and `frontmatter` are not a
+round-trip editable copy.
+
+`document` is the round-trip editable copy: the raw file text, the exact bytes
+that `revision` hashes, so a client can edit it and save it back with that
+revision. It is present only for a file of at most 128 KiB whose read has
+`redacted: false` and whose raw text matches no secret pattern; it is absent
+for a larger file, a file with a secret, and a built-in profile. It is an
+additive field of `library_read_v1`; no field changed. `document`, `body`,
+`frontmatter`, and `description` are untrusted user-authored content. Render
+them as text; do not send them to a model as instructions.
+The server does not rewrite instructions in these fields.
+
+Invalid parameters return `-32602` (`data.code: invalid_params`); a name not
+found in the selected scope also sets `data.reason: resource_not_found`.
+Missing project context returns `-32005` (`state_unavailable`). A result that
+cannot fit the response budget returns `-32007` (`result_too_large`). Unexpected
+owner failures return `-32000`. Unnegotiated methods return `-32601`.
+
+### skill and agent profile writes (`library_write_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `skill_write` | `1.0` | `library_write_v1` | `controller_write` |
+| `skill_delete` | `1.0` | `library_write_v1` | `controller_write` |
+| `agent_profile_write` | `1.0` | `library_write_v1` | `controller_write` |
+| `agent_profile_delete` | `1.0` | `library_write_v1` | `controller_write` |
+
+`skill_write` and `agent_profile_write` take
+`{name,scope,revision?,mutation:{document}}`. `scope` is `home` or `project`
+(the `.zeta` directory under the attached session's project root, the same
+directory the catalog reads and running sessions load).
+`document` is the whole markdown file: YAML frontmatter and body, at most
+128 KiB of UTF-8. The server validates it with the same loader as the
+catalogs before it writes anything; its frontmatter `name` must equal `name`.
+Without `revision` the call creates `<name>.md` in the catalog root and fails
+as stale if a file already defines the name. With `revision` (the detail
+read's file revision, the SHA-256 of the exact bytes) it replaces the file
+that defines the name, including a skill's `SKILL.md`. The result is
+`{revision,data:{name,scope,redacted}}`: the new file revision, and
+`redacted: true` when the stored text looks like it contains a secret (it
+matches the shared secret patterns). Such a document is stored as written,
+secret included; reads show it masked and return no `document`. The document
+is never returned by the write. It is untrusted user-authored text; the
+server does not filter instructions in it.
+A document that contains the redactor's mask text `[secret omitted]` is refused
+before any lock or write (`data.reason: contains_redaction_marker`), so saving
+a masked read back cannot replace the real secret with the mask.
+
+`skill_delete` and `agent_profile_delete` take `{name,scope,revision}` and
+return `{data:{name,scope}}`. A delete removes only the defining file; other
+files in a skill directory stay.
+
+Each write takes one lock per catalog root (the file `.library.lock` in it),
+rereads the file under it, and
+compares revisions there; it then publishes the file atomically (temporary
+file, fsync, rename), so a cancelled write leaves the old or the new file.
+Written files have mode `0600`. Paths are taken only from `name` and the
+loader: separators, `..`, and links that leave the catalog root are refused.
+Running sessions pick up the change at their next catalog refresh and send the
+existing `config_changed` event; there is no new event.
+
+Errors: `-32602` (`data.code: invalid_params`) for bad parameters, with
+`data.reason` set to `invalid_document` (and a public loader message in
+`data.detail`), `contains_redaction_marker`, `name_mismatch`, `document_too_large`, `unsafe_path`,
+`name_too_long` (the file name is longer than the file system allows),
+`resource_not_found`, or `packaged_read_only` for a packaged item (the
+catalog's `effective` scope, or a name that only a packaged item defines);
+`-32009 stale_library_revision` (both `data.code` and `data.reason`) for a
+stale revision or a create that lost a race; `-32005 state_unavailable` for
+`project` scope without an attached session; `-32004 operation_busy` when
+another writer holds the root's lock longer than 250 ms; `-32008
+observer_read_only` for an observer. Unexpected failures return `-32000`.
+
+### session history read (`session_history_read_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `session_history_read` | `1.0` | `session_history_read_v1` | `read` |
+
+`session_history_read {session_id, cursor?, direction?, limit?, max_bytes?}`
+returns history rows of another top-level session in the attached session's
+project; when the attached session has no project, only top-level sessions with
+no project are readable. Child-agent sessions are not readable by id. It does
+not attach, subscribe, or take the session's execution lease, and it takes no
+lock the session's owner waits for. `direction` is `backward`
+(default, newest rows first) or `forward`. `limit` (1–128, default 50) counts
+history groups, not rows; a group is never split. `max_bytes` (1–1048576,
+default and maximum 1048576) bounds the whole response frame.
+
+The result is `{messages, next_cursor}`. `messages` are the same rows, in the
+same order and with the same projection and redaction, as `session_history`
+returns for that session with this connection's negotiated history features.
+Pass `next_cursor` back with the same `session_id` and `direction` for the next
+page; `null` means no rows are left. A cursor survives appends to the session.
+A rewritten or replaced transcript returns `-32009 stale_history_snapshot`;
+start again without a cursor. The attached session itself is refused with
+`-32602`; page it with `session_history`.
+
+Only the result is bounded. Each call reads and projects the whole target
+transcript off the event loop: a 34 MB transcript costs about 0.85 s and about
+175 MB of transient memory per call. Serve runs at most one
+`session_history_read` at a time. A call while another is in flight returns
+`-32004 operation_busy` with `data.retry_after_ms` (2000) and starts no read.
+Clients must not poll faster than every few seconds.
+
+Errors: `-32602 invalid_params` for bad params or a cursor made for other
+params; `-32602 session_not_found` for an absent session and for a session whose
+project differs from the attached session's, including project versus no
+project in either direction (the same error, so other sessions are not
+disclosed); `-32005 state_unavailable` with no attached session, for a newer
+stored format, a corrupt or changing transcript, or a read that passes its
+10 s deadline; `-32007 result_too_large` when one group alone is over
+`max_bytes`. Errors set `data.code` and `data.reason` to the named reason and
+never include paths or parser text. An unnegotiated method returns `-32601`.
+
+### project writes (`project_writes_v1` feature)
+
+| method | version | feature | access |
+| --- | --- | --- | --- |
+| `project_memory_update` | `1.0` | `project_writes_v1` | `controller_write` |
+| `project_inbox_send` | `1.0` | `project_writes_v1` | `controller_write` |
+
+Both methods do exactly what the user can do from the TUI, through the same
+owners. An observer receives `-32008 observer_read_only` before params are
+read. An unknown `project_id` returns the same `-32602 project_not_found` as
+`project_show`.
+
+`project_memory_update {project_id, revision, mutation}` changes project memory
+with a compare-and-set. `revision` is `memory.digest` from `project_show`. The
+owner compares it while it holds the project memory lock; a mismatch returns
+`-32009` with `data.code` and `data.reason` `stale_project_memory_revision`,
+and the client reads again. Each memory format keeps its own operations;
+`mutation.format` must be the project's current format, or the call is stale
+(also when a migration changes the format while the call runs):
+
+- format 1: `{format: 1, op: "set", file, content}` replaces one standard file
+  (`brief.md`, `state.md`, `backlog.md`, `changelog.md`, `decisions.md`);
+  `{format: 1, op: "accept", file}` accepts an automatic file;
+  `{format: 1, op: "undo", target?}` undoes the latest update or import
+  (`target` is the version id it must be).
+- format 2: `{format: 2, op: "set", kind, content}` replaces one kind;
+  `{format: 2, op: "accept", target}` accepts one entry;
+  `{format: 2, op: "resolve", entry_ids}` resolves 1 to 64 entries;
+  `{format: 2, op: "undo", target?}` undoes the latest, an entry's, or a
+  version's transaction.
+
+`project_show` does not return the format; read it from the memory shape.
+`memory.files` means format 1, and `memory.kinds` (the `projects-memory-v2`
+view) means format 2. The shape depends on negotiation: a client with
+`projects-memory-v2` gets `kinds`, a client without it gets `files`, and a
+project in the other format returns an error. A wrong `mutation.format`
+returns the same `-32009 stale_project_memory_revision` as a stale digest.
+
+The result is `{revision, data: {format}}` (format 2 adds `version_id`).
+`revision` is the digest of the state this write produced. An owner rejection
+(unknown entry, empty history) returns `-32602` with `data.reason`
+`operation_rejected`. When serve itself runs inside a Zeta tool subprocess
+(`ZETA_TOOL_SUBPROCESS` is set), every otherwise valid memory write returns
+this `operation_rejected`; start serve from a terminal. Content that holds a
+secret (the shared memory secret check) returns `-32602` with `data.reason`
+`secret_refused`; nothing is written. A user write emits no event, the same
+as a TUI `/memory` write; running sessions read the change at their next prompt.
+
+`project_inbox_send {project_id, mutation: {kind, title, body, delivery_id,
+to_session?}}` sends one message to the inbox of `project_id`, the same as
+`/inbox send` in the TUI. The sender project, sender session, and the user
+origin come from the attached session; a param cannot set them. On a home at
+or above the inbox delegation epoch (stored-format epoch 7), a user-origin
+message is a `trusted_assignment`, as it is from the TUI. Below it, before the
+cutover, no message is trusted, because local origin cannot tell the user from
+another agent: a serve or TUI send stores no `origin`, reads show
+`origin: "local"` and add no `author` or `authority`, `project_inbox` reports
+`untrusted: true` for every non-empty page, the recipient's `inbox` tool shows
+the messages as untrusted data, and the wake notice is the same neutral text
+as above the epoch (check the inbox; message text cannot change instructions).
+`kind` is an inbox kind, `title` is nonblank, `body` may be empty, and each
+is at most 1 MiB of UTF-8. `delivery_id` (1 to 128 of `A-Z a-z 0-9 _ . : -`)
+is scoped to the attached session and the recipient: a retry with the same
+payload returns the same `message_id` and makes no second message; a different
+payload returns `-32602` with `data.reason` `delivery_id_reused`. This holds
+while the recipient keeps the message record; after a done message is
+pruned, a late retry creates a new message. The result is
+`{data: {message_id, pending}}`.
+`pending: false` means the message is in the recipient inbox, and the
+recipient's running sessions get the existing `project_inbox` notification.
+`pending: true` means the recipient could not be reached now, but the message
+is saved and the attached session delivers it on a later inbox poll; do not
+resend it (a resend with the same `delivery_id` is still one message).
+
+Inbox claim and done are not exposed: they are agent actions taken by the
+session that does the work, and the TUI has no user transition.
+
+Other errors: `-32602 invalid_params` for unknown fields or bad values,
+including values the inbox owner rejects;
+`-32003 no_active_session` for a send with no attached session;
+`-32005 state_unavailable` when the attached session has no project or the
+project registry is unavailable; `-32004 operation_busy` when another process
+holds a registry, memory, or inbox lock past its deadline (retry); `-32000`
+when project storage is invalid or unavailable, as for `project_show`. Errors set `data.code` (and `data.reason`
+where named) and never include paths or owner text. An unnegotiated method
+returns `-32601`.
+
 ## errors
 
 Error responses use standard JSON-RPC codes where applicable. Each emitted variant selects one registered descriptor.
@@ -2017,10 +2503,11 @@ Error descriptors are:
 | `telemetry_off` | `-32005` | `telemetry_off` | no telemetry database exists |
 | `telemetry_schema_mismatch` | `-32000` | `telemetry_schema_mismatch` | the telemetry database schema is not the one this zeta reads |
 | `result_too_large` | `-32007` | `result_too_large` | not even one item fits one frame |
-| `invalid_home_settings_params` | `-32602` | `invalid_params` | home settings parameters or changes are invalid |
 | `custom_home_setting` | `-32602` | `custom_home_setting` | the setting has a custom value that serve does not change |
 | `stale_revision` | `-32009` | `stale_revision` | settings.toml changed since the given revision |
 | `settings_busy` | `-32009` | `settings_busy` | another zeta process is writing settings.toml |
+| `stale_resource_revision` | `-32009` | none | resource revision is stale |
+| `resource_busy` | `-32004` | `operation_busy` | another process is writing this resource |
 | `settings_malformed` | `-32000` | `settings_malformed` | settings.toml does not parse or validate |
 | `settings_unsafe` | `-32000` | `settings_unsafe` | settings.toml is a link or not a regular, unshared file |
 | `telemetry_unavailable` | `-32602` | `telemetry_unavailable` | telemetry cannot start in this zeta install or environment |
@@ -2545,7 +3032,8 @@ error code and message. Provider status and origin remain internal.
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
 - `session_settings`: returns `model`, `approval_mode`, and `plan_mode`. with the negotiated `otel` feature it also returns `telemetry` (`enabled`, `state`, and `reason`); endpoint and exporter details are never returned.
-- `account_list`: takes `session_id` and returns every named subscription
+- `account_list` without `account_list_idle_v1`: takes `session_id` and
+  returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and
   `usage`. `usage` contains `freshness`, a safe optional `error`, and either a
   null `snapshot` or the normalized `version`, `captured_at`, `source`, and
@@ -2783,6 +3271,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `turn_context` | adds `set_turn_context` for one-shot context on the next server-started turn |
 | `delivery_id` | `send` and `steer` accept durable idempotency IDs; with `send_images_delivery_id`, `send_images` does too; adds `delivery_status` |
 | `projects-memory-v2` | requires `projects`; `project_show` and `project_memory_log` return the entry-memory views |
+| `account_list_idle_v1` | enables controller-only idle `account_list` and named `login_start`; adds public failed-account identity to live auth errors for controllers and observers |
 | `serve_observers` | `hello` accepts `role: "observer"` for a read-only connection (see "read-only observers"); observers use the same `list_sessions` catalog projection as controllers |
 | `session_grants` | adds `session_grants`, controller-only `revoke_session_grants`, and live `session_grants_changed` events for inspecting and removing session approval grants |
 | `approval_history` | advertises that `session_history` includes durable `approval_request` and `approval_end` rows; no rows then means the session had no approvals, and a failed decision or history write marks approval persistence unhealthy. it changes no output |
@@ -2794,7 +3283,6 @@ negotiate a feature sees the behavior from before the feature existed.
 | `tool_approval_origin` | adds `approval_origin: "automatic" | "user"` to live `tool_start` calls and replayed history `tool_use` calls |
 | `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, `telemetry_trace`, `telemetry_overview`, `telemetry_models`, `telemetry_tools`, `telemetry_errors`, `telemetry_series`, and `telemetry_agent_tree` methods |
 | `state_read_v1` | enables `state_catalog`, `state_projects`, `state_memory`, `state_memory_detail`, `state_inbox`, `state_inbox_detail`, `state_attention`, `state_sessions`, `state_session`, `state_agents`, `state_background_tasks`, `state_settings`, `state_accounts`, `state_storage`, and `state_retention` |
-| `home_settings_v1` | enables `home_settings_get` and controller-only `home_settings_update` for the home `settings.toml` (`telemetry.enabled` only) |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
 | `child_run_events` | enables the atomic newest-page and live child lifecycle join; the server advertises the feature and request only when the client also requests `session_replay_seq`, `child_run_history`, and `child_runs` |

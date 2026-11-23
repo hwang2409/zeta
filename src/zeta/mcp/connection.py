@@ -24,6 +24,7 @@ def build_mcp_client(
     *,
     registry: ToolRegistry | None,
     home: str | None = None,
+    capture_stderr: bool = True,
 ) -> MCPClient:
     """Build a client only after the shared namespace-policy gate permits it."""
 
@@ -32,7 +33,7 @@ def build_mcp_client(
     spill_store = registry.spills if registry is not None else None
     mcp_limits = registry.mcp_limits if registry is not None else None
     if config.transport == "stdio":
-        return StdioMCPClient(config, spill_store=spill_store, limits=mcp_limits)
+        return StdioMCPClient(config, spill_store=spill_store, limits=mcp_limits, capture_stderr=capture_stderr)
     return StreamableHTTPMCPClient(
         config, home=home, spill_store=spill_store, limits=mcp_limits
     )
