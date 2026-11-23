@@ -1000,7 +1000,7 @@ snapshot and returns the largest prefix that fits the frame.
 
 ```text
 Project   {project_id, name, path, session_count, memory_count, inbox: {new, claimed, done}, updated_ns}
-Memory    {memory_id, project_id, kind, automatic, summary, created_ns, updated_ns, source_session_id, has_body}
+Memory    {memory_id, project_id, kind, automatic, accepted, summary, created_ns, updated_ns, source_session_id, has_body}
 Inbox     {message_id, project_id, kind, status, sender, summary, created_ns, updated_ns, trusted_assignment, has_body}
 Attention {attention_id, project_id, session_id, kind, status, title, created_ns, updated_ns}
 ```
@@ -1008,6 +1008,8 @@ Attention {attention_id, project_id, session_id, kind, status, title, created_ns
 Project `path` is the canonical integration root, or `null` when there is none.
 `memory_count` counts all listed memory rows, including legacy files whose
 only content is a heading. These rows have `has_body: false`.
+
+Memory `accepted` is a boolean in list and detail rows: it is `true` for manual and legacy rows, and for automatic entries after acceptance. Acceptance does not change `automatic`.
 
 Counts and nanosecond timestamps are integers. `source_session_id` and the
 attention project and session ids may be `null`. Inbox kinds are `bug_report`,
