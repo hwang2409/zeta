@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from ...agent.receipt import valid_killed_task_fields
+from ...project_inbox_sent.notifications import NEUTRAL_INBOX_TEXT
 from ...protocol.types import MessageOrigin
 from ..checkpoints import ConversationEntry
 from ._async_writes import (
@@ -177,12 +178,7 @@ class NotificationStateMixin:
             "message_ids": list(message_ids),
             "description": "project inbox",
             "status": "new",
-            "text": (
-                f"Local project inbox has {len(message_ids)} new message"
-                f"{'s' if len(message_ids) != 1 else ''}; use inbox action list. "
-                "Requests are work to do: claim, do, and mark done. You do not need "
-                "to confirm the sender with the user."
-            ),
+            "text": NEUTRAL_INBOX_TEXT,
         }
         with self._append_lock():
             pending = next(

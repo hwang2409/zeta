@@ -472,3 +472,137 @@ def test_memory_source_evidence_rank_is_canonical_and_bounded(
     )
     with pytest.raises(ProjectRegistryError, match="entry source"):
         canonical_state_bytes(invalid_state)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "secret"),
+    [
+        (
+            "api_key = sk_exampleabcdefghijklmnopqrstuvwx1234",
+            "[secret omitted]",
+            "sk_exampleabcdefghijklmnopqrstuvwx1234",
+        ),
+        (
+            "use token=ghp_abcdefghijklmnopqrstuvwx now",
+            "use token=[secret omitted] now",
+            "ghp_abcdefghijklmnopqrstuvwx",
+        ),
+        (
+            "secret: AKIAABCDEFGHIJKLMNOP end",
+            "[secret omitted] end",
+            "AKIAABCDEFGHIJKLMNOP",
+        ),
+        (
+            "key AKIAABCDEFGHIJKLMNOP and password=hunter22",
+            "key [secret omitted] and [secret omitted]",
+            "hunter22",
+        ),
+        (
+            "API_KEY=sk_live_abcdefghijklmnopqrst;PASSWORD: hunter2",
+            "[secret omitted]",
+            "hunter2",
+        ),
+        ("nothing here", "nothing here", ""),
+    ],
+)
+def test_redact_secrets_overlapping_patterns_yield_one_clean_marker(
+    text: str, expected: str, secret: str
+) -> None:
+    from zeta.memory.safety import REDACTED_SECRET, redact_secrets
+
+    redacted = redact_secrets(text)
+    assert redacted == expected
+    marker_fragments = {
+        REDACTED_SECRET[i : i + 4] for i in range(len(REDACTED_SECRET) - 3)
+    }
+    leaked = [
+        fragment
+        for fragment in (secret[i : i + 4] for i in range(len(secret) - 3))
+        if fragment in redacted and fragment not in marker_fragments
+    ]
+    assert leaked == []
+
+
+_SK_DASH_KEYS = [
+    "sk-test-0000000000000000",
+    "sk-proj-AbCdEfGhIjKlMnOpQrStUv0123456789",
+    "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx-0123456789_ab",
+]
+
+
+@pytest.mark.parametrize("key", _SK_DASH_KEYS)
+@pytest.mark.parametrize("template", ["{}", "use {} now", "{}\nnext line", "first\n{}"])
+def test_dash_style_sk_keys_are_detected_and_redacted(key: str, template: str) -> None:
+    from zeta.memory.safety import REDACTED_SECRET, contains_secret, redact_secrets
+
+    text = template.format(key)
+    assert redact_secrets(text) == template.format(REDACTED_SECRET)
+    assert contains_secret(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "task-abcdefghijklmnopqrstu",
+        "risk-assessment-framework-v2",
+        "desk-0123456789abcdefgh",
+        "sk-abc",
+    ],
+)
+def test_sk_lookalikes_are_not_secrets(text: str) -> None:
+    from zeta.memory.safety import contains_secret, redact_secrets
+
+    assert redact_secrets(text) == text
+    assert not contains_secret(text)
+
+
+_JWT = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+    ".eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"
+    ".SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        (f"token {_JWT} expired", "token [secret omitted] expired"),
+        (f'{{"access_token_jwt": "{_JWT}"}}', '{"access_token_jwt": "[secret omitted]"}'),
+        (f"Authorization: Bearer {_JWT}", "Authorization: Bearer [secret omitted]"),
+        (
+            "authorization: bearer abcDEF0123456789opaque_tok",
+            "authorization: bearer [secret omitted]",
+        ),
+        (
+            "Bearer dGhpcyBpcyBhIGxvbmcgdG9rZW4=; next",
+            "Bearer [secret omitted]; next",
+        ),
+    ],
+)
+def test_jwt_and_bearer_tokens_are_detected_and_redacted(
+    text: str, expected: str
+) -> None:
+    from zeta.memory.safety import contains_secret, redact_secrets
+
+    assert redact_secrets(text) == expected
+    assert contains_secret(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "version 1.2.3 and 10.20.30",
+        "zeta.server.handlers.session_history",
+        "eyJ",
+        "eyJhbGc.abcd.efgh",
+        "see docs.example-company.com/path",
+        "id 123e4567-e89b-12d3-a456-426614174000",
+        "Bearer short",
+        "the bearer of bad news",
+    ],
+)
+def test_jwt_and_bearer_lookalikes_are_not_secrets(text: str) -> None:
+    from zeta.memory.safety import contains_secret, redact_secrets
+
+    assert redact_secrets(text) == text
+    assert not contains_secret(text)

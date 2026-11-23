@@ -446,6 +446,60 @@ def test_retention_skips_replaced_path(tmp_path: Path, monkeypatch) -> None:
     assert stale.read_bytes() == b"replacement"
 
 
+def test_concurrent_retention_does_not_push_fresh_log_out_of_primary_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import zeta.tui.stderr_capture as capture
+
+    directory = tmp_path / "logs"
+    path = directory / "1-1.log"
+    original_open = capture.os.open
+    original_fstat = capture.os.fstat
+    original_flock = capture.fcntl.flock
+    retention = threading.Thread(target=capture._retain_logs, args=(directory,))
+    retention_inside = threading.Event()
+    owner_locked = threading.Event()
+
+    def open_then_race_retention(target, flags, mode=0o777):
+        fd = original_open(target, flags, mode)
+        if flags & os.O_EXCL and not retention.is_alive():
+            # another process's retention pass reaches the temp before its owner locks it
+            retention.start()
+            assert retention_inside.wait(10)
+        return fd
+
+    def pause_retention_on_temp(fd: int):
+        result = original_fstat(fd)
+        if threading.current_thread() is retention and not retention_inside.is_set():
+            retention_inside.set()
+            assert owner_locked.wait(10)
+        return result
+
+    def owner_flock(fd: int, operation: int) -> None:
+        try:
+            original_flock(fd, operation)
+        finally:
+            if threading.current_thread() is not retention:
+                owner_locked.set()
+
+    monkeypatch.setattr(capture.os, "open", open_then_race_retention)
+    monkeypatch.setattr(capture.os, "fstat", pause_retention_on_temp)
+    monkeypatch.setattr(capture.fcntl, "flock", owner_flock)
+    fd = None
+    try:
+        try:
+            fd = capture._open_capture(path)
+        except OSError:
+            pass
+        assert list(directory.glob("*.log")) == [path]
+    finally:
+        owner_locked.set()
+        retention.join(10)
+        if fd is not None:
+            os.close(fd)
+    assert not retention.is_alive()
+
+
 def test_twenty_processes_keep_private_complete_logs(tmp_path: Path) -> None:
     home = tmp_path / "zeta-home"
     code = """

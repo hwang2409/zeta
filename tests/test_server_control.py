@@ -1300,3 +1300,100 @@ async def test_abort_with_child_approval_cancels_wake_held_at_start_gate(
         if held:
             hold.__exit__(None, None, None)
         await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_stall_is_visible_while_durable_stage_is_shielded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from io import StringIO
+
+    from rich.console import Console
+
+    import zeta.core.store._async_writes as writes
+    import zeta.runtime.loop.agent as agent_module
+    from tests.support.completion import ManualDeadlineClock
+    from tests.test_agent import RunBackend
+    from zeta.tui.render import render_event
+
+    backend = RunBackend()
+    backend.release_child.set()
+    clock = ManualDeadlineClock()
+    monkeypatch.setattr(agent_module, "MonotonicDeadlineClock", lambda: clock, raising=False)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    child_store = None
+    stage = ConversationStore.stage_delivery_request
+
+    async def stage_with_blocked_install(store, *args, **kwargs):
+        nonlocal child_store
+        if child_store is None and (store.agent_lifecycle() or {}).get("depth") == 1:
+            child_store = store
+
+            async def block_install():
+                entered.set()
+                await await_or_fail(release.wait(), what="release durable stage installation")
+
+            store._before_committed_install = block_install
+            try:
+                return await stage(store, *args, **kwargs)
+            finally:
+                del store._before_committed_install
+        return await stage(store, *args, **kwargs)
+
+    monkeypatch.setattr(ConversationStore, "stage_delivery_request", stage_with_blocked_install)
+    # test-contract: durability observe cancellation before releasing the real committed write
+    monkeypatch.setattr(writes, "_mutation_cancellation_observed", lambda _policy: cancelled.set())
+    server = ZetaServer(
+        home=tmp_path,
+        socket_path=_socket_path(tmp_path),
+        provider="codex",
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        await _request(reader, writer, 2, "new_session", {})
+        root_loop = server.controllers.attached().runtime.loop
+        assert root_loop is not None
+        events = []
+        sink = root_loop._background_event_sink
+        assert sink is not None
+
+        def capture_and_publish(event):
+            events.append(event)
+            sink(event)
+
+        root_loop.set_background_event_sink(capture_and_publish)
+        await _request(reader, writer, 3, "send", {"text": "start"})
+        await await_or_fail(entered.wait(), what="child delivery committed before install")
+        assert child_store is not None
+        assert child_store.agent_lifecycle()["current_step"] == "turn 1: admitting request"
+        clock.advance(15 * 60)
+        await await_or_fail(cancelled.wait(), what="watchdog cancelled durable stage")
+        step = "turn 1: stalled 15m in request admission, cancelling"
+        assert child_store.agent_lifecycle()["current_step"] == step
+        assert backend.child_prompts == []
+        assert not release.is_set()
+
+        frames = await read_until(
+            reader,
+            lambda frame: frame.get("params", {}).get("event") == "child_idle",
+            what="parent stall notice while the durable operation is still blocked",
+        )
+        notice = frames[-1]["params"]["data"]
+        assert notice["text"] == (
+            "turn stalled for 15 min while admitting request (stage: request admission)"
+        )
+        assert any(
+            frame.get("params", {}).get("data", {}).get("step") == step
+            for frame in frames
+        )
+        event = next(event for event in events if event.data.get("step") == step)
+        output = StringIO()
+        Console(file=output, width=140).print(render_event(event))
+        assert step in output.getvalue()
+    finally:
+        release.set()
+        await close_serve(server, writer)

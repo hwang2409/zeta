@@ -9,8 +9,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from prompt_toolkit.enums import EditingMode
 from rich.console import RenderableType
@@ -55,6 +57,7 @@ from ...session_retention import (
     retention_status,
 )
 from ...session_retention.pin import set_retention_pin
+from ...telemetry.receiver.process import OTLP_URL
 from ...tools._shared.user_discovery import trust_project_tools
 from .. import theme as _theme
 from ..models import known_models, match_models, validate_model_name
@@ -166,7 +169,29 @@ class SlashHandlerMixin:
                 viewed_health.summary if viewed_health is not None else None
             ),
             transcript_session_id=viewed_path.name,
+            otel_status=self._otel_status(),
+            otel_receiver=self._otel_receiver(),
         )
+
+    def _otel_status(self) -> str:
+        # TUI-only text: the endpoint stays local and never reaches serve.
+        status = self.telemetry.status()
+        if status.state == "healthy" and self._otel_endpoint is not None:
+            return f"healthy ({urlsplit(self._otel_endpoint).netloc})"
+        if status.reason is not None:
+            return f"{status.state} ({status.reason.replace('_', ' ')})"
+        return status.state
+
+    def _otel_receiver(self) -> str | None:
+        receiver = self.telemetry.receiver()
+        if receiver is None:
+            return None
+        state = receiver.state if receiver.error is None else f"{receiver.state} ({receiver.error})"
+        exported = self.telemetry.status()
+        if exported.last_export_ns is None:
+            return f"{OTLP_URL} {state}, no export yet"
+        age = max(0, (time.time_ns() - exported.last_export_ns) // 1_000_000_000)
+        return f"{OTLP_URL} {state}, last export {exported.last_export} {age}s ago"
 
     def model_choices(self) -> tuple[str, ...]:
         """Models the picker and the composer completer offer for this provider."""

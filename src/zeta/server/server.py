@@ -28,6 +28,7 @@ from ..storage_format import (
     feature_enabled,
     pending_releases,
 )
+from ..telemetry import Telemetry, TelemetryError
 from . import (
     accounts,
     login,
@@ -45,6 +46,8 @@ from .handlers.projects import (
     project_request_error,
 )
 from .handlers.registry import dispatch as _dispatch_request
+from .handlers.registry import state_read_available
+from .handlers.resources._mcp_auth import MCPAuth
 from .parking import ParkedPairs
 from .protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,
@@ -220,6 +223,7 @@ class ZetaServer:
         foreground_event_publisher: ForegroundEventPublisher | None = None,
         max_role: str = "controller",
         prebound_socket: socket.socket | None = None,
+        telemetry: Telemetry | None = None,
         _supported_features_for_test: frozenset[str] | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
@@ -253,6 +257,8 @@ class ZetaServer:
         self._supported_features = frozenset(
             FEATURES if _supported_features_for_test is None else _supported_features_for_test
         )
+        # a borrowed server shows its host's telemetry; an owning server configures its own in start()
+        self.telemetry = telemetry or Telemetry.disabled()
         runtime = runtime or ServerRuntime(
             self.home,
             cwd=cwd,
@@ -267,6 +273,7 @@ class ZetaServer:
             max_turns=max_turns,
             backend_factory=backend_factory,
         )
+        self._mcp_auth = MCPAuth()
         self._max_role = max_role
         self._foreground_event_publisher = foreground_event_publisher
         self._foreground_subscription = None
@@ -370,6 +377,8 @@ class ZetaServer:
         """Point the runtime's sinks at its control; a borrowed runtime keeps its owner's."""
         if not self._borrowed:
             runtime = control.runtime
+            # every pair's sessions trace through this server's process telemetry
+            runtime.set_telemetry_source(lambda: self.telemetry)
             runtime.set_approval_control_binder(control.bind_policy)
             runtime.set_background_event_sink(control._publish_background_event)
             runtime.set_memory_notice_sink(control._publish_memory_notice)
@@ -415,6 +424,13 @@ class ZetaServer:
         return str(self.socket_path)
 
     async def start(self) -> None:
+        if not self._borrowed and not self.telemetry.enabled():
+            try:
+                self.telemetry = await asyncio.to_thread(
+                    lambda: Telemetry.configure(load_settings(home=self.home).settings, self.home)
+                )
+            except TelemetryError as exc:
+                raise SessionError(str(exc)) from None
         if not self._borrowed:
             await self.controllers.attached().runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
@@ -535,6 +551,7 @@ class ZetaServer:
         await attempt(asyncio.gather(*handlers, return_exceptions=True))
         for client in clients:
             await attempt(client.close())
+        await attempt(self._mcp_auth.aclose())
         try:
             self.parking.close_all(approval_settlement_timeout)
         except BaseException as exc:  # noqa: BLE001
@@ -557,6 +574,9 @@ class ZetaServer:
         finally:
             self._server = None
             self._unix_listener = None
+            if not self._borrowed:
+                # Keep telemetry available through all other shutdown steps.
+                await attempt(asyncio.to_thread(self.telemetry.shutdown))
         if first is not None:
             raise first
 
@@ -762,9 +782,10 @@ class _Client:
         self._request = (request["method"], request_id, time.monotonic())
         await self.connections.wait_until_settled(self)
         try:
-            result = await self._dispatch(
-                request_id, request["method"], request["params"]
-            )
+            with self._traced(request):
+                result = await self._dispatch(
+                    request_id, request["method"], request["params"]
+                )
         except ProtocolError as exc:
             await self._write(
                 self.codec.error_response(
@@ -858,6 +879,27 @@ class _Client:
                     for control in self.server.controls():
                         await control.controller_ready(reconnect=True)
         self._request = None
+
+    @contextlib.contextmanager
+    def _traced(self, request: dict[str, Any]) -> Iterator[None]:
+        """Serve span for one request, under the client's W3C parent once it negotiated `otel`.
+
+        Tasks the handler starts (a send's turn) copy this context. A malformed
+        carrier is ignored whole and leaves only a value-free event on the span.
+        """
+        telemetry = self.server.telemetry
+        # hello itself is never parented: features are still empty while it runs
+        received = request["trace_context"] if "otel" in self.features else {}
+        carrier = {key: value for key, value in received.items() if type(value) is str}
+        accepted = telemetry.extract(carrier)
+        malformed = any(key not in accepted for key in received)
+        with (
+            telemetry.use_trace_context({} if malformed else accepted),
+            telemetry.serve_span(request["method"]) as span,
+        ):
+            if malformed:
+                span.invalid_propagation()
+            yield
 
     async def _read_frame(self) -> bytes | None:
         """Read one line while retaining a bounded prefix of oversized input."""
@@ -1219,6 +1261,8 @@ class _Client:
             if extended
             else []
         )
+        if "state_read_v1" in accepted and not state_read_available():
+            accepted.remove("state_read_v1")
         accepted = self.server.controllers.attached().runtime.available_project_features(accepted)
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")

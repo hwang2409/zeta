@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Literal
 
 from zeta.memory.safety import contains_secret
-from zeta.project_errors import ProjectRegistryError
+from zeta.project_errors import MemorySecretError, ProjectRegistryError
 from zeta.project_schema import KIND_KEY_PATTERN, MAX_MEMORY_FILE_SIZE
 from zeta.protocol.types import MessageOrigin
 from zeta.storage_format import reject_unknown_keys
@@ -324,7 +324,7 @@ def _validate_entry(entry: MemoryEntry, state: MemoryState, kinds: set[str]) -> 
         label="entry text",
     )
     if contains_secret(entry.text):
-        _fail("memory entry text contains a secret")
+        raise MemorySecretError("memory entry text contains a secret")
     if not isinstance(entry.status, str) or entry.status not in {
         "active", "superseded", "resolved", "expired"
     }:

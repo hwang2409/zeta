@@ -648,12 +648,12 @@ async def test_agent_loop_bootstrap_checks_missing_mcp_config(
     original_mount = mount_module.mount_mcp_servers
 
     async def observe_mount(
-        registry: ToolRegistry, config=None, *, notice_sink=None, home=None
+        registry: ToolRegistry, config=None, *, notice_sink=None, home=None, telemetry=None
     ):
         nonlocal calls
         calls += 1
         return await original_mount(
-            registry, config, notice_sink=notice_sink, home=home
+            registry, config, notice_sink=notice_sink, home=home, telemetry=telemetry
         )
 
     monkeypatch.setattr(
@@ -3646,13 +3646,13 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
     calls = 0
 
     async def delayed_mount(
-        registry: ToolRegistry, config=None, *, notice_sink=None, home=None
+        registry: ToolRegistry, config=None, *, notice_sink=None, home=None, telemetry=None
     ) -> MCPMount:
         nonlocal calls
-        del notice_sink, config, home
+        del notice_sink, config, home, telemetry
         calls += 1
         started.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 10)
         return MCPMount(registry, {}, {})
 
     monkeypatch.setattr(
@@ -3662,14 +3662,14 @@ async def test_mcp_status_waits_for_one_shared_initial_mount(
         FakeBackend([]), ConversationStore(tmp_path), skill_catalog=SkillCatalog.empty()
     )
     ensure_task = asyncio.create_task(loop.ensure_mcp_servers())
-    await started.wait()
+    await asyncio.wait_for(started.wait(), 10)
     status_task = asyncio.create_task(loop.slash_mcp(""))
     await asyncio.sleep(0)
     assert not status_task.done()
 
     release.set()
-    await ensure_task
-    assert await status_task == (
+    await asyncio.wait_for(ensure_task, 10)
+    assert await asyncio.wait_for(status_task, 10) == (
         "mcp: 0 mounted, 0 failed\n"
         "mcp limits: deadline 300s | wire 67108864 bytes | spill 262144 bytes"
     )

@@ -9,7 +9,7 @@ from typing import Literal
 
 from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.store import ConversationStore
-from ..project_inbox_sent.notifications import project_inbox_notification
+from ..core.store._child_runs import run_row_identity
 from ..protocol.types import (
     Message,
     MessageOrigin,
@@ -18,6 +18,7 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
+from ..telemetry import SpanHandle
 from .pending_delivery import (
     DeliveryPublications,
     StepDeliveryFlow,
@@ -84,12 +85,7 @@ class AgentNotificationMixin:
                 StreamEventType.AGENT_NOTIFICATION,
                 data={
                     "notification_id": notification.id,
-                    **project_notification_data(
-                        project_inbox_notification(
-                            notification.data,
-                            observed_epoch=self.store.observed_storage_epoch,
-                        )
-                    ),
+                    **project_notification_data(notification.data),
                     "kind": notification.data.get("kind", "agent_completion"),
                     "tui_presented": self.store.is_agent_notification_presented_to_tui(
                         notification.id
@@ -243,25 +239,81 @@ class AgentNotificationMixin:
             allow_assistant_reset=allow_assistant_reset,
             task_deadline=task_deadline,
         )
-        try:
-            async for event in stream:
-                yield event
-        finally:
+        telemetry = self.telemetry
+        turn_span: SpanHandle | None = None
+        run_id = self.agent_instance_id
+        outcome = "finished"
+        failure: object | None = None
+
+        def settle(span: SpanHandle, span_outcome: str) -> None:
+            span.set_outcome(span_outcome)
+            # a stream ERROR fails the turn without an exception; turn_limit is a designed stop, not an error
+            if span_outcome == "failed" and failure is not None:
+                span.fail(failure)
+
+        def close_turn(turn_outcome: str, exc: BaseException | None = None) -> None:
+            if turn_span is not None:
+                settle(turn_span, turn_outcome)
+                turn_span.__exit__(None if exc is None else type(exc), exc, None)
+
+        with telemetry.agent_span(
+            self.agent_profile,
+            agent_name=self.agent_profile,
+            conversation_id=self.conversation_id,
+            model=getattr(self.backend, "model", ""),
+            depth=self.agent_depth,
+            background=self.agent_background,
+            run_id=run_id,
+            parent_run_id=None if run_id is None else run_row_identity(run_id)[1],
+        ) as agent_span:
             try:
-                await stream.aclose()
-            except BaseException:  # noqa: BLE001, S110 - preserve turn cleanup
-                pass
-            if self.child_turn_control is not None:
-                self.child_turn_control.abandon_completion()
-            self.store.retire_terminal_approval_executions()
-            self._turn_active = False
-            self._delivering_prompt_id = None
-            flow = self.step_delivery
-            if flow is not None:
-                flow.release_active()
-            if self.agent_instance_id is None and self._delivery_wake_pending:
-                self._delivery_wake_pending = False
-                self._background_owner.notify_wake()
+                try:
+                    async for event in stream:
+                        # turn spans follow the loop's own turn events, so the
+                        # inference span the loop opens next is their child
+                        if event.type is StreamEventType.TURN_START:
+                            close_turn("redispatched")  # a redispatch starts a turn without TURN_END
+                            turn_span = telemetry.turn_span(
+                                conversation_id=self.conversation_id,
+                                turn_number=event.data.get("turn", 0),
+                                notification=notification_turn,
+                            )
+                            turn_span.__enter__()
+                        elif event.type is StreamEventType.TURN_END and turn_span is not None:
+                            turn_span.set_tool_count(tool_count=event.data.get("tool_calls", 0))
+                            close_turn("finished")
+                            turn_span = None
+                        elif event.type is StreamEventType.ERROR:
+                            failure = event.error
+                            outcome = "turn_limit" if getattr(failure, "code", None) == "max_turns" else "failed"
+                        yield event
+                finally:
+                    try:
+                        await stream.aclose()
+                    except BaseException:  # noqa: BLE001, S110 - preserve turn cleanup
+                        pass
+                    if self.child_turn_control is not None:
+                        self.child_turn_control.abandon_completion()
+                    self.store.retire_terminal_approval_executions()
+                    self._turn_active = False
+                    self._delivering_prompt_id = None
+                    flow = self.step_delivery
+                    if flow is not None:
+                        flow.release_active()
+                    if self.agent_instance_id is None and self._delivery_wake_pending:
+                        self._delivery_wake_pending = False
+                        self._background_owner.notify_wake()
+            except BaseException as exc:
+                outcome = "cancelled" if isinstance(exc, (asyncio.CancelledError, GeneratorExit, KeyboardInterrupt)) else "failed"
+                settle(agent_span, outcome)
+                close_turn(outcome, exc)
+                raise
+            if self._abort_admitted:
+                outcome = "interrupted"
+            elif self.child_turn_control is not None and self.child_turn_control.exhausted:
+                outcome = "turn_limit"
+            settle(agent_span, outcome)
+            close_turn(outcome)
 
     def set_background_wake_callback(self, callback: Callable[[], None] | None) -> None:
         if callback is None:

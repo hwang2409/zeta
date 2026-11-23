@@ -15,8 +15,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from ...core.abort import AbortSignal
+from ...telemetry import SpanHandle
 from ..client import MCPClient, degrades_server
-from .prompt import cancel_request, set_exception, set_result
+from .prompt import cancel_request, create_caller_task, set_exception, set_result
 
 if TYPE_CHECKING:
     from ..server_actor import MCPServerActor
@@ -33,6 +34,8 @@ class ResourceRequest:
     uri: str | None
     generation: int
     result: asyncio.Future[object]
+    trace_context: dict[str, str]
+    span: SpanHandle
     task: asyncio.Task[object] | None = None
     client: MCPClient | None = None
     abort_signal: AbortSignal | None = None
@@ -79,19 +82,29 @@ async def request_resource(
 ) -> object:
     """Queue one resource request with actor-owned cancellation."""
 
-    future: asyncio.Future[object] = asyncio.get_running_loop().create_future()
-    actor._next_identifier += 1
-    request = ResourceRequest(
-        actor._next_identifier, kind, uri, generation, future, abort_signal=abort_signal
-    )
-    if actor.is_terminal:
-        raise RuntimeError(resource_unavailable(actor.name))
-    actor._queue.put_nowait(request)
-    try:
-        return await asyncio.shield(future)
-    except asyncio.CancelledError:
-        await cancel_request(actor, request.identifier)
-        raise
+    telemetry = actor._telemetry
+    # the URI is content: the span names the method and server only
+    with telemetry.mcp_span(f"resources/{kind}", server=actor.name) as span:
+        future: asyncio.Future[object] = asyncio.get_running_loop().create_future()
+        actor._next_identifier += 1
+        request = ResourceRequest(
+            actor._next_identifier,
+            kind,
+            uri,
+            generation,
+            future,
+            telemetry.current_trace_context(),
+            span,
+            abort_signal=abort_signal,
+        )
+        if actor.is_terminal:
+            raise RuntimeError(resource_unavailable(actor.name))
+        actor._queue.put_nowait(request)
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            await cancel_request(actor, request.identifier)
+            raise
 
 
 def handle_resource(actor: MCPServerActor, request: ResourceRequest) -> None:
@@ -110,7 +123,7 @@ def _dispatch_resource(
     actor: MCPServerActor, request: ResourceRequest, client: MCPClient
 ) -> None:
     request.client = client
-    request.task = asyncio.create_task(_invoke_resource(client, request))
+    request.task = create_caller_task(actor, request, _invoke_resource(client, request))
     actor._resource_requests[request.identifier] = request
     actor._children.add(request.task)
     request.task.add_done_callback(

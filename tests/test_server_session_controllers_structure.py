@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from tests.support.owned import await_or_fail
-from zeta.server.handlers.registry import HANDLERS, RESOLVE
-from zeta.server.protocol import MethodDescriptor, ProtocolError
+from zeta.server.handlers.registry import HANDLERS, RESOLVE, _policy_key
+from zeta.server.protocol import RESOURCE_METHODS, MethodDescriptor, ProtocolError
 from zeta.server.session_controllers import SessionControllers
 
 ROOT = Path(__file__).parents[1] / "src" / "zeta" / "server"
@@ -236,11 +236,26 @@ def test_server_has_only_private_test_aliases() -> None:
 
 
 def test_every_method_has_a_resolve_policy() -> None:
-    assert RESOLVE.keys() == HANDLERS.keys() == set(MethodDescriptor)
+    assert HANDLERS.keys() == set(MethodDescriptor)
+    assert RESOLVE.keys() == {_policy_key(item) for item in (*MethodDescriptor, *RESOURCE_METHODS)}
 
 
 def test_records_are_resolved_once_at_request_entries() -> None:
     assert _resolver_violations() == []
+    # Resource adapters and state/telemetry entries must use the dispatch argument,
+    # not go around the one tracked resolution via the attached record or old aliases.
+    paths = [*(ROOT / "handlers/resources").glob("*.py"),
+             ROOT / "handlers/state.py", ROOT / "handlers/telemetry.py", ROOT / "accounts.py"]
+    bypasses = [
+        f"{_rel(path)}:{node.lineno}: {ast.unparse(node)}"
+        for path in paths
+        for node in ast.walk(ast.parse(path.read_text()))
+        if isinstance(node, ast.Attribute) and (
+            node.attr == "controllers"
+            or (node.attr in {"runtime", "control"} and ast.unparse(node.value).split(".")[-1] == "server")
+        )
+    ]
+    assert bypasses == []
 
 
 def test_use_and_completion_state_have_one_owner() -> None:

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import threading
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
@@ -45,8 +47,8 @@ def isolated_credentials(monkeypatch, tmp_path):
     monkeypatch.setattr(
         server_login,
         "build_login_provider",
-        lambda provider, home: replace(
-            real_build_login_provider(provider, home), callback_port=0
+        lambda provider, home, account="default": replace(
+            real_build_login_provider(provider, home, account), callback_port=0
         ),
     )
     # A missed stub must fail locally, before any HTTP request leaves the test.
@@ -72,10 +74,10 @@ async def callback(url, params):
     return status
 
 
-async def connect(tmp_path, provider="claude", version="1.1"):
+async def connect(tmp_path, provider="claude", version="1.1", *, features=()):
     server = ZetaServer(home=tmp_path / "zeta", port=0, provider=provider)
     reader, writer = await _connect(server)
-    hello = await rpc(reader, writer, "hello", protocol_version=version)
+    hello = await rpc(reader, writer, "hello", protocol_version=version, features=list(features))
     return server, reader, writer, hello["result"]
 
 
@@ -92,8 +94,51 @@ async def test_login_is_hidden_and_rejected_for_legacy_protocol(tmp_path, server
         await close_serve(server, writer)
 
 
-@pytest.mark.parametrize("provider", ["claude", "codex"])
-async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_path, monkeypatch, provider):
+@pytest.mark.parametrize("negotiated", [False, True])
+async def test_login_start_error_contract(tmp_path, negotiated):
+    features = ["account_list_idle_v1"] if negotiated else []
+    server, reader, writer, _ = await connect(tmp_path, features=features)
+    try:
+        invalid = (await rpc(reader, writer, "login_start", provider="unsupported"))["error"]
+        assert invalid == (
+            {"code": -32602, "message": "invalid params", "data": {"code": "invalid_params"}}
+            if negotiated else {"code": -32602, "message": "unsupported login provider"}
+        )
+        with patch.object(AccountStore, "provider_login_lock") as owner:
+            for failure, legacy_code in ((TypeError, -32000), (ValueError, -32602)):
+                owner.side_effect = failure("owner failure")
+                error = (await rpc(reader, writer, "login_start", provider="claude"))["error"]
+                assert error == ({"code": -32000, "message": "unexpected server or storage failure"}
+                                 if negotiated else {"code": legacy_code, "message": "owner failure"})
+    finally:
+        await close_serve(server, writer)
+
+
+async def test_named_login_start_reports_missing_registry_with_orphan(tmp_path):
+    home = tmp_path / "zeta"
+    initialize_storage_home(home)
+    orphan = home / "accounts" / "anthropic" / "work"
+    orphan.mkdir(parents=True)
+    (orphan / "oauth.json").write_bytes(b"kept")
+    feature = "account_list_idle_v1"
+    server, reader, writer, hello = await connect(tmp_path, features=[feature])
+    try:
+        assert feature in hello["capabilities"]["features"]
+        assert not (home / "accounts.json").exists()
+        reply = await rpc(reader, writer, "login_start", provider="claude", account="work")
+        assert reply["error"] == {
+            "code": -32005,
+            "message": "stored state is not available to read",
+            "data": {"code": "state_unavailable"},
+        }
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.parametrize("provider,reference", [("claude", None), ("codex", None), ("codex", "work-label"), ("claude", "anthropic:work")])
+async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_path, monkeypatch, provider, reference):
+    from tests.support.credentials import named_account_credentials
+    from zeta.accounts import AccountId
     expected = OAuthTokens("access", "refresh", 4_000_000_000)
     captured = {}
     def build(state, challenge, redirect):
@@ -109,19 +154,34 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
     monkeypatch.setattr(providers, f"build_{suffix}_authorization_url", build)
     monkeypatch.setattr(providers, f"exchange_{suffix}_authorization_code", exchange)
     monkeypatch.setattr(providers, "extract_account_id", lambda _: "test-account")
-    server, reader, writer, hello = await connect(tmp_path)
+    features = ["account_list_idle_v1"] if reference is not None else []
+    server, reader, writer, hello = await connect(tmp_path, features=features)
     try:
         assert set(LOGIN_REQUESTS) <= set(hello["capabilities"]["requests"])
         rows = (await rpc(reader, writer, "login_providers"))["result"]["providers"]
         assert rows == [{"provider": p, "credentials_present": False} for p in ("claude", "codex")]
-        result = (await rpc(reader, writer, "login_start", provider=provider))["result"]
+        params = {"provider": provider, "account": "missing"}
+        if reference is not None:
+            default = named_account_credentials(server.home, suffix)
+            named = named_account_credentials(server.home, suffix, "work")
+            old = OAuthTokens("old", "old-refresh", 4_000_000_000)
+            await asyncio.to_thread(default.save, old)
+            await asyncio.to_thread(named.save, old)
+            await asyncio.to_thread(named.store.rename, named.account, "work-label")
+            invalid = await rpc(reader, writer, "login_start", **params)
+            assert invalid["error"] == {
+                "code": -32602, "message": "invalid params", "data": {"code": "invalid_params"},
+            }
+            params["account"] = reference
+        result = (await rpc(reader, writer, "login_start", **params))["result"]
         assert result["state"] == "pending"
         expected_path = "/callback" if provider == "claude" else "/auth/callback"
         parsed_redirect = urlsplit(captured["redirect"])
         assert parsed_redirect.path == expected_path
         assert parsed_redirect.port is not None and parsed_redirect.port > 0
         assert parse_qs(urlsplit(result["authorization_url"]).query)["state"] == [captured["state"]]
-        duplicate = await rpc(reader, writer, "login_start", provider=provider)
+        duplicate = await rpc(reader, writer, "login_start", provider=provider, account="missing")
+        assert duplicate["error"]["code"] == -32005
         assert duplicate["error"]["data"]["code"] == "login_in_progress"
         # Both providers may wait at once, with independent cancellation.
         other = "codex" if provider == "claude" else "claude"
@@ -130,13 +190,55 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert await callback(captured["redirect"], {"code": "synthetic-code", "state": captured["state"]}) == 200
         await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks[provider], 10)
         assert (await rpc(reader, writer, "login_status", provider=provider))["result"] == {"state": "succeeded"}
-        saved = await asyncio.to_thread(credential_store, provider, home=server.home)
+        saved = await asyncio.to_thread(
+            credential_store, provider, home=server.home,
+            account=AccountId(suffix, "work" if reference is not None else "default"),
+        )
         assert await asyncio.wait_for(asyncio.to_thread(saved.read), 10) == expected
+        if reference is not None:
+            assert await asyncio.wait_for(asyncio.to_thread(default.read), 10) == old
         rows = (await rpc(reader, writer, "login_providers"))["result"]["providers"]
         assert next(row for row in rows if row["provider"] == provider)["credentials_present"]
         assert (await rpc(reader, writer, "status"))["result"]["state"] == "idle"
     finally:
         await close_serve(server, writer)
+
+
+async def test_login_start_reports_shared_provider_lock_contention(tmp_path, monkeypatch):
+    home = tmp_path / "zeta"
+    monkeypatch.setenv("ZETA_ACCOUNT_HOME", str(home))
+    holder = await asyncio.wait_for(asyncio.create_subprocess_exec(
+        sys.executable, "-c",
+        "import sys\n"
+        "from zeta.accounts import AccountStore\n"
+        "with AccountStore(sys.argv[1]).provider_login_lock('anthropic'):\n"
+        "    print('locked', flush=True)\n"
+        "    sys.stdin.read()\n",
+        str(home), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+    ), 10)
+    try:
+        assert await asyncio.wait_for(holder.stdout.readline(), 10) == b"locked\n"
+        for features in ((), ("account_list_idle_v1",)):
+            server, reader, writer, _ = await connect(tmp_path, features=features)
+            try:
+                response = await rpc(reader, writer, "login_start", provider="claude")
+                if features:
+                    assert response.get("error") == {
+                        "code": -32005, "message": "login is already pending",
+                        "data": {"code": "login_in_progress"},
+                    }, response
+                else:
+                    assert response["result"] == {
+                        "state": "failed",
+                        "error": {
+                            "code": "login_failed",
+                            "message": "Could not complete sign-in. Please try again.",
+                        },
+                    }
+            finally:
+                await close_serve(server, writer)
+    finally:
+        await asyncio.wait_for(holder.communicate(), 10)
 
 
 _MISSING_REGISTRY_REFUSAL = (

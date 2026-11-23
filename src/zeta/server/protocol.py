@@ -9,6 +9,8 @@ from collections.abc import Mapping
 from enum import Enum, StrEnum
 from typing import Any
 
+from .resource_protocol import Access, ResourceDescriptor, collect_families
+
 logger = logging.getLogger(__name__)
 
 
@@ -157,6 +159,27 @@ class ErrorDescriptor(Enum):
         "mcp_tool_refresh_failed",
         "an MCP tools/list refresh failed",
     )
+    INVALID_TELEMETRY_PARAMS = (-32602, "invalid_params", "telemetry read parameters or cursor are invalid")
+    INVALID_STATE_PARAMS = (-32602, "invalid_params", "state read parameters or cursor are invalid")
+    STATE_READ_UNAVAILABLE = (-32005, "state_unavailable", "stored state is not available to read")
+    CORRUPT_STATE = (-32000, "corrupt_state", "stored state is invalid or unsupported")
+    STALE_STATE_SNAPSHOT = (-32009, "stale_state_snapshot", "the stored state changed during the read")
+    TRACE_NOT_FOUND = (-32602, "trace_not_found", "the requested trace does not exist")
+    TELEMETRY_OFF = (-32005, "telemetry_off", "no telemetry database exists")
+    TELEMETRY_SCHEMA_MISMATCH = (
+        -32000,
+        "telemetry_schema_mismatch",
+        "the telemetry database schema is not the one this zeta reads",
+    )
+    RESULT_TOO_LARGE = (-32007, "result_too_large", "not even one item fits one frame")
+    CUSTOM_HOME_SETTING = (-32602, "custom_home_setting", "the setting has a custom value that serve does not change")
+    STALE_REVISION = (-32009, "stale_revision", "settings.toml changed since the given revision")
+    SETTINGS_BUSY = (-32009, "settings_busy", "another zeta process is writing settings.toml")
+    STALE_RESOURCE_REVISION = (-32009, None, "resource revision is stale")
+    RESOURCE_BUSY = (-32004, "operation_busy", "another process is writing this resource")
+    SETTINGS_MALFORMED = (-32000, "settings_malformed", "settings.toml does not parse or validate")
+    SETTINGS_UNSAFE = (-32000, "settings_unsafe", "settings.toml is a link or not a regular, unshared file")
+    TELEMETRY_UNAVAILABLE = (-32602, "telemetry_unavailable", "telemetry cannot start in this zeta install or environment")
 
     def __init__(self, code: int, data_code: str | None, meaning: str) -> None:
         self.code = code
@@ -192,6 +215,9 @@ class SlashErrorCodeDescriptor(StrEnum):
 class ApprovalDecision(StrEnum):
     APPROVE = "approve"
     DENY = "deny"
+
+
+APPROVAL_SCOPES = frozenset({"once", "always_tool"})
 
 
 class EventDescriptor(StrEnum):
@@ -248,7 +274,8 @@ PROTOCOL_VERSION = "1.2"
 SUPPORTED_PROTOCOL_VERSIONS = ("1.0", "1.1", PROTOCOL_VERSION)
 # Optional 1.1 features. A client opts in through ``hello.features``; the
 # server echoes the supported subset in ``capabilities.features``.
-FEATURES = (
+_LEGACY_FEATURES = (
+    "otel",
     "session_cwd",
     "new_session_settings",
     "user_message_event",
@@ -291,22 +318,16 @@ FEATURES = (
     "in_flight_replay",
     "session_park",
     "tool_approval_origin",
+    "telemetry_read_v1",
+    "state_read_v1",
 )
 
 # Dormant until multi-controller admission is complete in a later slice.
 DORMANT_FEATURES = ("multi_controller",)
 
 
-class Access(StrEnum):
-    READ = "read"
-    CONTROLLER_READ = "controller_read"
-    SESSION_MUTATION = "session_mutation"
-    DELIVERY = "delivery"
-    CONTROLLER_WRITE = "controller_write"
-
-
 class MethodDescriptor(Enum):
-    """The single declaration of a served request's wire capability."""
+    """Frozen legacy capabilities; new requests belong to resource families."""
 
     LIST_SESSIONS = ("list_sessions", None, None, Access.READ)
     NEW_SESSION = ("new_session", None, None, Access.CONTROLLER_WRITE)
@@ -394,24 +415,53 @@ class MethodDescriptor(Enum):
         "mcp_refresh_tools",
         Access.SESSION_MUTATION,
     )
+    STATE_SESSIONS = ("state_sessions", None, "state_read_v1", Access.READ)
+    STATE_SESSION = ("state_session", None, "state_read_v1", Access.READ)
+    STATE_AGENTS = ("state_agents", None, "state_read_v1", Access.READ)
+    STATE_BACKGROUND_TASKS = ("state_background_tasks", None, "state_read_v1", Access.READ)
+    STATE_CATALOG = ("state_catalog", None, "state_read_v1", Access.READ)
+    STATE_PROJECTS = ("state_projects", None, "state_read_v1", Access.READ)
+    STATE_MEMORY = ("state_memory", None, "state_read_v1", Access.READ)
+    STATE_MEMORY_DETAIL = ("state_memory_detail", None, "state_read_v1", Access.CONTROLLER_READ)
+    STATE_INBOX = ("state_inbox", None, "state_read_v1", Access.READ)
+    STATE_INBOX_DETAIL = ("state_inbox_detail", None, "state_read_v1", Access.CONTROLLER_READ)
+    STATE_ATTENTION = ("state_attention", None, "state_read_v1", Access.READ)
+    STATE_SETTINGS = ("state_settings", None, "state_read_v1", Access.READ)
+    STATE_ACCOUNTS = ("state_accounts", None, "state_read_v1", Access.READ)
+    STATE_STORAGE = ("state_storage", None, "state_read_v1", Access.READ)
+    STATE_RETENTION = ("state_retention", None, "state_read_v1", Access.READ)
+    TELEMETRY_STATUS = ("telemetry_status", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_SESSIONS = ("telemetry_sessions", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_TRACE = ("telemetry_trace", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_OVERVIEW = ("telemetry_overview", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_MODELS = ("telemetry_models", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_TOOLS = ("telemetry_tools", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_ERRORS = ("telemetry_errors", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_SERIES = ("telemetry_series", None, "telemetry_read_v1", Access.READ)
+    TELEMETRY_AGENT_TREE = ("telemetry_agent_tree", None, "telemetry_read_v1", Access.READ)
 
     def __init__(
         self, wire: str, since: str | None, feature: str | None, access: Access
     ) -> None:
-        if feature is not None and feature not in FEATURES:
+        if feature is not None and feature not in _LEGACY_FEATURES:
             raise ValueError(f"unknown method feature: {feature}")
         self.wire, self.since, self.feature, self.access = wire, since, feature, access
 
     @classmethod
-    def for_wire(cls, wire: str) -> MethodDescriptor | None:
-        return next((item for item in cls if item.wire == wire), None)
+    def for_wire(
+        cls, wire: str, features: frozenset[str] = frozenset(),
+    ) -> MethodDescriptor | ResourceDescriptor | None:
+        extension = _METHOD_EXTENSIONS.get(wire)
+        if extension is not None and extension.feature in features:
+            return extension
+        return _METHODS_BY_WIRE.get(wire)
 
     @classmethod
     def advertised(cls, version: str, features: frozenset[str], role: str) -> list[str]:
         negotiated = tuple(int(part) for part in version.split("."))
         methods = [
             item.wire
-            for item in cls
+            for item in served_methods()
             if (
                 item.since is None
                 or negotiated >= tuple(int(part) for part in item.since.split("."))
@@ -420,6 +470,32 @@ class MethodDescriptor(Enum):
             and (role != "observer" or item.access is Access.READ)
         ]
         return sorted(methods) if role == "observer" else methods
+
+
+def served_methods() -> tuple[MethodDescriptor | ResourceDescriptor, ...]:
+    """One ordered descriptor view for serve negotiation, dispatch, and telemetry."""
+    return _SERVED_METHODS
+
+
+RESOURCE_METHODS = collect_families()
+_SERVED_METHODS = (*MethodDescriptor, *(item for item in RESOURCE_METHODS if not item.extends_legacy))
+_METHODS_BY_WIRE = {item.wire: item for item in served_methods()}
+_METHOD_EXTENSIONS: dict[str, ResourceDescriptor] = {}
+if len(_METHODS_BY_WIRE) != len(served_methods()):
+    raise RuntimeError("serve resource methods must have unique names and may not replace legacy methods")
+for _extension in RESOURCE_METHODS:
+    if not _extension.extends_legacy:
+        continue
+    _legacy = _METHODS_BY_WIRE.get(_extension.wire)
+    if (
+        not isinstance(_legacy, MethodDescriptor)
+        or _legacy.feature is not None
+        or (_legacy.since, _legacy.access) != (_extension.since, _extension.access)
+        or _extension.wire in _METHOD_EXTENSIONS
+    ):
+        raise RuntimeError("serve method extensions must preserve the legacy version and access")
+    _METHOD_EXTENSIONS[_extension.wire] = _extension
+FEATURES = tuple(dict.fromkeys((*_LEGACY_FEATURES, *(item.feature for item in RESOURCE_METHODS))))
 
 
 EVENT_ACCESS = {
@@ -657,6 +733,34 @@ class ProtocolError(Exception):
         self.request_id = _safe_request_id(request_id)
 
 
+def closed_error(descriptor: ErrorDescriptor) -> ProtocolError:
+    """Use only the descriptor's public text and no owner-supplied detail."""
+    return ProtocolError(descriptor, descriptor.meaning)
+
+
+def resource_error(descriptor: ErrorDescriptor) -> ProtocolError:
+    """Opt in to a code and reason without changing the legacy descriptor's data."""
+    reason = descriptor.data_code or descriptor.name.lower()
+    return ProtocolError(descriptor, descriptor.meaning, {"code": reason, "reason": reason})
+
+
+def invalid_resource_params(*, reason: str | None = None, detail: str | None = None) -> ProtocolError:
+    """``detail`` is public owner text the adapter already made safe (relative paths, redacted)."""
+    data = {"code": "invalid_params"}
+    if reason is not None:
+        data["reason"] = reason
+    if detail is not None:
+        data["detail"] = detail
+    return ProtocolError(ErrorDescriptor.INVALID_PARAMS, "invalid params", data)
+
+
+def stale_resource_revision(family: str) -> ProtocolError:
+    reason = f"stale_{family}_revision"
+    return ProtocolError(ErrorDescriptor.STALE_RESOURCE_REVISION, "resource revision is stale", {
+        "code": reason, "reason": reason,
+    })
+
+
 def negotiate_protocol_version(requested: object, advertised: object) -> str:
     """Select one supported version from a hello request."""
 
@@ -671,7 +775,7 @@ def negotiate_protocol_version(requested: object, advertised: object) -> str:
     return requested
 
 
-def protocol_error(descriptor: MethodDescriptor) -> ProtocolError:
+def protocol_error(descriptor: MethodDescriptor | ResourceDescriptor) -> ProtocolError:
     message = {
         **dict.fromkeys(_LOGIN_METHODS, "login is unavailable on this server"),
         **dict.fromkeys(_ERGONOMICS_METHODS, "request requires protocol 1.1"),
@@ -688,7 +792,7 @@ def protocol_error(descriptor: MethodDescriptor) -> ProtocolError:
     return ProtocolError(ErrorDescriptor.METHOD_NOT_FOUND, message)
 
 
-def feature_error(descriptor: MethodDescriptor) -> ProtocolError:
+def feature_error(descriptor: MethodDescriptor | ResourceDescriptor) -> ProtocolError:
     message = {
         MethodDescriptor.CLEAR_STEERING: "clear_steering requires the negotiated abort_scope feature",
         MethodDescriptor.DELIVERY_STATUS: "delivery_status requires negotiated feature 'delivery_id'",
@@ -778,7 +882,9 @@ class FrameCodec:
                 "request params must be an object",
                 request_id=request_id,
             )
-        return {"id": raw_request_id, "method": method, "params": params}
+        # W3C trace context: kept raw here; the connection uses it only after `otel` was negotiated
+        trace_context = {key: value[key] for key in ("traceparent", "tracestate") if key in value}
+        return {"id": raw_request_id, "method": method, "params": params, "trace_context": trace_context}
 
     def response(self, request_id: str | int | None, result: object) -> _Frame:
         value = {"jsonrpc": "2.0", "id": request_id, "result": result}

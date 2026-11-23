@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -167,7 +168,7 @@ def _parse_tools(value: object, path: Path) -> frozenset[str] | None:
     return frozenset(_CLAUDE_TOOL_NAMES.get(name, name) for name in names)
 
 
-def _build_agent(
+def build_agent(
     document: MarkdownDocument, source: str, notices: list[str] | None
 ) -> AgentPreset:
     metadata = document.metadata
@@ -185,6 +186,8 @@ def _build_agent(
                 f"unknown model {model!r}; agent will inherit the parent model",
                 "agent",
             )
+            # Structured readers (the serve library catalog) get fixed text without the model value.
+            notice.error = "unknown model; agent will inherit the parent model"
             if notices is not None:
                 notices.append(notice)
             model = None
@@ -242,6 +245,7 @@ def discover_agents(
     *,
     source: str,
     notices: list[str] | None = None,
+    capture: Callable[[AgentPreset, MarkdownDocument], None] | None = None,
     agents_dir: Path | None = None,
 ) -> list[AgentPreset]:
     """Discover one tier of flat agent definitions."""
@@ -250,13 +254,15 @@ def discover_agents(
     return discover_markdown(
         agents_dir,
         kind="agent",
-        build=lambda document: _build_agent(document, source, notices),
+        build=lambda document: build_agent(document, source, notices),
         notices=notices,
+        capture=capture,
     )
 
 
 def discover_session_agents(
-    *, home: str | Path | None = None, project_dir: str | Path | None = None
+    *, home: str | Path | None = None, project_dir: str | Path | None = None,
+    capture: Callable[[AgentPreset, MarkdownDocument], None] | None = None,
 ) -> AgentCatalog:
     """Discover packaged, home, and project agents for one session."""
 
@@ -267,7 +273,7 @@ def discover_session_agents(
             replace(preset, source="packaged") for preset in AGENT_PRESETS.values()
         ],
         discover=lambda root, source, notices: discover_agents(
-            root, source=source, notices=notices
+            root, source=source, notices=notices, capture=capture
         ),
         warn_override=lambda agent: warn_discovery(
             agent.path or Path(agent.name),
@@ -285,6 +291,7 @@ def discover_packaged_agents() -> AgentCatalog:
 __all__ = [
     "AgentCatalog",
     "AgentMeta",
+    "build_agent",
     "discover_agents",
     "discover_packaged_agents",
     "discover_session_agents",

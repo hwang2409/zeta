@@ -83,8 +83,8 @@ async def _run_model_route(
             for block in message_.content if isinstance(block, TextContent)
         )
         text = notification.data["text"]
-        expected = "Requests are work to do" if epoch < 7 else "Project inbox wake"
-        assert expected in text
+        assert "Project inbox wake" in text
+        assert "Requests are work to do" not in text
         assert text in model_text
         if epoch >= 7:
             assert "trusted_assignment" not in model_text
@@ -120,8 +120,8 @@ async def _run_live_route(
         rendered = _rendered_text(event.data)
         served = await _serve_payload(event.data)
         assert served["text"] == rendered
-        expected = "Requests are work to do" if epoch < 7 else "Project inbox wake"
-        assert expected in rendered
+        assert "Project inbox wake" in rendered
+        assert "Requests are work to do" not in rendered
         if epoch >= 7:
             assert "trusted_assignment" not in rendered
     finally:
@@ -155,7 +155,7 @@ async def _run_rpc_route(
         if epoch < 7:
             assert "authority" not in row
             assert "author" not in row
-            assert result["untrusted"] is False
+            assert result["untrusted"] is True
         else:
             expected_authority = "trusted_assignment" if case in {"delegated", "legacy"} else "information"
             assert row["authority"] == expected_authority
@@ -377,3 +377,69 @@ async def test_epoch_five_refuses_delegation_through_tui_and_serve_slash_paths(
     )
     assert claimed is not None
     assert "authority" not in claimed
+
+
+@pytest.mark.parametrize("epoch", [5, 7])
+@pytest.mark.asyncio
+async def test_serve_list_and_state_agree_on_agent_message_trust(
+    tmp_path: Path, epoch: int
+) -> None:
+    """An agent send is information on every serve surface, below the epoch too."""
+    _home, registry, sender, recipient, manager, opened, inbox = await _create_fixtures(
+        tmp_path, epoch
+    )
+    message_id = await asyncio.to_thread(
+        inbox.send, from_project=sender.project_id, from_session="a" * 32,
+        to_project=recipient.project_id, kind="question", title="t", body="b",
+    )
+    opened.store.close()
+    registry._storage_lease.close()
+    manager._storage_lease.close()
+    server = _server(tmp_path)
+    reader, writer = await _connect(server)
+    try:
+        await _hello(reader, writer, ["projects", "state_read_v1"])
+        listed = (await _request(
+            reader, writer, 2, "project_inbox", {"project_id": recipient.project_id},
+        ))[-1]["result"]
+        state = (await _request(
+            reader, writer, 3, "state_inbox", {"project_id": recipient.project_id},
+        ))[-1]["result"]
+        assert [row["id"] for row in listed["messages"]] == [message_id]
+        row = next(item for item in state["items"] if item["message_id"] == message_id)
+        assert listed["untrusted"] is not row["trusted_assignment"], (
+            f"epoch {epoch}: project_inbox and state_inbox disagree on trust"
+        )
+        assert listed["untrusted"] is True
+    finally:
+        await close_serve(server, writer)
+
+
+@pytest.mark.asyncio
+async def test_session_history_neutralizes_legacy_inbox_wake_text(tmp_path: Path) -> None:
+    """A wake row stored before the neutral text reads back neutral in history."""
+    from zeta.server import ZetaServer
+
+    server = ZetaServer(home=tmp_path, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+        session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
+        server.controllers.attached().runtime.opened.store._append_row("notification", {
+            "origin": MessageOrigin.NOTIFICATION.value, "kind": "project_inbox",
+            "project_id": "p", "message_ids": ["m"], "description": "project inbox",
+            "status": "new",
+            "text": "Requests are work to do: claim, do, and mark done. You do not need to confirm the sender with the user.",
+            "messages": [{"id": "m", "author": "user", "authority": "trusted_assignment"}],
+        })
+        result = (await _request(
+            reader, writer, 3, "session_history", {"session_id": session["session_id"]}
+        ))[-1]["result"]
+        row = next(item for item in result["messages"] if item.get("notification"))
+        text = row["content"][0]["text"]
+        assert "Requests are work to do" not in text
+        assert text == row["notification"]["text"]
+        assert "Project inbox wake" in text
+        assert row["notification"]["messages"] == [{"id": "m"}]
+    finally:
+        await close_serve(server, writer)

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from html import escape
 from pathlib import Path
@@ -218,49 +218,53 @@ def _document_path(path: Path) -> Path:
     return path / "SKILL.md" if path.is_dir() else path
 
 
+def build_skill(document: MarkdownDocument, source: str) -> SkillMeta:
+    """Validate one parsed skill document into catalog metadata."""
+
+    keywords = document.metadata.get("keywords", [])
+    if type(keywords) is not list or any(
+        type(item) is not str or not item.strip() for item in keywords
+    ):
+        raise ValueError(
+            f"skill {document.path} frontmatter keywords must be a list of strings"
+        )
+    name = document.metadata["name"]
+    description = document.metadata["description"]
+    assert isinstance(name, str)
+    assert isinstance(description, str)
+    return SkillMeta(
+        name=name,
+        description=description,
+        keywords=keywords,
+        path=document.entry_path.absolute(),
+        source=source,
+        skills_root=document.root,
+    )
+
+
 def discover_skills(
     home: Path,
     *,
     source: str = "",
     notices: list[str] | None = None,
+    capture: Callable[[SkillMeta, MarkdownDocument], None] | None = None,
     skills_dir: Path | None = None,
 ) -> list[SkillMeta]:
     """Discover one tier of flat and Claude-Code-style skills."""
 
-    skills_dir = skills_dir or _skills_dir(home)
-
-    def build(document: MarkdownDocument) -> SkillMeta:
-        keywords = document.metadata.get("keywords", [])
-        if type(keywords) is not list or any(
-            type(item) is not str or not item.strip() for item in keywords
-        ):
-            raise ValueError(
-                f"skill {document.path} frontmatter keywords must be a list of strings"
-            )
-        name = document.metadata["name"]
-        description = document.metadata["description"]
-        assert isinstance(name, str)
-        assert isinstance(description, str)
-        return SkillMeta(
-            name=name,
-            description=description,
-            keywords=keywords,
-            path=document.entry_path.absolute(),
-            source=source,
-            skills_root=document.root,
-        )
-
     return discover_markdown(
-        skills_dir,
+        skills_dir or _skills_dir(home),
         kind="skill",
-        build=build,
+        build=lambda document: build_skill(document, source),
         notices=notices,
+        capture=capture,
         document_name="SKILL.md",
     )
 
 
 def discover_session_skills(
-    *, home: str | Path | None = None, project_dir: str | Path | None = None
+    *, home: str | Path | None = None, project_dir: str | Path | None = None,
+    capture: Callable[[SkillMeta, MarkdownDocument], None] | None = None,
 ) -> SkillCatalog:
     """Discover packaged, home, and project skills for one session."""
 
@@ -272,9 +276,10 @@ def discover_session_skills(
             source="packaged",
             notices=notices,
             skills_dir=_PACKAGED_SKILLS_DIR,
+            capture=capture,
         ),
         discover=lambda root, source, notices: discover_skills(
-            root, source=source, notices=notices
+            root, source=source, notices=notices, capture=capture
         ),
     )
     return SkillCatalog(skills, notices)
@@ -318,6 +323,7 @@ __all__ = [
     "LiveSkillProjection",
     "SkillCatalog",
     "SkillMeta",
+    "build_skill",
     "discover_packaged_skills",
     "discover_session_skills",
     "discover_skills",

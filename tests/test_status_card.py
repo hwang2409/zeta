@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import time
 from dataclasses import fields
 from io import StringIO
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.telemetry import ReceiverState, Telemetry, TelemetryStatus
 from zeta.tui.app import TUIApp
 from zeta.tui.overlay import OverlayControl
 from zeta.tui.slash_handlers import decisions_panel as decisions_panel_module
@@ -508,3 +510,97 @@ def test_status_card_content_is_width_bounded() -> None:
     assert len(rendered) == 12
     assert rendered.startswith("│")
     assert rendered.endswith("│")
+
+
+class _FixedReceiver:
+    def __init__(self, state: ReceiverState) -> None:
+        self._state = state
+
+    def snapshot(self) -> ReceiverState:
+        return self._state
+
+    def stop(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_status_card_renders_the_receiver_line(tmp_path) -> None:
+    exported = TelemetryStatus(True, "healthy", None, time.time_ns() - 5 * 10**9)
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+        telemetry=Telemetry(_StatusOnlyTelemetry(exported), _FixedReceiver(ReceiverState("ready"))),
+        otel_endpoint="http://127.0.0.1:4323/v1/traces",
+    )
+    try:
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
+        app.open_status_card(app.slash_status())
+
+        screen = await _render_status(session, 120, 30)
+        rows = [
+            "".join(screen.data_buffer[y][x].char for x in range(120)) for y in range(30)
+        ]
+        receiver_rows = [row for row in rows if "otel receiver:" in row]
+        assert len(receiver_rows) == 1, rows
+        assert "otel receiver: http://127.0.0.1:4323/v1/traces ready, last export ok" in receiver_rows[0]
+    finally:
+        await app.close()
+
+
+class _StatusOnlyTelemetry:
+    """A telemetry implementation that reports a fixed exporter state."""
+
+    def __init__(self, status: TelemetryStatus) -> None:
+        self._status = status
+
+    def status(self) -> TelemetryStatus:
+        return self._status
+
+    def shutdown(self) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (None, "otel: off"),
+        (TelemetryStatus(True, "healthy"), "otel: healthy (127.0.0.1:4318)"),
+        (
+            TelemetryStatus(True, "degraded", "export_unavailable"),
+            "otel: degraded (export unavailable)",
+        ),
+    ],
+    ids=["off", "healthy", "degraded"],
+)
+async def test_status_card_renders_otel_state(
+    tmp_path, status: TelemetryStatus | None, expected: str
+) -> None:
+    store = ConversationStore(tmp_path / "sessions")
+    app = TUIApp(
+        AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+        provider="codex",
+        model="offline",
+        console=Console(file=StringIO(), force_terminal=True),
+        telemetry=None if status is None else Telemetry(_StatusOnlyTelemetry(status)),
+        otel_endpoint=None if status is None else "http://127.0.0.1:4318/v1/traces",
+    )
+    try:
+        session = app._make_session()
+        app._active_session = session
+        app._install_full_screen_layout(session)
+        app.open_status_card(app.slash_status())
+
+        screen = await _render_status(session, 100, 30)
+        rows = [
+            "".join(screen.data_buffer[y][x].char for x in range(100)) for y in range(30)
+        ]
+        otel_rows = [row for row in rows if "otel:" in row]
+        assert [expected in row for row in otel_rows] == [True], otel_rows
+    finally:
+        await app.close()

@@ -173,7 +173,9 @@ class ChildApprovalPolicy(ApprovalAbortPolicy):
                     arguments.get("cwd"),
                 )
             )
-        return Path(os.path.abspath(self.child_cwd))
+        if tool_name in {"read", "edit", "write"}:
+            return Path(self.child_store.bash_cwd)
+        return self.child_cwd
 
     def _capture_pending_binding(
         self,
