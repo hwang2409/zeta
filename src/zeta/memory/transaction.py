@@ -18,7 +18,12 @@ from ..project_memory_history import (
 from ..project_schema import MAX_RECORD_SIZE
 from ..state_snapshot import BODY_BYTES, clip, timestamp_ns
 from .entry_store import EntryMemorySnapshot, MemoryEntry
-from .entry_views import active_entries, entry_is_accepted, inspect_value, render_all_kinds
+from .entry_views import (
+    active_entries,
+    entry_is_accepted,
+    inspect_value,
+    render_all_kinds,
+)
 
 if TYPE_CHECKING:
     from ..project_registry import ProjectRegistry
