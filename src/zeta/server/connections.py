@@ -439,16 +439,21 @@ class ConnectionRegistry(ReplayOutput):
                 state.features
             ):
                 shaped.pop(name)
-        if event is EventDescriptor.TOOL_START and "tool_approval_origin" not in state.features:
-            tool_call = shaped.get("tool_call")
+        return ConnectionRegistry._shape_event_fields(event, shaped, state.features)
+
+    @staticmethod
+    def _shape_event_fields(
+        event: EventDescriptor, fields: dict[str, object], features: frozenset[str],
+    ) -> dict[str, object]:
+        if event is EventDescriptor.TOOL_START and "tool_approval_origin" not in features:
+            tool_call = fields.get("tool_call")
             if isinstance(tool_call, dict) and "approval_origin" in tool_call:
-                shaped["tool_call"] = {key: value for key, value in tool_call.items() if key != "approval_origin"}
+                fields["tool_call"] = {key: value for key, value in tool_call.items() if key != "approval_origin"}
         if event is EventDescriptor.APPROVAL_END:
-            shaped = event_contract.approval_end_for_features(
-                shaped,
-                include_restart_reason="approval_restart_reason" in state.features,
+            return event_contract.approval_end_for_features(
+                fields, include_restart_reason="approval_restart_reason" in features,
             )
-        return shaped
+        return fields
 
     def publish_session(
         self,
@@ -475,12 +480,9 @@ class ConnectionRegistry(ReplayOutput):
         if not isinstance(coverage, DeferredFrame):
             self._publish_replay_subscribers(
                 event, session_id, required_feature, fields, coverage, replay_row,
-                exclude=owner if replay_scope is None else None, scope=replay_scope, feature_fields=feature_fields,
+                exclude=owner, scope=replay_scope, feature_fields=feature_fields,
                 legacy_observers=legacy_observers and route.legacy_observers,
             )
-        if replay_scope is not None:
-            # Child lifecycle has always been a parent-scope replay feed.
-            return Admission("no_controller")
         outcome, frame, output = self._event_preflight(
             state, event, session_id, required_feature=required_feature,
             fields=fields, feature_fields=feature_fields,

@@ -284,6 +284,60 @@ def _receipt_entry(store: Any, route: LiveRoute, run_id: str, call_id: str) -> A
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("transport", TRANSPORTS)
+@pytest.mark.parametrize("owner_subscribed", (False, True), ids=("live-owner", "replay-owner"))
+async def test_multi_child_lifecycle_reaches_owner_and_parent_replay_once(
+    tmp_path: Path, transport: Transport, owner_subscribed: bool,
+) -> None:
+    backend = Actors({
+        "delegate": [ScriptedTurn(tool_calls=[_agent("agent-1", "child-work", False)]), _text("done")],
+        "child-work": [_text("child done")],
+    })
+    server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
+    await server.start()
+    owner = await connect_replay(server, transport)
+    extra = (*FEATURES, "multi_controller")
+    serve = Serve(server, transport, owner, "")
+    try:
+        unrelated = await connect_replay(server, transport)
+        serve.clients.append(unrelated)
+        for client in (owner, unrelated):
+            hello = await negotiate(client, extra=extra, protocol_version="1.2")
+            assert {"multi_controller", "child_run_events"} <= set(hello["result"]["capabilities"]["features"])
+            created = await client.request(2, "new_session", {})
+            if client is owner:
+                serve.session_id = created["result"]["session"]["session_id"]
+            else:
+                assert created["result"]["session"]["session_id"] != serve.session_id
+        observer = await serve.observer()
+        await serve.join(observer, None)
+        if owner_subscribed:
+            await serve.join(owner, None)
+
+        await owner.request(serve.request_id(), "send", {"text": "delegate"})
+        owner_events = await _until(owner, "agent_end") + await serve.drain(owner)
+        observer_events = await serve.drain(observer)
+        unrelated_events = await serve.drain(unrelated)
+        run_id = f"{serve.session_id}:1"
+        for kind in ("child_started", "child_ended"):
+            observed = _lifecycle(observer_events, kind, run_id)
+            assert len(observed) == 1
+            owned = _lifecycle(owner_events, kind, run_id)
+            assert len(owned) == 1, f"owner received {len(owned)} {kind} events"
+            assert owned[0]["child"] == observed[0]["child"]
+            assert ("stream_id" in owned[0]) == owner_subscribed
+            assert _lifecycle(unrelated_events, kind, run_id) == []
+        progress = _lifecycle(observer_events, "child_progress", run_id)
+        assert progress
+        assert [row["revision"] for row in _lifecycle(owner_events, "child_progress", run_id)] == [
+            row["revision"] for row in progress
+        ]
+        assert _lifecycle(unrelated_events, "child_progress", run_id) == []
+    finally:
+        await _close(serve)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", TRANSPORTS)
 @pytest.mark.parametrize("route", LIVE_ROUTES, ids=[route.name for route in LIVE_ROUTES])
 async def test_live_terminal_route_publishes_one_child_ended_after_the_receipt(
     tmp_path: Path, transport: Transport, route: LiveRoute

@@ -431,10 +431,17 @@ class ZetaServer:
         self, event: EventDescriptor, scope: ReplayScopeId, session_id: str,
         fields: dict[str, object], covers: int | None,
     ) -> None:
-        if self.connections is not None:
-            self.connections.publish_session(
-                None, event, session_id, replay_scope=scope, covers=covers, **fields,
-            )
+        if self.connections is None:
+            return
+        owner = None
+        # Legacy child lifecycle remains a replay-only feed.
+        if self.controllers.controller_mode == "multi":
+            record = self.controllers.resident(session_id)
+            if record is not None:
+                owner = self.controllers.event_owner(record.control.event_source(session_id))
+        self.connections.publish_session(
+            owner, event, session_id, replay_scope=scope, covers=covers, **fields,
+        )
 
     async def _publish_foreground_events(self) -> None:
         assert self._foreground_subscription is not None and self._borrowed_source is not None
