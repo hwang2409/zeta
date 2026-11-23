@@ -14,7 +14,8 @@ from tests.support.replay_transport import (
 )
 from tests.test_server_replay_table import _backend_factory
 from zeta.protocol.types import StreamEvent, StreamEventType
-from zeta.server.protocol import DORMANT_FEATURES, FEATURES
+from zeta.server.connections import EVENT_FEATURES
+from zeta.server.protocol import DORMANT_FEATURES, FEATURES, EventDescriptor
 
 
 @pytest.mark.parametrize(("transport", "case"), [
@@ -26,14 +27,13 @@ from zeta.server.protocol import DORMANT_FEATURES, FEATURES
 @pytest.mark.asyncio
 async def test_event_routing_table(tmp_path: Path, transport: Transport, case: str, monkeypatch: pytest.MonkeyPatch) -> None:
     assert "multi_controller" not in FEATURES and "multi_controller" in DORMANT_FEATURES
+    assert set(EVENT_FEATURES) == set(EventDescriptor) and len(EVENT_FEATURES) == 45
     server = replay_server(tmp_path, transport, _backend_factory)
     await server.start()
     clients = [await connect_replay(server, transport) for _ in range(2)]
     try:
         first, second = clients
         if case == "legacy-precommit":
-            from zeta.server.protocol import EventDescriptor
-
             control = server.controllers.attached().control
             ready = control.controller_ready
 
@@ -68,12 +68,16 @@ async def test_event_routing_table(tmp_path: Path, transport: Transport, case: s
                 name = "replay_stream_ended"
             expected = [[], [session_id]]
         elif case == "global":
-            assert "result" in await negotiate(first, extra=("zeta_updated",))
-            assert "result" in await first.request(2, "new_session", {})
-            assert "result" in await negotiate(second, observer=True, extra=("zeta_updated",))
+            observer, ineligible = [await connect_replay(server, transport) for _ in range(2)]
+            clients.extend((observer, ineligible))
+            for client in (first, second):
+                assert "result" in await negotiate(client, extra=("multi_controller", "zeta_updated"))
+                assert "result" in await client.request(2, "new_session", {})
+            assert "result" in await negotiate(observer, observer=True, extra=("zeta_updated",))
+            assert "result" in await negotiate(ineligible, observer=True)
             await server.publish_update("old", "new")
             name = "zeta_updated"
-            expected = [[None], [None]]
+            expected = [[None], [None], [None], []]
         else:
             for client in clients:
                 assert "result" in await negotiate(client, extra=("multi_controller", "live_config_changed"))
@@ -135,6 +139,7 @@ async def test_finalization_cannot_overtake_config(tmp_path: Path, monkeypatch: 
             return await finalize(*args, **kwargs)
 
         monkeypatch.setattr(control.runtime.loop, "run_turn", stream)
+        # test-contract: seam holds the ordinary event before output admission
         monkeypatch.setattr(control, "_notify", hold)
         monkeypatch.setattr(control.deliveries, "finalize_or_fail", watch_finalize)
         task = asyncio.create_task(control._run_turn("test", turn_id="0" * 32))

@@ -344,6 +344,7 @@ async def test_observer_host_restart_keeps_borrowed_publisher_live(tmp_path: Pat
                 await original(*args, **kwargs)
                 consumed.set()
 
+            # test-contract: seam signals consumption before inspecting the observer wire
             monkeypatch.setattr(control, "_event", publish)
 
         observe(record.control)
