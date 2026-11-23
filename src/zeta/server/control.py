@@ -1334,6 +1334,8 @@ class ServeControl:
     def _admit_controller(
         self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> object:
+        if not self.attached:
+            self._maybe_idle()  # a parked approval can change the summary without a live frame
         return self.server.publish_session_event(self.event_source(session_id), event, **fields)
 
     async def _notify(
