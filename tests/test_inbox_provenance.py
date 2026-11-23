@@ -425,7 +425,7 @@ async def test_session_history_neutralizes_legacy_inbox_wake_text(tmp_path: Path
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
-        server.runtime.opened.store._append_row("notification", {
+        server.controllers.attached().runtime.opened.store._append_row("notification", {
             "origin": MessageOrigin.NOTIFICATION.value, "kind": "project_inbox",
             "project_id": "p", "message_ids": ["m"], "description": "project inbox",
             "status": "new",

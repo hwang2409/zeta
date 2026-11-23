@@ -53,14 +53,14 @@ async def _run(client, call):
     return await client.connections.run_blocking(run)
 
 
-async def home_settings_get(client, request_id, params):
+async def home_settings_get(client, request_id, params, controller):
     from ....config import home_settings
 
     require_params(params)
     return await _run(client, lambda: home_settings.get(client.server.home))
 
 
-async def home_settings_update(client, request_id, params):
+async def home_settings_update(client, request_id, params, controller):
     from ....config import home_settings
 
     require_params(params, "expected_revision", "changes")

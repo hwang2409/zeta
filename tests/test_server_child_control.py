@@ -56,7 +56,7 @@ async def _session(tmp_path, backend):
 async def test_child_control_rejects_observer_and_invalid_inputs_before_persistence(tmp_path):
     backend = FakeBackend([])
     async with _session(tmp_path, backend) as (server, controller, session_id):
-        store = server.runtime.loop.store
+        store = server.controllers.attached().runtime.loop.store
         head = store.active_branch_head_id()
         observer = await connect_replay(server, "unix")
         try:
@@ -97,7 +97,7 @@ async def test_child_control_rejects_observer_and_invalid_inputs_before_persiste
 async def test_serve_spawn_lifecycle_and_cancel_race(tmp_path, monkeypatch, winner):
     backend = _GatedChild()
     async with _session(tmp_path, backend) as (server, controller, session_id):
-        loop = server.runtime.loop
+        loop = server.controllers.attached().runtime.loop
         loop.explicit_finish = True
         # test-contract: seam make this run use the real explicit-finish fence
         catalog = loop.tool_registry.agent_catalog

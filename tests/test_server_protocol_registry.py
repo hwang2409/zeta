@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import json
 import re
-from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -171,27 +170,25 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
         features=frozenset(),
         connections=SimpleNamespace(run_blocking=run_blocking),
         logins=Logins(tmp_path),
-        server=SimpleNamespace(
-            home=tmp_path,
-            runtime=SimpleNamespace(
-                opened=SimpleNamespace(metadata=SimpleNamespace(project_id="test-project", cwd=tmp_path)),
-                project_dir=tmp_path, session_id="test-session",
-                manager=SimpleNamespace(project_registry=ProjectRegistry.for_state_read(tmp_path / "projects", 0)),
-                loop=SimpleNamespace(_mcp_project_dir_value=tmp_path, tool_registry=None),
-            ),
-            _mcp_auth=MCPAuth(),
-            control=SimpleNamespace(
-                _reject_if_unhealthy=lambda: None,
-                client_turn_detached=lambda: False,
-                state_change_busy=lambda: False,
-                hold_wake_start=nullcontext,
-            ),
+        server=SimpleNamespace(home=tmp_path, _mcp_auth=MCPAuth()),
+    )
+    controller = SimpleNamespace(
+        runtime=SimpleNamespace(
+            opened=SimpleNamespace(metadata=SimpleNamespace(project_id="test-project", cwd=tmp_path)),
+            project_dir=tmp_path, session_id="test-session",
+            manager=SimpleNamespace(project_registry=ProjectRegistry.for_state_read(tmp_path / "projects", 0)),
+            loop=SimpleNamespace(_mcp_project_dir_value=tmp_path, tool_registry=None),
+        ),
+        control=SimpleNamespace(
+            _reject_if_unhealthy=lambda: None,
+            client_turn_detached=lambda: False,
+            state_change_busy=lambda: False,
         ),
     )
     failure = RuntimeError("unexpected test exception at /private/test-config with test-secret-canary")
     with patch(target, side_effect=failure) as owner:
         with pytest.raises(ProtocolError) as caught:
-            await handler(client, 7, params)
+            await handler(client, 7, params, controller)
         # test-contract: seam prove the injected failure came from the owner, not adapter setup
         assert owner.call_count == 1, f"{method} did not reach its owner"
 

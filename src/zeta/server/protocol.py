@@ -477,13 +477,13 @@ def served_methods() -> tuple[MethodDescriptor | ResourceDescriptor, ...]:
     return _SERVED_METHODS
 
 
-_RESOURCE_METHODS = collect_families()
-_SERVED_METHODS = (*MethodDescriptor, *(item for item in _RESOURCE_METHODS if not item.extends_legacy))
+RESOURCE_METHODS = collect_families()
+_SERVED_METHODS = (*MethodDescriptor, *(item for item in RESOURCE_METHODS if not item.extends_legacy))
 _METHODS_BY_WIRE = {item.wire: item for item in served_methods()}
 _METHOD_EXTENSIONS: dict[str, ResourceDescriptor] = {}
 if len(_METHODS_BY_WIRE) != len(served_methods()):
     raise RuntimeError("serve resource methods must have unique names and may not replace legacy methods")
-for _extension in _RESOURCE_METHODS:
+for _extension in RESOURCE_METHODS:
     if not _extension.extends_legacy:
         continue
     _legacy = _METHODS_BY_WIRE.get(_extension.wire)
@@ -495,7 +495,7 @@ for _extension in _RESOURCE_METHODS:
     ):
         raise RuntimeError("serve method extensions must preserve the legacy version and access")
     _METHOD_EXTENSIONS[_extension.wire] = _extension
-FEATURES = tuple(dict.fromkeys((*_LEGACY_FEATURES, *(item.feature for item in _RESOURCE_METHODS))))
+FEATURES = tuple(dict.fromkeys((*_LEGACY_FEATURES, *(item.feature for item in RESOURCE_METHODS))))
 
 
 EVENT_ACCESS = {

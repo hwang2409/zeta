@@ -1355,7 +1355,7 @@ async def test_pre_dispatch_stall_is_visible_while_durable_stage_is_shielded(
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         await _request(reader, writer, 2, "new_session", {})
-        root_loop = server.runtime.loop
+        root_loop = server.controllers.attached().runtime.loop
         assert root_loop is not None
         events = []
         sink = root_loop._background_event_sink

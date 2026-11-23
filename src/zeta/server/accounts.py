@@ -70,8 +70,7 @@ async def list_accounts(
     }
 
 
-async def list_account_catalog(client: Any) -> dict[str, object]:
-    runtime = client.server.runtime
+async def list_account_catalog(client: Any, runtime: ServerRuntime) -> dict[str, object]:
     context = getattr(runtime.loop, "account_context", None)
     selected = context.snapshot() if context is not None else {}
 

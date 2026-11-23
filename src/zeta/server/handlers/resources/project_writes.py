@@ -61,10 +61,10 @@ def _entry_id(value: object) -> str:
     return value
 
 
-def _registry(client):
+def _registry(runtime):
     from ...protocol import ErrorDescriptor, resource_error
 
-    registry = client.server.runtime.manager.project_registry
+    registry = runtime.manager.project_registry
     if registry is None:
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
     return registry
@@ -199,20 +199,19 @@ def _memory_write(registry, project_id: str, revision: str, mutation: object) ->
     return write
 
 
-async def project_memory_update(client, request_id, params):
+async def project_memory_update(client, request_id, params, controller):
     require_params(params, "project_id", "revision", "mutation")
     require_revision(params["revision"])
-    registry = _registry(client)
+    registry = _registry(controller.runtime)
     project_id = _project_id(params)
     write = _memory_write(registry, project_id, params["revision"], params["mutation"])
     return await client.connections.run_blocking(lambda: _owner_call(registry, project_id, write))
 
 
-def _sender(client) -> tuple[str, str, Any]:
+def _sender(runtime) -> tuple[str, str, Any]:
     """The attached session and its project are the sender, exactly as `/inbox send` uses them."""
     from ...protocol import ErrorDescriptor, resource_error
 
-    runtime = client.server.runtime
     if runtime.opened is None or runtime.loop is None:
         raise resource_error(ErrorDescriptor.NO_ACTIVE_SESSION)
     project_id = runtime.opened.metadata.project_id
@@ -221,7 +220,7 @@ def _sender(client) -> tuple[str, str, Any]:
     return project_id, runtime.session_id, runtime.loop
 
 
-async def project_inbox_send(client, request_id, params):
+async def project_inbox_send(client, request_id, params, controller):
     from ...protocol import invalid_resource_params
 
     require_params(params, "project_id", "mutation")
@@ -238,8 +237,8 @@ async def project_inbox_send(client, request_id, params):
     ):
         raise invalid_resource_params()
     title, body = _text(mutation["title"]), _text(mutation["body"], empty=True)
-    registry = _registry(client)
-    from_project, from_session, loop = _sender(client)
+    registry = _registry(controller.runtime)
+    from_project, from_session, loop = _sender(controller.runtime)
     # One delivery id per sender session and recipient: a retry maps to the same message id,
     # so the owner's immutable-record check gives idempotency and rejects a changed payload.
     message_id = hashlib.sha256(

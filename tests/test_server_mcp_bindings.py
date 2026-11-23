@@ -2354,12 +2354,12 @@ async def test_serve_restart_runs_the_restored_approved_mcp_tool(
         assert "error" not in resumed[-1]
         allowed = await _request(reader, writer, 3, "approve", {"request_id": "page-call"})
         assert "error" not in allowed[-1]
-        assert server.control._turn_task is not None
+        assert server.controllers.attached().control._turn_task is not None
         await await_or_fail(
-            asyncio.shield(server.control._turn_task), timeout=30, what="restored tool"
+            asyncio.shield(server.controllers.attached().control._turn_task), timeout=30, what="restored tool"
         )
 
-        result = server.runtime.opened.store.tool_result("page-call")
+        result = server.controllers.attached().runtime.opened.store.tool_result("page-call")
         assert result is not None
         assert result.is_error is not server_kept, result.content
         assert mcp.methods.count("tools/call") == int(server_kept)

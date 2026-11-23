@@ -28,7 +28,7 @@ def live_view(telemetry: Telemetry) -> dict[str, Any]:
     }
 
 
-async def telemetry_status(client, request_id, params):
+async def telemetry_status(client, request_id, params, controller):
     if params:
         raise ProtocolError(ErrorDescriptor.INVALID_TELEMETRY_PARAMS, "invalid params")
     home = client.server.home
@@ -36,37 +36,37 @@ async def telemetry_status(client, request_id, params):
     return await _read(client, request_id, lambda reader, fits: reader.status(home, _endpoint(home), live))
 
 
-async def telemetry_sessions(client, request_id, params):
+async def telemetry_sessions(client, request_id, params, controller):
     return await _read(client, request_id, lambda reader, fits: reader.sessions(client.server.home, params, fits))
 
 
-async def telemetry_trace(client, request_id, params):
+async def telemetry_trace(client, request_id, params, controller):
     return await _read(client, request_id, lambda reader, fits: reader.trace(client.server.home, params, fits))
 
 
-async def telemetry_overview(client, request_id, params):
+async def telemetry_overview(client, request_id, params, controller):
     home = client.server.home
     live = live_view(client.server.telemetry)
     return await _read(client, request_id, lambda reader, fits: reader.overview(home, params, fits, _endpoint(home), live))
 
 
-async def telemetry_models(client, request_id, params):
+async def telemetry_models(client, request_id, params, controller):
     return await _read(client, request_id, lambda reader, fits: reader.models(client.server.home, params, fits))
 
 
-async def telemetry_tools(client, request_id, params):
+async def telemetry_tools(client, request_id, params, controller):
     return await _read(client, request_id, lambda reader, fits: reader.tools(client.server.home, params, fits))
 
 
-async def telemetry_errors(client, request_id, params):
+async def telemetry_errors(client, request_id, params, controller):
     return await _read(client, request_id, lambda reader, fits: reader.errors(client.server.home, params, fits))
 
 
-async def telemetry_series(client, request_id, params):
+async def telemetry_series(client, request_id, params, controller):
     return await _read(client, request_id, lambda reader, fits: reader.series(client.server.home, params, fits))
 
 
-async def telemetry_agent_tree(client, request_id, params):
+async def telemetry_agent_tree(client, request_id, params, controller):
     return await _read(client, request_id, lambda reader, fits: reader.agent_tree(client.server.home, params, fits))
 
 

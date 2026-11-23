@@ -36,11 +36,10 @@ def _owner_error(code: str):
     }[code])
 
 
-def _active(client, params):
+def _active(runtime, params):
     from ...protocol import ErrorDescriptor, resource_error
 
     session_id = _string(params, "session_id", 256)
-    runtime = client.server.runtime
     if runtime.opened is None:
         raise resource_error(ErrorDescriptor.NO_ACTIVE_SESSION)
     if runtime.session_id != session_id:
@@ -50,37 +49,36 @@ def _active(client, params):
     return runtime.loop
 
 
-async def child_run_spawn(client, request_id, params):
+async def child_run_spawn(client, request_id, params, controller):
     from ....agent.runner import ChildControlError, spawn_child
     from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
 
     require_params(params, "session_id", "agent_type", "task", optional=("cwd", "background"))
-    loop = _active(client, params)
+    loop = _active(controller.runtime, params)
     agent_type = _string(params, "agent_type", 256)
     task = _string(params, "task", 64 * 1024)
     cwd = _string(params, "cwd", 4096) if "cwd" in params else None
     if params.get("background", True) is not True:
         raise invalid_resource_params()
-    control = client.server.control
+    control = controller.control
     control._reject_if_unhealthy()
     if control.client_turn_detached():
         raise resource_error(ErrorDescriptor.NO_ACTIVE_SESSION)
     if control.state_change_busy():
         raise resource_error(ErrorDescriptor.OPERATION_BUSY)
     try:
-        with control.hold_wake_start():
-            run_id = await spawn_child(loop, agent_type=agent_type, task=task, cwd=cwd)
+        run_id = await spawn_child(loop, agent_type=agent_type, task=task, cwd=cwd)
     except ChildControlError as exc:
         raise _owner_error(exc.code) from None
     return {"data": {"accepted": True, "run_id": run_id}}
 
 
-async def child_run_cancel(client, request_id, params):
+async def child_run_cancel(client, request_id, params, controller):
     from ....agent.runner import ChildControlError, cancel_child_run
     from ...protocol import invalid_resource_params
 
     require_params(params, "session_id", "run_id", optional=("reason",))
-    loop = _active(client, params)
+    loop = _active(controller.runtime, params)
     run_id = _string(params, "run_id", 256)
     if params.get("reason", "user_cancelled") != "user_cancelled":
         raise invalid_resource_params()

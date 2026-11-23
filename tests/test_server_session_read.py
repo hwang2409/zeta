@@ -52,8 +52,8 @@ class Harness:
         self.other_project = registry.create_project("beta", "repo").project_id
 
     def session(self, project_id: str | None, turns: int = 0, *, keep_open: bool = False):
-        opened = self.server.runtime.manager.create(
-            provider="codex", model="offline", cwd=self.server.runtime.cwd, project_id=project_id, auto_project=False,
+        opened = self.server.controllers.attached().runtime.manager.create(
+            provider="codex", model="offline", cwd=self.server.controllers.attached().runtime.cwd, project_id=project_id, auto_project=False,
         )
         for turn in range(turns):
             append_turn(opened.store, f"turn {turn}")
@@ -87,7 +87,7 @@ async def start(tmp_path: Path, attach: bool = True, *, projectless: bool = Fals
     attached = None
     if attach:
         attached = await asyncio.to_thread(harness.session, None if projectless else harness.project)
-        await harness.server.runtime.resume_session(attached)
+        await harness.server.controllers.attached().runtime.resume_session(attached)
     await harness.server.start()
     return harness, attached
 
@@ -166,8 +166,8 @@ async def test_observer_reads_same_project_session_as_its_session_history(tmp_pa
             rows = [row for group in (reversed(pages) if direction == "backward" else pages) for row in group]
             assert rows == forward["messages"], direction
 
-        assert harness.server.runtime.session_id == attached
-        with session_root(harness.server.runtime.manager.sessions_dir) as root, child_directory(root, target) as fd:
+        assert harness.server.controllers.attached().runtime.session_id == attached
+        with session_root(harness.server.controllers.attached().runtime.manager.sessions_dir) as root, child_directory(root, target) as fd:
             assert execution_owner_state(fd) is None, "the read must not take execution ownership"
     finally:
         await close_serve(harness.server, *harness.writers)

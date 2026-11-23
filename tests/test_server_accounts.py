@@ -50,7 +50,7 @@ async def test_account_list_error_contract(tmp_path: Path, monkeypatch, negotiat
         if not negotiated:
             created = await request("new_session", {"provider": "codex"})
             params["session_id"] = created["result"]["session"]["session_id"]
-            loop = server.runtime.loop
+            loop = server.controllers.attached().runtime.loop
             with patch.object(loop, "account_context", None):
                 error = (await request("account_list", params))["error"]
                 assert error == {"code": -32005, "message": "accounts unavailable for this session"}

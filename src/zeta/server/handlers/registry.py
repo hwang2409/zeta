@@ -10,6 +10,7 @@ from .. import abort_scope, accounts, model_selection, slash_commands
 from .. import control as session_grants
 from ..protocol import (
     APPROVAL_SCOPES,
+    RESOURCE_METHODS,
     Access,
     ApprovalDecision,
     ErrorDescriptor,
@@ -77,7 +78,7 @@ class Resolve(Enum):
 
 _O, _S, _N, _F = Resolve.OWNED, Resolve.SELECTED, Resolve.NONE, Resolve.OWNED_FIRST
 _M = MethodDescriptor
-RESOLVE: dict[MethodDescriptor, Resolve] = {
+RESOLVE: dict[MethodDescriptor | tuple[str, str], Resolve] = {
     _M.LIST_SESSIONS: _N,
     _M.NEW_SESSION: _O,
     _M.RESUME: _O,
@@ -130,14 +131,83 @@ RESOLVE: dict[MethodDescriptor, Resolve] = {
     _M.CHILD_RUN_LIST: _S,
     _M.CHILD_RUN_SEND: _O,
     _M.MCP_REFRESH_TOOLS: _F,
+    _M.STATE_SESSIONS: _O,
+    _M.STATE_SESSION: _O,
+    _M.STATE_AGENTS: _O,
+    _M.STATE_BACKGROUND_TASKS: _O,
+    _M.STATE_CATALOG: _N,
+    _M.STATE_PROJECTS: _N,
+    _M.STATE_MEMORY: _N,
+    _M.STATE_MEMORY_DETAIL: _N,
+    _M.STATE_INBOX: _N,
+    _M.STATE_INBOX_DETAIL: _N,
+    _M.STATE_ATTENTION: _N,
+    _M.STATE_SETTINGS: _N,
+    _M.STATE_ACCOUNTS: _N,
+    _M.STATE_STORAGE: _N,
+    _M.STATE_RETENTION: _N,
+    _M.TELEMETRY_STATUS: _N,
+    _M.TELEMETRY_SESSIONS: _N,
+    _M.TELEMETRY_TRACE: _N,
+    _M.TELEMETRY_OVERVIEW: _N,
+    _M.TELEMETRY_MODELS: _N,
+    _M.TELEMETRY_TOOLS: _N,
+    _M.TELEMETRY_ERRORS: _N,
+    _M.TELEMETRY_SERIES: _N,
+    _M.TELEMETRY_AGENT_TREE: _N,
+    # account_list_idle_v1
+    ("account_list_idle_v1", "account_list"): _O,
+    ("account_list_idle_v1", "login_start"): _O,
+    # agent_run_catalog_v1
+    ("agent_run_catalog_v1", "agent_run_catalog"): _N,
+    # child_run_control_v1
+    ("child_run_control_v1", "child_run_spawn"): _O,
+    ("child_run_control_v1", "child_run_cancel"): _O,
+    # home_settings_v1
+    ("home_settings_v1", "home_settings_get"): _N,
+    ("home_settings_v1", "home_settings_update"): _O,
+    # library_read_v1
+    ("library_read_v1", "skill_catalog"): _O,
+    ("library_read_v1", "skill_read"): _O,
+    ("library_read_v1", "agent_profile_catalog"): _O,
+    ("library_read_v1", "agent_profile_read"): _O,
+    # library_write_v1
+    ("library_write_v1", "skill_write"): _O,
+    ("library_write_v1", "skill_delete"): _O,
+    ("library_write_v1", "agent_profile_write"): _O,
+    ("library_write_v1", "agent_profile_delete"): _O,
+    # mcp_management_v1
+    ("mcp_management_v1", "mcp_server_list"): _O,
+    ("mcp_management_v1", "mcp_server_add"): _O,
+    ("mcp_management_v1", "mcp_server_remove"): _O,
+    ("mcp_management_v1", "mcp_server_set_enabled"): _O,
+    ("mcp_management_v1", "mcp_server_set_trusted"): _O,
+    ("mcp_management_v1", "mcp_server_test"): _O,
+    ("mcp_management_v1", "mcp_auth_start"): _O,
+    ("mcp_management_v1", "mcp_auth_status"): _N,
+    ("mcp_management_v1", "mcp_auth_cancel"): _O,
+    ("mcp_management_v1", "mcp_auth_logout"): _O,
+    # project_writes_v1
+    ("project_writes_v1", "project_memory_update"): _O,
+    ("project_writes_v1", "project_inbox_send"): _O,
+    # session_history_read_v1
+    ("session_history_read_v1", "session_history_read"): _O,
 }
-if RESOLVE.keys() != set(MethodDescriptor) or any(
-    (RESOLVE[item] is Resolve.OWNED_FIRST) != (item.access is Access.SESSION_MUTATION)
+
+
+def _policy_key(descriptor: MethodDescriptor | ResourceDescriptor) -> MethodDescriptor | tuple[str, str]:
+    if isinstance(descriptor, ResourceDescriptor):
+        return descriptor.feature, descriptor.wire
+    return descriptor
+
+
+if RESOLVE.keys() != {_policy_key(item) for item in (*MethodDescriptor, *RESOURCE_METHODS)} or any(
+    (RESOLVE[_policy_key(item)] is Resolve.OWNED_FIRST) != (item.access is Access.SESSION_MUTATION)
     or (
         item.access in {Access.DELIVERY, Access.CONTROLLER_WRITE}
-        and RESOLVE[item] is not Resolve.OWNED
+        and RESOLVE[_policy_key(item)] is not Resolve.OWNED
     )
-    for item in MethodDescriptor
+    for item in (*MethodDescriptor, *RESOURCE_METHODS)
 ):
     raise RuntimeError("serve method resolve policies are not exhaustive")
 
@@ -673,11 +743,12 @@ async def dispatch(
         raise ProtocolError(
             ErrorDescriptor.METHOD_NOT_FOUND, f"method not found: {method}"
         )
-    policy = RESOLVE[descriptor]
+    policy = RESOLVE[_policy_key(descriptor)]
+    handler = descriptor.handler if isinstance(descriptor, ResourceDescriptor) else HANDLERS[descriptor]
     if policy is not Resolve.OWNED_FIRST:
         _require_negotiated(client, descriptor)
     if policy not in {Resolve.OWNED_FIRST, Resolve.OWNED}:
-        return await HANDLERS[descriptor](client, request_id, params, None)
+        return await handler(client, request_id, params, None)
     with client.server.controllers.owned(client) as controller:
         if policy is Resolve.OWNED_FIRST:
             # legacy order: a mutation's health error precedes its version/feature error
@@ -688,11 +759,11 @@ async def dispatch(
         if descriptor.access in {Access.SESSION_MUTATION, Access.CONTROLLER_WRITE}:
             # a queued wake may not start its setup while a state change runs
             with controller.control.hold_wake_start():
-                return await HANDLERS[descriptor](client, request_id, params, controller)
-        return await HANDLERS[descriptor](client, request_id, params, controller)
+                return await handler(client, request_id, params, controller)
+        return await handler(client, request_id, params, controller)
 
 
-def _require_negotiated(client: object, descriptor: MethodDescriptor) -> None:
+def _require_negotiated(client: object, descriptor: MethodDescriptor | ResourceDescriptor) -> None:
     if descriptor.since is not None and tuple(
         int(part) for part in client.protocol_version.split(".")  # type: ignore[attr-defined]
     ) < tuple(int(part) for part in descriptor.since.split(".")):

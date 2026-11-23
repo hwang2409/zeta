@@ -155,7 +155,7 @@ def _retrieve(future: asyncio.Future) -> None:
         future.exception()  # a timed-out caller no longer awaits this result
 
 
-async def _handle(client, request_id, params):
+async def _handle(client, request_id, params, controller):
     from ...protocol import (
         MAX_FRAME_BYTES,
         ErrorDescriptor,
@@ -182,7 +182,7 @@ async def _handle(client, request_id, params):
         start = resume(params.get("cursor"), (_METHOD, session_id, direction), (0,), _ORDER)
     except (SessionError, InvalidParams):
         raise invalid_resource_params() from None
-    runtime = client.server.runtime
+    runtime = controller.runtime
     opened = runtime.opened
     if opened is None:
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
@@ -195,8 +195,9 @@ async def _handle(client, request_id, params):
         error.data["retry_after_ms"] = RETRY_AFTER_MS
         raise error
     features = history_features(client.features)
+    manager = runtime.manager
     read = asyncio.ensure_future(client.connections.run_blocking(lambda: _read(
-        client.server.home, runtime.manager, session_id, project_id, request_id, features,
+        client.server.home, manager, session_id, project_id, request_id, features,
         start, direction == "backward", limit, max_bytes,
     )))
     _in_flight[loop] = read
