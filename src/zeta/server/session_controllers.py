@@ -13,6 +13,7 @@ from ..runtime.foreground_events import SessionEventSource
 from .protocol import ErrorDescriptor, ProtocolError
 
 if TYPE_CHECKING:
+    from ..session_retention.activation import RetentionActivationOwner
     from .control import ServeControl
     from .runtime import ServerRuntime
 
@@ -123,7 +124,11 @@ class SessionUse:
 class SessionControllers:
     """Own the attached record and the records available for selection."""
 
-    def __init__(self, control: ServeControl, *, owns_runtime: bool = True) -> None:
+    def __init__(
+        self, control: ServeControl, *, owns_runtime: bool = True,
+        retention_owner: RetentionActivationOwner | None = None,
+    ) -> None:
+        self._retention_owner = retention_owner
         self._generations = itertools.count(1)
         self._records: dict[ServeControl, SessionController] = {
             control: SessionController(control, next(self._generations), owns_runtime)
@@ -429,10 +434,16 @@ class SessionControllers:
             self._by_session[acquisition.session_id] = acquisition.target
         return None
 
+    def bind_retention_planner(self) -> None:
+        # Bind at startup and legacy swaps, not when the planner publishes.
+        if self._retention_owner is not None:
+            self._retention_owner.set_publish(self._attached.runtime.retention_event_sink)
+
     def attach(self, record: SessionController) -> SessionController:
         assert not record.closing
         self._parked.pop(record.runtime.session_id, None)
         self._attached = record
+        self.bind_retention_planner()
         return record
 
     def park(self, record: SessionController) -> SessionController:

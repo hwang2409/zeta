@@ -339,7 +339,9 @@ class ZetaServer:
         control = ServeControl(self, runtime, self.foreground_event_publisher)
         # every pair shares this manager; sessionless reads use it with no record
         self.manager = runtime.manager
-        self.controllers = SessionControllers(control, owns_runtime=not self._borrowed)
+        self.controllers = SessionControllers(
+            control, owns_runtime=not self._borrowed, retention_owner=self._retention_owner,
+        )
         self._borrowed_source = (control.event_source(runtime.session_id if runtime.opened is not None else None)
                                  if foreground_event_publisher is not None else None)
         self._bind_pair(control)
@@ -506,10 +508,7 @@ class ZetaServer:
         if self._foreground_event_publisher is not None:
             self._foreground_subscription = self._foreground_event_publisher.subscribe()
             self._foreground_task = asyncio.create_task(self._publish_foreground_events())
-        if self._retention_owner is not None:
-            self._retention_owner.set_publish(
-                self.controllers.attached().runtime.retention_event_sink
-            )
+        self.controllers.bind_retention_planner()
 
     async def serve_forever(self) -> None:
         if self._server is None:
