@@ -228,6 +228,7 @@ class ServerRuntime:
         self.manager = SessionManager(self.home, owner_surface="serve")
         self._project_registry_probed = False
         self._state: SessionState | None = None
+        self.attachment_generation = 0
         self._init_sinks()
 
     def _init_sinks(self) -> None:
@@ -312,6 +313,7 @@ class ServerRuntime:
         runtime._project_registry_probed = True
         runtime._init_sinks()
         runtime._telemetry_source = lambda: loop.telemetry
+        runtime.attachment_generation = 0
         runtime._state = SessionState(
             opened=opened,
             loop=loop,
@@ -335,6 +337,7 @@ class ServerRuntime:
                 setattr(runtime, name, getattr(self, name))
         runtime._project_registry_probed = True
         runtime._state = None
+        runtime.attachment_generation = 0
         runtime._init_sinks()
         return runtime
 
@@ -487,14 +490,17 @@ class ServerRuntime:
         await self._replace(composition)
         return self.metadata
 
-    def _prepare_new_session(
+    def launch_project_id(self) -> str | None:
+        """Resolve the project a default new session would get, without opening one."""
+        _, _, _, _, project, _ = self._new_session_project(self.cwd, None, None)
+        return project.project_id if project is not None else None
+
+    def _new_session_project(
         self, session_cwd: Path, provider: str | None, model: str | None
-    ) -> tuple[object, object, object, object, object, object]:
+    ):
         discovery = discover_project(session_cwd, user_home=self.home.parent)
         repo_root = discovery.primary_root or discovery.cwd
         config = self._config(provider, model, project_root=repo_root)
-        skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
-        agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
         registry = self.manager.project_registry
         if registry is not None and config.auto_project:
             try:
@@ -516,6 +522,17 @@ class ServerRuntime:
         )
         if session_project is None and cwd_project is not None:
             session_project = cwd_project
+        return discovery, repo_root, config, projection, session_project, cwd_project
+
+    def _prepare_new_session(
+        self, session_cwd: Path, provider: str | None, model: str | None
+    ) -> tuple[object, object, object, object, object, object]:
+        discovery, repo_root, config, projection, session_project, cwd_project = (
+            self._new_session_project(session_cwd, provider, model)
+        )
+        skill_catalog = discover_session_skills(home=self.home, project_dir=repo_root)
+        agent_catalog = discover_session_agents(home=self.home, project_dir=repo_root)
+        registry = self.manager.project_registry
         context, projection = compose_with_stable_projection(
             registry,
             session_project.project_id if session_project is not None else None,
@@ -765,6 +782,7 @@ class ServerRuntime:
         try:
             await self.close()
             self._state = state
+            self.attachment_generation += 1
             if self._approval_control_binder is not None:
                 self._approval_control_binder(state.policy)
             self._bind_background_event_sink(state)

@@ -21,6 +21,7 @@ from ....core.session_files import (
     session_root,
 )
 from ....core.store import ConversationStore, ObserverSnapshotChanged
+from ....project_registry import ProjectRegistryError
 from ....read_page import InvalidParams, Key, TooLarge, page_result, resume
 from ....storage_format import StorageFormatError, open_reader
 from ...resource_protocol import Access, ResourceMethod, require_params
@@ -184,10 +185,9 @@ async def _handle(client, request_id, params):
         raise invalid_resource_params() from None
     runtime = client.server.runtime
     opened = runtime.opened
-    if opened is None:
-        raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
-    project_id = opened.metadata.project_id  # None reads only project-less sessions
-    if session_id == runtime.session_id:
+    generation = runtime.attachment_generation if opened is None else None
+    project_id = opened.metadata.project_id if opened is not None else None
+    if opened is not None and session_id == runtime.session_id:
         raise invalid_resource_params()  # the attached session pages through session_history
     loop = asyncio.get_running_loop()
     if loop in _in_flight:
@@ -195,10 +195,24 @@ async def _handle(client, request_id, params):
         error.data["retry_after_ms"] = RETRY_AFTER_MS
         raise error
     features = history_features(client.features)
-    read = asyncio.ensure_future(client.connections.run_blocking(lambda: _read(
-        client.server.home, runtime.manager, session_id, project_id, request_id, features,
-        start, direction == "backward", limit, max_bytes,
-    )))
+
+    def launch_project_id():
+        try:
+            return runtime.launch_project_id()
+        except (ProjectRegistryError, OSError, ValueError, StorageFormatError):
+            raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
+
+    def read_page():
+        scope = launch_project_id() if opened is None else project_id
+        page = _read(
+            client.server.home, runtime.manager, session_id, scope, request_id, features,
+            start, direction == "backward", limit, max_bytes,
+        )
+        if opened is None and launch_project_id() != scope:
+            raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
+        return page
+
+    read = asyncio.ensure_future(client.connections.run_blocking(read_page))
     _in_flight[loop] = read
     # The slot frees only when the worker thread is done, even after a timeout or cancel.
     read.add_done_callback(lambda done: (_retrieve(done), _in_flight.pop(loop, None)))
@@ -207,7 +221,14 @@ async def _handle(client, request_id, params):
             page = await asyncio.shield(read)
     except TimeoutError:
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
-    if runtime.opened is not opened or opened.metadata.project_id != project_id:
+    if opened is None:
+        # A session can attach and detach before the worker returns to an idle serve.
+        if (
+            client.server.runtime is not runtime or runtime.opened is not None
+            or runtime.attachment_generation != generation
+        ):
+            raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
+    elif runtime.opened is not opened or opened.metadata.project_id != project_id:
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
     return page
 
