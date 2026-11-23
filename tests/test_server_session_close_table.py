@@ -68,6 +68,7 @@ class Hold:
     def __init__(self) -> None:
         self.entered = asyncio.Event()
         self.opened = asyncio.Event()
+        self.cancelled = asyncio.Event()
         self.count = 0
 
     async def __call__(self) -> None:
@@ -79,6 +80,7 @@ class Hold:
                 await asyncio.wait_for(asyncio.shield(self.opened.wait()), 10)
             except asyncio.CancelledError:
                 cancelled = True
+                self.cancelled.set()
         if cancelled:
             raise asyncio.CancelledError
 
@@ -234,6 +236,8 @@ async def delivery_cancel_before_commit(run: Run) -> None:
     exists."""
     store, turns, echoes, delivery_id = await _delivery_held_at_commit(run, before_commit=True)
     closing = await run.shutdown_while_held()
+    if run.transport == "unix":
+        await await_or_fail(run.hold.cancelled.wait(), what="shutdown cancels the held delivery")
     await run.finish(closing)
     committed = store.client_delivery(delivery_id) is not None
     assert turns[0] == int(committed) and echoes[0] <= turns[0], (committed, turns, echoes)
