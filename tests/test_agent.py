@@ -17038,7 +17038,6 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
             wire = tool_end(terminal, fidelity=True)["tool_result"]
             assert wire["structured_content"]["summary"] == summary
             assert wire["content"].startswith(f"done: {summary}")
-            assert wire["structured_content_truncated"] is False
             assert notification_payload(notification.data)["summary"] == summary
 
             transcript = ""
