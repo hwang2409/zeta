@@ -9,6 +9,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from markdown_it import MarkdownIt
+
 from ..core.agent_progress import publish_child_ended
 from ..core.checkpoints import ConversationEntry
 from ..protocol.types import (
@@ -593,6 +595,31 @@ def agent_output_pointer(handle: str) -> str:
     return f"agent action=output handle={handle}"
 
 
+def finish_report_truncation_note(handle: str) -> str:
+    return (
+        f"{_TRUNCATION_NOTE.strip()} Ask this agent for the full report: "
+        f"{agent_output_pointer(handle)}"
+    )
+
+
+def _markdown_cut(summary: str, end: int) -> int:
+    # Block maps have source offsets in lines; inline tokens have no source
+    # columns. Keep only whole inline blocks that might contain a link or code.
+    offsets = [0, *(match.end() for match in re.finditer(r"\r\n?|\n", summary)), len(summary)]
+    for token in MarkdownIt("commonmark").enable("table").parse(summary):
+        if token.map is None:
+            continue
+        first, last = token.map
+        if not offsets[first] < end < offsets[last]:
+            continue
+        if token.type == "fence" or (
+            token.type in {"inline", "table_open"}
+            and any(c in summary[offsets[first]:offsets[last]] for c in "[`<")
+        ):
+            end = offsets[first]
+    return len(summary[:end].rstrip())
+
+
 def build_explicit_finish_receipt(
     report: Mapping[str, object],
     stats: Mapping[str, object] | None,
@@ -627,10 +654,7 @@ def build_explicit_finish_receipt(
     full = candidate(summary)
     if json_size(full) <= max_bytes:
         return full
-    note = (
-        f"{_TRUNCATION_NOTE.strip()} Read the full report: "
-        f"{agent_output_pointer(child_instance_id)}"
-    )
+    note = finish_report_truncation_note(child_instance_id)
     if json_size(candidate(note)) > max_bytes:
         base = fields
     ends = [0, *(match.end() for match in re.finditer(r"\S+", summary) if match.end() < len(summary))]
@@ -645,7 +669,7 @@ def build_explicit_finish_receipt(
             low = middle
         else:
             high = middle - 1
-    return candidate(preview(ends[low]))
+    return candidate(preview(_markdown_cut(summary, ends[low])))
 
 
 def build_agent_progress(

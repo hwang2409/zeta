@@ -16941,25 +16941,31 @@ async def test_explicit_finish_ignores_parent_run_background_task(
         store.close()
 
 
-@pytest.mark.parametrize("long_report", [False, True], ids=["short", "long"])
+@pytest.mark.parametrize(
+    "construct",
+    [None, "[cut here {}](https://example.com/report)", "`cut here {}`", "```text\ncut here {}\n```"],
+    ids=["fits", "link", "code-span", "fence"],
+)
 @pytest.mark.asyncio
 async def test_explicit_finish_background_child_preserves_report_end_to_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, long_report: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, construct: str | None
 ) -> None:
+    from zeta.tui.render import render_event
+
+    prefix = "\n\n".join(
+        f"Check {i}: verified that the integration wrapper returns the expected "
+        "result when a background build completes. Replayed the parent session "
+        "and confirmed that each completed job still has its own report. "
+        "The existing workflow needs no configuration changes."
+        for i in range(1, 18 if construct else 13)
+    )
+    prefix += "\n\n[exact-head remote tests](https://example.com/ci) passed with `pytest`."
     report = {
         "status": "done",
-        "summary": "implemented the requested repair",
+        "summary": f"{prefix}\n\n{construct.format('segment ' * 150)}" if construct else prefix,
         "head_sha": "abcdef0",
         "verdict": "pass",
     }
-    if long_report:
-        report["summary"] = "\n\n".join(
-            f"Check {i}: verified that the integration wrapper returns the expected "
-            "result when a background build completes. Replayed the parent session "
-            "and confirmed that each completed job still has its own report. "
-            "The existing workflow needs no configuration changes."
-            for i in range(1, 22)
-        )
     finish_call = ToolCall("finish-1", "finish", report)
     backend = FakeBackend(
         [
@@ -17015,30 +17021,32 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
 
         assert terminal.tool_result is not None
         assert terminal.tool_result.structured_content is not None
-        summary = report["summary"]
-        if long_report:
+        console_output = StringIO()
+        console = Console(file=console_output, width=120, color_system=None)
+        console.print(render_event(terminal))
+        rendered = console_output.getvalue()
+        assert "done: Check 1" in rendered
+        summary = prefix
+        if construct:
             from zeta.server.event_contract import notification_payload, tool_end
-            from zeta.tui.render import render_event
 
             handle = notification.data["child_instance_id"]
-            pointer = f"agent action=output handle={handle}"
-            shown = terminal.tool_result.structured_content["summary"]
-            marker = f"\n\n[truncated] Read the full report: {pointer}"
-            assert shown.endswith(marker), f"summary silently cut to {len(shown)} characters"
-            prefix = shown.removesuffix(marker)
-            assert len(prefix) > 4_000
-            assert summary.startswith(prefix) and summary[len(prefix)].isspace()
-            summary = shown
-
-            console_output = StringIO()
-            console = Console(file=console_output, width=120, color_system=None)
-            console.print(render_event(terminal))
-            assert "done: Check 1" in console_output.getvalue()
-            assert f"[truncated] Read the full report: {pointer}" in console_output.getvalue()
+            marker = f"[truncated] Ask this agent for the full report: agent action=output handle={handle}"
+            assert marker in rendered, "completion card cut the report without a visible marker"
+            assert "cut here" not in rendered
+            summary += f"\n\n{marker}"
             wire = tool_end(terminal, fidelity=True)["tool_result"]
             assert wire["structured_content"]["summary"] == summary
             assert wire["content"].startswith(f"done: {summary}")
             assert notification_payload(notification.data)["summary"] == summary
+
+            console_output.seek(0)
+            console_output.truncate()
+            console.print(render_event(StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={"kind": "agent_completion", **notification.data},
+            )))
+            assert marker in console_output.getvalue()
 
             transcript = ""
             offset = 0
@@ -17064,6 +17072,9 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
                     if isinstance(block, ToolUseContent)
                 )
 
+        assert "exact-head remote tests (https://example.com/ci) passed with pytest." in rendered
+        assert "[exact-head remote tests]" not in rendered
+        assert "`pytest`" not in rendered
         expected = {
             "report_status": report["status"],
             "summary": summary,
