@@ -705,17 +705,22 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
     policy = server.controllers.attached().runtime.policy
     assert policy is not None
     request = ApprovalRequest(call.id, call, child_instance_id="child")
-    events: list[str] = []
-    original_notify = server.controllers.attached().control._notify
+    events: list[EventDescriptor] = []
+    original_publish = server.publish_session_event
 
-    async def record_notify(event: str, *args: object, **kwargs: object) -> bool:
+    def record_publish(source, event: EventDescriptor, **fields):
         events.append(event)
-        return await original_notify(event, *args, **kwargs)
+        return original_publish(source, event, **fields)
 
-    # test-contract: seam patches the attached pair's private hook
-    monkeypatch.setattr(server.controllers.attached().control, "_notify", record_notify)
     parent = server.controllers.attached().runtime.opened.store
+    gate = _StoreGate(parent, "append_approval_history")
+    start = None
     try:
+        # The independent retention planner also uses the session event route.
+        if server._retention_owner is not None:
+            await server._retention_owner.stop()
+        monkeypatch.setattr(server, "publish_session_event", record_publish)
+        gate.install(monkeypatch)
         policy.register_delegated(request, child, child_instance_id="child")
         start = asyncio.create_task(
             server.controllers.attached().control._event(
@@ -728,16 +733,11 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
                 background=True,
             )
         )
-        # the async durable-writer seam does not expose the old registry-thread gate;
-        # cleanup may overlap the off-loop history append without publishing a ghost.
-        async with asyncio.timeout(10):
-            while ("child", call.id) not in server.controllers.attached().control._approvals.state.records:
-                await asyncio.sleep(0)
+        await _wait_thread_gate(gate)
         cleanup = policy.cleanup_delegated("child")
-        cleanup_task = asyncio.ensure_future(cleanup) if cleanup is not None else None
-        await asyncio.wait_for(
-            asyncio.gather(start, *(task for task in [cleanup_task] if task)), 10
-        )
+        assert cleanup is not None
+        gate.release.set()
+        await asyncio.wait_for(asyncio.gather(start, cleanup), 10)
         await server.controllers.attached().control.wait_for_approval_settlement()
 
         history = [
@@ -754,8 +754,15 @@ async def test_delegated_cleanup_during_request_history_write_publishes_no_ghost
         assert events == []
         assert server.controllers.attached().control.pending_approvals_now() == []
     finally:
-        await close_serve(server, writer)
-        child.close()
+        gate.release.set()
+        try:
+            if start is not None:
+                await await_or_fail(
+                    asyncio.gather(start, return_exceptions=True), what="approval start cleanup"
+                )
+        finally:
+            await close_serve(server, writer)
+            child.close()
 
 
 @pytest.mark.asyncio
