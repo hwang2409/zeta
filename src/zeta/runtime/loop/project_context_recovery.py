@@ -72,23 +72,22 @@ class ProjectContextRecoveryMixin:
         generation = self._prompt_generation
         base = self._skill_prompt_base()
         context = await await_joined_offload(self._project_context_prepare, projection)
-        prepared = RuntimePrompt(context.system_prompt, context.prompt_components)
-        if self._project_context_replace_component is None:
+        component = self._project_context_replace_component
+        if component is None:
             prompt = replace_runtime_prompt(
                 base, context.system_prompt, context.prompt_components
             )
+        elif component not in base.prompt_components:
+            # Like a fresh inheriting child, keep the prompt if it has no owned slot.
+            prompt = base
         else:
+            prepared = RuntimePrompt(context.system_prompt, context.prompt_components)
             replacement = (
-                owned_fragment(prepared, self._project_context_replace_component)
-                if self._project_context_replace_component
-                in prepared.prompt_components
+                owned_fragment(prepared, component)
+                if component in prepared.prompt_components
                 else PromptFragment("", {})
             )
-            prompt = replace_owned_fragment(
-                base,
-                self._project_context_replace_component,
-                replacement,
-            )
+            prompt = replace_owned_fragment(base, component, replacement)
         return _PreparedProjectContext(generation, base, prompt, context)
 
     def _consume_project_context_recovery(self) -> None:
