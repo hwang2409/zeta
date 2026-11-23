@@ -87,6 +87,11 @@ class SessionUse:
     def runtime(self) -> ServerRuntime:
         return self.record.runtime
 
+    def is_current_binding(self, connection: Any) -> bool:
+        """Whether a new owned read would still use this record."""
+        owner = self._owner
+        return not self.record.closing and owner._by_connection.get(connection, owner._attached) is self.record
+
     def __enter__(self) -> Self:
         return self
 

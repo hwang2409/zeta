@@ -11,6 +11,7 @@ import hashlib
 import os
 import weakref
 from dataclasses import replace
+from functools import partial
 
 from ....core.checkpoints import ConversationIntegrityError
 from ....core.session import validate_session_id
@@ -21,6 +22,7 @@ from ....core.session_files import (
     session_root,
 )
 from ....core.store import ConversationStore, ObserverSnapshotChanged
+from ....project_registry import ProjectRegistryError
 from ....read_page import InvalidParams, Key, TooLarge, page_result, resume
 from ....storage_format import StorageFormatError, open_reader
 from ...resource_protocol import Access, ResourceMethod, require_params
@@ -134,7 +136,9 @@ def _read(home, manager, session_id, project_id, request_id, features, start, ba
                                     raise ObserverSnapshotChanged("session directory changed")
                             if source != transcript(directory):
                                 raise ObserverSnapshotChanged("transcript source changed")
-                            return _page(store, request_id, features, source, start, backward, limit, max_bytes)
+                            page = _page(store, request_id, features, source, start, backward, limit, max_bytes)
+                            check_project()
+                            return page
                 except ObserverSnapshotChanged:
                     if continuation:
                         raise resource_error(ErrorDescriptor.HISTORY_SNAPSHOT_STALE) from None
@@ -148,6 +152,34 @@ def _read(home, manager, session_id, project_id, request_id, features, start, ba
         raise resource_error(ErrorDescriptor.SESSION_NOT_FOUND) from None
     except (OSError, SessionError, ConversationIntegrityError, StorageFormatError):
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
+
+
+def _read_scope(client, session_id, controller):
+    from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
+
+    runtime = controller.runtime
+    opened = runtime.opened
+    generation = runtime.attachment_generation
+    if opened is None:
+        try:
+            project_id = runtime.launch_project_id
+        except ProjectRegistryError:
+            raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
+    else:
+        if session_id == runtime.session_id:
+            raise invalid_resource_params()  # the attached session pages through session_history
+        project_id = opened.metadata.project_id
+
+    def validate():
+        # A session can attach and detach during the read.
+        if (
+            not controller.is_current_binding(client) or runtime.opened is not opened
+            or runtime.attachment_generation != generation
+            or (opened is not None and opened.metadata.project_id != project_id)
+        ):
+            raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
+
+    return partial(_read, client.server.home, runtime.manager, session_id, project_id), validate
 
 
 def _retrieve(future: asyncio.Future) -> None:
@@ -182,24 +214,16 @@ async def _handle(client, request_id, params, controller):
         start = resume(params.get("cursor"), (_METHOD, session_id, direction), (0,), _ORDER)
     except (SessionError, InvalidParams):
         raise invalid_resource_params() from None
-    runtime = controller.runtime
-    opened = runtime.opened
-    if opened is None:
-        raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
-    project_id = opened.metadata.project_id  # None reads only project-less sessions
-    if session_id == runtime.session_id:
-        raise invalid_resource_params()  # the attached session pages through session_history
+    reader, validate_scope = _read_scope(client, session_id, controller)
     loop = asyncio.get_running_loop()
     if loop in _in_flight:
         error = resource_error(ErrorDescriptor.OPERATION_BUSY)
         error.data["retry_after_ms"] = RETRY_AFTER_MS
         raise error
     features = history_features(client.features)
-    manager = runtime.manager
-    read = asyncio.ensure_future(client.connections.run_blocking(lambda: _read(
-        client.server.home, manager, session_id, project_id, request_id, features,
-        start, direction == "backward", limit, max_bytes,
-    )))
+
+    read_page = partial(reader, request_id, features, start, direction == "backward", limit, max_bytes)
+    read = asyncio.ensure_future(client.connections.run_read(client, read_page, controller, fence=False))
     _in_flight[loop] = read
     # The slot frees only when the worker thread is done, even after a timeout or cancel.
     read.add_done_callback(lambda done: (_retrieve(done), _in_flight.pop(loop, None)))
@@ -208,8 +232,7 @@ async def _handle(client, request_id, params, controller):
             page = await asyncio.shield(read)
     except TimeoutError:
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
-    if runtime.opened is not opened or opened.metadata.project_id != project_id:
-        raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
+    validate_scope()
     return page
 
 

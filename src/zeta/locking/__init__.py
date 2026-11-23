@@ -85,6 +85,26 @@ def shape_lock() -> AbstractContextManager[None]:
     return ranked_lock(_Rank.SHAPE)
 
 
+# one retry was always enough in 766 measured races; the bound keeps a deleted
+# directory (a real ENOENT) from looping forever.
+_CREATE_RACE_RETRIES = 8
+
+
+def open_created(name: str, flags: int, mode: int, *, dir_fd: int) -> int:
+    """openat that survives Darwin's concurrent first create.
+
+    Two racing ``openat(dir_fd, name, O_CREAT)`` calls can report ENOENT to the
+    loser although the winner just created the file. Only non-exclusive creates retry.
+    """
+    for attempt in range(_CREATE_RACE_RETRIES):
+        try:
+            return os.open(name, flags, mode, dir_fd=dir_fd)
+        except FileNotFoundError:
+            if not flags & os.O_CREAT or flags & os.O_EXCL or attempt + 1 == _CREATE_RACE_RETRIES:
+                raise
+    raise AssertionError("unreachable")
+
+
 def domain_lock_name(project_id: str, domain: str) -> str:
     """Name of the process-shared lock file for one domain authority."""
     return f"{project_id.encode('utf-8').hex()}-{domain.encode('utf-8').hex()}.lock"
@@ -114,7 +134,7 @@ def domain_authority(
         )
         try:
             lock_name = domain_lock_name(project_id, domain)
-            fd = os.open(
+            fd = open_created(
                 lock_name,
                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
                 0o600,

@@ -88,6 +88,7 @@ class _BackgroundTerminal:
     text: str
     stats: dict[str, object]
     payload: dict[str, object]
+    report: dict[str, object] | None
     killed_task_ids: object = None
     killed_task_count: object = None
     killed_task_ids_truncated: object = False
@@ -97,7 +98,7 @@ def _background_terminal(
     lifecycle: dict[str, object] | None,
     report: dict[str, object] | None,
     turns_used: int,
-    tool_call_id: str,
+    child_instance_id: str,
     fallback_text: str,
     structured_content: dict[str, object] | None = None,
     max_bytes: int = MAX_AGENT_RESULT_BYTES,
@@ -134,7 +135,7 @@ def _background_terminal(
             report,
             stats,
             structured_content=structured_content,
-            tool_call_id=tool_call_id,
+            child_instance_id=child_instance_id,
             max_bytes=max_bytes,
         )
         if report is not None
@@ -146,11 +147,19 @@ def _background_terminal(
         and lifecycle.get("final_result_is_receipt") is True
     ):
         payload["content"][0]["text"] = text
+    bounded_report = None
+    if report is not None:
+        structured = payload["structuredContent"]
+        bounded_report = {"status": structured["report_status"], "summary": structured["summary"]}
+        for key in ("head_sha", "verdict"):
+            if key in structured:
+                bounded_report[key] = structured[key]
     return _BackgroundTerminal(
         status=status,
         text=payload["content"][0]["text"],
         stats=stats,
         payload=payload,
+        report=bounded_report,
         killed_task_ids=lifecycle.get("killed_task_ids") if lifecycle else None,
         killed_task_count=lifecycle.get("killed_task_count") if lifecycle else None,
         killed_task_ids_truncated=(
@@ -304,7 +313,7 @@ def _recover_nested_children(
                         lifecycle=lifecycle,
                         report=accepted_report,
                         turns_used=marker.get("turns_used", 0),
-                        tool_call_id=tool_call.id,
+                        child_instance_id=child_instance_id,
                         fallback_text=(
                             "background child canceled when the parent session exited"
                         ),
@@ -324,7 +333,7 @@ def _recover_nested_children(
                             status=terminal.status,
                             text=terminal.text,
                             stats=terminal.stats,
-                            report=accepted_report,
+                            report=terminal.report,
                         ),
                         child_lifecycle=(
                             child_store.agent_lifecycle() if child_store is not None else None
@@ -469,7 +478,7 @@ def _recover_agent_children(
                         lifecycle=lifecycle,
                         report=accepted_report,
                         turns_used=marker.get("turns_used", 0),
-                        tool_call_id=tool_call.id,
+                        child_instance_id=child_instance_id,
                         fallback_text=(
                             "background child canceled when the parent session exited"
                         ),
@@ -492,7 +501,7 @@ def _recover_agent_children(
                             killed_task_ids=terminal.killed_task_ids,
                             killed_task_count=terminal.killed_task_count,
                             killed_task_ids_truncated=terminal.killed_task_ids_truncated,
-                            report=accepted_report,
+                            report=terminal.report,
                         ),
                         child_lifecycle=(
                             child_store.agent_lifecycle() if child_store is not None else None
@@ -680,6 +689,7 @@ async def finish_background_child(
             {**lifecycle, **live_lifecycle, "turns_used": turns_used}, status=status
         )
         result_text = notification_text or "background child completed"
+        notification_report = None
         if explicit_finish_report is not None:
             explicit_terminal = _background_terminal(
                 lifecycle={
@@ -688,7 +698,7 @@ async def finish_background_child(
                 },
                 report=explicit_finish_report,
                 turns_used=turns_used,
-                tool_call_id=tool_call.id,
+                child_instance_id=child_instance_id,
                 fallback_text=result_text,
                 structured_content=explicit_finish_content,
                 max_bytes=max_receipt_bytes or MAX_AGENT_RESULT_BYTES,
@@ -696,6 +706,7 @@ async def finish_background_child(
             status = explicit_terminal.status
             terminal_stats = explicit_terminal.stats
             terminal_payload = explicit_terminal.payload
+            notification_report = explicit_terminal.report
         else:
             build_parameters = inspect.signature(build_result).parameters
             build_kwargs: dict[str, object] = {}
@@ -735,17 +746,6 @@ async def finish_background_child(
             notification_text = payload_content[0]["text"]
         else:
             notification_text = result_text
-        payload_structured = terminal_payload.get("structuredContent")
-        notification_report = None
-        if explicit_finish_report is not None and isinstance(payload_structured, dict):
-            notification_report = {
-                "status": payload_structured["report_status"],
-                "summary": payload_structured["summary"],
-            }
-            for key in ("head_sha", "verdict"):
-                if key in payload_structured:
-                    notification_report[key] = payload_structured[key]
-
         if turn_limited:
             terminal_payload = project_payload(terminal_payload, child_path)
 

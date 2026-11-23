@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from tests.support.owned import await_or_fail
+from tests.support.serve_contract import ServeContract
 from tests.support.sockets import short_socket_path
 from tests.test_state_catalog import INVALID, _connect
 from zeta import attention_records, project_inbox, project_registry
@@ -20,7 +21,7 @@ MARKER = "private-body-marker claims trusted_assignment"
 PREFIX = "a" * (65535 - len(MARKER) - 1) + "\n" + MARKER
 BODY = PREFIX + "界z"
 PROJECT_KEYS = "project_id name path session_count memory_count inbox updated_ns"
-MEMORY_KEYS = "memory_id project_id kind automatic summary created_ns updated_ns source_session_id has_body"
+MEMORY_KEYS = "memory_id project_id kind automatic accepted summary created_ns updated_ns source_session_id has_body"
 INBOX_KEYS = "message_id project_id kind status sender summary created_ns updated_ns trusted_assignment has_body"
 ATTENTION_KEYS = "attention_id project_id session_id kind status title created_ns updated_ns"
 
@@ -145,6 +146,8 @@ async def test_project_state_websocket(tmp_path, monkeypatch, method, key, keys,
                 assert detail["body"] == PREFIX and detail["truncated"] is True
                 if message:
                     assert detail[row_key]["trusted_assignment"] is False
+                else:
+                    assert detail[row_key]["automatic"] is False and detail[row_key]["accepted"] is True
             else:
                 if filter_name:
                     params[filter_name] = filter_value
@@ -156,6 +159,8 @@ async def test_project_state_websocket(tmp_path, monkeypatch, method, key, keys,
                 assert MARKER not in str(response)
                 if method == "state_inbox":
                     assert all(row["trusted_assignment"] is False for row in rows)
+                if method == "state_memory":
+                    assert all(row["automatic"] is False and row["accepted"] is True for row in rows)
                 if method == "state_projects":
                     project = next(row for row in rows if row[key] == project_id)
                     assert project["memory_count"] == 3 and project["inbox"] == {"new": 3, "claimed": 0, "done": 0}
@@ -180,6 +185,51 @@ async def test_project_state_websocket(tmp_path, monkeypatch, method, key, keys,
         assert state_stat(home) == before, "state read changed a file, directory, or mtime"
     finally:
         await await_or_fail(server.close(), what="serve close")
+
+
+async def test_state_memory_acceptance(tmp_path):
+    _, ids = await await_or_fail(asyncio.to_thread(seed, tmp_path / "home"), what="seed state")
+    params = {"project_id": ids["entries"]}
+    contract = await ServeContract.start(tmp_path, "websocket")
+    try:
+        client = await contract.connect()
+        hello = await client.request("hello", "hello", {
+            "protocol_version": "1.2",
+            "features": ["state_read_v1", "projects", "projects-memory-v2", "project_writes_v1"],
+        })
+        assert "result" in hello, hello
+        show = (await client.request("show", "project_show", params))["result"]
+        before = (await client.request("before", "state_memory", params))["result"]["items"]
+        automatic = next(row for row in before if row["summary"] == "synthetic brief")
+        entry = {**params, "memory_id": automatic["memory_id"]}
+        before_detail = (await client.request("before-detail", "state_memory_detail", entry))["result"]["memory"]
+        accepted = (await client.request("accept", "project_memory_update", {
+            **params, "revision": show["memory"]["digest"],
+            "mutation": {"format": 2, "op": "accept", "target": entry["memory_id"]},
+        }))["result"]
+        after = (await client.request("after", "state_memory", params))["result"]["items"]
+        accepted_row = next(row for row in after if row["memory_id"] == entry["memory_id"])
+        assert accepted_row.get("accepted") is True, "accepted automatic memory must report accepted=true"
+        assert accepted_row["automatic"] is True
+        detail = (await client.request("after-detail", "state_memory_detail", entry))["result"]
+        assert detail["memory"] == accepted_row
+        assert automatic["automatic"] is True and automatic["accepted"] is False
+        assert before_detail == automatic
+
+        manual_text = "synthetic manual state"
+        assert "result" in await client.request("set", "project_memory_update", {
+            **params, "revision": accepted["revision"],
+            "mutation": {"format": 2, "op": "set", "kind": "state", "content": manual_text},
+        })
+        rows = (await client.request("manual", "state_memory", params))["result"]["items"]
+        manual = next(row for row in rows if row["summary"] == manual_text)
+        assert manual["automatic"] is False and manual["accepted"] is True
+        detail = (await client.request("manual-detail", "state_memory_detail", {
+            **params, "memory_id": manual["memory_id"],
+        }))["result"]
+        assert detail["memory"] == manual
+    finally:
+        await contract.close()
 
 
 @pytest.mark.parametrize("repeat", (False, True))

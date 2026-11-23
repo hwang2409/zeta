@@ -26,6 +26,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
 from websockets.protocol import State
 
+from ..locking import open_created
 from .protocol import MAX_FRAME_BYTES
 
 if TYPE_CHECKING:
@@ -311,7 +312,7 @@ def acquire_connection_lock(path: Path, secure_parent: bool = True) -> int:
     parent_fd = _prepare_parent(path, secure_parent=secure_parent)
     fd = -1
     try:
-        fd = os.open(
+        fd = open_created(
             path.name,
             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
             0o600,

@@ -1170,16 +1170,19 @@ def test_callback_error_is_safe_for_terminal() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("token_type", "expected_scheme"),
+    [("bearer", "Bearer"), ("bEaReR", "Bearer"), ("dPoP", "dPoP")],
+)
 async def test_http_client_refreshes_on_401_and_retries(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, token_type: str, expected_scheme: str
 ) -> None:
     home = _monkey_home(monkeypatch, tmp_path)
-    initial = _write_token("live", home, access_token="stale-token")
+    _write_token("live", home, access_token="stale-token")
 
-    call_count = 0
+    tool_call_auth_headers: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal call_count
         url = str(request.url)
         if url.endswith("/token"):
             form = {
@@ -1193,7 +1196,7 @@ async def test_http_client_refreshes_on_401_and_retries(
                     "access_token": "fresh-token",
                     "refresh_token": "refresh-token-2",
                     "expires_in": 3600,
-                    "token_type": "Bearer",
+                    "token_type": token_type,
                 },
                 request=request,
             )
@@ -1211,12 +1214,9 @@ async def test_http_client_refreshes_on_401_and_retries(
                 request=request,
             )
         if body["method"] == "tools/call":
-            call_count += 1
-            auth_header = request.headers.get("authorization", "")
-            if call_count == 1:
-                assert auth_header == "Bearer stale-token"
+            tool_call_auth_headers.append(request.headers.get("authorization", ""))
+            if len(tool_call_auth_headers) == 1:
                 return httpx.Response(401, text="expired", request=request)
-            assert auth_header == "Bearer fresh-token"
             return httpx.Response(
                 200,
                 json={
@@ -1237,18 +1237,19 @@ async def test_http_client_refreshes_on_401_and_retries(
         url="https://mcp.test/rpc",
         auth_type="oauth",
     )
-    transport_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    client = StreamableHTTPMCPClient(config, client=transport_client, home=str(home))
-    await client.connect()
-    result = await client.call_tool("echo", {}, AbortSignal())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as transport:
+        client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
+        try:
+            await client.connect()
+            result = await client.call_tool("echo", {}, AbortSignal())
+        finally:
+            await client.close()
+    assert tool_call_auth_headers == ["Bearer stale-token", f"{expected_scheme} fresh-token"]
     assert result["content"][0]["text"] == "ok"
-    assert call_count == 2
     persisted = (await MCPCredentialStore(home=home).load("live")).token
     assert persisted is not None and persisted.access_token == "fresh-token"
     assert persisted.refresh_token == "refresh-token-2"
     assert persisted.refresh_error is None
-    del initial
-    await client.close()
 
 
 @pytest.mark.asyncio

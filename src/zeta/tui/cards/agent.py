@@ -17,7 +17,11 @@ from rich.text import Text
 
 from ...agent.conversation_channel import has_follow_up_loop
 from ...agent.explicit_finish import format_idle_resource_usage, idle_resource_usage
-from ...agent.receipt import has_agent_receipt_suffix, terminal_state
+from ...agent.receipt import (
+    finish_report_truncation_note,
+    has_agent_receipt_suffix,
+    terminal_state,
+)
 from ...core.agent_progress import live_agent_lifecycle
 from ...core.checkpoints import ConversationIntegrityError
 from ...core.child_runs import NONTERMINAL_AGENT_STATES, child_run_rows
@@ -42,9 +46,10 @@ MAX_TAIL_LINES = 20
 
 
 class _Receipt:
-    def __init__(self, header: Text, answer: str) -> None:
+    def __init__(self, header: Text, answer: str, note: str = "") -> None:
         self._header = header
         self._answer = answer
+        self._note = note
 
     @property
     def plain(self) -> str:
@@ -54,7 +59,11 @@ class _Receipt:
         self, console: Console, options: ConsoleOptions
     ) -> RenderResult:
         yield self._header
-        yield render_markdown(self._answer)
+        answer = self._answer.removesuffix(self._note).rstrip() if self._note else self._answer
+        yield render_markdown(answer)
+        if self._note:
+            yield Text()
+            yield Text(self._note, style=theme.NOTICE)
 
 
 class _TailLine(str):
@@ -567,7 +576,13 @@ class AgentCard:
         )
         if not receipt_answer:
             return header
-        return _Receipt(header, receipt_answer)
+        note = ""
+        child_id = structured.get("child_instance_id")
+        if isinstance(child_id, str) and structured.get("report_status"):
+            truncation = finish_report_truncation_note(child_id)
+            if receipt_answer.endswith(truncation):
+                note = truncation
+        return _Receipt(header, receipt_answer, note)
 
     @classmethod
     def render_start(cls, event: StreamEvent) -> RenderableType | None:

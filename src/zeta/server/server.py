@@ -485,6 +485,7 @@ class ZetaServer:
         if not self._borrowed:
             await self.controllers.attached().runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
+        await self.controllers.attached().runtime.capture_launch_scope()
         self.connections = ConnectionRegistry(
             asyncio.get_running_loop(), self._publish_child_lifecycle
         )

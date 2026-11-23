@@ -166,16 +166,19 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
     async def run_blocking(call):
         return call()
 
+    async def run_read(_client, call, _controller, *, fence):
+        return await run_blocking(call)
+
     client = SimpleNamespace(
         features=frozenset(),
-        connections=SimpleNamespace(run_blocking=run_blocking),
+        connections=SimpleNamespace(run_blocking=run_blocking, run_read=run_read),
         logins=Logins(tmp_path),
         server=SimpleNamespace(home=tmp_path, _mcp_auth=MCPAuth()),
     )
     controller = SimpleNamespace(
         runtime=SimpleNamespace(
             opened=SimpleNamespace(metadata=SimpleNamespace(project_id="test-project", cwd=tmp_path)),
-            project_dir=tmp_path, session_id="test-session",
+            project_dir=tmp_path, session_id="test-session", attachment_generation=0,
             manager=SimpleNamespace(project_registry=ProjectRegistry.for_state_read(tmp_path / "projects", 0)),
             loop=SimpleNamespace(_mcp_project_dir_value=tmp_path, tool_registry=None),
         ),

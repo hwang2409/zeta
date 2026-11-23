@@ -1035,8 +1035,8 @@ class ConversationLogMixin:
                             self._delivery_fold.apply(entry)
                         self._task_notification_ids = set()
                         self._sent_message_receipts = []
-                        self._client_deliveries = {}
-                        self._client_delivery_outcomes = {}
+                        # Warm snapshots exclude delivery rows and delivery metadata.
+                        self._rebuild_client_deliveries(())
                         self._reset_generation += 1
                         self._set_log_stat(
                             stat, bytes.fromhex(str(facts["prefix_fingerprint"]))
