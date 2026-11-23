@@ -2330,8 +2330,11 @@ observer_read_only` for an observer. Unexpected failures return `-32000`.
 
 `session_history_read {session_id, cursor?, direction?, limit?, max_bytes?}`
 returns history rows of another top-level session in the attached session's
-project; when the attached session has no project, only top-level sessions with
-no project are readable. Child-agent sessions are not readable by id. It does
+project. When serve is idle, reads use the project resolved for the launch cwd
+at startup. Later project registration or reassociation does not change that
+scope. If startup cannot resolve the scope, idle reads return `-32005 state_unavailable`.
+If startup confirms there is no project, only top-level sessions with no project
+are readable. Child-agent sessions are not readable by id. It does
 not attach, subscribe, or take the session's execution lease, and it takes no
 lock the session's owner waits for. `direction` is `backward`
 (default, newest rows first) or `forward`. `limit` (1–128, default 50) counts
@@ -2356,11 +2359,11 @@ Clients must not poll faster than every few seconds.
 
 Errors: `-32602 invalid_params` for bad params or a cursor made for other
 params; `-32602 session_not_found` for an absent session and for a session whose
-project differs from the attached session's, including project versus no
-project in either direction (the same error, so other sessions are not
-disclosed); `-32005 state_unavailable` with no attached session, for a newer
-stored format, a corrupt or changing transcript, or a read that passes its
-10 s deadline; `-32007 result_too_large` when one group alone is over
+project differs from the read scope, including project versus no project in
+either direction (the same error, so other sessions are not disclosed);
+`-32005 state_unavailable` if the read scope cannot be resolved or changes
+during the read, for a newer stored format, a corrupt or changing transcript,
+or a read that passes its 10 s deadline; `-32007 result_too_large` when one group alone is over
 `max_bytes`. Errors set `data.code` and `data.reason` to the named reason and
 never include paths or parser text. An unnegotiated method returns `-32601`.
 
