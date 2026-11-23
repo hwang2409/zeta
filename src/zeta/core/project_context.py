@@ -100,7 +100,7 @@ class ProjectContext:
 
 def _git_env() -> dict[str, str]:
     """Environment for discovery, never allowing ambient repository selection."""
-    env = subprocess_env({"GIT_CONFIG_NOSYSTEM": "1"})
+    env = subprocess_env({"GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"})
     for name in tuple(env):
         if name.startswith("GIT_") and name not in {"GIT_CONFIG_NOSYSTEM"}:
             del env[name]
@@ -123,6 +123,7 @@ class ProjectDiscovery:
     eligible: bool
     project: Project | None = None
     registry_busy: bool = False
+    git_unavailable: bool = False  # distinct from a successful discovery outside a repository
 
 
 def _run_discovery_git(
@@ -156,7 +157,9 @@ def _run_discovery_git(
         logging.getLogger(__name__).warning(
             "git project discovery failed for %s (exit %s)", directory, exc.returncode
         )
-        return None, "non-repository"
+        if (exc.stderr or "").startswith("fatal: not a git repository ("):
+            return None, "non-repository"
+        return None, "git-error"
     except OSError as exc:
         logging.getLogger(__name__).warning(
             "git project discovery failed for %s (%s)", directory, type(exc).__name__
@@ -188,15 +191,18 @@ def discover_project(
         deadline=deadline,
     )
     lines = getattr(geometry, "stdout", "").splitlines()
-    if len(lines) != 3:
-        ordinary_directory = geometry_error == "non-repository"
-        eligible = ordinary_directory and directory not in {home, root}
+    if len(lines) != 3 or not all(Path(line).is_absolute() for line in lines):
+        # Preserve best-effort association on Git exits for callers that do not require a known scope.
+        eligible = geometry_error in {"non-repository", "git-error"} and directory not in {home, root}
         if geometry is not None and lines:
             logging.getLogger(__name__).warning(
                 "git project discovery failed for %s: incomplete repository geometry",
                 directory,
             )
-        return ProjectDiscovery(directory, directory, None, None, home, root, eligible)
+        return ProjectDiscovery(
+            directory, directory, None, None, home, root, eligible,
+            git_unavailable=geometry_error != "non-repository",
+        )
     repo_root, git_dir, common_dir = (
         Path(line).expanduser().resolve() for line in lines
     )
@@ -217,13 +223,14 @@ def discover_project(
             if worktrees is not None
             else None
         )
-        if first is None:
+        if first is None or not Path(first.removeprefix("worktree ")).is_absolute():
             logging.getLogger(__name__).warning(
                 "git project discovery failed for %s: worktree list had no primary",
                 directory,
             )
             return ProjectDiscovery(
-                directory, repo_root, common_dir, None, home, root, False
+                directory, repo_root, common_dir, None, home, root, False,
+                git_unavailable=True,
             )
         primary = Path(first.removeprefix("worktree ")).expanduser().resolve()
         # A separate Git directory can be reported instead of its checkout.

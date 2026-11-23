@@ -7742,6 +7742,8 @@ async def test_idle_status_resolves_config_off_event_loop_once_per_request(
         "127.0.0.1", server.port
     )
     try:
+        startup_config_calls = len(config_threads)
+        assert startup_config_calls == 1
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         await _request(
             observer_reader,
@@ -7762,7 +7764,7 @@ async def test_idle_status_resolves_config_off_event_loop_once_per_request(
 
         assert controller_status["max_agent_depth"] == 3
         assert observer_status["max_agent_depth"] == 3
-        assert len(config_threads) == 2
+        assert len(config_threads) - startup_config_calls == 2
         assert all(thread_id != event_loop_thread for thread_id in config_threads)
     finally:
         await close_serve(server, writer, observer_writer)

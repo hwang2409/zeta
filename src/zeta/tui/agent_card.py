@@ -374,7 +374,11 @@ class AgentTranscriptControl(UIControl):
         if path is None:
             return True
         transcript = self._root_transcript if path == self._root_path else self.transcript
-        anchor = transcript.durable_scroll_anchor if transcript is not None else None
+        anchor = (
+            transcript.durable_scroll_anchor
+            if transcript is not None and not transcript.follow_tail
+            else None
+        )
         state = capture_inactive_view(
             buffer=self._composer_buffer,
             prompt_history=self._prompt_history,

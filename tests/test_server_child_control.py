@@ -11,6 +11,7 @@ from rich.console import Console
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, close_owned_app
 from tests.support.replay_transport import connect_replay, negotiate, replay_server
+from zeta.agent import runner
 from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.protocol.types import StreamEventType, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
@@ -175,3 +176,70 @@ async def test_serve_spawn_lifecycle_and_cancel_race(tmp_path, monkeypatch, winn
             backend.release.set()
             loop.set_background_event_sink(sink)
             await close_owned_app(tui)
+
+
+@pytest.mark.asyncio
+async def test_child_follow_ups_recover_registry_without_owned_memory(tmp_path, monkeypatch, caplog):
+    # An unbound session in a new home has neither a memory span nor a registry directory.
+    monkeypatch.chdir(tmp_path)
+    boundary = asyncio.Queue()
+    release = asyncio.Queue()
+    script = FakeBackend([ScriptedTurn([TextContent("ok")]) for _ in range(3)])
+    registry_root = tmp_path / "projects"
+    consume = runner.consume_child
+
+    async def pause_at_boundary(child, *args, **kwargs):
+        if not registry_root.exists():
+            assert child.project_context_health.code == "project_registry_unavailable"
+            assert "project_memory" not in child._skill_prompt_base().prompt_components
+            registry_root.mkdir(mode=0o700)
+        result = await consume(child, *args, **kwargs)
+        boundary.put_nowait(child)
+        await await_or_fail(release.get(), what="release child turn boundary")
+        return result
+
+    # test-contract: seam enqueue follow-ups between full runtime turns, not model calls.
+    monkeypatch.setattr(runner, "consume_child", pause_at_boundary)
+    async with _session(tmp_path, script) as (server, controller, session_id):
+        parent = server.controllers.attached().runtime.loop
+        parent.explicit_finish = True
+        catalog = parent.tool_registry.agent_catalog
+        monkeypatch.setattr(parent.tool_registry, "agent_catalog", replace(catalog, agents=tuple(
+            replace(preset, explicit_finish=True) if preset.name == "run" else preset
+            for preset in catalog.agents
+        )))
+        assert "project_memory" not in parent._skill_prompt_base().prompt_components
+        assert not registry_root.exists()
+        try:
+            spawned = await controller.request(3, "child_run_spawn", {
+                "session_id": session_id, "agent_type": "run", "task": "inspect fixture",
+            })
+            run_id = spawned["result"]["data"]["run_id"]
+            child = await await_or_fail(boundary.get(), what="initial child turn")
+            first, _ = script.calls[0]
+            for request_id, task_attr in enumerate((
+                "_project_context_read_task", "_project_context_prepare_task",
+            ), 4):
+                pending = getattr(child, task_attr)
+                assert pending is not None
+                await await_or_fail(asyncio.wait({pending}), what="child recovery stage")
+                text = f"follow-up {request_id}"
+                sent = await controller.request(request_id, "child_run_send", {
+                    "session_id": session_id, "run_id": run_id, "text": text,
+                })
+                assert sent["result"] == {"accepted": True, "run_id": run_id}
+                release.put_nowait(None)
+                await await_or_fail(boundary.get(), what=text)
+                messages, _ = script.calls[-1]
+                assert any(TextContent(text) in message.content for message in messages)
+
+            assert not any(
+                record.getMessage() == "project context preparation failed"
+                for record in caplog.records
+            )
+            assert child.project_context_health is None
+            assert child._project_context_pending is None
+            assert child._project_context_read_task is child._project_context_prepare_task is None
+            assert messages[0] == first[0]
+        finally:
+            release.put_nowait(None)

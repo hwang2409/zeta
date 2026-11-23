@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import errno
 import fcntl
 import json
 import os
@@ -493,6 +494,38 @@ def _run_owner_as(role: str, owner: RetentionActivationOwner, finished: threadin
     finally:
         if finished is not None:
             finished.set()
+
+
+@pytest.mark.asyncio
+async def test_owner_survives_darwin_concurrent_create_enoent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    initialize_storage_home(home)
+    (home / "storage-format.json").write_text('{"writer_epoch":11}\n')
+    lease = await asyncio.to_thread(open_writer, home)
+    coordinator = domain_lock_name(RETENTION_HOME_ID, "coordinator")
+    real_open = os.open
+    lost = []
+
+    def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+        if path == coordinator and flags & os.O_CREAT and not lost:
+            # another owner wins the first create; Darwin then reports ENOENT to this
+            # O_CREAT openat even though the file now exists
+            os.close(real_open(path, flags, mode, dir_fd=dir_fd))
+            lost.append(path)
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", racing_open)
+    owner = make_retention_owner(home, lease, lambda: 30)
+    try:
+        projections, failure = await asyncio.to_thread(owner._run_episode)
+        assert lost == [coordinator]
+        assert failure is None and projections, (projections, failure)
+    finally:
+        await owner.stop()
+        await asyncio.to_thread(lease.close)
 
 
 @pytest.mark.asyncio
