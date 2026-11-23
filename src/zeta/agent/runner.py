@@ -1269,10 +1269,8 @@ async def _run_child(
         await request_child_cancel().cleanup
 
     if background:
-        # Notification text has a stricter durable contract than the foreground
-        # tool result. Size the canonical background receipt, including its
-        # persisted tool-result envelope, to the smaller limit; lifecycle
-        # final_result reuses this same bounded text.
+        # Lifecycle final_result and the notification reuse the bounded
+        # background receipt text, so respect both output limits.
         background_receipt_bytes = min(
             getattr(loop.tool_registry, "max_output_chars", MAX_AGENT_RESULT_BYTES),
             MAX_AGENT_NOTIFICATION_TEXT,

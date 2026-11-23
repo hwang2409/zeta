@@ -16941,9 +16941,10 @@ async def test_explicit_finish_ignores_parent_run_background_task(
         store.close()
 
 
+@pytest.mark.parametrize("long_report", [False, True], ids=["short", "long"])
 @pytest.mark.asyncio
 async def test_explicit_finish_background_child_preserves_report_end_to_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, long_report: bool
 ) -> None:
     report = {
         "status": "done",
@@ -16951,6 +16952,14 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
         "head_sha": "abcdef0",
         "verdict": "pass",
     }
+    if long_report:
+        report["summary"] = "\n\n".join(
+            f"Check {i}: verified that the integration wrapper returns the expected "
+            "result when a background build completes. Replayed the parent session "
+            "and confirmed that each completed job still has its own report. "
+            "The existing workflow needs no configuration changes."
+            for i in range(1, 22)
+        )
     finish_call = ToolCall("finish-1", "finish", report)
     backend = FakeBackend(
         [
@@ -16982,47 +16991,100 @@ async def test_explicit_finish_background_child_preserves_report_end_to_end(
 
     loop.set_background_event_sink(collect_event)
 
-    await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-    await wait_background_owner(loop)
-    notifications = store.agent_notifications(pending_only=False)
-    assert len(backend.calls) == 2
-    assert not any(
-        message.metadata.get("zeta_event") == "empty_turn_nudge"
-        for message in branch_messages(store)
-    )
-    assert len(notifications) == 1
-    notification = notifications[0]
-    assert notification.data["status"] == "completed"
-    # Persistence precedes terminal-card publication, so synchronize on the sink too.
-    await asyncio.wait_for(terminal_published.wait(), timeout=10)
-    terminal = next(
-        event
-        for event in background_events
-        if event.type is StreamEventType.TOOL_EXECUTION_END
-        and event.tool_call is not None
-        and event.tool_call.name == "agent"
-    )
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await wait_background_owner(loop)
+        notifications = store.agent_notifications(pending_only=False)
+        assert len(backend.calls) == 2
+        assert not any(
+            message.metadata.get("zeta_event") == "empty_turn_nudge"
+            for message in branch_messages(store)
+        )
+        assert len(notifications) == 1
+        notification = notifications[0]
+        assert notification.data["status"] == "completed"
+        # Persistence precedes terminal-card publication, so synchronize on the sink too.
+        await asyncio.wait_for(terminal_published.wait(), timeout=10)
+        terminal = next(
+            event
+            for event in background_events
+            if event.type is StreamEventType.TOOL_EXECUTION_END
+            and event.tool_call is not None
+            and event.tool_call.name == "agent"
+        )
 
-    assert terminal.tool_result is not None
-    assert terminal.tool_result.structured_content is not None
-    expected = {
-        "report_status": report["status"],
-        "summary": report["summary"],
-        "head_sha": report["head_sha"],
-        "verdict": report["verdict"],
-    }
-    assert {
-        key: terminal.tool_result.structured_content[key] for key in expected
-    } == expected
-    assert {key: notification.data[key] for key in expected} == expected
-    from zeta.tools.agent import _read_agent_status
+        assert terminal.tool_result is not None
+        assert terminal.tool_result.structured_content is not None
+        summary = report["summary"]
+        if long_report:
+            from zeta.server.event_contract import notification_payload, tool_end
+            from zeta.tui.render import render_event
 
-    status = _read_agent_status(
-        store,
-        requested_handle=str(notification.data["child_instance_id"]),
-    )
-    assert status[0]["report_status"] == "done"
-    await loop.close()
+            handle = notification.data["child_instance_id"]
+            pointer = f"agent action=output handle={handle}"
+            shown = terminal.tool_result.structured_content["summary"]
+            marker = f"\n\n[truncated] Read the full report: {pointer}"
+            assert shown.endswith(marker), f"summary silently cut to {len(shown)} characters"
+            prefix = shown.removesuffix(marker)
+            assert len(prefix) > 4_000
+            assert summary.startswith(prefix) and summary[len(prefix)].isspace()
+            summary = shown
+
+            console_output = StringIO()
+            console = Console(file=console_output, width=120, color_system=None)
+            console.print(render_event(terminal))
+            assert "done: Check 1" in console_output.getvalue()
+            assert f"[truncated] Read the full report: {pointer}" in console_output.getvalue()
+            wire = tool_end(terminal, fidelity=True)["tool_result"]
+            assert wire["structured_content"]["summary"] == summary
+            assert wire["content"].startswith(f"done: {summary}")
+            assert wire["structured_content_truncated"] is False
+            assert notification_payload(notification.data)["summary"] == summary
+
+            transcript = ""
+            offset = 0
+            while True:
+                page = await loop.tool_registry.execute(
+                    ToolCall(f"output-{offset}", "agent_output", {"handle": handle, "offset": offset})
+                )
+                assert page["isError"] is False
+                transcript += page["content"][0]["text"]
+                next_offset = page["structuredContent"].get("next_offset")
+                if next_offset is None:
+                    break
+                assert next_offset > offset
+                offset = next_offset
+            # Tool arguments are rendered as JSON when reading the transcript.
+            assert json.dumps(report["summary"], ensure_ascii=False) in transcript
+            child_path = Path(notification.data["child_session_path"])
+            with ConversationStore(child_path.parent, session_id=child_path.name, _read_only=True) as child:
+                assert any(
+                    block.tool_call == finish_call
+                    for message in branch_messages(child)
+                    for block in message.content
+                    if isinstance(block, ToolUseContent)
+                )
+
+        expected = {
+            "report_status": report["status"],
+            "summary": summary,
+            "head_sha": report["head_sha"],
+            "verdict": report["verdict"],
+        }
+        assert {
+            key: terminal.tool_result.structured_content[key] for key in expected
+        } == expected
+        assert {key: notification.data[key] for key in expected} == expected
+        from zeta.tools.agent import _read_agent_status
+
+        status = _read_agent_status(
+            store,
+            requested_handle=str(notification.data["child_instance_id"]),
+        )
+        assert status[0]["report_status"] == "done"
+    finally:
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
@@ -17314,12 +17376,12 @@ async def test_explicit_finish_blocked_and_failed_map_to_receipts(
     blocked = build_explicit_finish_receipt(
         {"status": "blocked", "summary": "need approval", "verdict": "inconclusive"},
         {},
-        tool_call_id="a",
+        child_instance_id="root:1",
     )
     failed = build_explicit_finish_receipt(
         {"status": "failed", "summary": "tests failed", "verdict": "fail"},
         {},
-        tool_call_id="b",
+        child_instance_id="root:1",
     )
     assert blocked["isError"] is False
     assert blocked["content"][0]["text"].startswith("blocked: need approval")

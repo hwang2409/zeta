@@ -589,62 +589,63 @@ def build_agent_receipt(
     )
 
 
+def agent_output_pointer(handle: str) -> str:
+    return f"agent action=output handle={handle}"
+
+
 def build_explicit_finish_receipt(
     report: Mapping[str, object],
     stats: Mapping[str, object] | None,
     *,
+    child_instance_id: str,
     structured_content: Mapping[str, object] | None = None,
-    tool_call_id: str = "",
     max_bytes: int = MAX_AGENT_RESULT_BYTES,
 ) -> StructuredToolResult:
-    """Build one receipt whose text and structured content share one summary."""
+    """Build one background receipt whose text and structured content share one summary."""
 
     report_status = report.get("status")
     summary = report.get("summary")
     if report_status not in {"done", "blocked", "failed"} or type(summary) is not str:
         raise ValueError("invalid explicit finish report")
     state: TerminalState = "failed" if report_status == "failed" else "completed"
-    base = dict(structured_content or {})
-    base["report_status"] = report_status
+    suffix = format_agent_stats(dict(stats) if stats is not None else {}, state=state)
+    max_bytes = max(max_bytes, MIN_AGENT_RECEIPT_BYTES)
+    fields: dict[str, object] = {"report_status": report_status}
     for key in ("head_sha", "verdict"):
         if key in report:
-            base[key] = report[key]
+            fields[key] = report[key]
+    base = {**(structured_content or {}), **fields}
 
-    def candidate(length: int) -> StructuredToolResult:
-        canonical = summary[:length]
-        return build_agent_receipt(
-            state,
-            f"{report_status}: {canonical}",
-            stats,
-            structured_content={**base, "summary": canonical},
-            tool_call_id=tool_call_id,
-            max_bytes=max_bytes,
+    def candidate(shown: str) -> StructuredToolResult:
+        return _candidate(
+            state, f"{report_status}: {shown}", suffix, {**base, "summary": shown}
         )
 
-    def keeps(value: StructuredToolResult, expected: str) -> bool:
-        structured = value.get("structuredContent")
-        content = value.get("content")
-        expected_text = f"{report_status}: {expected}"
-        return (
-            isinstance(structured, dict)
-            and structured.get("summary") == expected
-            and isinstance(content, list)
-            and bool(content)
-            and content[0].get("text", "").startswith(expected_text)
-        )
-
-    full = candidate(len(summary))
-    if keeps(full, summary):
+    # The background terminal payload is published, not written as a tool
+    # message. Its durable notification stores text and summary, not the extra
+    # text copies from Message.content and ToolResult.content_blocks.
+    full = candidate(summary)
+    if json_size(full) <= max_bytes:
         return full
-    low, high = 0, len(summary)
+    note = (
+        f"{_TRUNCATION_NOTE.strip()} Read the full report: "
+        f"{agent_output_pointer(child_instance_id)}"
+    )
+    if json_size(candidate(note)) > max_bytes:
+        base = fields
+    ends = [0, *(match.end() for match in re.finditer(r"\S+", summary) if match.end() < len(summary))]
+
+    def preview(end: int) -> str:
+        return f"{summary[:end]}\n\n{note}" if end else note
+
+    low, high = 0, len(ends) - 1
     while low < high:
         middle = (low + high + 1) // 2
-        value = candidate(middle)
-        if keeps(value, summary[:middle]):
+        if json_size(candidate(preview(ends[middle]))) <= max_bytes:
             low = middle
         else:
             high = middle - 1
-    return candidate(low)
+    return candidate(preview(ends[low]))
 
 
 def build_agent_progress(
