@@ -937,14 +937,15 @@ async def test_protocol_1_1_client_receives_sub_agent_receipt_for_known_kinds(
             await _request(reader, writer, 1, "hello", {"protocol_version": "1.1"})
         )[-1]["result"]
         assert hello["protocol_version"] == "1.1"
-        assert next(iter(server.connections.clients()), None) is not None
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = server.controllers.attached().runtime.session_id
         for kind in NOTIFICATION_KINDS:
             await server.controllers.attached().control._event(
                 StreamEvent(
                     StreamEventType.AGENT_NOTIFICATION,
                     data={"kind": kind},
                 ),
-                session_id="session",
+                session_id=session_id,
             )
         events = [(await _read(reader))["params"]["event"] for _ in NOTIFICATION_KINDS]
 
@@ -964,7 +965,8 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
             await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
         )[-1]["result"]
         assert hello["protocol_version"] == "1.2"
-        assert next(iter(server.connections.clients()), None) is not None
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = server.controllers.attached().runtime.session_id
         for kind in (*NOTIFICATION_KINDS, "future_kind"):
             data = {"kind": kind}
             if kind == "child_question":
@@ -974,7 +976,7 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
                     StreamEventType.AGENT_NOTIFICATION,
                     data=data,
                 ),
-                session_id="session",
+                session_id=session_id,
             )
         notifications = [
             (await _read(reader))["params"]
@@ -999,19 +1001,20 @@ async def test_child_message_delivered_event_maps_from_background_run(
     reader, writer = await _connect(server)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
-        assert next(iter(server.connections.clients()), None) is not None
+        await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+        session_id = server.controllers.attached().runtime.session_id
         await server.controllers.attached().control._event(
             StreamEvent(
                 StreamEventType.CHILD_MESSAGE_DELIVERED,
                 data={"child_label": "worker", "preview": "check the retry"},
             ),
-            session_id="parent",
+            session_id=session_id,
         )
 
         notification = await _read(reader)
         assert notification["params"] == {
             "event": "child_message_delivered",
-            "session_id": "parent",
+            "session_id": session_id,
             "data": {"child_label": "worker", "preview": "check the retry"},
         }
     finally:
@@ -2015,12 +2018,10 @@ async def test_session_history_records_controller_disconnect_approval_abort(
     try:
         # The approval aborts first; the old controller releases only after
         # its turn is canceled. Reconnect after the release, as a client must.
-        for _ in range(500):
-            if not (server.connections is not None and next(iter(server.connections.clients()), None) is not None):
-                break
-            await asyncio.sleep(0.01)
-        else:
-            pytest.fail("controller was not released after disconnect")
+        assert server.connections is not None
+        holder = server.connections.legacy_controller_holder
+        if holder is not None:
+            await await_or_fail(holder.released.wait(), what="old controller release")
         assert server.controllers.attached().runtime.policy is not None
         assert not (await server.controllers.attached().runtime.policy.pending_requests())
 
@@ -5067,11 +5068,10 @@ async def test_live_approval_without_exact_pending_request_is_not_approvable(
 
     client._run_blocking = run_blocking
     notifications: list[tuple[str, dict[str, object]]] = []
-    original_admit = client._admit_controller
 
     def admit(event: str, session_id: str | None, **fields: object) -> Admission:
         notifications.append((event, fields))
-        return original_admit(event, session_id, **fields)
+        return Admission("no_controller")
 
     # test-contract: seam observe approval admission through the single publication route
     monkeypatch.setattr(client, "_admit_controller", admit)

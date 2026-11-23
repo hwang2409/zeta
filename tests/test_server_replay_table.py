@@ -53,7 +53,7 @@ def test_feature_tables_only_name_negotiable_features() -> None:
     would gate an event behind a feature no client can ever hold."""
     valid = set(FEATURES)
     for event, required in connection_module.EVENT_FEATURES.items():
-        unknown = sorted(required - valid)
+        unknown = sorted(required.features - valid)
         assert not unknown, f"{event.value} requires unknown features {unknown}"
     for (event, field), required in connection_module.OPTIONAL_FIELD_FEATURES.items():
         assert isinstance(event, EventDescriptor), f"{event!r}.{field} is not an event"

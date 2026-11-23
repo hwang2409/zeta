@@ -131,13 +131,13 @@ class ParkedPairs:
     ) -> None:
         """Close a parked pair now; its turn ends ``disconnect``."""
         if control in self._controllers.parked_controls():
-            self._parked_by.pop(control, None)
             session_id = control.runtime.session_id
             self._controllers.retire(self._controllers.record_for(control), settlement_timeout)
             self._publish(
                 control,
                 {"session_id": session_id, "state": "closed", "pending_approvals": 0},
             )
+            self._parked_by.pop(control, None)
             self._sent.pop(session_id, None)
 
     async def claim(

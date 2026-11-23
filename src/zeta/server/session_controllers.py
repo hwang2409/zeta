@@ -293,11 +293,9 @@ class SessionControllers:
             None,
         )
 
-    def event_source_for_session(self, session_id: str) -> SessionEventSource | None:
-        return next((SessionEventSource(record.generation, session_id)
-                     for record in self._records.values()
-                     if not record.closing and record.runtime.opened is not None
-                     and record.runtime.session_id == session_id), None)
+    def legacy_observers_of(self, source: SessionEventSource) -> bool:
+        # Empty mode also covers legacy observers waiting without a controller.
+        return self._controller_mode != "multi" and self.event_record(source) is self._attached
 
     def register(self, control: ServeControl) -> SessionUse:
         """A new generation for ``control``, reserved by the returned use until

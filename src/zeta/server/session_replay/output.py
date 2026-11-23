@@ -51,21 +51,26 @@ class ReplayOutput:
         *,
         exclude: Any = None,
         scope: ReplayScopeId | None = None,
+        legacy_observers: bool = False,
         feature_fields: event_contract.FeatureFields | None = None,
     ) -> None:
-        if EVENT_ACCESS.get(event, Access.READ) is not Access.READ:
+        replay_allowed = EVENT_ACCESS.get(event, Access.READ) is Access.READ
+        if not replay_allowed and not legacy_observers:
             return
         for state in tuple(self._connections.values()):
             connection = state.connection
             if (connection is exclude or state.paused or state.role is None
-                    or self.replay.scope_for(connection) is None
                     or self._feature_rejected(state, event, required_feature, fields)):
                 continue
-            self._publish_replay(
-                state, event, session_id,
-                self._fields_for_connection(state, event, fields, feature_fields=feature_fields),
-                covers, scope=scope, replay_row=replay_row,
-            )
+            shaped = self._fields_for_connection(state, event, fields, feature_fields=feature_fields)
+            if self.replay.scope_for(connection) is not None and self._publish_replay(
+                state, event, session_id, shaped, covers, scope=scope, replay_row=replay_row,
+            ):
+                continue
+            if legacy_observers and state.role == "observer" and state.output is not None:
+                frame = connection.codec.notification(event, session_id, **shaped)
+                if frame is not None and state.output.phase == "ready":
+                    self._publish_local(state, state.output, frame, wait_for_write=False)
 
     def _replay_covers(
         self,

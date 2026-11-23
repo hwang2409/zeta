@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,9 @@ from zeta.server.protocol import DORMANT_FEATURES, FEATURES, EventDescriptor
 async def test_event_routing_table(tmp_path: Path, transport: Transport, case: str, monkeypatch: pytest.MonkeyPatch) -> None:
     assert "multi_controller" not in FEATURES and "multi_controller" in DORMANT_FEATURES
     assert set(EVENT_FEATURES) == set(EventDescriptor) and len(EVENT_FEATURES) == 45
+    assert Counter(route.destination for route in EVENT_FEATURES.values()) == {
+        "session": 42, "connection": 2, "global": 1,
+    }
     server = replay_server(tmp_path, transport, _backend_factory)
     await server.start()
     clients = [await connect_replay(server, transport) for _ in range(2)]

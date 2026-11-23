@@ -396,6 +396,17 @@ class ZetaServer:
             runtime.set_work_changed_sink(
                 lambda: self.parking.changed_from_any_thread(control)
             )
+            if self._retention_owner is not None:
+                async def publish_retention(projection: dict[str, object]) -> None:
+                    if projection.get("mode") == "none" and not projection.get("errors"):
+                        return
+                    if runtime.opened is not None:
+                        await control._notify(
+                            EventDescriptor.SESSION_RETENTION, runtime.session_id, data=projection,
+                        )
+
+                runtime.retention_event_sink = publish_retention
+                runtime.retention_wake = self._retention_owner.wake
 
     async def route_serve_event(self, envelope: ServeEvent, *, turn_id: str | None = None) -> None:
         record = self.controllers.event_record(envelope.source)
@@ -410,7 +421,8 @@ class ZetaServer:
         if self.connections is None:
             return Admission("no_controller")
         return self.connections.publish_session(
-            self.controllers.event_owner(source), event, source.session_id, **fields,
+            self.controllers.event_owner(source), event, source.session_id,
+            legacy_observers=self.controllers.legacy_observers_of(source), **fields,
         )
 
     def _publish_child_lifecycle(
@@ -418,10 +430,8 @@ class ZetaServer:
         fields: dict[str, object], covers: int | None,
     ) -> None:
         if self.connections is not None:
-            source = self.controllers.event_source_for_session(session_id)
-            owner = self.controllers.event_owner(source) if source is not None else None
             self.connections.publish_session(
-                owner, event, session_id, replay_scope=scope, covers=covers, **fields,
+                None, event, session_id, replay_scope=scope, covers=covers, **fields,
             )
 
     async def _publish_foreground_events(self) -> None:
@@ -497,19 +507,9 @@ class ZetaServer:
             self._foreground_subscription = self._foreground_event_publisher.subscribe()
             self._foreground_task = asyncio.create_task(self._publish_foreground_events())
         if self._retention_owner is not None:
-            record = self.controllers.attached()
-
-            async def publish_retention(projection: dict[str, object]) -> None:
-                if projection.get("mode") == "none" and not projection.get("errors"):
-                    return
-                if record.runtime.opened is not None:
-                    await record.control._notify(
-                        EventDescriptor.SESSION_RETENTION, record.runtime.session_id, data=projection,
-                    )
-
-            record.runtime.retention_event_sink = publish_retention
-            record.runtime.retention_wake = self._retention_owner.wake
-            self._retention_owner.set_publish(publish_retention)
+            self._retention_owner.set_publish(
+                self.controllers.attached().runtime.retention_event_sink
+            )
 
     async def serve_forever(self) -> None:
         if self._server is None:

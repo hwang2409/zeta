@@ -73,7 +73,14 @@ OUTPUT_OVERFLOW_CLOSE_DEADLINE = 1.0
 REFUSAL_LOG_INTERVAL_SECONDS = 30.0
 
 # one owner for feature gates and optional wire fields on every output path
-NO_FEATURE = frozenset()
+@dataclass(frozen=True, slots=True)
+class _EventRoute:
+    features: frozenset[str] = frozenset()
+    legacy_observers: bool = False
+    destination: Literal["session", "connection", "global"] = "session"
+
+
+NO_FEATURE = _EventRoute()
 EVENT_FEATURES = {
     EventDescriptor.AGENT_START: NO_FEATURE,
     EventDescriptor.TURN_START: NO_FEATURE,
@@ -96,9 +103,9 @@ EVENT_FEATURES = {
     EventDescriptor.PROJECT_INBOX_NOTIFICATION: NO_FEATURE,
     EventDescriptor.PROJECT_INBOX_HEALTH: NO_FEATURE,
     EventDescriptor.CHILD_QUESTION: NO_FEATURE,
-    EventDescriptor.CHILD_STARTED: frozenset({"child_run_events"}),
-    EventDescriptor.CHILD_PROGRESS: frozenset({"child_run_events"}),
-    EventDescriptor.CHILD_ENDED: frozenset({"child_run_events"}),
+    EventDescriptor.CHILD_STARTED: _EventRoute(frozenset({"child_run_events"})),
+    EventDescriptor.CHILD_PROGRESS: _EventRoute(frozenset({"child_run_events"})),
+    EventDescriptor.CHILD_ENDED: _EventRoute(frozenset({"child_run_events"})),
     EventDescriptor.CHILD_QUESTION_WITHDRAWN: NO_FEATURE,
     EventDescriptor.CHILD_MESSAGE_DELIVERED: NO_FEATURE,
     EventDescriptor.ACCOUNT_LIMIT: NO_FEATURE,
@@ -107,19 +114,19 @@ EVENT_FEATURES = {
     EventDescriptor.SERVED_TURN_END: NO_FEATURE,
     EventDescriptor.AGENT_END: NO_FEATURE,
     EventDescriptor.ERROR: NO_FEATURE,
-    EventDescriptor.DELIVERY_STATUS: frozenset({"session_history_fidelity"}),
-    EventDescriptor.MEMORY_UPDATED: frozenset({"memory_updated"}),
+    EventDescriptor.DELIVERY_STATUS: _EventRoute(frozenset({"session_history_fidelity"})),
+    EventDescriptor.MEMORY_UPDATED: _EventRoute(frozenset({"memory_updated"})),
     EventDescriptor.TURN_ABORTED: NO_FEATURE,
     EventDescriptor.USAGE: NO_FEATURE,
-    EventDescriptor.USER_MESSAGE: frozenset({"user_message_event"}),
-    EventDescriptor.SESSION_GRANTS_CHANGED: frozenset({"session_grants"}),
-    EventDescriptor.REPLAY_STREAM_ENDED: NO_FEATURE,
-    EventDescriptor.CONFIG_CHANGED: frozenset({"live_config_changed"}),
-    EventDescriptor.BACKGROUND_TASK_UPDATED: frozenset({"run_work"}),
-    EventDescriptor.SESSION_RETENTION: frozenset({"session_retention"}),
-    EventDescriptor.TODO_UPDATED: frozenset({"run_work"}),
-    EventDescriptor.ZETA_UPDATED: frozenset({"zeta_updated"}),
-    EventDescriptor.PARKED_SESSION_CHANGED: frozenset({"session_park"}),
+    EventDescriptor.USER_MESSAGE: _EventRoute(frozenset({"user_message_event"})),
+    EventDescriptor.SESSION_GRANTS_CHANGED: _EventRoute(frozenset({"session_grants"}), legacy_observers=True),
+    EventDescriptor.REPLAY_STREAM_ENDED: _EventRoute(destination="connection"),
+    EventDescriptor.CONFIG_CHANGED: _EventRoute(frozenset({"live_config_changed"})),
+    EventDescriptor.BACKGROUND_TASK_UPDATED: _EventRoute(frozenset({"run_work"})),
+    EventDescriptor.SESSION_RETENTION: _EventRoute(frozenset({"session_retention"}), legacy_observers=True),
+    EventDescriptor.TODO_UPDATED: _EventRoute(frozenset({"run_work"})),
+    EventDescriptor.ZETA_UPDATED: _EventRoute(frozenset({"zeta_updated"}), destination="global"),
+    EventDescriptor.PARKED_SESSION_CHANGED: _EventRoute(frozenset({"session_park"}), destination="connection"),
 }
 OPTIONAL_FIELD_FEATURES = {
     (EventDescriptor.USER_MESSAGE, "delivery_id"): frozenset(
@@ -406,7 +413,7 @@ class ConnectionRegistry(ReplayOutput):
         if event not in EVENT_FEATURES:
             # fail closed: an event the table does not name is never admitted.
             return True
-        required = EVENT_FEATURES[event]
+        required = EVENT_FEATURES[event].features
         if required_feature is not None:
             required |= frozenset({required_feature})
         if not required <= history_features(state.features):
@@ -454,18 +461,26 @@ class ConnectionRegistry(ReplayOutput):
         feature_fields: event_contract.FeatureFields | None = None,
         replay_scope: ReplayScopeId | None = None,
         covers: int | None = None,
+        legacy_observers: bool = False,
         wait_for_write: bool = False,
         **fields: object,
     ) -> Admission:
         """Admit once per target. Only the owner may receive a plain frame."""
+        route = EVENT_FEATURES.get(event)
+        if route is None or route.destination != "session":
+            return Admission("feature_rejected")
         coverage = (self._replay_covers(event, session_id, fields, replay_row, required_feature)
                     if replay_scope is None else covers)
         state = self._connections.get(owner)
         if not isinstance(coverage, DeferredFrame):
             self._publish_replay_subscribers(
                 event, session_id, required_feature, fields, coverage, replay_row,
-                exclude=owner, scope=replay_scope, feature_fields=feature_fields,
+                exclude=owner if replay_scope is None else None, scope=replay_scope, feature_fields=feature_fields,
+                legacy_observers=legacy_observers and route.legacy_observers,
             )
+        if replay_scope is not None:
+            # Child lifecycle has always been a parent-scope replay feed.
+            return Admission("no_controller")
         outcome, frame, output = self._event_preflight(
             state, event, session_id, required_feature=required_feature,
             fields=fields, feature_fields=feature_fields,
