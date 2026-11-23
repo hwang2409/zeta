@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -22,7 +23,12 @@ from ..core.session_files import (
     quarantine_path,
     reservation_path,
 )
-from ..locking import _CREATE_RACE_RETRIES, RETENTION_HOME_ID, domain_lock_name
+from ..locking import (
+    _CREATE_RACE_RETRIES,
+    RETENTION_HOME_ID,
+    domain_lock_name,
+    open_created,
+)
 from ..storage_format import (
     ACCEPTED_KEY_SETS,
     FEATURE_EPOCHS,
@@ -147,10 +153,14 @@ def _writer_epoch(home):
 '''
 
 
-_PROJECT_AUTHORITY = _REMOTE_WRITER_EPOCH + r'''
+# Remote Python need not have zeta installed; ship the same retry policy with it.
+_REMOTE_OPEN_CREATED = f"\n_CREATE_RACE_RETRIES = {_CREATE_RACE_RETRIES}\n{inspect.getsource(open_created)}\n"
+
+
+_PROJECT_AUTHORITY = _REMOTE_WRITER_EPOCH + _REMOTE_OPEN_CREATED + r'''
 def _lock_file(directory_fd, name, operation):
     try:
-        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
+        fd = open_created(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
     except OSError as exc:
         _reject(f"lock {name}: cannot open ({exc.strerror})")
     info = os.fstat(fd)
@@ -296,11 +306,10 @@ print(value, end="")
 # "{ident}" placeholder is filled at remote runtime by str.format).
 _RESERVATION_RELATIVE = reservation_path(Path(), "{ident}").as_posix()
 _QUARANTINE_RELATIVE = quarantine_path(Path(), "{ident}").as_posix()
-_SESSION_REFERENCE_GATE = _REMOTE_WRITER_EPOCH + rf'''
+_SESSION_REFERENCE_GATE = _REMOTE_WRITER_EPOCH + _REMOTE_OPEN_CREATED + rf'''
 _SESSION_RETENTION_EPOCH = {FEATURE_EPOCHS[StorageFeature.SESSION_RETENTION]}
 _GENERATION_NAME = {SESSION_REFERENCE_GENERATION!r}
 _REFERENCE_LOCK_NAME = {domain_lock_name(RETENTION_HOME_ID, REFERENCES_DOMAIN)!r}
-_CREATE_RACE_RETRIES = {_CREATE_RACE_RETRIES}
 _RETENTION_PIN_FILENAME = {RETENTION_PIN_FILENAME!r}
 _RESERVATION_RELATIVE = {_RESERVATION_RELATIVE!r}
 _QUARANTINE_RELATIVE = {_QUARANTINE_RELATIVE!r}
@@ -358,12 +367,7 @@ def _reference_gate(home, installed_ids, referenced_ids):
         lock_dir_fd = os.open(".domain-locks", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=home_fd)
         try:
             lock_name = _REFERENCE_LOCK_NAME
-            for attempt in range(_CREATE_RACE_RETRIES):  # Darwin: a racing first create can report ENOENT
-                try:
-                    fd = os.open(lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=lock_dir_fd)
-                    break
-                except FileNotFoundError:
-                    if attempt + 1 == _CREATE_RACE_RETRIES: raise
+            fd = open_created(lock_name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=lock_dir_fd)
             try:
                 info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:

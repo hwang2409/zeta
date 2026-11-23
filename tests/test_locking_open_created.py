@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from zeta.core.session_files import SessionError, open_session_file
-from zeta.locking import _CREATE_RACE_RETRIES, open_created
 
 CREATE = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
 
@@ -32,12 +31,16 @@ def _winner_publishes_hard_link(directory: Path, name: str) -> None:
 CASES = [
     ("loser of a concurrent create gets the winner's file", "helper", CREATE, None,
      _winner_creates, 2, "same inode"),
+    ("session file: loser gets the winner's file", "session", CREATE, None,
+     _winner_creates, 2, "same inode"),
     ("existing file opens on the first try", "helper", CREATE, "existing",
      None, 1, "same inode"),
     ("no O_CREAT: ENOENT raises at once", "helper", os.O_RDWR, None,
      None, 1, FileNotFoundError),
+    ("exclusive create: ENOENT raises at once", "helper", CREATE | os.O_EXCL, None,
+     _winner_creates, 1, FileNotFoundError),
     ("deleted directory: ENOENT raises after the bound", "helper", CREATE, "rmdir",
-     None, _CREATE_RACE_RETRIES, FileNotFoundError),
+     None, 8, FileNotFoundError),
     ("session file: retry finds a symlink", "session", os.O_RDWR | os.O_CREAT, None,
      _winner_publishes_symlink, 2, errno.ELOOP),
     ("session file: retry finds a hard-linked file", "session", os.O_RDWR | os.O_CREAT,
@@ -85,13 +88,21 @@ def test_open_created_table(
     monkeypatch.setattr(os, "open", counting_open)
     try:
         if through == "helper":
+            from zeta.locking import open_created
+
             def opened() -> int:
                 return open_created(name, flags, 0o600, dir_fd=directory_fd)
         else:
             def opened() -> int:
                 return open_session_file(directory_fd, name, flags)
         if expected == "same inode":
-            fd = opened()
+            fd = None
+            failure = None
+            try:
+                fd = opened()
+            except FileNotFoundError as exc:
+                failure = exc
+            assert fd is not None, failure
             try:
                 assert os.fstat(fd).st_ino == os.stat(directory / name).st_ino
             finally:

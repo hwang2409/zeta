@@ -12,7 +12,7 @@ from contextvars import ContextVar
 from typing import TypeVar
 
 from ..core.session_files import require_off_loop_lock
-from ..locking import domain_lock, identity_lock
+from ..locking import domain_lock, identity_lock, open_created
 from ..project_errors import (
     ProjectNotFoundError,
     ProjectRegistryBusyError,
@@ -59,7 +59,7 @@ class ProjectLockingMixin:
     def _open_lock(root_fd: int, *, create: bool) -> int | None:
         flags = os.O_RDWR | os.O_CREAT if create else os.O_RDONLY
         try:
-            lock_fd = os.open(".lock", flags | os.O_NOFOLLOW, 0o600, dir_fd=root_fd)
+            lock_fd = open_created(".lock", flags | os.O_NOFOLLOW, 0o600, dir_fd=root_fd)
         except FileNotFoundError:
             if not create:
                 return None
@@ -123,7 +123,7 @@ class ProjectLockingMixin:
     @staticmethod
     def _open_named_lock(directory_fd: int, name: str) -> int:
         try:
-            lock_fd = os.open(
+            lock_fd = open_created(
                 name,
                 os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
                 0o600,

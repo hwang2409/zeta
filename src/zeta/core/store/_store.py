@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import fcntl
 import json  # noqa: F401 - re-exported by the compatibility store facade
 import math  # noqa: F401 - re-exported by the compatibility store facade
 import os
@@ -211,22 +210,14 @@ class ConversationStore(
             self._transcript_generation = 0
             self._initialize_async_writes()
             if not _read_only and not _must_exist:
-                with shape_lock(), session_root(self.root_dir, create=True) as root_fd:
-                    # Serialize first publication of the permanent append lock. On
-                    # Darwin, racing O_CREAT | O_NOFOLLOW opens can transiently
-                    # report ENOENT even though neither constructor removes it.
-                    fcntl.flock(root_fd, fcntl.LOCK_EX)
-                    try:
-                        with child_directory(
-                            root_fd, self.session_id, create=True
-                        ) as directory_fd:
-                            os.close(
-                                open_session_file(
-                                    directory_fd, ".lock", os.O_RDWR | os.O_CREAT
-                                )
-                            )
-                    finally:
-                        fcntl.flock(root_fd, fcntl.LOCK_UN)
+                with (
+                    shape_lock(),
+                    session_root(self.root_dir, create=True) as root_fd,
+                    child_directory(root_fd, self.session_id, create=True) as directory_fd,
+                ):
+                    os.close(
+                        open_session_file(directory_fd, ".lock", os.O_RDWR | os.O_CREAT)
+                    )
             self.path = self.session_dir / "conversation.jsonl"
             self.state_path = self.session_dir / "session_state.json"
             self._history_index = _history_index

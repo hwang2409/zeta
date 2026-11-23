@@ -94,13 +94,13 @@ def open_created(name: str, flags: int, mode: int, *, dir_fd: int) -> int:
     """openat that survives Darwin's concurrent first create.
 
     Two racing ``openat(dir_fd, name, O_CREAT)`` calls can report ENOENT to the
-    loser although the winner just created the file. Only that case retries.
+    loser although the winner just created the file. Only non-exclusive creates retry.
     """
     for attempt in range(_CREATE_RACE_RETRIES):
         try:
             return os.open(name, flags, mode, dir_fd=dir_fd)
         except FileNotFoundError:
-            if not flags & os.O_CREAT or attempt + 1 == _CREATE_RACE_RETRIES:
+            if not flags & os.O_CREAT or flags & os.O_EXCL or attempt + 1 == _CREATE_RACE_RETRIES:
                 raise
     raise AssertionError("unreachable")
 
