@@ -62,7 +62,7 @@ async def _closing(
 
 def _watch_release(server: ZetaServer, monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
     assert server.connections is not None
-    connection, released = server._client, asyncio.Event()
+    connection, released = next(iter(server.connections.clients()), None), asyncio.Event()
     original = server.connections.release
 
     def release(target: Any) -> None:
@@ -124,7 +124,7 @@ async def _started_owner(
 ) -> tuple[ZetaServer, ReplayClient, str, Any, Any, asyncio.Event]:
     server, client, session_id = await _started(tmp_path, transport)
     assert server.connections is not None
-    owner = server._client
+    owner = next(iter(server.connections.clients()), None)
     output = server.connections._connections[owner].output
     return server, client, session_id, owner, output, _watch_release(server, monkeypatch)
 

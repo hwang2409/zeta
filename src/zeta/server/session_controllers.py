@@ -25,6 +25,16 @@ class HelloAdmission:
     generation: int
 
 
+@dataclass(frozen=True, slots=True)
+class SessionAcquisition:
+    connection: Any
+    session_id: str
+    generation: int
+    previous: SessionController | None
+    target: SessionController
+    created: bool
+
+
 @dataclass(slots=True, eq=False)
 class SessionController:
     """The persistent runtime/control pair for one resident session. Only
@@ -53,12 +63,18 @@ class SessionUse:
     or the completion it was handed to settles. A close of the record waits
     until it holds no use."""
 
-    __slots__ = ("_owner", "_state", "generation", "record")
+    __slots__ = ("_owner", "_state", "acquisition", "generation", "record")
 
-    def __init__(self, owner: SessionControllers, record: SessionController) -> None:
+    def __init__(
+        self,
+        owner: SessionControllers,
+        record: SessionController,
+        acquisition: SessionAcquisition | None = None,
+    ) -> None:
         self._owner = owner
         self._state: Literal["held", "transferred", "released"] = "held"
         self.record = record
+        self.acquisition = acquisition
         self.generation = record.generation
 
     @property
@@ -113,10 +129,16 @@ class SessionControllers:
         }
         self._attached = self._records[control]
         self._parked: dict[str, SessionController] = {}
+        # These maps are the sole semantic ownership state.  A reservation is
+        # installed before any target runtime operation can await.
+        self._by_connection: dict[Any, SessionController] = {}
+        self._by_session: dict[str, SessionAcquisition | SessionController] = {}
+        self._session_generations = itertools.count(1)
         # hello admission is semantic state.  The generation makes rollback
         # safe when a failed connection races a later hello.
         self._controller_mode: Literal["empty", "legacy", "multi"] = "empty"
         self._controller_members: dict[Any, int] = {}
+        self._hello_records: dict[Any, SessionController] = {}
         self._hello_generations = itertools.count(1)
         # a reconnect grace keeps the negotiated mode alive after its member
         # closes.  admission state follows one table: tokens (provisional or
@@ -188,18 +210,52 @@ class SessionControllers:
         del self._controller_members[admission.connection]
         self._refresh_controller_mode()
 
+    def is_controller(self, connection: Any) -> bool:
+        return connection in self._controller_members
+
+    def controller_for(self, connection: Any) -> SessionController | None:
+        """Return the exact committed or provisional record for ``connection``."""
+        record = self._by_connection.get(connection)
+        if record is not None:
+            return record
+        record = self._hello_records.get(connection)
+        if record is not None:
+            return record
+        return next((
+            owner.target for owner in self._by_session.values()
+            if isinstance(owner, SessionAcquisition) and owner.connection is connection
+        ), None)
+
+    async def begin_controller_release(
+        self, connection: Any, *, reconnect: bool, keep_turn: bool
+    ) -> None:
+        """Release only this connection's semantic controller state."""
+        record = self.controller_for(connection)
+        if record is not None:
+            await record.control.begin_controller_release(
+                reconnect=reconnect, keep_turn=keep_turn
+            )
+
     def release_connection(self, connection: Any, reason: str = "eof") -> None:
         del reason
+        previous = self._by_connection.get(connection)
+        self._hello_records.pop(connection, None)
         generation = self._controller_members.pop(connection, None)
         if generation is None:
             self._refresh_controller_mode()
             return
+        self._by_connection.pop(connection, None)
         if not self._controller_members:
             session_id = (
-                self._attached.runtime.session_id
-                if self._attached.runtime.opened is not None
+                previous.runtime.session_id
+                if previous is not None and previous.runtime.opened is not None
                 else None
             )
+            if session_id is None:
+                for record in self._records.values():
+                    if record.runtime.opened is not None:
+                        session_id = record.runtime.session_id
+                        break
             self._grace_session_id = session_id
             # legacy has a reconnect grace without a session id; dormant multi
             # does not. the mode selected by the released token distinguishes them.
@@ -224,12 +280,17 @@ class SessionControllers:
     def attached(self) -> SessionController:
         return self._attached
 
-    def owned(self, connection: Any) -> SessionUse:
+    def owned(self, connection: Any, session_id: str | None = None) -> SessionUse:
         """A use of the persistent record controlled by ``connection``."""
-        del connection
-        if self._attached.closing:
+        if session_id is not None:
+            acquisition = self.reserve_existing(connection, session_id)
+            return self._use(acquisition.target, acquisition)
+        record = self._by_connection.get(connection, self._attached)
+        if self._controller_mode == "multi" and connection not in self._by_connection:
+            self._hello_records[connection] = record
+        if record.closing:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
-        return self._use(self._attached)
+        return self._use(record)
 
     def selected(
         self,
@@ -242,20 +303,104 @@ class SessionControllers:
 
         ``unattached_error`` replaces the absence error while no session is
         attached, for an operation whose legacy wire text differs."""
-        del connection
-        attached = self._attached.runtime
+        current = self._by_connection.get(connection, self._attached)
+        attached = current.runtime
         if (
-            not self._attached.closing
+            not current.closing
             and attached.opened is not None
             and attached.session_id == session_id
         ):
-            return self._use(self._attached)
-        record = self._parked.get(session_id)
+            return self._use(current)
+        record = self._by_session.get(session_id)
+        if isinstance(record, SessionAcquisition):
+            if record.connection is not connection:
+                raise ProtocolError(
+                    ErrorDescriptor.SESSION_CONTROLLED,
+                    "session is controlled by another client",
+                    {"session_id": session_id},
+                )
+            record = record.target
+        if record is None:
+            record = self._parked.get(session_id)
         if record is not None:
             return self._use(record)
         if attached.opened is None and unattached_error is not None:
             raise unattached_error
         raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+
+    def resident(self, session_id: str) -> SessionController | None:
+        """Return the live record for ``session_id`` without changing ownership."""
+        owner = self._by_session.get(session_id)
+        if isinstance(owner, SessionAcquisition):
+            return owner.target
+        if owner is not None and not owner.closing:
+            return owner
+        parked = self._parked.get(session_id)
+        if parked is not None and not parked.closing:
+            return parked
+        return next((
+            record for record in self._records.values()
+            if record.runtime.opened is not None
+            and record.runtime.session_id == session_id
+            and not record.closing
+        ), None)
+
+    def reserve_existing(self, connection: Any, session_id: str) -> SessionAcquisition:
+        """Reserve an existing resident session for an exact reconnect."""
+        record = self.resident(session_id)
+        if record is None or record.closing:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        return self.reserve_session(connection, session_id, record)
+
+    def reserve_session(
+        self, connection: Any, session_id: str, candidate: SessionController
+    ) -> SessionAcquisition:
+        """Reserve a session synchronously, before opening its runtime."""
+        existing = self._by_session.get(session_id)
+        target = existing.target if isinstance(existing, SessionAcquisition) else existing
+        holder = next((
+            owner for owner, record in self._by_connection.items()
+            if record is target and owner is not connection
+        ), None)
+        if isinstance(existing, SessionAcquisition) or holder is not None:
+            raise ProtocolError(
+                ErrorDescriptor.SESSION_CONTROLLED,
+                "session is controlled by another client",
+                {"session_id": session_id},
+            )
+        previous = self._by_connection.get(connection)
+        acquisition = SessionAcquisition(
+            connection, session_id, next(self._session_generations), previous,
+            candidate, existing is None and candidate is not previous,
+        )
+        self._by_session[session_id] = acquisition
+        return acquisition
+
+    def use_acquisition(self, acquisition: SessionAcquisition) -> SessionUse:
+        """Hold the exact target reserved by ``acquisition`` during setup."""
+        if self._by_session.get(acquisition.session_id) is not acquisition:
+            raise RuntimeError("session acquisition is no longer current")
+        return self._use(acquisition.target)
+
+    def commit_session(self, acquisition: SessionAcquisition) -> SessionUse:
+        if self._by_session.get(acquisition.session_id) is not acquisition:
+            raise RuntimeError("session acquisition is no longer current")
+        self._by_session[acquisition.session_id] = acquisition.target
+        self._by_connection[acquisition.connection] = acquisition.target
+        self._hello_records.pop(acquisition.connection, None)
+        self._parked.pop(acquisition.session_id, None)
+        return self._use(acquisition.target)
+
+    def abort_session(self, acquisition: SessionAcquisition) -> asyncio.Task[None] | None:
+        if self._by_session.get(acquisition.session_id) is not acquisition:
+            return None
+        if acquisition.created:
+            del self._by_session[acquisition.session_id]
+            if self._records.get(acquisition.target.control) is acquisition.target:
+                return self.retire(acquisition.target)
+        else:
+            self._by_session[acquisition.session_id] = acquisition.target
+        return None
 
     def attach(self, record: SessionController) -> SessionController:
         assert not record.closing
@@ -352,6 +497,12 @@ class SessionControllers:
                     await control.wait_for_approval_settlement(settlement_timeout)
         finally:
             del self._records[control]
+            for session_id, owner in tuple(self._by_session.items()):
+                if owner is record:
+                    del self._by_session[session_id]
+            for connection, owner in tuple(self._by_connection.items()):
+                if owner is record:
+                    del self._by_connection[connection]
 
     async def wait_closed(self, session_id: str) -> None:
         """Wait until every closing record of ``session_id`` has closed."""
@@ -371,8 +522,14 @@ class SessionControllers:
         runtime would close (owned or not), and that close's error propagates;
         the others are logged by their close. A cancel of the shutdown does not
         cancel a close."""
-        for record in tuple(self._parked.values()):
-            self.retire(record, settlement_timeout)
+        committed = {
+            *self._parked.values(),
+            *self._by_connection.values(),
+            *(record for record in self._records.values() if not record.uses),
+        }
+        for record in committed:
+            if record is not self._attached:
+                self.retire(record, settlement_timeout)
         done = self._attached.close_task
         if done is not None and done.done():
             # a repeated shutdown: the first one already reported this close
@@ -405,8 +562,12 @@ class SessionControllers:
             self._drains.setdefault(record, []).append(waiter)
             await waiter
 
-    def _use(self, record: SessionController) -> SessionUse:
-        use = SessionUse(self, record)
+    def _use(
+        self,
+        record: SessionController,
+        acquisition: SessionAcquisition | None = None,
+    ) -> SessionUse:
+        use = SessionUse(self, record, acquisition)
         record.uses.add(use)
         return use
 

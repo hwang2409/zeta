@@ -294,7 +294,7 @@ async def test_websocket_drop_during_approval_finishes_cleanly(
             opened = server.controllers.attached().runtime.opened
             if (
                 opened is not None
-                and server._client is None
+                and next(iter(server.connections.clients()), None) is None
                 and any(
                     entry.type == "approval_resolution"
                     and entry.data.get("decision") == "abort"

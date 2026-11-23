@@ -209,7 +209,7 @@ async def test_serve_resume_cancel_closes_store_after_preparation_finishes(
     await server.controllers.attached().runtime.create_session()
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     opened: list[object] = []
     preparation_started = threading.Event()
@@ -264,7 +264,7 @@ async def test_serve_resume_cancel_reaper_waits_for_composition_before_closing_s
     await server.controllers.attached().runtime.create_session()
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     opened: list[object] = []
     compose_started = threading.Event()
@@ -323,7 +323,7 @@ async def test_serve_create_cancel_reaps_after_compose_finishes(
     server = _server(tmp_path)
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     compose_started = threading.Event()
     compose_release = threading.Event()
@@ -382,7 +382,7 @@ async def test_serve_resume_cancel_reaper_closes_store_after_compose(
     previous = server.controllers.attached().runtime.session_id
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     compose_started = threading.Event()
     compose_release = threading.Event()
@@ -443,7 +443,7 @@ async def test_serve_create_cancel_reaper_closes_store_after_compose(
     server = _server(tmp_path)
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     compose_started = threading.Event()
     compose_release = threading.Event()
@@ -503,7 +503,7 @@ async def test_serve_repeated_cancel_still_hands_setup_to_reaper(
         params = {"session_id": created.session_id}
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     compose_started = threading.Event()
     compose_release = threading.Event()
@@ -548,7 +548,7 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
     await server.controllers.attached().runtime.create_session()
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     compose_started = threading.Event()
     compose_release = threading.Event()
@@ -676,7 +676,7 @@ async def test_serve_blocking_git_does_not_block_ping(
             monkeypatch.setattr(
                 slash_commands, "build_registry", blocking_build_registry
             )
-        client = server._client
+        client = next(iter(server.connections.clients()), None)
         assert client is not None
         _acquired, release, holder = _hold_registry_lock(
             server.home / "projects" / ".lock"

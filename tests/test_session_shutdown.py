@@ -252,7 +252,8 @@ async def test_server_cleanup_continues_after_close_error(
     listener = server._server
     assert listener is not None
     client = AsyncMock()
-    server._client = client
+    client._run_task = None
+    monkeypatch.setattr(server.connections, "clients", lambda: (client,))
     original_close = listener.close
     original_wait_closed = listener.wait_closed
 
