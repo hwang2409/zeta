@@ -300,6 +300,50 @@ async def test_idle_history_reads_only_the_launch_project(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_idle_history_read_rejects_malformed_launch_project(tmp_path: Path) -> None:
+    harness, _ = await start(tmp_path, attach=False)
+    try:
+        target = await asyncio.to_thread(harness.session, None, 1)
+        observer = await harness.client()
+        record = harness.server.home / "projects" / harness.project / "project.json"
+        await asyncio.to_thread(record.write_text, "{")
+
+        reply = await read(observer, "unresolved", session_id=target)
+        assert "error" in reply, reply
+        assert (reply["error"]["code"], reply["error"]["data"]["code"]) == (-32005, "state_unavailable")
+    finally:
+        await close_serve(harness.server, *harness.writers)
+
+
+@pytest.mark.asyncio
+async def test_idle_history_read_discards_rows_after_target_reassociation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness, _ = await start(tmp_path, attach=False, projectless=True)
+    owner = await asyncio.to_thread(harness.session, None, 1, keep_open=True)
+    manager = harness.server.runtime.manager
+    real_page = session_read._page
+
+    def reassociate_before_page_returns(*args):
+        page = real_page(*args)
+        assert texts(page) == ["turn 0 question", "turn 0 answer"]
+        manager.associate_project(owner.metadata, harness.project)
+        return page
+
+    # test-contract: seam force a durable reassociation after projection, before _page returns
+    monkeypatch.setattr(session_read, "_page", reassociate_before_page_returns)
+    try:
+        observer = await harness.client()
+        absent = await read(observer, "absent", session_id="0" * 32)
+        reply = await read(observer, "reassociated", session_id=owner.metadata.session_id)
+        assert "error" in reply, reply
+        assert reply["error"] == absent["error"]
+    finally:
+        await asyncio.to_thread(owner.store.close)
+        await close_serve(harness.server, *harness.writers)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("transition", ["attach", "attach-detach", "detach"])
 async def test_history_read_discards_rows_when_the_attachment_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transition: str

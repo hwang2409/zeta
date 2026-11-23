@@ -11,6 +11,7 @@ import hashlib
 import os
 import weakref
 from dataclasses import replace
+from functools import partial
 
 from ....core.checkpoints import ConversationIntegrityError
 from ....core.session import validate_session_id
@@ -135,7 +136,9 @@ def _read(home, manager, session_id, project_id, request_id, features, start, ba
                                     raise ObserverSnapshotChanged("session directory changed")
                             if source != transcript(directory):
                                 raise ObserverSnapshotChanged("transcript source changed")
-                            return _page(store, request_id, features, source, start, backward, limit, max_bytes)
+                            page = _page(store, request_id, features, source, start, backward, limit, max_bytes)
+                            check_project()
+                            return page
                 except ObserverSnapshotChanged:
                     if continuation:
                         raise resource_error(ErrorDescriptor.HISTORY_SNAPSHOT_STALE) from None
@@ -149,6 +152,25 @@ def _read(home, manager, session_id, project_id, request_id, features, start, ba
         raise resource_error(ErrorDescriptor.SESSION_NOT_FOUND) from None
     except (OSError, SessionError, ConversationIntegrityError, StorageFormatError):
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
+
+
+def _launch_project_id(runtime):
+    from ...protocol import ErrorDescriptor, resource_error
+
+    try:
+        return runtime.launch_project_id()
+    except (ProjectRegistryError, OSError, ValueError, StorageFormatError):
+        raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
+
+
+def _read_idle(home, runtime, session_id, request_id, features, start, backward, limit, max_bytes):
+    from ...protocol import ErrorDescriptor, resource_error
+
+    scope = _launch_project_id(runtime)
+    page = _read(home, runtime.manager, session_id, scope, request_id, features, start, backward, limit, max_bytes)
+    if _launch_project_id(runtime) != scope:
+        raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
+    return page
 
 
 def _retrieve(future: asyncio.Future) -> None:
@@ -196,22 +218,12 @@ async def _handle(client, request_id, params):
         raise error
     features = history_features(client.features)
 
-    def launch_project_id():
-        try:
-            return runtime.launch_project_id()
-        except (ProjectRegistryError, OSError, ValueError, StorageFormatError):
-            raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
-
-    def read_page():
-        scope = launch_project_id() if opened is None else project_id
-        page = _read(
-            client.server.home, runtime.manager, session_id, scope, request_id, features,
-            start, direction == "backward", limit, max_bytes,
-        )
-        if opened is None and launch_project_id() != scope:
-            raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
-        return page
-
+    home = client.server.home
+    reader = (
+        partial(_read_idle, home, runtime, session_id) if opened is None
+        else partial(_read, home, runtime.manager, session_id, project_id)
+    )
+    read_page = partial(reader, request_id, features, start, direction == "backward", limit, max_bytes)
     read = asyncio.ensure_future(client.connections.run_blocking(read_page))
     _in_flight[loop] = read
     # The slot frees only when the worker thread is done, even after a timeout or cancel.
