@@ -713,7 +713,7 @@ async def test_slow_observer_does_not_delay_grant_or_revoke_response(
         await _event(reader, "approval_request")
         assert server.connections is not None
         observer_connection = server.connections._observers[0].connection
-        controller_connection = server.connections._primary_controller.connection
+        controller_connection = server.connections.legacy_controller_holder.connection
         original_observer_write = observer_connection._write_physical
         original_controller_write = controller_connection._write_physical
         original_client_read = server_client.read
@@ -2315,7 +2315,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
             failed_payloads: list[bytes] = []
             if case.startswith("fail_"):
                 assert server.connections is not None
-                controller = server.connections._primary_controller
+                controller = server.connections.legacy_controller_holder
                 assert controller is not None
                 original_write = controller.connection._write_physical
 
@@ -2491,7 +2491,7 @@ async def test_session_grant_lifecycle_table_over_real_transports(
                 )
             elif case == "cancel_write":
                 assert server.connections is not None
-                controller = server.connections._primary_controller
+                controller = server.connections.legacy_controller_holder
                 assert controller is not None
                 original_write = controller.connection._write_physical
 

@@ -128,16 +128,16 @@ async def _make_server(tmp_path: Path, transport: Transport) -> ZetaServer:
 
 
 def _is_lost(server: ZetaServer) -> bool:
-    controller = server.connections._primary_controller
+    controller = server.connections.legacy_controller_holder
     return controller is not None and getattr(controller, "lost", False)
 
 
 def _released(server: ZetaServer) -> bool:
-    return server.connections._primary_controller is None
+    return server.connections.legacy_controller_holder is None
 
 
 def _contended(server: ZetaServer) -> bool:
-    controller = server.connections._primary_controller
+    controller = server.connections.legacy_controller_holder
     event = getattr(controller, "contended", None) if controller is not None else None
     return event is not None and event.is_set()
 
@@ -499,7 +499,7 @@ async def test_parked_output_drain_on_lost_holder_releases_slot(tmp_path: Path) 
         a.writer.get_extra_info("socket").setsockopt(
             socket.SOL_SOCKET, socket.SO_RCVBUF, 8192
         )
-        state = server.connections._primary_controller
+        state = server.connections.legacy_controller_holder
         conn, output = state.connection, state.output
         # publish big live events the holder never reads; the writer parks in
         # drain() with its caller still counted, so callers_settled stays clear.

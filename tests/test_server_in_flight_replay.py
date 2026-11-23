@@ -94,8 +94,8 @@ def _server(tmp_path: Path, backend: CompletionBackend) -> ZetaServer:
 def _published(server: ZetaServer, event: str, match: str) -> asyncio.Event:
     """An event set once serve publishes a frame whose text contains ``match``."""
     seen = asyncio.Event()
-    connections = server.connections
-    original = connections.publish_controller
+    control = server.controllers.attached().control
+    original = control._notify
 
     async def publish(name, session_id, **fields):
         written = await original(name, session_id, **fields)
@@ -104,7 +104,7 @@ def _published(server: ZetaServer, event: str, match: str) -> asyncio.Event:
             seen.set()
         return written
 
-    connections.publish_controller = publish
+    control._notify = publish
     return seen
 
 

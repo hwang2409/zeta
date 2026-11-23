@@ -31,6 +31,7 @@ class ParkedPairs:
         self.limit = limit
         # the last parked_session_changed data sent per parked session
         self._sent: dict[str, dict[str, object]] = {}
+        self._parked_by: dict[ServeControl, object] = {}
 
     def require_room(self) -> None:
         held = [
@@ -57,6 +58,7 @@ class ParkedPairs:
     def forget(self, record: SessionController) -> None:
         """Forget the presentation state after an exact owner claims a record."""
         self._controllers.unpark(record)
+        self._parked_by.pop(record.control, None)
         if record.runtime.opened is not None:
             self._sent.pop(record.runtime.session_id, None)
 
@@ -68,12 +70,15 @@ class ParkedPairs:
             return False
         assert self._controllers.unpark(record) is not None
         self._sent.pop(session_id, None)
+        self._parked_by.pop(incoming, None)
         return True
 
-    def leave(self, outgoing: ServeControl) -> None:
+    def leave(self, outgoing: ServeControl, parked_by: object | None) -> None:
         """The client left ``outgoing``: park it while it holds work, else close it."""
         if outgoing.holds_work():
             self._controllers.park(self._controllers.record_for(outgoing))
+            if parked_by is not None:
+                self._parked_by[outgoing] = parked_by
             self.changed(outgoing)
         else:
             self._controllers.retire(self._controllers.record_for(outgoing))
@@ -116,15 +121,17 @@ class ParkedPairs:
         if self._sent.get(session_id) == data or connections is None:
             return
         self._sent[session_id] = data
-        connections.try_admit_controller(
-            EventDescriptor.PARKED_SESSION_CHANGED, session_id, data=data
-        )
+        if (parked_by := self._parked_by.get(control)) is not None:
+            connections.publish_connection(
+                parked_by, EventDescriptor.PARKED_SESSION_CHANGED, session_id, data=data
+            )
 
     def close(
         self, control: ServeControl, settlement_timeout: float | None = None
     ) -> None:
         """Close a parked pair now; its turn ends ``disconnect``."""
         if control in self._controllers.parked_controls():
+            self._parked_by.pop(control, None)
             session_id = control.runtime.session_id
             self._controllers.retire(self._controllers.record_for(control), settlement_timeout)
             self._publish(

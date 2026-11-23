@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Self
 
+from ..runtime.foreground_events import SessionEventSource
 from .protocol import ErrorDescriptor, ProtocolError
 
 if TYPE_CHECKING:
@@ -269,6 +270,34 @@ class SessionControllers:
 
     def record_for(self, control: ServeControl) -> SessionController:
         return self._records[control]
+
+    def event_record(self, source: SessionEventSource) -> SessionController | None:
+        return next((record for record in self._records.values()
+                     if record.generation == source.generation
+                     and (record.runtime.opened.metadata.session_id if record.runtime.opened is not None else None) == source.session_id
+                     and (record.close_task is None or not record.close_task.done())), None)
+
+    def legacy_event_owner(self, record: SessionController) -> Any | None:
+        # The sole legacy hello member controls this record, including during
+        # reconnect setup before the hello response can be queued.
+        if self._controller_mode == "legacy" and self._attached is record:
+            return next(iter(self._controller_members), None)
+        return None
+
+    def event_owner(self, source: SessionEventSource) -> Any | None:
+        record = self.event_record(source)
+        if record is None:
+            return None
+        return self.legacy_event_owner(record) if self._controller_mode == "legacy" else next(
+            (connection for connection, owner in self._by_connection.items() if owner is record),
+            None,
+        )
+
+    def event_source_for_session(self, session_id: str) -> SessionEventSource | None:
+        return next((SessionEventSource(record.generation, session_id)
+                     for record in self._records.values()
+                     if not record.closing and record.runtime.opened is not None
+                     and record.runtime.session_id == session_id), None)
 
     def register(self, control: ServeControl) -> SessionUse:
         """A new generation for ``control``, reserved by the returned use until

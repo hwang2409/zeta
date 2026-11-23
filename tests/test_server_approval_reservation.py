@@ -2061,7 +2061,7 @@ async def _wait_controller_release(server: ZetaServer) -> None:
     for _ in range(100):
         if (
             server.connections is not None
-            and server.connections.controller_metadata() is None
+            and server.connections.legacy_controller_holder is None
         ):
             return
         await asyncio.sleep(0)

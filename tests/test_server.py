@@ -3324,7 +3324,7 @@ async def test_lifecycle_prunes_ended_approvals(
     )
     reader, writer = await _ready(server)
     tool_end_written = asyncio.Event()
-    controller = server.connections.controller_metadata().connection
+    controller = server.connections.legacy_controller_holder.connection
     original_send = server.connections.send
     original_write = controller._write_physical
 
@@ -4644,7 +4644,7 @@ async def test_late_approval_after_disconnect_abort_is_rejected(
     )
     reader, writer = await _ready(server)
     assert server.connections is not None
-    controller = server.connections.controller_metadata()
+    controller = server.connections.legacy_controller_holder
     assert controller is not None
     first_client_released = asyncio.Event()
     release = server.connections.release
@@ -13697,7 +13697,8 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
     parent_tool_ended = asyncio.Event()
     release_parent_turn = asyncio.Event()
     parent_session_id = server.controllers.attached().runtime.session_id
-    publish_controller = server.connections.publish_controller
+    control = server.controllers.attached().control
+    notify = control._notify
 
     async def force_parent_tool_end_first(event, session_id, **fields):
         if failure == "cancelled" and event == "approval_end":
@@ -13709,7 +13710,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
             and parent_tool_ended.is_set()
         ):
             await asyncio.wait_for(release_parent_turn.wait(), timeout=10)
-        published = await publish_controller(event, session_id, **fields)
+        published = await notify(event, session_id, **fields)
         tool_call = fields.get("tool_call") or {}
         if event == "tool_end" and tool_call.get("id") == agent.id:
             parent_tool_ended.set()
@@ -13717,7 +13718,7 @@ async def test_delegated_history_failure_still_publishes_approval_end_first(
 
     # test-contract: seam no public event exposes controller admission order
     monkeypatch.setattr(
-        server.connections, "publish_controller", force_parent_tool_end_first
+        control, "_notify", force_parent_tool_end_first
     )
     frames: list[dict[str, Any]] = []
     try:
@@ -13848,7 +13849,7 @@ async def test_approval_end_backpressure_releases_before_tool_and_turn_end(
     reader, writer = await _ready(server)
     write_started = asyncio.Event()
     release_write = asyncio.Event()
-    controller = server.connections.controller_metadata()
+    controller = server.connections.legacy_controller_holder
     assert controller is not None
     connection = controller.connection
     original_write = connection._write_physical

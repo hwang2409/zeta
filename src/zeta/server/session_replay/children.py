@@ -10,13 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import weakref
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from typing import Any
 
 from ..protocol import EventDescriptor
 from . import ReplayScopeId
-
-if TYPE_CHECKING:
-    from .output import ReplayOutput
 
 
 def parent_scope(row: dict[str, object]) -> ReplayScopeId:
@@ -28,9 +26,9 @@ def parent_scope(row: dict[str, object]) -> ReplayScopeId:
 
 
 class ChildRunProjection:
-    def __init__(self, loop: asyncio.AbstractEventLoop, output: ReplayOutput) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop, publish: Callable[[EventDescriptor, ReplayScopeId, str, dict[str, object], int | None], None]) -> None:
         self._loop = loop
-        self._output = output
+        self._publish = publish
         # run_id -> (row, revision, start row sequence)
         self._rows: dict[str, tuple[dict[str, object], int, int | None]] = {}
         self._stores: dict[str, weakref.ReferenceType[object]] = {}
@@ -69,7 +67,7 @@ class ChildRunProjection:
             self._rows[run_id] = (row, number, sequence)
             if store is not None:
                 self._stores[run_id] = weakref.ref(store)
-            self._output.publish_child_lifecycle(
+            self._publish(
                 EventDescriptor.CHILD_PROGRESS,
                 parent_scope(row),
                 session_id,
@@ -85,7 +83,7 @@ class ChildRunProjection:
             self._rows.pop(run_id, None)
             self._stores.pop(run_id, None)
             event = EventDescriptor.CHILD_ENDED
-        self._output.publish_child_lifecycle(
+        self._publish(
             event,
             parent_scope(row),
             session_id,

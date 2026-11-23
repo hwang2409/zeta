@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -41,7 +41,6 @@ from .session_replay import (
     history_features,
 )
 from .session_replay.children import ChildRunProjection
-from .session_replay.in_flight import InFlightReply
 from .session_replay.output import ReplayOutput, _OutputFrame
 from .session_replay.rows import RowFacts
 
@@ -145,12 +144,10 @@ class Admission:
     ]
     connection: Any | None = None
 
+    write: Awaitable[bool] | None = None
 
-@dataclass(frozen=True)
-class ControllerMetadata:
-    connection: Any
-    protocol_version: str
-    features: frozenset[str]
+    async def delivered(self) -> bool:
+        return await self.write if self.write is not None else self.kind == "admitted"
 
 
 @dataclass
@@ -183,6 +180,7 @@ class _Connection:
     protocol_version: str = "1.0"
     features: frozenset[str] = frozenset()
     output: _OutputState | None = None
+    paused: bool = False
     # set when the run loop sees the peer gone while a request still runs
     lost: bool = False
     # set when a controller hello starts waiting for this lost holder to release
@@ -197,12 +195,10 @@ class ConnectionRegistry(ReplayOutput):
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
-        in_flight: Callable[[], InFlightReply],
+        publish_child_lifecycle: Callable[[EventDescriptor, ReplayScopeId, str, dict[str, object], int | None], None],
     ) -> None:
         self.loop = loop
         self._connections: dict[Any, _Connection] = {}
-        self._controllers: list[_Connection] = []
-        self._controller_output_paused = False
         # Rate-limit state for the contended-slot refusal log: the holder a
         # refusal was last logged against, that log's time, and how many later
         # refusals against the same holder were suppressed. The clock is an
@@ -214,9 +210,7 @@ class ConnectionRegistry(ReplayOutput):
         self._observers: list[_Connection] = []
         self._closed = False
         self.replay = SessionReplay()
-        # the attached control's unfinished reply, read by a join and the live skip
-        self.in_flight = in_flight
-        self.child_runs = ChildRunProjection(loop, self)
+        self.child_runs = ChildRunProjection(loop, publish_child_lifecycle)
         self._unregister_child_run_sink = register_child_run_sink(self.child_runs.sink)
         self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
         self._child_reader_lock = threading.Lock()
@@ -224,8 +218,9 @@ class ConnectionRegistry(ReplayOutput):
         self.state_reader = ReadCatalog(self.run_blocking)
 
     @property
-    def _primary_controller(self) -> _Connection | None:
-        return self._controllers[0] if self._controllers else None
+    def legacy_controller_holder(self) -> _Connection | None:
+        return next((state for state in self._connections.values()
+                     if state.role == "controller" and "multi_controller" not in state.features), None)
 
     def clients(self) -> tuple[Any, ...]:
         """The physical clients currently owned by this registry."""
@@ -298,7 +293,7 @@ class ConnectionRegistry(ReplayOutput):
         count. The holder's stuck request and await chain are added only when
         its connection is already closed while a request still runs.
         """
-        holder = self._primary_controller
+        holder = self.legacy_controller_holder
         if holder is None:
             return
         client = holder.connection
@@ -325,13 +320,13 @@ class ConnectionRegistry(ReplayOutput):
         state = self._connections[connection]
         if state.role is not None:
             raise ValueError("connection already claimed")
-        if role == "controller":
-            self._controllers.append(state)
-        else:
+        if role == "observer":
             if len(self._observers) >= 8:
                 raise RuntimeError("observer limit reached")
             self._observers.append(state)
         state.role = role
+        # Legacy hello buffers its own pre-commit events. Multi claims activate independently.
+        state.paused = role == "controller" and "multi_controller" in features
         assert state.output is not None
         state.output.overflow_frame = self._overflow_frame(role)
         state.protocol_version = protocol_version
@@ -339,7 +334,7 @@ class ConnectionRegistry(ReplayOutput):
 
     def is_controller(self, connection: Any) -> bool:
         state = self._connections.get(connection)
-        return state is not None and state is self._primary_controller
+        return state is not None and state.role == "controller"
 
     def output_state(self, connection: Any) -> _OutputState | None:
         state = self._connections.get(connection)
@@ -360,7 +355,7 @@ class ConnectionRegistry(ReplayOutput):
     async def wait_for_lost_controller(self, deadline: float) -> None:
         """If the controller slot is held by a lost holder, signal contention
         and wait up to ``deadline`` seconds for the slot to be released."""
-        state = self._primary_controller
+        state = self.legacy_controller_holder
         if state is None or not state.lost:
             return
         state.contended.set()
@@ -368,18 +363,11 @@ class ConnectionRegistry(ReplayOutput):
             await asyncio.wait_for(state.released.wait(), deadline)
 
     def activate_controller(self, connection: Any) -> None:
-        if self.is_controller(connection):
-            self._controller_output_paused = False
+        state = self._connections.get(connection)
+        if state is not None and state.role == "controller":
+            state.paused = False
 
-    def controller_metadata(self) -> ControllerMetadata | None:
-        state = self._primary_controller
-        if state is None:
-            return None
-        return ControllerMetadata(
-            state.connection, state.protocol_version, state.features
-        )
-
-    def _controller_preflight(
+    def _event_preflight(
         self,
         state: _Connection | None,
         event: EventDescriptor,
@@ -391,7 +379,7 @@ class ConnectionRegistry(ReplayOutput):
     ) -> tuple[Admission, _Frame | None, _OutputState | None]:
         if state is None:
             return Admission("no_controller"), None, None
-        if state is self._primary_controller and self._controller_output_paused:
+        if state.paused or state.role is None:
             return Admission("not_writable"), None, None
         if self._feature_rejected(state, event, required_feature, fields):
             return Admission("feature_rejected"), None, None
@@ -444,6 +432,10 @@ class ConnectionRegistry(ReplayOutput):
                 state.features
             ):
                 shaped.pop(name)
+        if event is EventDescriptor.TOOL_START and "tool_approval_origin" not in state.features:
+            tool_call = shaped.get("tool_call")
+            if isinstance(tool_call, dict) and "approval_origin" in tool_call:
+                shaped["tool_call"] = {key: value for key, value in tool_call.items() if key != "approval_origin"}
         if event is EventDescriptor.APPROVAL_END:
             shaped = event_contract.approval_end_for_features(
                 shaped,
@@ -451,143 +443,81 @@ class ConnectionRegistry(ReplayOutput):
             )
         return shaped
 
-    def try_admit_controller(
+    def publish_session(
         self,
-        event: EventDescriptor,
-        session_id: str | None,
-        *,
-        required_feature: str | None = None,
-        replay_row: RowFacts | None = None,
-        **fields: object,
-    ) -> Admission:
-        """Admit one controller event without waiting for physical output."""
-        covers = self._replay_covers(
-            event, session_id, fields, replay_row, required_feature
-        )
-        if not isinstance(covers, DeferredFrame):
-            self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers, replay_row
-            )
-        outcome, frame, output = self._controller_preflight(
-            self._primary_controller,
-            event,
-            session_id,
-            required_feature=required_feature,
-            fields=fields,
-        )
-        if outcome.kind != "admitted" or frame is None or output is None:
-            return outcome
-        assert self._primary_controller is not None
-        if self._replay_holds_copy(self._primary_controller, covers):
-            return outcome
-        if not isinstance(covers, DeferredFrame) and self._publish_replay(
-            self._primary_controller,
-            event,
-            session_id,
-            self._fields_for_connection(self._primary_controller, event, fields),
-            covers,
-            replay_row=replay_row,
-        ):
-            return outcome
-        if not self._admit(self._primary_controller, frame):
-            return Admission("capacity_rejected")
-        self._enqueue(
-            output,
-            _OutputFrame(frame),
-            wake=self._phase_allows_writes(output),
-        )
-        return outcome
-
-    def _replay_holds_copy(self, state: _Connection, covers: object) -> bool:
-        """True when a deferred record will send the controller's copy on its stream.
-
-        A controller with no stream or join in the scope gets the frame plainly now.
-        """
-        return isinstance(covers, DeferredFrame) and self.replay.scope_for(
-            state.connection
-        ) == ReplayScopeId.top(covers.session_id)
-
-    async def publish_controller(
-        self,
+        owner: Any | None,
         event: EventDescriptor,
         session_id: str | None,
         *,
         required_feature: str | None = None,
         replay_row: RowFacts | None = None,
         feature_fields: event_contract.FeatureFields | None = None,
+        replay_scope: ReplayScopeId | None = None,
+        covers: int | None = None,
+        wait_for_write: bool = False,
         **fields: object,
-    ) -> bool:
-        covers = self._replay_covers(
-            event, session_id, fields, replay_row, required_feature
-        )
-        if not isinstance(covers, DeferredFrame):
-            self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers, replay_row,
-                feature_fields=feature_fields,
+    ) -> Admission:
+        """Admit once per target. Only the owner may receive a plain frame."""
+        coverage = (self._replay_covers(event, session_id, fields, replay_row, required_feature)
+                    if replay_scope is None else covers)
+        state = self._connections.get(owner)
+        if not isinstance(coverage, DeferredFrame):
+            self._publish_replay_subscribers(
+                event, session_id, required_feature, fields, coverage, replay_row,
+                exclude=owner, scope=replay_scope, feature_fields=feature_fields,
             )
-        outcome, frame, output = self._controller_preflight(
-            self._primary_controller,
-            event,
-            session_id,
-            required_feature=required_feature,
-            fields=fields,
-            feature_fields=feature_fields,
+        outcome, frame, output = self._event_preflight(
+            state, event, session_id, required_feature=required_feature,
+            fields=fields, feature_fields=feature_fields,
         )
-        if outcome.kind != "admitted" or frame is None or output is None:
-            return False
-        state = self._primary_controller
-        assert state is not None
-        if self._replay_holds_copy(state, covers):
-            return True
-        if not isinstance(covers, DeferredFrame) and self._publish_replay(
-            state,
-            event,
-            session_id,
+        if state is None or frame is None or output is None:
+            return outcome
+        if isinstance(coverage, DeferredFrame):
+            if self.replay.scope_for(owner) == ReplayScopeId.top(coverage.session_id):
+                return outcome
+        elif self._publish_replay(
+            state, event, session_id,
             self._fields_for_connection(state, event, fields, feature_fields=feature_fields),
-            covers,
-            replay_row=replay_row,
+            coverage, scope=replay_scope, replay_row=replay_row,
         ):
-            return True
+            return outcome
+        return self._publish_local(state, output, frame, wait_for_write=wait_for_write)
+
+    def _publish_local(
+        self, state: _Connection, output: _OutputState, frame: _Frame, *, wait_for_write: bool
+    ) -> Admission:
+        if wait_for_write and output.phase == "ready":
+            return Admission("admitted", state.connection, self._write_event(state, output, frame))
         if not self._admit(state, frame):
+            return Admission("capacity_rejected")
+        self._enqueue(output, _OutputFrame(frame), wake=self._phase_allows_writes(output))
+        return Admission("admitted", state.connection)
+
+    async def _write_event(self, state: _Connection, output: _OutputState, frame: _Frame) -> bool:
+        if output.phase != "ready" or state.paused or not self._admit(state, frame):
             return False
-        if output.phase in {"claimed_buffering", "flushing"}:
-            self._enqueue(
-                output,
-                _OutputFrame(frame),
-                wake=self._phase_allows_writes(output),
-            )
-            return True
         return await self._send_frame(output, frame)
 
-    async def publish_feature_event(
-        self,
-        feature: str,
-        event: EventDescriptor,
-        session_id: str,
-        *,
-        data: dict[str, object],
-    ) -> None:
-        """Queue one live event for every connection that negotiated a feature."""
-        states = tuple(
-            state
-            for state in (self._primary_controller, *self._observers)
-            if state is not None
-            and feature in state.features
-            and (state is not self._primary_controller or not self._controller_output_paused)
+    def publish_connection(
+        self, connection: Any, event: EventDescriptor, session_id: str | None,
+        *, wait_for_write: bool = False, **fields: object,
+    ) -> Admission:
+        state = self._connections.get(connection)
+        outcome, frame, output = self._event_preflight(
+            state, event, session_id, required_feature=None, fields=fields,
         )
-        covers = self._replay_covers(event, session_id, {"data": data}, None)
-        # feature events have no publish-first route
-        assert not isinstance(covers, DeferredFrame)
-        for state in states:
-            frame = state.connection.codec.notification(event, session_id, data=data)
-            if frame is None:
-                continue
-            if self._publish_replay(state, event, session_id, {"data": data}, covers):
-                continue
-            if state is self._primary_controller:
-                await self.send(state.connection, frame)
-            else:
-                self._publish_observer(state, frame)
+        if state is None or frame is None or output is None:
+            return outcome
+        return self._publish_local(state, output, frame, wait_for_write=wait_for_write)
+
+    async def publish_global(
+        self, event: EventDescriptor, *, required_feature: str, data: dict[str, object]
+    ) -> None:
+        for state in tuple(self._connections.values()):
+            if required_feature in state.features:
+                await self.publish_connection(
+                    state.connection, event, None, wait_for_write=state.role == "controller", data=data,
+                ).delivered()
 
     def release(self, connection: Any) -> None:
         """Release physical role/output state, retaining the client until close."""
@@ -596,9 +526,7 @@ class ConnectionRegistry(ReplayOutput):
         if state is None or state.role is None:
             return
         state.released.set()
-        if state in self._controllers:
-            self._controllers.remove(state)
-            self._controller_output_paused = True
+        state.paused = True
         if state in self._observers:
             self._observers.remove(state)
         output = state.output
@@ -826,17 +754,6 @@ class ConnectionRegistry(ReplayOutput):
         self._finish_future(output.ready, result, error=error)
         output.ready = self.loop.create_future()
         output.phase = "claimed_buffering"
-
-    def _publish_observer(self, state: _Connection, frame: _Frame) -> None:
-        output = state.output
-        if (
-            state.connection not in self._connections
-            or output is None
-            or output.phase != "ready"
-            or not self._admit(state, frame)
-        ):
-            return
-        self._enqueue(output, _OutputFrame(frame))
 
     def _fits(self, output: _OutputState, size: int, frames: int = 1) -> bool:
         control = output.overflow_frame
@@ -1303,7 +1220,6 @@ class ConnectionRegistry(ReplayOutput):
             return_exceptions=True,
         )
         self._observers.clear()
-        self._controllers.clear()
         if first is not None:
             raise first
 

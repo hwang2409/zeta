@@ -297,10 +297,13 @@ def test_descriptor_rejects_overlong_socket_before_probe(tmp_path: Path) -> None
         validate(path)
 
 
+@pytest.mark.parametrize("swap", (False, True))
 @pytest.mark.asyncio
-async def test_observer_host_restart_keeps_borrowed_publisher_live(tmp_path: Path) -> None:
+async def test_observer_host_restart_keeps_borrowed_publisher_live(tmp_path: Path, swap: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     """A host close (fork suspend) must not close the TUI's publisher, so a
     restarted host still streams foreground events to new observers."""
+    import asyncio
+
     from tests.support.fake_backend import FakeBackend
     from tests.support.owned import await_or_fail
     from tests.support.replay_transport import ReplayClient, negotiate
@@ -329,12 +332,38 @@ async def test_observer_host_restart_keeps_borrowed_publisher_live(tmp_path: Pat
         joined = await client.request(2, "session_history_and_subscribe", {"session_id": session_id})
         assert "error" not in joined, joined
 
+        assert host._server is not None
+        controllers = host._server.controllers
+        record = controllers.attached()
+        consumed = asyncio.Event()
+
+        def observe(control):
+            original = control._event
+
+            async def publish(*args, **kwargs):
+                await original(*args, **kwargs)
+                consumed.set()
+
+            monkeypatch.setattr(control, "_event", publish)
+
+        observe(record.control)
+        if swap:
+            with host._server.new_pair() as replacement:
+                await replacement.runtime.create_session(provider="codex")
+                controllers.attach(replacement.record)
+                observe(replacement.control)
+
         async def source():
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, delta="live after restart")
 
         assert [event.delta async for event in publisher.events(source())] == ["live after restart"]
-        event = await await_or_fail(client.event("assistant_delta"), what="observer live event")
-        assert event["delta"] == "live after restart"
+        await await_or_fail(consumed.wait(), what="borrowed publisher consumed event")
+        await client.request(3, "status", {})
+        copies = [params for frame in client.wire_received
+                  if (params := frame.get("params", {})).get("event") == "assistant_delta"]
+        assert [(event["session_id"], event["delta"]) for event in copies] == [
+            (session_id, "live after restart")
+        ], "borrowed stream must retain its construction session and emit once"
     finally:
         if client is not None:
             await client.close()

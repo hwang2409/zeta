@@ -2688,7 +2688,7 @@ Event fields are:
 | `config_changed` (feature `live_config_changed`) | `event`, `data: object` | `session_id` |
 | `background_task_updated` (feature `run_work`) | `event`, `session_id: string`, `task: BackgroundTaskRow` | none |
 | `todo_updated` (feature `run_work`) | `event`, `session_id: string`, `todo: array[TodoItem]` | none |
-| `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: string` when a session is open |
+| `zeta_updated` (feature `zeta_updated`) | `event`, `data: {old_revision: string, new_revision: string}` | `session_id: null` |
 | `parked_session_changed` (feature `session_park`, controller only) | `event`, `session_id: string` (the parked session), `data: {session_id: string, state: "running"|"tool"|"idle"|"closed", pending_approvals: integer, last_turn_outcome: {turn_id: string, reason: string}|null}`; a parked session reports `running` for its whole turn, so `tool` is not sent while a turn runs | none |
 | `session_retention` (feature `session_retention`) | `event`, `data: {timestamp, mode, days, armed_by_zeta_version, preview_id, cutoff, root_ids, count, descendant_count, bytes, skip_counts, progress_counts, errors, disable_pending}` | `session_id` |
 
