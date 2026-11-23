@@ -628,6 +628,10 @@ class MCPManagementService:
                 digest.update(data)
         return digest.hexdigest()
 
+    def _check_revision(self, revision: str | None, paths: tuple[Path | None, ...]) -> None:
+        if revision is not None and revision != self._content_revision(paths):
+            raise MCPManagementError("MCP revision is stale", code="stale_revision")
+
     def read_disk(self, *, require_project: bool = False) -> tuple[str, tuple[ManagedServer, ...]]:
         """Read disk state under the writer locks, without reconciling any mount."""
         candidate = self._transaction(snapshot=True, require_project=require_project)
@@ -657,8 +661,7 @@ class MCPManagementService:
             if require_project and usable_project is None:
                 raise self._no_project_error()
             revision_paths = (home_path, usable_project, trust_path)
-            if revision is not None and revision != self._content_revision(revision_paths):
-                raise MCPManagementError("MCP revision is stale", code="stale_revision")
+            self._check_revision(revision, revision_paths)
             if mutation is not None:
                 mutation(home_path, usable_project, trust_path)
             candidate = self._candidate_locked(home_path, usable_project, trust_path)
@@ -979,9 +982,17 @@ class MCPManagementService:
     def _policy_registry(self) -> ToolRegistry | None:
         return getattr(self.mount, "registry", None)
 
-    def _command_target(self, name: str, scope: Scope) -> tuple[ManagedServer, MCPServerConfig | None]:
-        # Trust and the config used to connect must come from the same lock acquisition.
+    async def action_target(
+        self, name: str, *, scope: Scope, revision: str | None = None,
+    ) -> tuple[ManagedServer, MCPServerConfig | None]:
+        return await asyncio.to_thread(self._command_target, name, scope, revision)
+
+    def _command_target(
+        self, name: str, scope: Scope, revision: str | None,
+    ) -> tuple[ManagedServer, MCPServerConfig | None]:
+        # Check and resolve under the writer locks; the action uses the returned config.
         with self._locked_paths() as (home, project, trust_path, _):
+            self._check_revision(revision, (home, project, trust_path))
             if scope == "project" and project is None:
                 raise self._no_project_error()
             for selected, path in (("project", project), ("user", home)):
@@ -995,10 +1006,10 @@ class MCPManagementService:
 
     async def test(
         self, name: str, *, scope: Scope = "effective", wire: bool = False,
-        registry: ToolRegistry | None = None,
+        registry: ToolRegistry | None = None, revision: str | None = None,
     ) -> dict[str, object]:
         registry = registry if registry is not None else self._policy_registry()
-        item, config = await asyncio.to_thread(self._command_target, name, scope)
+        item, config = await self.action_target(name, scope=scope, revision=revision)
         if not mcp_connection.mcp_server_allowed(registry, name):
             return {
                 "name": name,
@@ -1045,11 +1056,12 @@ class MCPManagementService:
         launch_ready: Callable[[str], None] | None = None,
         before_commit: Callable[[], None] | None = None,
         registry: ToolRegistry | None = None,
+        target: tuple[ManagedServer, MCPServerConfig | None] | None = None,
     ) -> None:
         from .oauth import authorize
 
         registry = registry if registry is not None else self._policy_registry()
-        item, config = await asyncio.to_thread(self._command_target, name, scope)
+        item, config = target if target is not None else await self.action_target(name, scope=scope)
         if not mcp_connection.mcp_server_allowed(registry, name):
             raise MCPManagementError("skipped by tool policy")
         if config is None or item.config.get("transport") != "streamable-http":
@@ -1094,8 +1106,13 @@ class MCPManagementService:
             raise MCPManagementError("credentials changed during login")
         return saved.snapshot.token
 
-    async def logout(self, name: str, *, scope: Scope = "effective") -> None:
-        await asyncio.to_thread(self._command_target, name, scope)
+    async def logout(
+        self, name: str, *, scope: Scope = "effective", revision: str | None = None,
+        before_delete: Callable[[], Awaitable[object]] | None = None,
+    ) -> None:
+        await self.action_target(name, scope=scope, revision=revision)
+        if before_delete is not None:
+            await before_delete()
         await self._credential_store.delete(name)
         self._credential_status[name] = "unauthorized"
         self.credential_store_error = None

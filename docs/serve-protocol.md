@@ -2100,8 +2100,16 @@ and reason `observer_read_only`, plus the method, before parameter validation.
 Unnegotiated methods return `-32601`.
 
 `mcp_server_test`, `mcp_auth_start`, and `mcp_auth_logout` accept
-`{name,scope?}`, with the same scopes as list. `mcp_server_test` performs a
-bounded connection and lists tools without calling them or returning tool
+`{name,scope?,revision?}`, with the same scopes as list. To detect support,
+request `mcp_action_revision_v1` alongside `mcp_management_v1` in `hello`
+and check for it in `capabilities.features`. `revision` is the opaque revision
+from `mcp_server_list`. A mismatch returns `-32009` with `data.code` and
+`data.reason` both set to `stale_mcp_revision`; re-list and review the new
+definition before retrying. No connection, stdio process, OAuth attempt, or
+credential deletion occurs on a mismatch. A malformed revision returns
+`-32602 invalid_params`. Omit the revision to act on the current definition.
+
+`mcp_server_test` performs a bounded connection and lists tools without calling them or returning tool
 names, descriptions, or stdio stderr. It returns `{data:{status,tool_count}}`.
 One MCP call deadline covers initialization and listing. On timeout, the probe
 closes the transport, reaps any stdio child, and returns
