@@ -6,6 +6,7 @@ import re
 import sys
 from collections.abc import Callable
 from io import StringIO
+from pathlib import Path
 from time import perf_counter
 
 import pytest
@@ -30,7 +31,9 @@ from tests.support.tui_child_view_home import (
     ChildViewHome,
     generate_child_view_home,
 )
+from zeta.core.checkpoints.mutation import AppendConversationRows, ConversationRow
 from zeta.core.store import ConversationStore
+from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.app import TUIApp
@@ -275,6 +278,58 @@ async def _assert_child_keeps_place(app: TUIApp, rows: list[str], how: str) -> N
 @pytest.fixture(scope="module")
 def child_view_fixture(tmp_path_factory: pytest.TempPathFactory) -> ChildViewHome:
     return generate_child_view_home(tmp_path_factory.mktemp("child-view-home"))
+
+
+@pytest.mark.asyncio
+async def test_root_follows_latest_tail_after_child_view(tmp_path: Path) -> None:
+    # Use a private fixture: this journey adds durable rows to the root log.
+    fixture = await asyncio.to_thread(generate_child_view_home, tmp_path)
+    with await asyncio.to_thread(
+        ConversationStore, fixture.home / "sessions", session_id=fixture.session_id
+    ) as store:
+        async def append_root_rows(count: int, marker: str) -> None:
+            texts = [f"root update {i}" for i in range(count - 1)] + [marker]
+            rows = tuple(
+                ConversationRow("message", {"message": Message(
+                    MessageRole.ASSISTANT, [TextContent(text)]
+                ).to_dict()})
+                for text in texts
+            )
+            delta = await store.commit_async(AppendConversationRows(rows), store.conversation_generation)
+            entry = delta.committed_entries[-1]
+            assert store.active_branch_head_id() == entry.id
+            assert entry.data["message"]["content"][0]["text"] == marker
+
+        # Fill the first page with enough rendered units to use virtual history.
+        initial_tail = "root-tail-before-child-view"
+        await append_root_rows(128, initial_tail)
+        app = TUIApp(
+            AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
+            provider="codex", model="offline", resumed=True, zeta_home=fixture.home,
+        )
+        output = Vt100_Output(StringIO(), lambda: Size(rows=42, columns=120), enable_cpr=False)
+        with create_pipe_input() as pipe, create_app_session(input=pipe, output=output):
+            session = app._make_session()
+            run_task = asyncio.create_task(app.run(session))
+            try:
+                await _wait_until(lambda: session.app.is_running, what="running TUIApp")
+                await _wait_for_screen(app, initial_tail, "initial root tail")
+                transcript = app._transcript
+                assert transcript.follow_tail
+                assert len(transcript.units) >= 128
+                assert transcript.durable_scroll_anchor is not None
+
+                await _enter_child(app, pipe)
+                final_tail = "root-tail-after-child-view"
+                # The old anchor's one newer page cannot reach this marker.
+                await append_root_rows(260, final_tail)
+                await _return_to_root(app, pipe)
+
+                assert transcript.follow_tail, "returning from a child stopped root tail-follow"
+                await _wait_for_screen(app, final_tail, "latest root tail after returning with h")
+            finally:
+                app.request_exit()
+                await await_or_fail(run_task, what="root tail regression TUI shutdown")
 
 
 @pytest.mark.skipif(
