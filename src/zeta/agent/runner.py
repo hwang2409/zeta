@@ -11,14 +11,21 @@ from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from ..core.abort import AbortSignal as ToolAbortSignal
+from ..core.agent_state import LoadedAgentLifecycle, MissingAgentLifecycle
+from ..core.checkpoints.mutation import AppendConversationRows, ConversationRow
+from ..core.child_runs import TERMINAL_AGENT_STATES, read_child_lifecycle
 from ..core.session import env_home
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
+from ..core.store._child_runs import child_run_segments
 from ..media.image_policy import image_policy_for_provider
 from ..path_identity import same_physical_path
 from ..project_registry import ProjectRegistryError
 from ..protocol.types import (
+    ASSISTANT_RESPONSE_STATE,
+    ASSISTANT_RESPONSE_SYNTHETIC,
     CompletionBackend,
     Message,
     MessageOrigin,
@@ -28,6 +35,7 @@ from ..protocol.types import (
     TextContent,
     ToolCall,
     ToolResult,
+    ToolUseContent,
     assistant_text,
     is_owned_completion_backend,
 )
@@ -64,6 +72,7 @@ from .conversation_channel import NO_HOLD_WAKE, HoldWake, has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
 from .finish_gate import FinishGateControl, FinishGateState, run_finish_gate
+from .pending_delivery import delivery_preview
 from .presets import (
     GENERAL_PRESET,
     RUN_PRESET,
@@ -78,6 +87,7 @@ from .receipt import (
     recoverable_error_result,
 )
 from .terminal_fence import TerminalTransitionFence, persist_confirmed_cancel
+from .tool_results import validated_tool_result
 from .turn_limit import (
     ChildTurnControl,
     append_child_start,
@@ -556,33 +566,110 @@ async def run_agent_tool(
     error_message: Callable[[BaseException], str],
     execution_context: ToolExecutionContext | None = None,
 ) -> dict[str, object]:
-    return await loop._background_owner.start_child_setup(
-        lambda: _run_agent_tool(
-            loop, tool_call, arguments, abort_signal, publisher,
-            validate_result, error_message, execution_context,
-        )
-    )
+    result = await loop._background_owner.start_child_setup(lambda: _run_child(
+        loop, tool_call, arguments, abort_signal, publisher, validate_result,
+        error_message, execution_context,
+    ))
+    assert isinstance(result, dict)
+    return result
 
 
-async def _run_agent_tool(
+class ChildControlError(Exception):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+async def spawn_child(
+    loop: AgentLoop, *, agent_type: str, task: str, cwd: str | None,
+) -> str:
+    arguments = {
+        "preset": agent_type,
+        "prompt": task,
+        "description": delivery_preview(task),
+        "background": True,
+        "cwd": cwd,
+    }
+    # A disconnected controller must not interrupt the durable start sequence.
+    launch = loop._background_owner.start_child_setup(lambda: _run_child(
+        loop, None, arguments, ToolAbortSignal(), None, validated_tool_result, str,
+    ))
+    if await _complete_despite_cancellation(launch):
+        raise asyncio.CancelledError
+    result = launch.result()
+    assert isinstance(result, str)
+    return result
+
+
+async def cancel_child_run(loop: AgentLoop, run_id: str) -> str:
+    store = loop.store
+    try:
+        segments = child_run_segments(store.session_id, run_id)
+    except ValueError:
+        raise ChildControlError("child_run_not_found") from None
+    path = store.session_dir.absolute()
+    for segment in segments:
+        path = path / "agents" / str(segment)
+
+    def state() -> str:
+        try:
+            lifecycle, _ = read_child_lifecycle(store, path)
+        except FileNotFoundError:
+            raise ChildControlError("child_run_not_found") from None
+        if isinstance(lifecycle, MissingAgentLifecycle):
+            raise ChildControlError("child_run_not_found")
+        if not isinstance(lifecycle, LoadedAgentLifecycle):
+            raise ChildControlError("state_unavailable")
+        if lifecycle.value.get("handle") != run_id:
+            raise ChildControlError("child_run_not_found")
+        return lifecycle.value["state"]
+
+    try:
+        current = await await_joined_offload(state)
+    except asyncio.CancelledError:
+        # An interrupted reply must not withdraw cancellation of a live child.
+        loop._background_owner.cancel(run_id)
+        raise
+    if current in TERMINAL_AGENT_STATES:
+        return current
+    outcome = await loop._background_owner.cancel_and_wait(run_id)
+    if outcome.status == "confirmed":
+        return "cancelling"
+    current = await await_joined_offload(state)
+    if current in TERMINAL_AGENT_STATES:
+        return current
+    if outcome.status == "failed" or not loop._background_owner.owns_running(run_id):
+        raise ChildControlError("state_unavailable")
+    raise ChildControlError("operation_busy")
+
+
+async def _run_child(
     loop: AgentLoop,
-    tool_call: ToolCall,
+    tool_call: ToolCall | None,
     arguments: dict[str, Any],
     abort_signal: ToolAbortSignal,
     publisher: ToolStreamPublisher | None,
     validate_result: Callable[[object, str], ToolResult],
     error_message: Callable[[BaseException], str],
     execution_context: ToolExecutionContext | None = None,
-) -> dict[str, object]:
+) -> dict[str, object] | str:
+    external = tool_call is None
+    if tool_call is None:
+        # Existing markers and cards use a call id; no tool execution is admitted.
+        tool_call = ToolCall(f"spawn-{uuid4().hex}", "agent", arguments)
+
+    def failure(text: str, *, code: str = "invalid_params") -> dict[str, object]:
+        if external:
+            raise ChildControlError(code)
+        return loop._child_result_payload(tool_call.id, text, state="failed")
+
     prompt = arguments.get("prompt")
     description = arguments.get("description")
     requested_preset = arguments.get("preset")
     legacy_agent_type = arguments.get("agent_type")
     if requested_preset is not None and legacy_agent_type is not None:
-        return loop._child_result_payload(
-            tool_call.id,
+        return failure(
             "agent error: pass only one of preset and agent_type",
-            state="failed",
         )
     agent_type = (
         requested_preset
@@ -593,51 +680,61 @@ async def _run_agent_tool(
     )
     model = arguments.get("model")
     if type(prompt) is not str or not prompt.strip():
-        return loop._child_result_payload(
-            tool_call.id,
+        return failure(
             "agent error: prompt must be a nonempty string",
-            state="failed",
         )
     if type(description) is not str or not description.strip():
-        return loop._child_result_payload(
-            tool_call.id,
+        return failure(
             "agent error: description must be a nonempty string",
-            state="failed",
         )
     catalog = loop.tool_registry.agent_catalog
     if type(agent_type) is not str:
-        return loop._child_result_payload(
-            tool_call.id,
+        return failure(
             f"agent error: preset must be one of: {', '.join(catalog.names())}",
-            state="failed",
         )
     try:
         preset = catalog.find(agent_type)
     except ValueError:
-        return loop._child_result_payload(
-            tool_call.id,
+        return failure(
             f"agent error: unknown agent_type/preset {agent_type!r}; expected one of: "
             f"{', '.join(catalog.names())}",
-            state="failed",
         )
     if (
         loop.plan_mode
         and preset.source == "packaged"
         and preset.name == GENERAL_PRESET.name
     ):
-        return loop._child_result_payload(
-            tool_call.id,
+        return failure(
             "agent error: general agents are unavailable in plan mode; "
             "use agent_type 'explore' or 'plan'",
-            state="failed",
         )
     requested_max_turns = arguments.get("max_turns", preset.max_turns)
     if requested_max_turns is not None and not valid_max_turns(requested_max_turns):
-        return loop._child_result_payload(
-            tool_call.id,
+        return failure(
             "agent error: max_turns must be a positive integer",
-            state="failed",
         )
+    raw_cwd = arguments.get("cwd")
+    child_cwd = str(loop.store.cwd)
+    cwd_override: str | None = None
+    if raw_cwd is not None:
+        if type(raw_cwd) is not str or not raw_cwd.strip():
+            return failure("agent error: cwd must be a nonempty string")
+
+        def resolve_cwd() -> str:
+            if external and not Path(raw_cwd).is_absolute():
+                raise ValueError("cwd must be absolute")
+            candidate = Path(raw_cwd).expanduser()
+            if not candidate.is_absolute():
+                candidate = require_bash_cwd(loop.tool_registry.bash_cwd) / candidate
+            resolved = Path(os.path.abspath(candidate))
+            if not resolved.is_dir():
+                raise ValueError(f"cwd is not an existing directory: {resolved}")
+            return str(resolved)
+
+        try:
+            child_cwd = cwd_override = await asyncio.to_thread(resolve_cwd)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return failure(f"agent error: {exc}")
     effective_model = model if model is not None else preset.model
     if getattr(loop, "account_context", None) is None:
         child_backend, backend_error = resolve_child_backend(loop, effective_model)
@@ -646,10 +743,8 @@ async def _run_agent_tool(
             resolve_child_backend, loop, effective_model
         )
     if backend_error is not None:
-        return loop._child_result_payload(
-            tool_call.id,
-            backend_error,
-            state="failed",
+        return failure(
+            backend_error, code="state_unavailable",
         )
     # The long kinds default to background -- a run on someone else's model, or
     # one sized for a big task. Waiting on either blocks the orchestrator for
@@ -660,32 +755,28 @@ async def _run_agent_tool(
         or (preset.source == "packaged" and preset.name == RUN_PRESET.name),
     )
     if type(background) is not bool:
-        return loop._child_result_payload(
-            tool_call.id,
+        return failure(
             "agent error: background must be a boolean",
-            state="failed",
         )
     if getattr(loop, "one_shot", False):
+        if external:
+            raise ChildControlError("operation_busy")
         # Headless exits after this turn, so a background child would be canceled.
         background = False
     child_depth, nesting_error = budget.child_depth(
         loop.agent_depth, loop.max_agent_depth, background
     )
     if nesting_error is not None:
-        return loop._child_result_payload(
-            tool_call.id,
-            nesting_error,
-            state="failed",
+        return failure(
+            nesting_error, code="operation_busy",
         )
     try:
         await loop._ensure_mcp_servers()
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001 - setup failures become receipts
-        return loop._child_result_payload(
-            tool_call.id,
-            f"agent error: {error_message(exc)}",
-            state="failed",
+        return failure(
+            f"agent error: {error_message(exc)}", code="state_unavailable",
         )
     follow_up_loop = has_follow_up_loop(
         accepts_follow_ups=preset.accepts_follow_ups,
@@ -696,35 +787,6 @@ async def _run_agent_tool(
         if preset.source == "packaged" and preset.name == GENERAL_PRESET.name
         else preset.name
     )
-    raw_cwd = arguments.get("cwd")
-    child_cwd = str(loop.store.cwd)
-    cwd_override: str | None = None
-    if raw_cwd is not None:
-        if type(raw_cwd) is not str or not raw_cwd.strip():
-            return loop._child_result_payload(
-                tool_call.id,
-                "agent error: cwd must be a nonempty string",
-                state="failed",
-            )
-        candidate = Path(raw_cwd).expanduser()
-        if not candidate.is_absolute():
-            try:
-                candidate = await asyncio.to_thread(
-                    require_bash_cwd, loop.tool_registry.bash_cwd
-                ) / candidate
-            except ValueError as exc:
-                return loop._child_result_payload(
-                    tool_call.id, f"agent error: {exc}", state="failed"
-                )
-        resolved_cwd = Path(os.path.abspath(candidate))
-        if not resolved_cwd.is_dir():
-            return loop._child_result_payload(
-                tool_call.id,
-                f"agent error: cwd is not an existing directory: {resolved_cwd}",
-                state="failed",
-            )
-        child_cwd = str(resolved_cwd)
-        cwd_override = child_cwd
     child_number = loop.store.allocate_agent_index()
     parent_identity = loop.agent_instance_id or loop.store.session_id
     child_instance_id = f"{parent_identity}:{child_number}"
@@ -876,13 +938,11 @@ async def _run_agent_tool(
         child_loop.agent_profile = preset.name
         child_loop.agent_background = background
     except asyncio.CancelledError:
-        cleanup = asyncio.create_task(cancel_setup())
-        await _complete_despite_cancellation(cleanup)
+        await _complete_despite_cancellation(asyncio.create_task(cancel_setup()))
         raise
     except Exception as exc:
         if not store_bound:
-            cleanup = asyncio.create_task(release_setup_store())
-            if await _complete_despite_cancellation(cleanup):
+            if await _complete_despite_cancellation(asyncio.create_task(release_setup_store())):
                 raise asyncio.CancelledError
             raise
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
@@ -916,6 +976,10 @@ async def _run_agent_tool(
             child_store.update_agent_lifecycle_result(
                 failure_content[0]["text"], canonical_receipt=True
             )
+        if external:
+            if await _complete_despite_cancellation(asyncio.create_task(release_setup_store())):
+                raise asyncio.CancelledError
+            raise ChildControlError("state_unavailable") from None
         return failure_payload
     lifecycle_sink = (
         execution_context.lifecycle_sink if execution_context is not None else None
@@ -1114,8 +1178,11 @@ async def _run_agent_tool(
     if getattr(child_loop, "explicit_finish", False) and terminal_fence is None:
         terminal_fence = TerminalTransitionFence(child_store)
     cancellation: asyncio.Task[bool] | None = None
+    spawn_ready = asyncio.Event() if external else None
 
     async def run_child() -> dict[str, object]:
+        if spawn_ready is not None:
+            await spawn_ready.wait()
         try:
             return await consume(
                 child_loop,
@@ -1152,7 +1219,7 @@ async def _run_agent_tool(
 
     async def confirm_child_cancel() -> bool:
         nonlocal child_canceled
-        if child_canceled:
+        if child_canceled or (background and child_task.done()):
             return False
         # Claim before any await: concurrent requests (owner cleanup and the
         # child's own abort path) must not both write; a failed write releases it.
@@ -1296,7 +1363,6 @@ async def _run_agent_tool(
             active_store=child_store,
             parent_instance_id=loop.agent_instance_id,
         )
-        loop._background_owner.finish_child_setup()
         # The tree owner now keeps this task pair alive after this loop closes.
         loop._tracked_tasks.discard(child_task)
         loop._tracked_tasks.discard(watcher)
@@ -1314,13 +1380,34 @@ async def _run_agent_tool(
         running_tool_result = validate_result(running_result, tool_call.id)
         # Keep this publication synchronous: parallel agent calls rely on task
         # dispatch order when exposing their immediate running receipts.
-        loop.store.append_message(
-            Message(
-                MessageRole.TOOL_RESULT,
-                [TextContent(running_tool_result.content)],
-                tool_result=running_tool_result,
-            )
+        receipt = Message(
+            MessageRole.TOOL_RESULT,
+            [TextContent(running_tool_result.content)],
+            tool_result=running_tool_result,
         )
+        if external:
+            # Keep the discoverable receipt paired without leaving a pending tool.
+            anchor = Message(
+                MessageRole.ASSISTANT,
+                [ToolUseContent(tool_call)],
+                metadata={ASSISTANT_RESPONSE_STATE: ASSISTANT_RESPONSE_SYNTHETIC},
+            )
+            try:
+                await loop.store._commit_address_async(AppendConversationRows((
+                    ConversationRow("message", {"message": anchor.to_dict()}),
+                    ConversationRow("message", {"message": receipt.to_dict()}),
+                )))
+            except (Exception, asyncio.CancelledError):
+                loop._background_owner.cancel(child_instance_id)
+                raise
+            loop._publish_background_event(StreamEvent(
+                StreamEventType.TOOL_EXECUTION_START, tool_call=tool_call,
+                data={"child_session_path": child_path, "depth": child_depth},
+            ))
+            assert spawn_ready is not None
+            spawn_ready.set()
+            return child_instance_id
+        loop.store.append_message(receipt)
         return running_result
 
     loop._background_owner.register(

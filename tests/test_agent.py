@@ -3793,12 +3793,14 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
         notification = await original_publish(**kwargs)
         if kwargs["child_instance_id"].count(":") == 1:
             completion_published.set()
-            await await_or_fail(release_child_watcher.wait(), what="release child watcher")
+            await await_or_fail(release_child_watcher.wait(), what="release child publication")
         return notification
+
+    hold_child_loop = asyncio.Event()
 
     async def hold_child_loop_cancellation(coroutine):
         try:
-            await await_or_fail(asyncio.Event().wait(), what="child close owns cancellation task")
+            await await_or_fail(hold_child_loop.wait(), what="release child-local cleanup")
         finally:
             coroutine.close()
 
@@ -3812,8 +3814,8 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
             )
         return original_create_task(loop_self, coroutine)
 
-    def signal_cancellation() -> None:
-        original_cancel_all()
+    def signal_cancellation(*args, **kwargs) -> None:
+        original_cancel_all(*args, **kwargs)
         cancellation_requested.set()
 
     monkeypatch.setattr(
@@ -3828,10 +3830,21 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
         await await_or_fail(completion_published.wait(), what="child publishes completion")
+        grandchild_id, = (run_id for run_id in owner.active_instance_ids if run_id.count(":") == 2)
+        assert owner.controls_child(store, grandchild_id)
+        grandchild_store, _ = owner._active_stores[grandchild_id]
         closing = asyncio.create_task(loop.close())
-        await await_or_fail(cancellation_requested.wait(), what="close requests cancellation")
-        release_child_watcher.set()
-        await await_or_fail(closing, what="root close joins adopted grandchild")
+
+        # Watch close itself too, so a premature exception cannot look like a stuck wake.
+        async def release_on_cancellation():
+            await await_or_fail(cancellation_requested.wait(), what="root requested child cancellation")
+            release_child_watcher.set()
+
+        async with asyncio.TaskGroup() as group:
+            group.create_task(release_on_cancellation())
+            group.create_task(await_or_fail(closing, what="close joins adopted child"))
+        assert grandchild_store.agent_lifecycle()["state"] == "canceled"
+        assert grandchild_store.directory_fd == -1
         assert not owner.running
     finally:
         release_child_watcher.set()
@@ -3843,6 +3856,7 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
         else:
             await await_or_fail(loop.close(), what="close after failed setup")
         await await_or_fail(owner.wait(), what="drain background owner")
+        hold_child_loop.set()
         store.close()
 
 

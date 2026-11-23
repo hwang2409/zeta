@@ -99,6 +99,7 @@ class HeldFrame:
     """A frame buffered for a pending join; seq is assigned at the join's end."""
 
     event: Any
+    session_id: str
     fields: dict[str, object]
     covers: Covers
     size: int
@@ -360,9 +361,11 @@ class SessionReplay:
             "replay": {"stream_id": pending.stream_id, "history_seq": 0},
         }
 
-    def hold(self, connection: Any, event: Any, fields: dict[str, object], size: int) -> None:
+    def hold(
+        self, connection: Any, event: Any, session_id: str, fields: dict[str, object], size: int
+    ) -> None:
         """Append one charged live frame to a pending join that has no frontier yet."""
-        self._pending[connection].frames.append(HeldFrame(event, fields, None, size))
+        self._pending[connection].frames.append(HeldFrame(event, session_id, fields, None, size))
 
     def pending_tail(self, connection: Any) -> list[HeldFrame]:
         pending = self._pending.get(connection)
@@ -437,6 +440,7 @@ class SessionReplay:
         self,
         connection: Any,
         event: Any,
+        session_id: str,
         fields: dict[str, object],
         published: PublishedSessionEvent,
         frame_size: int,
@@ -450,7 +454,7 @@ class SessionReplay:
         pending = self._pending.get(connection)
         if pending is not None:
             pending.frames.append(
-                HeldFrame(event, fields, covers, frame_size, published.seq)
+                HeldFrame(event, session_id, fields, covers, frame_size, published.seq)
             )
         return PublishedSessionEvent(
             published.stream_id, published.seq, published.scope, frame_size

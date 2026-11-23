@@ -3,20 +3,30 @@ from __future__ import annotations
 import ast
 import json
 import re
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
+from zeta.project_registry import ProjectRegistry
+from zeta.server.handlers.resources import FAMILIES
+from zeta.server.handlers.resources._mcp_auth import MCPAuth
+from zeta.server.login import Logins
 from zeta.server.protocol import (
     ErrorDescriptor,
     EventDescriptor,
     FrameCodec,
     MethodDescriptor,
+    ProtocolError,
     SlashErrorCodeDescriptor,
     SlashResultKindDescriptor,
+    served_methods,
 )
+from zeta.server.resource_protocol import collect_families
 from zeta.skills import SkillCatalog
 
 ROOT = Path(__file__).parents[1]
@@ -78,15 +88,119 @@ def _documented_slash_error_codes(document: str) -> set[str]:
 def test_method_registry_matches_documented_table() -> None:
     document = PROTOCOL_DOC.read_text(encoding="utf-8")
     section = _section(document, "## method table", "## common JSON-RPC shapes")
-    rows = re.findall(
-        r"^\| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \|$",
-        section,
-        re.MULTILINE,
+    rows = re.compile(r"^\| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \| `([^`]+)` \|$", re.MULTILINE)
+    legacy = rows.findall(section)
+    families = rows.findall(_section(document, "## resource families", "## errors"))
+    expected = [(item.wire, item.since or "1.0", item.feature or "none", item.access.value) for item in served_methods()]
+    assert legacy == expected[:len(legacy)]
+    assert sorted(legacy + families) == sorted(expected), "document each resource method in its own family section"
+
+
+_REVISION = "0" * 64
+_MCP_OWNER = "zeta.mcp.management.MCPManagementService"
+# Valid inputs and the owner entry point each registered method must reach.
+_OWNER_FAILURE_CASES = {
+    "home_settings_get": ("zeta.config.home_settings.get", {}),
+    "home_settings_update": ("zeta.config.home_settings.update", {
+        "expected_revision": f"sha256:{_REVISION}", "changes": {"telemetry": {"enabled": True}},
+    }),
+    "agent_run_catalog": ("zeta.server.handlers.resources._agent_run_catalog.read_page", {}),
+    "child_run_spawn": ("zeta.agent.runner.spawn_child", {
+        "session_id": "test-session", "agent_type": "worker", "task": "test task",
+    }),
+    "child_run_cancel": ("zeta.agent.runner.cancel_child_run", {
+        "session_id": "test-session", "run_id": "test-run",
+    }),
+    "skill_catalog": ("zeta.skills.catalog.discover_session_skills", {}),
+    "skill_read": ("zeta.skills.catalog.discover_session_skills", {"name": "test", "scope": "effective"}),
+    "agent_profile_catalog": ("zeta.skills.agent_catalog.discover_session_agents", {}),
+    "agent_profile_read": (
+        "zeta.skills.agent_catalog.discover_session_agents", {"name": "test", "scope": "effective"},
+    ),
+    "skill_write": ("zeta.skills.resource_store.write", {"name": "test", "scope": "home", "mutation": {"document": "x"}}),
+    "skill_delete": ("zeta.skills.resource_store.delete", {"name": "test", "scope": "home", "revision": _REVISION}),
+    "agent_profile_write": (
+        "zeta.skills.resource_store.write", {"name": "test", "scope": "project", "mutation": {"document": "x"}},
+    ),
+    "agent_profile_delete": (
+        "zeta.skills.resource_store.delete", {"name": "test", "scope": "project", "revision": _REVISION},
+    ),
+    "session_history_read": ("zeta.server.handlers.resources.session_read._read", {"session_id": "other-session"}),
+    "mcp_server_list": (f"{_MCP_OWNER}.read_disk", {}),
+    "mcp_server_add": (f"{_MCP_OWNER}.add", {
+        "revision": _REVISION, "mutation": {"name": "test", "scope": "user", "command": "test"},
+    }),
+    "mcp_server_remove": (f"{_MCP_OWNER}.remove", {
+        "revision": _REVISION, "mutation": {"name": "test", "scope": "user"},
+    }),
+    "mcp_server_set_enabled": (f"{_MCP_OWNER}.set_enabled", {
+        "revision": _REVISION, "mutation": {"name": "test", "scope": "user", "enabled": False},
+    }),
+    "mcp_server_set_trusted": (f"{_MCP_OWNER}.set_trusted", {
+        "revision": _REVISION, "mutation": {"name": "test", "trusted": True},
+    }),
+    "mcp_server_test": (f"{_MCP_OWNER}.test", {"name": "test"}),
+    "mcp_auth_start": ("zeta.server.handlers.resources._mcp_auth.MCPAuth.start", {"name": "test"}),
+    "mcp_auth_status": ("zeta.server.handlers.resources._mcp_auth.MCPAuth.status", {"name": "test"}),
+    "mcp_auth_cancel": ("zeta.server.handlers.resources._mcp_auth.MCPAuth.cancel", {"name": "test"}),
+    "mcp_auth_logout": (f"{_MCP_OWNER}.logout", {"name": "test"}),
+    "account_list": ("zeta.accounts.AccountStore.catalog_snapshot", {}),
+    "login_start": ("zeta.server.login.Logins.login_start", {"provider": "claude"}),
+    "project_memory_update": ("zeta.project_registry.ProjectRegistry.show_project", {
+        "project_id": "test-project", "revision": _REVISION,
+        "mutation": {"format": 1, "op": "set", "file": "brief.md", "content": "test"},
+    }),
+    "project_inbox_send": ("zeta.project_registry.ProjectRegistry.show_project", {
+        "project_id": "test-project",
+        "mutation": {"kind": "question", "title": "test", "body": "test", "delivery_id": "test-delivery"},
+    }),
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", [method.wire for family in FAMILIES for method in family.METHODS])
+async def test_collected_resource_handler_closes_unexpected_errors(method: str, tmp_path: Path) -> None:
+    assert method in _OWNER_FAILURE_CASES, f"add an owner failure case for {method}"
+    target, params = _OWNER_FAILURE_CASES[method]
+    handler = next(descriptor.handler for descriptor in collect_families() if descriptor.wire == method)
+
+    async def run_blocking(call):
+        return call()
+
+    client = SimpleNamespace(
+        features=frozenset(),
+        connections=SimpleNamespace(run_blocking=run_blocking),
+        logins=Logins(tmp_path),
+        server=SimpleNamespace(
+            home=tmp_path,
+            runtime=SimpleNamespace(
+                opened=SimpleNamespace(metadata=SimpleNamespace(project_id="test-project", cwd=tmp_path)),
+                project_dir=tmp_path, session_id="test-session",
+                manager=SimpleNamespace(project_registry=ProjectRegistry.for_state_read(tmp_path / "projects", 0)),
+                loop=SimpleNamespace(_mcp_project_dir_value=tmp_path, tool_registry=None),
+            ),
+            _mcp_auth=MCPAuth(),
+            control=SimpleNamespace(
+                _reject_if_unhealthy=lambda: None,
+                client_turn_detached=lambda: False,
+                state_change_busy=lambda: False,
+                hold_wake_start=nullcontext,
+            ),
+        ),
     )
-    assert rows == [
-        (item.wire, item.since or "1.0", item.feature or "none", item.access.value)
-        for item in MethodDescriptor
-    ], "document every method in descriptor order"
+    failure = RuntimeError("unexpected test exception at /private/test-config with test-secret-canary")
+    with patch(target, side_effect=failure) as owner:
+        with pytest.raises(ProtocolError) as caught:
+            await handler(client, 7, params)
+        # test-contract: seam prove the injected failure came from the owner, not adapter setup
+        assert owner.call_count == 1, f"{method} did not reach its owner"
+
+    error = caught.value
+    assert json.loads(FrameCodec().error_response(7, error.descriptor, error.message, error.data)) == {
+        "jsonrpc": "2.0",
+        "id": 7,
+        "error": {"code": -32000, "message": "unexpected server or storage failure"},
+    }, f"{method} must return the fixed internal error for unexpected owner failures"
 
 
 @pytest.mark.asyncio
@@ -888,7 +1002,7 @@ class _DispatchMappingVisitor(ast.NodeVisitor):
 
 
 def _dispatch_mapping_bypasses(sources: dict[Path, str]) -> list[str]:
-    wires = {item.wire for item in MethodDescriptor}
+    wires = {item.wire for item in served_methods()}
     violations: list[str] = []
     for path, source in sources.items():
         tree = ast.parse(source)
@@ -935,9 +1049,28 @@ def test_one_table_is_the_only_serve_method_dispatch_authority() -> None:
         and node.target.id == "HANDLERS"
     )
     assert isinstance(handlers, ast.Dict)
-    assert len(handlers.keys) == len(MethodDescriptor)
+    names = """
+        LIST_SESSIONS NEW_SESSION RESUME SEND STEER APPROVE DENY ABORT STATUS RENAME_SESSION
+        DELETE_SESSION REPAIR_TRANSCRIPT SESSION_TREE SESSION_HISTORY SESSION_HISTORY_AND_SUBSCRIBE
+        CHILD_RUN_HISTORY CHILD_RUN_EVENTS CONTENT_READ SWITCH_BRANCH FORK_MESSAGE MODEL_CATALOG
+        SESSION_SETTINGS SET_SETTINGS SET_COMPACTION SEND_IMAGES PATH_COMPLETE SLASH_LIST SLASH_RUN
+        ACCOUNT_LIST ACCOUNT_LOGOUT ACCOUNT_REFRESH ACCOUNT_SWITCH LOGIN_START LOGIN_STATUS
+        LOGIN_CANCEL LOGIN_PROVIDERS PING SET_TURN_CONTEXT LIST_PROJECTS PROJECT_SHOW
+        PROJECT_MEMORY_LOG PROJECT_INBOX CLEAR_STEERING DELIVERY_STATUS SESSION_GRANTS
+        REVOKE_SESSION_GRANTS RUN_WORK_LIST BACKGROUND_TASK_CANCEL CHILD_RUN_LIST CHILD_RUN_SEND
+        MCP_REFRESH_TOOLS STATE_SESSIONS STATE_SESSION STATE_AGENTS STATE_BACKGROUND_TASKS
+        STATE_CATALOG STATE_PROJECTS STATE_MEMORY STATE_MEMORY_DETAIL STATE_INBOX STATE_INBOX_DETAIL
+        STATE_ATTENTION STATE_SETTINGS STATE_ACCOUNTS STATE_STORAGE STATE_RETENTION TELEMETRY_STATUS
+        TELEMETRY_SESSIONS TELEMETRY_TRACE TELEMETRY_OVERVIEW TELEMETRY_MODELS TELEMETRY_TOOLS
+        TELEMETRY_ERRORS TELEMETRY_SERIES TELEMETRY_AGENT_TREE
+    """
+    legacy = frozenset(names.split())
+    message = "add new methods through src/zeta/server/resource_protocol.py and handlers/resources/, not the legacy registry"
+    assert {item.name for item in MethodDescriptor} == legacy, message
+    assert {ast.unparse(key).removeprefix("MethodDescriptor.") for key in handlers.keys} == legacy, message
+    assert len(handlers.keys) == len(legacy), message
     assert all(isinstance(value, ast.Name) for value in handlers.values)
-    assert len({value.id for value in handlers.values}) == len(MethodDescriptor)
+    assert len({value.id for value in handlers.values}) == len(legacy)
     assert not (
         violations := _dispatch_mapping_bypasses(_server_sources())
     ), "\n".join(violations)
@@ -1186,11 +1319,12 @@ STRUCTURED_ERROR_FIXTURES = (
         "result exceeds frame limit",
         None,
         b'{"jsonrpc":"2.0","id":7,"error":{"code":-32007,"message":"result exceeds frame limit","data":{"code":"result_too_large"}}}\n',
-    ),    (
-        ErrorDescriptor.INVALID_HOME_SETTINGS_PARAMS,
-        "invalid params",
+    ),
+    (
+        ErrorDescriptor.RESOURCE_BUSY,
+        "another process is writing this resource",
         None,
-        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32602,"message":"invalid params","data":{"code":"invalid_params"}}}\n',
+        b'{"jsonrpc":"2.0","id":7,"error":{"code":-32004,"message":"another process is writing this resource","data":{"code":"operation_busy"}}}\n',
     ),
     (
         ErrorDescriptor.CUSTOM_HOME_SETTING,

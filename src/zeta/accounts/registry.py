@@ -285,10 +285,12 @@ class _AccountRegistry:
                 f"and {len(refused) - _MAX_SWEEP_WARNING_PATHS} more account directories could not be cleaned up"
             )
 
-    def _read_registry(self, home_fd: int) -> dict[str, Any]:
+    def _read_registry(self, home_fd: int, *, refuse_orphans: bool = False) -> dict[str, Any]:
         state, value = self._load_registry(home_fd)
         if state is _Registry.BROKEN:
             raise AccountRegistryBrokenError(str(self.registry.absolute()))
+        if refuse_orphans and state is _Registry.MISSING and self._has_unregistered_account_directories(home_fd, set()):
+            raise AccountRegistryMissingError
         return value
 
     def _load_registry(self, home_fd: int) -> tuple[_Registry, dict[str, Any]]:

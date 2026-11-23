@@ -54,9 +54,9 @@ _APPROVAL_SCOPES = frozenset({"once", "always_tool"})
 
 def _serve_methods() -> frozenset[str]:
     # one source: the served method table, plus hello, which the connection routes before that table
-    from ..server.protocol import MethodDescriptor
+    from ..server.protocol import served_methods
 
-    return frozenset({"hello", *(descriptor.wire for descriptor in MethodDescriptor)})
+    return frozenset({"hello", *(descriptor.wire for descriptor in served_methods())})
 
 
 _SERVE_METHODS = _serve_methods()

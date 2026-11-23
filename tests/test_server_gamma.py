@@ -1386,7 +1386,10 @@ def _documented_features() -> list[str]:
     doc = (Path(__file__).parents[1] / "docs" / "serve-protocol.md").read_text()
     table = doc.split("| feature | effect |", 1)[1].split("\n\n", 1)[0]
     rows = [line for line in table.splitlines() if line.startswith("| `")]
-    return [row.split("`", 2)[1] for row in rows]
+    families = doc.split("\n## resource families\n", 1)[1]
+    families = re.split(r"^## ", families, maxsplit=1, flags=re.MULTILINE)[0]
+    headings = re.findall(r"^### .+ \(`([^`\n]+)` feature\)$", families, re.MULTILINE)
+    return [row.split("`", 2)[1] for row in rows] + headings
 
 
 def test_every_advertised_feature_is_documented_and_every_documented_one_exists() -> (
