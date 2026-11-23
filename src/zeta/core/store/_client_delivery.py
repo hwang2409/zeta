@@ -142,15 +142,14 @@ class ClientDeliveryMixin:
     """Own acceptance, queue state, transitions, and bounded O(1) lookup."""
 
     def _initialize_client_delivery_lifecycle(self: ConversationStore) -> None:
-        self._client_deliveries: OrderedDict[str, ClientDelivery] = OrderedDict()
-        self._client_delivery_outcomes: dict[bytes, bytes] = {}
+        self._rebuild_client_deliveries(())
         self._client_steering: deque[_QueuedSteering] = deque()
 
     def _rebuild_client_deliveries(
         self: ConversationStore, entries: Iterable[ConversationEntry]
     ) -> None:
-        self._client_deliveries = OrderedDict()
-        self._client_delivery_outcomes = {}
+        self._client_deliveries: OrderedDict[str, ClientDelivery] = OrderedDict()
+        self._client_delivery_outcomes: dict[bytes, bytes] = {}
         self._record_client_delivery_entries(entries)
 
     def _record_client_delivery_entries(
