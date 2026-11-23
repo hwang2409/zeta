@@ -22,7 +22,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final, Self
 
-from .locking import format_lock, shape_lock
+from .locking import format_lock, open_created, shape_lock
 
 WRITER_EPOCH: Final = 12
 P06_FEATURE_EPOCH: Final = 6
@@ -716,7 +716,7 @@ def _shape_lock(
                 | getattr(os, "O_CLOEXEC", 0),
             )
             try:
-                fd = os.open(
+                fd = open_created(
                     digest,
                     os.O_RDWR
                     | os.O_CREAT
