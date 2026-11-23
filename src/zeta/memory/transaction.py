@@ -18,7 +18,12 @@ from ..project_memory_history import (
 from ..project_schema import MAX_RECORD_SIZE
 from ..state_snapshot import BODY_BYTES, clip, timestamp_ns
 from .entry_store import EntryMemorySnapshot, MemoryEntry
-from .entry_views import active_entries, inspect_value, render_all_kinds
+from .entry_views import (
+    active_entries,
+    entry_is_accepted,
+    inspect_value,
+    render_all_kinds,
+)
 
 if TYPE_CHECKING:
     from ..project_registry import ProjectRegistry
@@ -119,7 +124,8 @@ class MemoryTransactions:
                 snapshot = registry._entry_snapshot_locked(fd)
                 entries = (
                     (e.id, _state_kind(e),
-                     e.text, e.automatic, timestamp_ns(e.created_at), timestamp_ns(e.updated_at),
+                     e.text, e.automatic, entry_is_accepted(e),
+                     timestamp_ns(e.created_at), timestamp_ns(e.updated_at),
                      e.sources[0].session_id if e.sources else None)
                     for e in active_entries(snapshot.state)
                 )
@@ -127,17 +133,18 @@ class MemoryTransactions:
                 project = registry._decode(registry._read_fd(fd, "project.json"), project_id)
                 snapshot = registry._snapshot_locked(fd)
                 entries = (
-                    (name, "legacy", text, False, timestamp_ns(project.created_at),
+                    (name, "legacy", text, False, True, timestamp_ns(project.created_at),
                      timestamp_ns(project.updated_at), None)
                     for name, text in snapshot.contents.items() if text
                 )
             rows = []
-            for ident, entry_kind, text, automatic, created, updated, source in entries:
+            for ident, entry_kind, text, automatic, accepted, created, updated, source in entries:
                 if (kind is not None and entry_kind != kind) or (memory_id is not None and ident != memory_id):
                     continue
                 row = {
                     "memory_id": ident, "project_id": project_id, "kind": entry_kind,
-                    "automatic": automatic, "summary": clip(text.partition("\n")[0], 512)[0],
+                    "automatic": automatic, "accepted": accepted,
+                    "summary": clip(text.partition("\n")[0], 512)[0],
                     "created_ns": created, "updated_ns": updated,
                     "source_session_id": source,
                     "has_body": bool(text) and not (

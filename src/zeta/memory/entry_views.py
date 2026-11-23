@@ -18,7 +18,7 @@ GENERATED_MIRROR_HEADER = (
 )
 
 
-def _accepted(entry: MemoryEntry) -> bool:
+def entry_is_accepted(entry: MemoryEntry) -> bool:
     return not entry.automatic or entry.accepted_at is not None
 
 
@@ -66,8 +66,8 @@ def render_kind(state: MemoryState, kind_key: str) -> str:
             prefix = [legacy[0].text.rstrip(), "", "## Entry memory", ""]
             heading_level = "###"
         entries = structured
-    accepted = [entry for entry in entries if _accepted(entry)]
-    automatic = [entry for entry in entries if not _accepted(entry)]
+    accepted = [entry for entry in entries if entry_is_accepted(entry)]
+    automatic = [entry for entry in entries if not entry_is_accepted(entry)]
     lines = prefix or [f"# {kind.name}", ""]
     for heading, values in (("Accepted", accepted), ("Automatic", automatic)):
         lines.extend((f"{heading_level} {heading}", ""))
@@ -168,8 +168,8 @@ def kind_views(state: MemoryState) -> list[dict[str, object]]:
                 "name": kind.name,
                 "description": kind.description,
                 "active_count": len(entries),
-                "automatic_count": sum(not _accepted(entry) for entry in entries),
-                "accepted_count": sum(_accepted(entry) for entry in entries),
+                "automatic_count": sum(not entry_is_accepted(entry) for entry in entries),
+                "accepted_count": sum(entry_is_accepted(entry) for entry in entries),
                 "rendered": render_kind(state, kind.key),
                 "rendered_truncated": False,
             }
