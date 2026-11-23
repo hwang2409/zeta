@@ -302,14 +302,41 @@ async def test_idle_history_reads_only_the_launch_project(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("projectless", [True, False], ids=["registration", "reassociation"])
+async def test_idle_history_keeps_launch_scope_after_registry_change(tmp_path: Path, projectless: bool) -> None:
+    harness, _ = await start(tmp_path, attach=False, projectless=projectless)
+    try:
+        original = await asyncio.to_thread(harness.session, None if projectless else harness.project, 1)
+        projects = harness.server.home / "projects"
+        if not projectless:
+            await asyncio.to_thread((projects / harness.project).rename, tmp_path / "old-project")
+        replacement = await asyncio.to_thread(
+            ProjectRegistry(projects).create_project, "replacement", "repo", str(harness.server.runtime.cwd),
+        )
+        foreign = await asyncio.to_thread(harness.session, replacement.project_id, 1)
+        observer = await harness.client()
+        reply = await read(observer, "out-of-scope", session_id=foreign)
+        assert "error" in reply, reply
+        assert (reply["error"]["code"], reply["error"]["data"]["code"]) == (-32602, "session_not_found")
+        reply = await read(observer, "original-scope", session_id=original)
+        assert "result" in reply, reply
+        assert texts(reply["result"]) == ["turn 0 question", "turn 0 answer"]
+    finally:
+        await close_serve(harness.server, *harness.writers)
+
+
+@pytest.mark.asyncio
 async def test_idle_history_read_rejects_malformed_launch_project(tmp_path: Path) -> None:
-    harness, _ = await start(tmp_path, attach=False)
+    harness = await asyncio.to_thread(Harness, tmp_path, launch_project=True)
     try:
         target = await asyncio.to_thread(harness.session, None, 1)
-        observer = await harness.client()
         record = harness.server.home / "projects" / harness.project / "project.json"
+        original = await asyncio.to_thread(record.read_text)
         await asyncio.to_thread(record.write_text, "{")
+        await harness.server.start()
+        await asyncio.to_thread(record.write_text, original)
 
+        observer = await harness.client()
         reply = await read(observer, "unresolved", session_id=target)
         assert "error" in reply, reply
         assert (reply["error"]["code"], reply["error"]["data"]["code"]) == (-32005, "state_unavailable")
@@ -322,14 +349,11 @@ async def test_idle_history_read_rejects_malformed_launch_project(tmp_path: Path
 async def test_idle_history_read_rejects_failed_launch_git_discovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
-    harness, _ = await start(tmp_path, attach=False)
+    harness = await asyncio.to_thread(Harness, tmp_path, launch_project=True)
     try:
         cwd = harness.server.runtime.cwd
         await asyncio.to_thread(subprocess.run, ["git", "init", str(cwd)], check=True, capture_output=True)
-        target = await asyncio.to_thread(harness.session, harness.project, 1)
         projectless = await asyncio.to_thread(harness.session, None, 1)
-        observer = await harness.client()
-        assert texts((await read(observer, "healthy", session_id=target))["result"])
         real_run = project_context.subprocess.run
 
         def failed_discovery(command, **kwargs):
@@ -343,6 +367,8 @@ async def test_idle_history_read_rejects_failed_launch_git_discovery(
 
         # test-contract: seam force a failure at the launch Git subprocess, not at the history handler
         monkeypatch.setattr(project_context.subprocess, "run", failed_discovery)
+        await harness.server.start()
+        observer = await harness.client()
         reply = await read(observer, "failed-discovery", session_id=projectless)
         assert "error" in reply, reply
         assert (reply["error"]["code"], reply["error"]["data"]["code"]) == (-32005, "state_unavailable")

@@ -154,53 +154,32 @@ def _read(home, manager, session_id, project_id, request_id, features, start, ba
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
 
 
-def _launch_project_id(runtime):
-    from ...protocol import ErrorDescriptor, resource_error
-
-    try:
-        return runtime.launch_project_id()
-    except (ProjectRegistryError, OSError, ValueError, StorageFormatError):
-        raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
-
-
-def _read_idle(home, runtime, session_id, request_id, features, start, backward, limit, max_bytes):
-    from ...protocol import ErrorDescriptor, resource_error
-
-    scope = _launch_project_id(runtime)
-    page = _read(home, runtime.manager, session_id, scope, request_id, features, start, backward, limit, max_bytes)
-    if _launch_project_id(runtime) != scope:
-        raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
-    return page
-
-
 def _read_scope(client, session_id):
     from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
 
     runtime = client.server.runtime
-    home = client.server.home
     opened = runtime.opened
+    generation = runtime.attachment_generation
     if opened is None:
-        generation = runtime.attachment_generation
-
-        def validate():
-            # A session can attach and detach during the read.
-            if (
-                client.server.runtime is not runtime or runtime.opened is not None
-                or runtime.attachment_generation != generation
-            ):
-                raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
-
-        return partial(_read_idle, home, runtime, session_id), validate
-
-    if session_id == runtime.session_id:
-        raise invalid_resource_params()  # the attached session pages through session_history
-    project_id = opened.metadata.project_id
+        try:
+            project_id = runtime.launch_project_id
+        except ProjectRegistryError:
+            raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
+    else:
+        if session_id == runtime.session_id:
+            raise invalid_resource_params()  # the attached session pages through session_history
+        project_id = opened.metadata.project_id
 
     def validate():
-        if runtime.opened is not opened or opened.metadata.project_id != project_id:
+        # A session can attach and detach during the read.
+        if (
+            client.server.runtime is not runtime or runtime.opened is not opened
+            or runtime.attachment_generation != generation
+            or (opened is not None and opened.metadata.project_id != project_id)
+        ):
             raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
 
-    return partial(_read, home, runtime.manager, session_id, project_id), validate
+    return partial(_read, client.server.home, runtime.manager, session_id, project_id), validate
 
 
 def _retrieve(future: asyncio.Future) -> None:

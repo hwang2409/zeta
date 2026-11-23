@@ -7,6 +7,7 @@ import logging
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,7 @@ from ..runtime.project_registry_state import load_project_registry
 from ..runtime.prompt_resume import resume_prompt
 from ..skills import discover_session_skills
 from ..skills.agent_catalog import discover_session_agents
+from ..storage_format import StorageFormatError
 from ..telemetry import Telemetry
 from ..tools._shared.background_task_types import BackgroundTaskNotice
 from ..tools._shared.run_work import background_task_row
@@ -192,8 +194,15 @@ class SessionState:
         self.status = "idle"
 
 
+class _LaunchScopeState(Enum):
+    NOT_CAPTURED = auto()
+    UNAVAILABLE = auto()
+
+
 class ServerRuntime:
     """Own the current session and its provider-neutral agent loop."""
+
+    _launch_scope: str | None | _LaunchScopeState = _LaunchScopeState.NOT_CAPTURED
 
     def __init__(
         self,
@@ -331,7 +340,7 @@ class ServerRuntime:
             "home", "cwd", "_server_provider", "_server_model", "_server_tools",
             "_server_disallowed_tools", "_require_tools", "_allow_hooks",
             "_auto_memory", "_cli_yolo", "_max_turns", "_test_scripted_provider",
-            "backend_factory", "manager", "retention_event_sink", "retention_wake",
+            "backend_factory", "manager", "retention_event_sink", "retention_wake", "_launch_scope",
         ):
             if hasattr(self, name):
                 setattr(runtime, name, getattr(self, name))
@@ -490,12 +499,27 @@ class ServerRuntime:
         await self._replace(composition)
         return self.metadata
 
-    def launch_project_id(self) -> str | None:
-        """Resolve the project a default new session would get, without opening one."""
-        discovery, _, _, projection, project, _ = self._new_session_project(self.cwd, None, None)
+    async def capture_launch_scope(self) -> None:
+        """Freeze the idle history scope before accepting connections."""
+        if self._launch_scope is _LaunchScopeState.NOT_CAPTURED:
+            self._launch_scope = await asyncio.to_thread(self._resolve_launch_scope)
+
+    def _resolve_launch_scope(self) -> str | None | _LaunchScopeState:
+        try:
+            discovery, _, _, projection, project, _ = self._new_session_project(self.cwd, None, None)
+        except (ProjectRegistryError, OSError, ValueError, StorageFormatError):
+            return _LaunchScopeState.UNAVAILABLE
         if discovery.git_unavailable or projection is None or projection.health is not None:
-            raise ProjectRegistryError("cannot establish the serve launch project")
+            return _LaunchScopeState.UNAVAILABLE
         return project.project_id if project is not None else None
+
+    @property
+    def launch_project_id(self) -> str | None:
+        """The captured project ID, or None for a confirmed project-less launch."""
+        scope = self._launch_scope
+        if isinstance(scope, _LaunchScopeState):
+            raise ProjectRegistryError("cannot establish the serve launch project")
+        return scope
 
     def _new_session_project(
         self, session_cwd: Path, provider: str | None, model: str | None
@@ -522,9 +546,7 @@ class ServerRuntime:
             if projection is not None
             else None
         )
-        if session_project is None and cwd_project is not None:
-            session_project = cwd_project
-        return discovery, repo_root, config, projection, session_project, cwd_project
+        return discovery, repo_root, config, projection, session_project or cwd_project, cwd_project
 
     def _prepare_new_session(
         self, session_cwd: Path, provider: str | None, model: str | None
