@@ -2012,19 +2012,16 @@ async def test_session_history_records_controller_disconnect_approval_abort(
     )
     reader, writer, session_id = await _ready_extensions(server)
     await _request(reader, writer, 3, "send", {"text": "read it"})
-    await _event(reader, "approval_request")
-    writer.close()
-    await writer.wait_closed()
     try:
-        # The approval aborts first; the old controller releases only after
-        # its turn is canceled. Reconnect after the release, as a client must.
+        await _event(reader, "approval_request")
         assert server.connections is not None
         holder = server.connections.legacy_controller_holder
-        if holder is not None:
-            await await_or_fail(holder.released.wait(), what="old controller release")
-        assert server.controllers.attached().runtime.policy is not None
-        assert not (await server.controllers.attached().runtime.policy.pending_requests())
+        assert holder is not None
+        writer.close()
+        await writer.wait_closed()
+        await await_or_fail(holder.released.wait(), what="old controller slot release")
 
+        # The slot can release before approval cleanup; hello waits for both.
         reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
         hello = await _request(
             reader,
@@ -2034,6 +2031,8 @@ async def test_session_history_records_controller_disconnect_approval_abort(
             {"protocol_version": "1.0", "client_version": "1.1"},
         )
         assert hello[-1]["result"]["protocol_version"] == "1.1"
+        assert server.controllers.attached().runtime.policy is not None
+        assert not (await server.controllers.attached().runtime.policy.pending_requests())
         history = (
             await _request(
                 reader,
@@ -3792,7 +3791,9 @@ async def test_foreground_abort_only_ends_foreground_approval(
             child_instance_id="background-child",
         )
         assert server.controllers.attached().runtime.loop is not None
-        child_task = asyncio.create_task(asyncio.sleep(60))
+        child_task = asyncio.create_task(
+            asyncio.wait_for(asyncio.Event().wait(), 60)
+        )
         server.controllers.attached().runtime.loop._background_owner.register(
             "background-child", child_task.cancel, child_task
         )
