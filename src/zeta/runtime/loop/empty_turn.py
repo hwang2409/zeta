@@ -245,7 +245,7 @@ class DispatchProgress:
         store: Any,
         prepared: Any,
         flow: Any,
-        retrying_context: bool,
+        retry: bool,
         *,
         waits_for_input: bool,
     ) -> str | ErrorInfo:
@@ -256,7 +256,7 @@ class DispatchProgress:
             prepared.prompt_id,
             prepared.notification_ids,
         )
-        if retrying_context or prepared.steering is not None or mark != self._mark:
+        if retry or prepared.steering is not None or mark != self._mark:
             self._mark = mark
             self._repeats = 0
             return "dispatch"
