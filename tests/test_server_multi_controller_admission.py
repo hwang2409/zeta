@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
 from pathlib import Path
@@ -15,7 +14,6 @@ from tests.support.replay_transport import (
     connect_replay,
     negotiate,
     replay_server,
-    short_socket_path,
 )
 from tests.test_server_in_flight_replay import HOLD, GatedBackend
 from tests.test_server_replay_table import _backend_factory
@@ -23,7 +21,7 @@ from zeta.protocol.types import TextContent
 from zeta.server import connections as connection_module
 from zeta.server.handlers import lifecycle
 from zeta.server.protocol import EventDescriptor
-from zeta.server.server import ZetaServer, _Client
+from zeta.server.server import _Client
 
 
 async def _close_server(server, clients) -> None:
@@ -222,42 +220,6 @@ async def test_multi_reconnect_requires_matching_session_id(
     finally:
         await _close_server(server, (wrong, right))
 
-
-def test_production_sources_do_not_supply_private_feature_override() -> None:
-    root = Path(__file__).parents[1] / "src" / "zeta"
-    for path in root.rglob("*.py"):
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
-                continue
-            if node.func.id != "ZetaServer":
-                continue
-            assert all(
-                keyword.arg != "_supported_features_for_test" for keyword in node.keywords
-            ), path
-
-
-@pytest.mark.asyncio
-async def test_ordinary_server_keeps_multi_controller_dormant(tmp_path: Path) -> None:
-    server = ZetaServer(
-        home=tmp_path,
-        socket_path=short_socket_path(tmp_path),
-        provider="codex",
-        backend_factory=_backend_factory,
-    )
-    await server.start()
-    first = await connect_replay(server, "unix")
-    second = await connect_replay(server, "unix")
-    try:
-        hello = await negotiate(first, replay=False, extra=("multi_controller",))
-        assert "multi_controller" not in hello["result"]["capabilities"].get("features", [])
-        refused = await negotiate(second, replay=False, extra=("multi_controller",))
-        assert refused["error"] == {
-            "code": -32001,
-            "message": "another client is already connected",
-        }
-    finally:
-        await _close_server(server, (first, second))
 
 _CANCEL_ROWS = (
     "reconnect_mcp_bindings_before", "reconnect_mcp_bindings_after",

@@ -15,7 +15,7 @@ from tests.test_server_replay_table import _backend_factory
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
 @pytest.mark.asyncio
-async def test_dormant_multi_controller_test_capability_keeps_legacy_admission(
+async def test_ordinary_server_negotiates_multi_controller(
     tmp_path: Path, transport: Transport
 ) -> None:
     server = replay_server(tmp_path, transport, _backend_factory)

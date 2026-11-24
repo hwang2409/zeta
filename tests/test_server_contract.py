@@ -191,7 +191,9 @@ async def test_failed_client_close_still_cleans_up_server(
         socket_path.unlink(missing_ok=True)
 
 
-async def _hello(client: ServeClient, request_id: str = "hello") -> dict[str, object]:
+async def _hello(
+    client: ServeClient, request_id: str = "hello", *, features: tuple[str, ...] = ()
+) -> dict[str, object]:
     reply = await client.request(
         request_id,
         "hello",
@@ -200,7 +202,7 @@ async def _hello(client: ServeClient, request_id: str = "hello") -> dict[str, ob
             "features": [
                 "serve_observers",
                 "session_grants",
-                "multi_controller",
+                *features,
                 "not_a_server_feature",
             ],
         },
@@ -214,15 +216,15 @@ async def test_hello_negotiates_the_same_features(
 ) -> None:
     client = await serve_contract.connect()
 
-    hello = await _hello(client)
+    hello = await _hello(client, features=("multi_controller",))
 
     assert hello["server"] == "zeta"
     assert hello["protocol_version"] == "1.2"
     assert hello["capabilities"]["features"] == [
         "serve_observers",
         "session_grants",
+        "multi_controller",
     ]
-    assert "multi_controller" not in hello["capabilities"]["features"]
     assert {
         "new_session",
         "send",

@@ -323,10 +323,6 @@ _LEGACY_FEATURES = (
     "state_read_v1",
 )
 
-# Dormant until multi-controller admission is complete in a later slice.
-DORMANT_FEATURES = ("multi_controller",)
-
-
 class MethodDescriptor(Enum):
     """Frozen legacy capabilities; new requests belong to resource families."""
 
@@ -496,7 +492,11 @@ for _extension in RESOURCE_METHODS:
     ):
         raise RuntimeError("serve method extensions must preserve the legacy version and access")
     _METHOD_EXTENSIONS[_extension.wire] = _extension
-FEATURES = tuple(dict.fromkeys((*_LEGACY_FEATURES, *(item.feature for item in RESOURCE_METHODS))))
+FEATURES = tuple(dict.fromkeys((
+    *_LEGACY_FEATURES,
+    *(item.feature for item in RESOURCE_METHODS),
+    "multi_controller",
+)))
 
 
 EVENT_ACCESS = {
