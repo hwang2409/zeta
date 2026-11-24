@@ -170,6 +170,7 @@ async def test_live_config_adds_profile_to_next_agent_schema_and_spawn(
             ])
             await ensure_mcp_servers()
 
+        # test-contract: seam no public event exposes the transcript at MCP setup entry
         monkeypatch.setattr(loop, "_ensure_mcp_servers", observe_mcp_setup)
         _ = [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
 
