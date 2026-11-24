@@ -20,10 +20,13 @@ from ...project_inbox import InboxBusyError, InboxError, ProjectInbox
 from ...project_inbox_provenance import is_trusted
 from ...project_memory_history import PROJECT_MEMORY_FILES
 from ...project_registry import Project, ProjectRegistry
-from ..protocol import ErrorDescriptor, FrameCodec
+from ..protocol import ErrorDescriptor
 
 if TYPE_CHECKING:
-    from ..runtime import ServerRuntime
+    from ...core.session import SessionManager
+
+
+ResponseFits = Callable[[object], bool]
 
 
 class ProjectNotFound(Exception):
@@ -83,37 +86,17 @@ _KNOWN_OPTIONAL_MESSAGE_FIELDS = frozenset(
 class ProjectRequests:
     """Build bounded project views without changing project or session state."""
 
-    @classmethod
-    def for_runtime(
-        cls, *, home: Path, runtime: ServerRuntime, codec: FrameCodec
-    ) -> ProjectRequests | None:
-        registry = runtime.manager.project_registry
-        return (
-            cls(home=home, runtime=runtime, codec=codec, registry=registry)
-            if registry is not None
-            else None
-        )
-
     def __init__(
         self,
         *,
         home: Path,
-        runtime: ServerRuntime,
-        codec: FrameCodec,
+        manager: SessionManager,
         registry: ProjectRegistry,
     ) -> None:
+        self.manager = manager
         self.registry = registry
-        self.inbox = ProjectInbox(
-            self.registry,
-            sessions_root=home / "sessions",
-        )
-        self.runtime = runtime
-        self.codec = codec
-        self.entry_views = EntryProjectViews(
-            registry=self.registry,
-            runtime=runtime,
-            codec=codec,
-        )
+        self.inbox = ProjectInbox(registry, sessions_root=home / "sessions")
+        self.entry_views = EntryProjectViews(registry=registry, manager=manager)
 
     def project_sessions(self, project_id: object) -> list[Any]:
         """Read provider-compatible sessions for one validated project."""
@@ -122,18 +105,13 @@ class ProjectRequests:
         self.require_project(project_id)
         return [
             item
-            for item in self.runtime.list_sessions_read_only()
+            for item in self.manager.list_sessions_read_only()
             if item.project_id == project_id
         ]
 
-    def list_projects(
-        self, request_id: str | int, params: dict[str, Any]
-    ) -> dict[str, object]:
-        return self._list_projects(request_id, params)
-
     def show(
         self,
-        request_id: str | int,
+        fits: ResponseFits,
         params: dict[str, Any],
         *,
         entry_response: bool,
@@ -141,48 +119,48 @@ class ProjectRequests:
         project = self.require_project(self._project_id(params))
         self._only(params, {"project_id"})
         return (
-            self.entry_views.show(request_id, project)
+            self.entry_views.show(fits, project)
             if entry_response
-            else self._show(request_id, project)
+            else self._show(fits, project)
         )
 
     def memory_log(
         self,
-        request_id: str | int,
+        fits: ResponseFits,
         params: dict[str, Any],
         *,
         entry_response: bool,
     ) -> dict[str, object]:
         project = self.require_project(self._project_id(params))
         return (
-            self.entry_views.memory_log(request_id, project, params)
+            self.entry_views.memory_log(fits, project, params)
             if entry_response
-            else self._memory_log(request_id, project, params)
+            else self._memory_log(fits, project, params)
         )
 
     def inbox_view(
-        self, request_id: str | int, params: dict[str, Any]
+        self, fits: ResponseFits, params: dict[str, Any]
     ) -> dict[str, object]:
         project = self.require_project(self._project_id(params))
-        return self._inbox(request_id, project, params)
+        return self._inbox(fits, project, params)
 
-    def _list_projects(
-        self, request_id: str | int, params: dict[str, Any]
+    def list_projects(
+        self, fits: ResponseFits, params: dict[str, Any]
     ) -> dict[str, object]:
         self._only(params, {"offset", "limit"})
         offset = self._integer(params, "offset", 0, minimum=0)
         limit = self._integer(
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
         )
-        sessions = self.runtime.manager.list_sessions_read_only()
+        sessions = self.manager.list_sessions_read_only()
         projects = [
             self._project_metadata(project, sessions)
             for project in self.registry.list_projects()
         ]
-        return self._page(request_id, "projects", projects, offset, limit)
+        return self._page(fits, "projects", projects, offset, limit)
 
-    def _show(self, request_id: str | int, project: Project) -> dict[str, object]:
-        sessions = self.runtime.manager.list_sessions_read_only()
+    def _show(self, fits: ResponseFits, project: Project) -> dict[str, object]:
+        sessions = self.manager.list_sessions_read_only()
         state = self.registry.memory_state(project.project_id)
         automatic = set(state.automatic_files)
         files = [
@@ -202,7 +180,7 @@ class ProjectRequests:
                 "files": files,
             },
         }
-        while not self.codec.response_fits(request_id, result):
+        while not fits(result):
             largest = max(files, key=lambda item: len(str(item["content"]).encode()))
             content = str(largest["content"])
             size = len(content.encode())
@@ -214,7 +192,7 @@ class ProjectRequests:
 
     def _memory_log(
         self,
-        request_id: str | int,
+        fits: ResponseFits,
         project: Project,
         params: dict[str, Any],
     ) -> dict[str, object]:
@@ -253,7 +231,7 @@ class ProjectRequests:
                     "diff_truncated": truncated,
                 }
             }
-            while not self.codec.response_fits(request_id, result):
+            while not fits(result):
                 detail = result["version"]
                 assert isinstance(detail, dict)
                 field = "diff" if detail["diff"] else "content"
@@ -274,11 +252,11 @@ class ProjectRequests:
             self._record(item)
             for item in self.registry.memory_log(project.project_id, limit=10_000)
         ]
-        return self._page(request_id, "versions", records, offset, limit)
+        return self._page(fits, "versions", records, offset, limit)
 
     def _inbox(
         self,
-        request_id: str | int,
+        fits: ResponseFits,
         project: Project,
         params: dict[str, Any],
     ) -> dict[str, object]:
@@ -294,11 +272,11 @@ class ProjectRequests:
         projected = [
             self.inbox.decorate(project.project_id, item) for item in state[status]
         ]
-        messages = [self._bounded_message(request_id, item) for item in projected]
+        messages = [self._bounded_message(fits, item) for item in projected]
         projected_by_id = {item["id"]: item for item in projected}
         invalid = [item for item in state["invalid"] if item["status"] == status]
         return self._page(
-            request_id,
+            fits,
             "messages",
             messages,
             offset,
@@ -313,7 +291,7 @@ class ProjectRequests:
         )
 
     def _bounded_message(
-        self, request_id: str | int, message: dict[str, Any]
+        self, fits: ResponseFits, message: dict[str, Any]
     ) -> dict[str, object]:
         result: dict[str, object] = {}
         truncated: list[str] = []
@@ -368,14 +346,14 @@ class ProjectRequests:
             )
         optional.sort(key=lambda item: _json_size(item[1]), reverse=True)
         for path, _value in optional:
-            if self.codec.response_fits(request_id, envelope):
+            if fits(envelope):
                 return result
             parent = result if len(path) == 1 else sender
             assert isinstance(parent, dict)
             parent.pop(path[-1], None)
             mark(path)
 
-        while not self.codec.response_fits(request_id, envelope):
+        while not fits(envelope):
             strings = _message_strings(result)
             if not strings:
                 raise RuntimeError("validated inbox message cannot fit the frame limit")
@@ -390,7 +368,7 @@ class ProjectRequests:
 
     def _page(
         self,
-        request_id: str | int,
+        fits: ResponseFits,
         key: str,
         available: list[dict[str, object]],
         offset: int,
@@ -407,7 +385,7 @@ class ProjectRequests:
         for item in selected:
             candidate = [*page, item]
             result = {**metadata(candidate), key: candidate, "next_offset": None}
-            if not self.codec.response_fits(request_id, result):
+            if not fits(result):
                 break
             page = candidate
         while True:
@@ -418,7 +396,7 @@ class ProjectRequests:
                 "next_offset": end if end < len(available) else None,
                 **({"truncated": True} if len(page) < len(selected) else {}),
             }
-            if self.codec.response_fits(request_id, result) or not page:
+            if fits(result) or not page:
                 return result
             page.pop()
 
@@ -526,15 +504,13 @@ class EntryProjectViews:
         self,
         *,
         registry: ProjectRegistry,
-        runtime: Any,
-        codec: FrameCodec,
+        manager: SessionManager,
     ) -> None:
         self.registry = registry
-        self.runtime = runtime
-        self.codec = codec
+        self.manager = manager
 
-    def show(self, request_id: str | int, project: Project) -> dict[str, object]:
-        sessions = self.runtime.manager.list_sessions_read_only()
+    def show(self, fits: ResponseFits, project: Project) -> dict[str, object]:
+        sessions = self.manager.list_sessions_read_only()
         projection = self.registry.memory_transactions.read(project.project_id)
         if projection.format != 2:
             raise ProjectRegistryError("project uses legacy memory format")
@@ -550,7 +526,7 @@ class EntryProjectViews:
                 "kinds": kinds,
             },
         }
-        while not self.codec.response_fits(request_id, result):
+        while not fits(result):
             largest = max(kinds, key=lambda item: len(str(item["rendered"]).encode()))
             rendered = str(largest["rendered"])
             size = len(rendered.encode())
@@ -562,7 +538,7 @@ class EntryProjectViews:
 
     def memory_log(
         self,
-        request_id: str | int,
+        fits: ResponseFits,
         project: Project,
         params: dict[str, Any],
     ) -> dict[str, object]:
@@ -583,7 +559,7 @@ class EntryProjectViews:
         if entry_id is not None and (not isinstance(entry_id, str) or not entry_id):
             raise RequestValidationError("entry_id must be a non-empty string")
         if version is not None:
-            return self._version(request_id, project, params, version, entry_id)
+            return self._version(fits, project, params, version, entry_id)
         offset = ProjectRequests._integer(params, "offset", 0, minimum=0)
         limit = ProjectRequests._integer(
             params, "limit", DEFAULT_PAGE_LIMIT, minimum=1, maximum=MAX_PAGE_LIMIT
@@ -591,11 +567,11 @@ class EntryProjectViews:
         records = self.registry._entry_memory_log(
             project.project_id, entry_id=entry_id, limit=10_000
         )
-        return self._page(request_id, "versions", records, offset, limit)
+        return self._page(fits, "versions", records, offset, limit)
 
     def _version(
         self,
-        request_id: str | int,
+        fits: ResponseFits,
         project: Project,
         params: dict[str, Any],
         version: object,
@@ -668,7 +644,7 @@ class EntryProjectViews:
                 "diff_truncated": truncated,
             }
         }
-        self._fit_version(request_id, result)
+        self._fit_version(fits, result)
         return result
 
     @staticmethod
@@ -701,10 +677,10 @@ class EntryProjectViews:
         end = offset + len(selected)
         return selected, len(available), end if end < len(available) else None
 
-    def _fit_version(self, request_id: str | int, result: dict[str, object]) -> None:
+    def _fit_version(self, fits: ResponseFits, result: dict[str, object]) -> None:
         detail = result["version"]
         assert isinstance(detail, dict)
-        while not self.codec.response_fits(request_id, result):
+        while not fits(result):
             if detail["diff"]:
                 value = str(detail["diff"])
                 detail["diff"], _ = _truncate_utf8(value, len(value.encode()) // 2)
@@ -749,7 +725,7 @@ class EntryProjectViews:
 
     def _page(
         self,
-        request_id: str | int,
+        fits: ResponseFits,
         key: str,
         available: list[dict[str, object]],
         offset: int,
@@ -760,7 +736,7 @@ class EntryProjectViews:
         for item in selected:
             candidate = [*page, item]
             result = {key: candidate, "next_offset": None}
-            if not self.codec.response_fits(request_id, result):
+            if not fits(result):
                 break
             page = candidate
         while True:
@@ -770,7 +746,7 @@ class EntryProjectViews:
                 "next_offset": end if end < len(available) else None,
                 **({"truncated": True} if len(page) < len(selected) else {}),
             }
-            if self.codec.response_fits(request_id, result) or not page:
+            if fits(result) or not page:
                 return result
             page.pop()
 

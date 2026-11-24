@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from enum import Enum, auto
+from functools import partial
 from typing import Any
 
 from ...mcp import MCPManagementError, MCPToolRefreshError
@@ -121,7 +122,7 @@ RESOLVE: dict[MethodDescriptor | tuple[str, str], Resolve] = {
     _M.LIST_PROJECTS: _N,
     _M.PROJECT_SHOW: _N,
     _M.PROJECT_MEMORY_LOG: _N,
-    _M.PROJECT_INBOX: _O,
+    _M.PROJECT_INBOX: _N,
     _M.CLEAR_STEERING: _F,
     _M.DELIVERY_STATUS: _O,
     _M.SESSION_GRANTS: _O,
@@ -131,10 +132,10 @@ RESOLVE: dict[MethodDescriptor | tuple[str, str], Resolve] = {
     _M.CHILD_RUN_LIST: _S,
     _M.CHILD_RUN_SEND: _O,
     _M.MCP_REFRESH_TOOLS: _F,
-    _M.STATE_SESSIONS: _O,
-    _M.STATE_SESSION: _O,
-    _M.STATE_AGENTS: _O,
-    _M.STATE_BACKGROUND_TASKS: _O,
+    _M.STATE_SESSIONS: _N,
+    _M.STATE_SESSION: _N,
+    _M.STATE_AGENTS: _N,
+    _M.STATE_BACKGROUND_TASKS: _N,
     _M.STATE_CATALOG: _N,
     _M.STATE_PROJECTS: _N,
     _M.STATE_MEMORY: _N,
@@ -513,35 +514,32 @@ async def set_turn_context(client, request_id, params, controller):
     )
 
 
-async def _project(client, request_id, params, operation):
-    assert client.projects is not None
-    return await asyncio.to_thread(operation, request_id, params)
+async def _project(client, request_id, params, method, **kwargs):
+    return await asyncio.to_thread(
+        method, partial(client.codec.response_fits, request_id), params, **kwargs,
+    )
 
 
 async def list_projects(client, request_id, params, controller):
-    return await _project(client, request_id, params, client.projects.list_projects)
+    return await _project(client, request_id, params, client.server.projects.list_projects)
 
 
 async def project_show(client, request_id, params, controller):
-    return await asyncio.to_thread(
-        client.projects.show,
-        request_id,
-        params,
+    return await _project(
+        client, request_id, params, client.server.projects.show,
         entry_response="projects-memory-v2" in client.features,
     )
 
 
 async def project_memory_log(client, request_id, params, controller):
-    return await asyncio.to_thread(
-        client.projects.memory_log,
-        request_id,
-        params,
+    return await _project(
+        client, request_id, params, client.server.projects.memory_log,
         entry_response="projects-memory-v2" in client.features,
     )
 
 
 async def project_inbox(client, request_id, params, controller):
-    return await _project(client, request_id, params, client.projects.inbox_view)
+    return await _project(client, request_id, params, client.server.projects.inbox_view)
 
 
 async def clear_steering(client, request_id, params, controller):

@@ -417,19 +417,6 @@ class ServerRuntime:
         self.manager.project_registry_unavailable = state.unavailable
         self._project_registry_probed = True
 
-    def list_sessions_read_only(self) -> list[SessionMetadata]:
-        return self.manager.list_sessions_read_only()
-
-    def available_project_features(self, features: list[str]) -> list[str]:
-        if self.manager.project_registry is not None:
-            return features
-        return [item for item in features if not item.startswith("projects")]
-
-    @property
-    def project_registry_warning(self) -> str | None:
-        unavailable = self.manager.project_registry_unavailable
-        return unavailable.warning if unavailable is not None else None
-
     def set_approval_control_binder(self, binder: ApprovalControlBinder) -> None:
         self._approval_control_binder = binder
 

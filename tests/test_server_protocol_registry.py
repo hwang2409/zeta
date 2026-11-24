@@ -12,10 +12,13 @@ import pytest
 from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
 from zeta.project_registry import ProjectRegistry
+from zeta.server.handlers.projects import ProjectRequests
+from zeta.server.handlers.registry import RESOLVE, Resolve
 from zeta.server.handlers.resources import FAMILIES
 from zeta.server.handlers.resources._mcp_auth import MCPAuth
 from zeta.server.login import Logins
 from zeta.server.protocol import (
+    Access,
     ErrorDescriptor,
     EventDescriptor,
     FrameCodec,
@@ -95,6 +98,111 @@ def test_method_registry_matches_documented_table() -> None:
     assert sorted(legacy + families) == sorted(expected), "document each resource method in its own family section"
 
 
+
+# Each key is either a legacy method or feature:method for a resource method.
+_EXPECTED_OWNERSHIP = {
+    Resolve.OWNED: """
+        new_session resume send steer status delete_session content_read
+        model_catalog session_settings send_images slash_list account_list
+        account_logout account_refresh account_switch login_start
+        login_cancel delivery_status session_grants run_work_list
+        child_run_send
+        account_list_idle_v1:account_list account_list_idle_v1:login_start
+        child_run_control_v1:child_run_spawn child_run_control_v1:child_run_cancel
+        home_settings_v1:home_settings_update library_read_v1:skill_catalog
+        library_read_v1:skill_read library_read_v1:agent_profile_catalog
+        library_read_v1:agent_profile_read library_write_v1:skill_write
+        library_write_v1:skill_delete library_write_v1:agent_profile_write
+        library_write_v1:agent_profile_delete mcp_management_v1:mcp_server_list
+        mcp_management_v1:mcp_server_add mcp_management_v1:mcp_server_remove
+        mcp_management_v1:mcp_server_set_enabled mcp_management_v1:mcp_server_set_trusted
+        mcp_management_v1:mcp_server_test mcp_management_v1:mcp_auth_start
+        mcp_management_v1:mcp_auth_cancel mcp_management_v1:mcp_auth_logout
+        project_writes_v1:project_memory_update project_writes_v1:project_inbox_send
+        session_history_read_v1:session_history_read
+    """,
+    Resolve.SELECTED: """
+        session_tree session_history session_history_and_subscribe
+        child_run_history child_run_events path_complete child_run_list
+    """,
+    Resolve.OWNED_FIRST: """
+        approve deny abort rename_session repair_transcript switch_branch
+        fork_message set_settings set_compaction slash_run set_turn_context
+        clear_steering revoke_session_grants background_task_cancel
+        mcp_refresh_tools
+    """,
+    Resolve.NONE: """
+        list_sessions login_status login_providers ping list_projects
+        project_show project_memory_log project_inbox state_sessions
+        state_session state_agents state_background_tasks state_catalog
+        state_projects state_memory state_memory_detail state_inbox
+        state_inbox_detail state_attention state_settings state_accounts
+        state_storage state_retention telemetry_status telemetry_sessions
+        telemetry_trace telemetry_overview telemetry_models telemetry_tools
+        telemetry_errors telemetry_series telemetry_agent_tree
+        agent_run_catalog_v1:agent_run_catalog home_settings_v1:home_settings_get
+        mcp_management_v1:mcp_auth_status
+    """,
+}
+
+
+def test_request_ownership_is_exhaustive() -> None:
+    expected = [
+        (key, policy)
+        for policy, methods in _EXPECTED_OWNERSHIP.items()
+        for key in methods.split()
+    ]
+    actual = {
+        key.wire if isinstance(key, MethodDescriptor) else ":".join(key): policy
+        for key, policy in RESOLVE.items()
+    }
+    assert len(expected) == len(dict(expected)), "each method must have exactly one owner"
+    assert actual == dict(expected)
+    assert MethodDescriptor.PROJECT_INBOX.access is Access.CONTROLLER_READ
+
+    server_root = PROTOCOL_MODULE.parent
+    sources = {path.relative_to(server_root).as_posix(): ast.parse(path.read_text())
+               for path in server_root.rglob("*.py")}
+    accesses = {"attached": [], "selected": []}
+
+    def scan(node, path, scope=()):
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope = (*scope, node.name)
+        if isinstance(node, ast.Attribute) and node.attr in accesses and (
+            isinstance(node.value, ast.Attribute) and node.value.attr == "controllers"
+        ):
+            accesses[node.attr].append((path, ".".join(scope)))
+        for child in ast.iter_child_nodes(node):
+            scan(child, path, scope)
+
+    for path, tree in sources.items():
+        scan(tree, path)
+    assert sorted(accesses["attached"]) == sorted([
+        ("server.py", "ZetaServer.__init__"),  # retention startup eligibility
+        ("server.py", "ZetaServer.controls"),  # legacy attached + parked iteration
+        ("server.py", "ZetaServer.new_pair"),  # legacy path without an explicit source
+        ("server.py", "ZetaServer.attach"),  # legacy attached/parked swap
+        ("server.py", "ZetaServer.start"),  # bootstrap project registry probe
+        ("server.py", "ZetaServer.start"),  # bootstrap launch scope capture
+    ])
+    assert sorted(accesses["selected"]) == sorted([
+        ("connections.py", "ConnectionRegistry.read_tree"),  # session_tree
+        ("connections.py", "ConnectionRegistry.read_history"),  # session_history
+        ("session_replay/__init__.py", "join_history_and_subscribe"),
+        ("connections.py", "ConnectionRegistry.read_child_run_history"),
+        ("handlers/registry.py", "child_run_events"),
+        ("handlers/registry.py", "path_complete"),
+        ("handlers/registry.py", "child_run_list"),
+    ])
+    client = next(node for node in sources["server.py"].body
+                  if isinstance(node, ast.ClassDef) and node.name == "_Client")
+    assert not any(isinstance(node, ast.Attribute) and node.attr == "projects"
+                   and isinstance(node.value, ast.Name) and node.value.id == "self"
+                   for node in ast.walk(client))
+    assert not any(isinstance(node, ast.Attribute) and node.attr in {"runtime", "codec"}
+                   for node in ast.walk(sources["handlers/projects.py"]))
+
+
 _REVISION = "0" * 64
 _MCP_OWNER = "zeta.mcp.management.MCPManagementService"
 # Valid inputs and the owner entry point each registered method must reach.
@@ -169,17 +277,22 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
     async def run_read(_client, call, _controller, *, fence):
         return await run_blocking(call)
 
+    registry = ProjectRegistry.for_state_read(tmp_path / "projects", 0)
+    manager = SimpleNamespace(project_registry=registry)
     client = SimpleNamespace(
         features=frozenset(),
         connections=SimpleNamespace(run_blocking=run_blocking, run_read=run_read),
         logins=Logins(tmp_path),
-        server=SimpleNamespace(home=tmp_path, _mcp_auth=MCPAuth()),
+        server=SimpleNamespace(
+            home=tmp_path, _mcp_auth=MCPAuth(),
+            projects=ProjectRequests(home=tmp_path, manager=manager, registry=registry),
+        ),
     )
     controller = SimpleNamespace(
         runtime=SimpleNamespace(
             opened=SimpleNamespace(metadata=SimpleNamespace(project_id="test-project", cwd=tmp_path)),
             project_dir=tmp_path, session_id="test-session", attachment_generation=0,
-            manager=SimpleNamespace(project_registry=ProjectRegistry.for_state_read(tmp_path / "projects", 0)),
+            manager=manager,
             loop=SimpleNamespace(_mcp_project_dir_value=tmp_path, tool_registry=None),
         ),
         control=SimpleNamespace(

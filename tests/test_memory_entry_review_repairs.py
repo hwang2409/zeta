@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -353,21 +354,21 @@ def test_large_version_detail_is_bounded_and_reports_paging(tmp_path: Path) -> N
         operations=tuple(AddOperation("state", f"entry {index}", sources) for index in range(128)),
         reconciliation_key="4" * 64,
     )
-    runtime = SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list))
+    manager = SimpleNamespace(list_sessions_read_only=list)
+    fits = partial(_SizedCodec(1024 * 1024).response_fits, 1)
     requests = ProjectRequests(
         home=home,
-        runtime=runtime,
-        codec=_SizedCodec(1024 * 1024),
+        manager=manager,
         registry=registry,
     )
 
     result = requests.memory_log(
-        1,
+        fits,
         {"project_id": project_id, "version_id": large.version},
         entry_response=True,
     )
 
-    assert requests.codec.response_fits(1, result)
+    assert fits(result)
     detail = result["version"]
     assert detail["after_entries_count"] == 128
     assert detail["after_entries_next_offset"] is not None

@@ -473,11 +473,10 @@ def _assert_migrated_public_surfaces(
 
     shown = ProjectRequests(
         home=first,
-        runtime=SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list)),
-        codec=FrameCodec(),
+        manager=SimpleNamespace(list_sessions_read_only=list),
         registry=registry,
     ).show(
-        1, {"project_id": project_id}, entry_response=True
+        lambda result: FrameCodec().response_fits(1, result), {"project_id": project_id}, entry_response=True
     )
     assert shown["memory"]["profile"] == "zeta"
 
@@ -1026,10 +1025,10 @@ async def test_dormancy_public_entry_points_leave_format_one_unchanged(
             )
             await ServerSlashSession(runtime).slash_memory(action)
     elif entry_point == "serve-project-request":
-        runtime = SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list))
+        manager = SimpleNamespace(list_sessions_read_only=list)
         ProjectRequests(
-            home=home, runtime=runtime, codec=FrameCodec(), registry=registry
-        ).show(1, {"project_id": project_id}, entry_response=False)
+            home=home, manager=manager, registry=registry
+        ).show(lambda result: FrameCodec().response_fits(1, result), {"project_id": project_id}, entry_response=False)
     elif entry_point == "sync-push":
         await asyncio.to_thread(
             push_project_memory,

@@ -44,20 +44,12 @@ state_inbox_detail = _project_state_handler("inbox_detail")
 state_attention = _project_state_handler("attention")
 
 
-async def _session_read(client, request_id, params, method, controller, *, collection=None, detail=False):
+async def _session_read(client, request_id, params, method, *, collection=None, detail=False):
     server = client.server
-    active = controller.runtime.state
-    statuses = {}
-    if active is not None:
-        status = active.status
-        if controller.control.has_pending_approvals():
-            status = "approval"
-        elif controller.control.turn_busy() or status == "tool":
-            status = "running"
-        statuses[active.metadata.session_id] = status
+    snapshot = server.session_statuses()
     try:
         return await client.connections.run_blocking(lambda: read_session_page(
-            server.home, method, params, lambda result: client.codec.response_fits(request_id, result), statuses,
+            server.home, method, params, lambda result: client.codec.response_fits(request_id, result), snapshot,
             collection=collection, detail=detail,
         ))
     except InvalidParams:
@@ -67,19 +59,19 @@ async def _session_read(client, request_id, params, method, controller, *, colle
 
 
 async def state_sessions(client, request_id, params, controller):
-    return await _session_read(client, request_id, params, MethodDescriptor.STATE_SESSIONS, controller)
+    return await _session_read(client, request_id, params, MethodDescriptor.STATE_SESSIONS)
 
 
 async def state_session(client, request_id, params, controller):
-    return await _session_read(client, request_id, params, MethodDescriptor.STATE_SESSION, controller, detail=True)
+    return await _session_read(client, request_id, params, MethodDescriptor.STATE_SESSION, detail=True)
 
 
 async def state_agents(client, request_id, params, controller):
-    return await _session_read(client, request_id, params, MethodDescriptor.STATE_AGENTS, controller, collection="agents")
+    return await _session_read(client, request_id, params, MethodDescriptor.STATE_AGENTS, collection="agents")
 
 
 async def state_background_tasks(client, request_id, params, controller):
-    return await _session_read(client, request_id, params, MethodDescriptor.STATE_BACKGROUND_TASKS, controller, collection="background_tasks")
+    return await _session_read(client, request_id, params, MethodDescriptor.STATE_BACKGROUND_TASKS, collection="background_tasks")
 
 
 def _home_state_handler(owner_read):
