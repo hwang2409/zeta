@@ -63,7 +63,8 @@ OBSERVER_REQUESTS = frozenset(
         "session_grants",
     }
 )
-MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
+MAX_CONNECTIONS = 32
+MAX_OBSERVERS = 8
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 OUTPUT_MAX_FRAMES = 256
 OUTPUT_OVERFLOW_CLOSE_DEADLINE = 1.0
@@ -255,6 +256,7 @@ class ConnectionRegistry(ReplayOutput):
         features: frozenset[str],
         *,
         max_role: str = "controller",
+        multi_mode: bool = False,
     ) -> str:
         if requested_role not in {"controller", "observer"}:
             raise ProtocolError(
@@ -274,6 +276,8 @@ class ConnectionRegistry(ReplayOutput):
                 "observer requires protocol 1.1 and serve_observers",
             )
         try:
+            if role == "observer" and not multi_mode and len(self._observers) >= MAX_OBSERVERS:
+                raise RuntimeError("observer limit reached")
             self._claim(connection, role, protocol_version, features)
         except RuntimeError as exc:
             if role == "observer":
@@ -287,6 +291,14 @@ class ConnectionRegistry(ReplayOutput):
             ) from exc
         connection.role = role
         return role
+
+    def require_observer_room(self, session_id: str) -> None:
+        if sum(
+            record.runtime.opened is not None and record.runtime.session_id == session_id
+            for state in self._observers
+            if (record := self.replay.controller_for(state.connection)) is not None
+        ) >= MAX_OBSERVERS:
+            raise ProtocolError(ErrorDescriptor.CONNECTION_CAPACITY, "observer limit reached")
 
     def log_controller_refusal(self, refused: Any) -> None:
         """Record the physical diagnostic for a semantic controller refusal."""
@@ -328,8 +340,6 @@ class ConnectionRegistry(ReplayOutput):
         if state.role is not None:
             raise ValueError("connection already claimed")
         if role == "observer":
-            if len(self._observers) >= 8:
-                raise RuntimeError("observer limit reached")
             self._observers.append(state)
         state.role = role
         # Legacy hello buffers its own pre-commit events. Multi claims activate independently.
@@ -756,7 +766,7 @@ class ConnectionRegistry(ReplayOutput):
         if output.phase != "overflowing":
             return False
         self._cancel_overflow_deadline(output)
-        await state.connection.close()
+        await self._close_overflow_connection(state)
         self._finish_future(output.ready, False)
         return True
 
@@ -827,8 +837,16 @@ class ConnectionRegistry(ReplayOutput):
         if writer is not None:
             writer.cancel()
             await asyncio.gather(writer, return_exceptions=True)
-        await state.connection.close()
+        await self._close_overflow_connection(state)
         self._finish_future(output.ready, False)
+
+    async def _close_overflow_connection(self, state: _Connection) -> None:
+        if state.role == "controller" and "multi_controller" in state.features:
+            # The connection runner settles its active request before releasing
+            # a semantic slot, even when overflow originates in this writer.
+            state.connection.stop_transport()
+        else:
+            await state.connection.close()
 
     @staticmethod
     def _overflow_frame(role: str) -> _Frame:

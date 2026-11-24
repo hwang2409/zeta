@@ -85,14 +85,20 @@ async def _session_swap(
             server.connections.replay_session_replaced()
             yield None
         return
-    # this setup holds the new generation's reservation until it ends
-    with (server.new_pair(controller) if multi else server.new_pair()) as reservation:
+    # Keep the outgoing charge and incoming use across setup and rollback.
+    with (
+        server.controllers.reserve_park(self),
+        (server.new_pair(controller) if multi else server.new_pair()) as reservation,
+    ):
         incoming = reservation.record
         with incoming.control.reserve_session_swap():
             try:
                 yield incoming
             except BaseException:
-                if not incoming.control.attached:
+                if (
+                    not incoming.control.attached
+                    and server.controllers.controller_for(self) is not incoming
+                ):
                     closed = server.controllers.retire(incoming)
                     reservation.release()
                     await asyncio.shield(closed)
@@ -145,8 +151,12 @@ async def _release_previous(
     previous = acquisition.previous
     if previous is None or previous is acquisition.target:
         return
-    cancelled = await _settle_controller_release(self, previous.control)
-    self.server.parking.leave(previous.control, self)
+    try:
+        cancelled = await _settle_controller_release(self, previous.control)
+    except BaseException:
+        self.server.controllers.retire(previous)
+        raise
+    self.server.parking.leave(previous, self)
     if cancelled:
         raise asyncio.CancelledError
 
@@ -155,7 +165,6 @@ async def _new_session(
     self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
     acquisition = None
-    target_use = None
     try:
         bindings = await mcp_bindings(self, params, controller)
         initial_model = validation.optional_string(params, "model")
@@ -183,10 +192,9 @@ async def _new_session(
                     acquisition = self.server.controllers.reserve_session(
                         self, incoming.runtime.session_id, incoming
                     )
-                    target_use = self.server.controllers.use_acquisition(acquisition)
-                    controller = target_use
+                    controller = incoming
                 else:
-                    controller = self.server.attach(incoming)
+                    controller = self.server.attach(incoming, self)
             if initial_model is not None and initial_mode is not None:
                 await model_selection.apply_rpc(
                     controller.runtime, initial_model, initial_mode
@@ -229,9 +237,6 @@ async def _new_session(
             controller.control._active_host_commands = None
             controller.control._host_binding_required = False
         raise
-    finally:
-        if target_use is not None:
-            target_use.release()
 
 
 async def _resume(
@@ -253,23 +258,24 @@ async def _resume(
             await self.server.controllers.wait_closed(session_id)
             resident = self.server.controllers.resident(session_id)
             if "resume_attach" in self.features and resident is not None and not resident.control.unhealthy():
-                acquisition = self.server.controllers.reserve_existing(self, session_id)
-                target_use = self.server.controllers.use_acquisition(acquisition)
-                if acquisition.previous is not acquisition.target:
-                    resident_claimed = await target_use.control.controller_claimed(
-                        reconnect="approval_reconnect" in self.features,
-                        require_host_binding="session_host_commands" in self.features,
-                        deadline=control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS,
+                with self.server.controllers.reserve_park(self, target=resident):
+                    acquisition = self.server.controllers.reserve_existing(self, session_id)
+                    target_use = self.server.controllers.use_acquisition(acquisition)
+                    if acquisition.previous is not acquisition.target:
+                        resident_claimed = await target_use.control.controller_claimed(
+                            reconnect="approval_reconnect" in self.features,
+                            require_host_binding="session_host_commands" in self.features,
+                            deadline=control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS,
+                        )
+                    attached = await _attach_live_turn(
+                        self, bindings, candidate, controller=target_use
                     )
-                attached = await _attach_live_turn(
-                    self, bindings, candidate, controller=target_use
-                )
-                if acquisition.previous is not acquisition.target:
-                    await target_use.control.publish_session_grant_reset()
-                self.server.controllers.commit_session(acquisition).release()
-                self.server.parking.forget(acquisition.target)
-                await _release_previous(self, acquisition)
-                return attached
+                    if acquisition.previous is not acquisition.target:
+                        await target_use.control.publish_session_grant_reset()
+                    self.server.controllers.commit_session(acquisition).release()
+                    resident_claimed = False
+                    await _release_previous(self, acquisition)
+                    return attached
         else:
             attached, park = await _resume_live_or_parked(
                 self, params, bindings, candidate, park, controller
@@ -286,7 +292,6 @@ async def _resume(
                 acquisition = self.server.controllers.reserve_session(
                     self, session_id, candidate
                 )
-                target_use = self.server.controllers.use_acquisition(acquisition)
             unhealthy_same_session = (
                 incoming is None
                 and controller.control.unhealthy()
@@ -322,10 +327,8 @@ async def _resume(
                         str(exc),
                         {"session_id": session_id},
                     ) from exc
-            if target_use is not None:
-                controller = target_use
-            if incoming is not None and not multi:
-                controller = self.server.attach(incoming)
+            if incoming is not None:
+                controller = incoming if multi else self.server.attach(incoming, self)
             if bindings is not None:
                 headers, configs = bindings
                 # assign the control's binding state before the await so a cancel
@@ -353,7 +356,6 @@ async def _resume(
             snapshot = {"session": session_snapshot(self, controller)}
             if acquisition is not None:
                 self.server.controllers.commit_session(acquisition).release()
-                self.server.parking.forget(acquisition.target)
                 await _release_previous(self, acquisition)
             return snapshot
     except BaseException:
@@ -473,7 +475,7 @@ async def _attach_live_turn(
             )
     if parked is not None:
         # one step after the last await: the pair cannot start closing first
-        controller = self.server.attach(parked)
+        controller = self.server.attach(parked, self)
     # Bind host commands before the await, so a turn that ends meanwhile never
     # sees a half-attached session. The running turn keeps its snapshot.
     with control.hold_binding_transition():
@@ -747,7 +749,7 @@ async def status(
     }
     status.update(suffix)
     if "session_park" in self.features:
-        status["parked_sessions"] = self.server.parking.rows()
+        status["parked_sessions"] = self.server.parking.rows(self)
     if "telemetry_read_v1" in self.features:
         status["telemetry"] = live_view(self.server.telemetry)
     slash_command = controller.control.slash_lock.status()

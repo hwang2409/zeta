@@ -363,30 +363,34 @@ class ZetaServer:
 
     def new_pair(self, owner: SessionUse | SessionController | None = None) -> SessionUse:
         """Create a pair beside the owner's record, sharing its manager."""
-        self.parking.require_room()
+        if self.controllers.controller_mode != "multi":
+            self.controllers.require_legacy_parked_room()
         source = owner.record if isinstance(owner, SessionUse) else owner
         if source is None:
             source = self.controllers.attached()
-        control = ServeControl(
-            self, source.runtime.sibling(), self.foreground_event_publisher
-        )
-        self._bind_pair(control)
-        return self.controllers.register(control)
 
-    def attach(self, incoming: SessionController) -> SessionController:
+        def make_control() -> ServeControl:
+            control = ServeControl(
+                self, source.runtime.sibling(), self.foreground_event_publisher
+            )
+            self._bind_pair(control)
+            return control
+
+        return self.controllers.register(make_control)
+
+    def attach(self, incoming: SessionController, connection: _Client) -> SessionController:
         """Make ``incoming`` the attached pair in one step (no await): park the
         outgoing pair while it holds work, else start its close."""
         previous = self.controllers.attached()
         outgoing = previous.control
-        if not self.parking.unpark(incoming.control):
+        if self.controllers.unpark(incoming) is None:
             # a new pair takes over the controller slot state of the pair it replaces
             incoming.control._controller_attached = outgoing._controller_attached
-        parked_by = self.controllers.legacy_event_owner(previous)
         self.controllers.attach(incoming)
         assert self.connections is not None
         self.connections.replay_session_replaced()
         if outgoing.runtime.opened is not None:
-            self.parking.leave(outgoing, parked_by)
+            self.parking.leave(previous, connection)
         return incoming
 
     def session_statuses(self) -> Mapping[str, str]:
@@ -723,7 +727,7 @@ class _Client:
     async def run(self) -> None:
         graceful = True
         try:
-            while True:
+            while not (self._local_close and "multi_controller" in self.features):
                 line = await self._read_frame()
                 if not line:
                     self._release_dead_connection()
@@ -1068,6 +1072,11 @@ class _Client:
         self.server.controllers.release_connection(self)
         self.connections.release(self)
 
+    def stop_transport(self) -> None:
+        self._local_close = True
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.writer.close()
+
     async def close(self, *, graceful: bool = False) -> None:
         async with self._close_lock:
             if self._closed:
@@ -1170,7 +1179,6 @@ class _Client:
                 self.server.controllers.commit_hello(admission)
             if acquisition is not None:
                 self.server.controllers.commit_session(acquisition).release()
-                self.server.parking.forget(acquisition.target)
             self.handshaken = True
         except BaseException:
             if acquisition is not None:
@@ -1205,6 +1213,7 @@ class _Client:
                 self.protocol_version,
                 self.features,
                 max_role=self.max_role,
+                multi_mode=self.server.controllers.controller_mode == "multi",
             )
         except BaseException:
             if admission is not None:

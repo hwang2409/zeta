@@ -362,7 +362,7 @@ def test_a_closing_record_stays_resident_until_its_close_ends() -> None:
         assert owner.park(record) is record
         assert owner.unpark(record) is record
         assert owner.attach(record) is record
-        assert owner.register(Control()).generation > generation  # type: ignore[arg-type]
+        assert owner.register(Control).generation > generation  # type: ignore[arg-type]
         with owner.owned(None) as use:
             assert (use.record, use.generation, record.uses) == (record, generation, {use})
         assert record.uses == set()
@@ -413,7 +413,7 @@ def test_a_transferred_use_settles_only_with_its_completion() -> None:
         owner = SessionControllers(Control())  # type: ignore[arg-type]
         for settle in ("result", "exception", "cancel"):
             closed.clear()
-            use = owner.register(Control())  # type: ignore[arg-type]
+            use = owner.register(Control)  # type: ignore[arg-type]
             record = use.record
             completion = asyncio.get_running_loop().create_future()
             use.transfer_to(completion)

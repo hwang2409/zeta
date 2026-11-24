@@ -122,9 +122,8 @@ strings returns `-32602` and closes the connection. A 1.0 negotiation ignores
 
 `multi_controller` is the negotiated capability for the later multi-controller
 serve mode. it is documented here so clients can prepare for that mode, but this
-slice does not advertise it in production and does not change admission behavior.
-a private in-process test server may echo the capability while retaining the
-current single-controller rules.
+slice does not advertise it in production. a private in-process test server
+can negotiate it to exercise the multi-controller rules.
 
 When enabled in a later slice, controller mode is exclusive: a serve process is
 in either legacy mode (one controller) or negotiated multi-controller mode; the
@@ -140,11 +139,24 @@ approval checks. an unattached negotiated connection does not infer reconnect
 from another session's grace record. a reconnect failure leaves the existing
 record in grace for the current reconnect rules.
 
-The later mode starts with limits of four negotiated controllers, eight
-observers per session, 32 physical connections, and eight resident session
-records (including parked, closing, and reconnect-grace records). the existing
-256-frame / 4 MiB per-connection output bounds remain in force. these are fixed
-protocol limits, not settings.
+Multi-controller mode admits four controllers. A fifth hello receives `-32001`
+and closes the connection. Each session admits eight pending or active observer
+subscriptions, including child streams for that session. A ninth join returns
+`-32001` without closing the connection. An observer without a subscription
+does not occupy a session bucket.
+
+The eight resident records include setup, parked, closing, and reconnect-grace
+records. A ninth record is refused with `-32004` and `reason: "resident_limit"`.
+Each connection can charge three parked or closing records. The existing
+`-32004` `parked_limit` response lists only that connection's charged sessions.
+`status.parked_sessions` and `parked_session_changed` show only the requesting
+controller's parked records. Closing records stay charged until settlement.
+
+The shared physical limit is 32 connections (previously 10) across all
+transports, including clients that have not sent hello. The legacy role limits
+are unchanged. Excess transports close without a JSON-RPC response. The
+existing 256-frame / 4 MiB per-connection output bounds remain in force. These
+are fixed limits, not settings.
 
 The compatibility trace for this capability covers legacy hello, resume, park,
 refusal, reconnect, and close on both Unix and WebSocket transports. until the
