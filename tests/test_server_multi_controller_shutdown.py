@@ -536,3 +536,60 @@ async def test_frozen_shutdown_drains_all_owners(
                 await await_or_fail(waiter, what="cancelled close waiter settles")
         with contextlib.suppress(RuntimeError):
             await await_or_fail(_close_server(server, clients), what="dispose composed shutdown peers")
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.parametrize("exit_path", ("pre_hello", "refused_hello"))
+@pytest.mark.asyncio
+async def test_closed_unclaimed_connection_settles_its_output_writer(
+    tmp_path: Path, transport: Transport, exit_path: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    registry = server.connections
+    holder = None
+    probe = None
+    writers: list[asyncio.Task[None]] = []  # strong refs: GC must not hide a pending writer
+    registered = asyncio.Event()
+    gone = asyncio.Event()
+    original_register, original_unregister = registry.register, registry.unregister
+
+    def register(connection: Any) -> None:
+        original_register(connection)
+        writers.append(registry.output_state(connection).writer_task)
+        registered.set()
+
+    def unregister(connection: Any) -> None:
+        original_unregister(connection)
+        gone.set()
+
+    try:
+        if exit_path == "refused_hello":
+            holder = await connect_replay(server, transport)
+            assert "result" in await negotiate(holder, replay=False)
+        # test-contract: seam observes the physical row's register and unregister, not timing.
+        monkeypatch.setattr(registry, "register", register)
+        monkeypatch.setattr(registry, "unregister", unregister)
+        probe = await connect_replay(server, transport)
+        await await_or_fail(registered.wait(), what="probe registered")
+        (writer,) = writers
+        if exit_path == "refused_hello":
+            refused = await negotiate(probe, replay=False)
+            assert refused["error"]["code"] == -32001, refused
+        await probe.close()
+        await await_or_fail(gone.wait(), what="probe unregistered")
+        assert writer.done() or writer.cancelling(), "closed connection left its writer pending"
+        clients = [client for client in (holder,) if client is not None]
+        await await_or_fail(_close_server(server, clients), what="server close")
+        holder = None
+        assert writer.done(), "server close left the closed connection's writer pending"
+        assert not [
+            task for task in asyncio.all_tasks()
+            if getattr(task.get_coro(), "__qualname__", "") == "ConnectionRegistry._output_writer"
+        ], "a serve output writer outlived server close"
+    finally:
+        with contextlib.suppress(RuntimeError):
+            await await_or_fail(
+                _close_server(server, [c for c in (holder, probe) if c is not None]),
+                what="dispose writer probe",
+            )
