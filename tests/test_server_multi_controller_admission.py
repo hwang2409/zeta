@@ -1449,9 +1449,12 @@ async def test_multi_reconnect_grace_is_independent(
             assert grace is not None
             expire_b.set()
             await await_or_fail(asyncio.shield(grace), what="settle B's grace")
+            unrelated = await connect()
+            refused = await negotiate(unrelated, replay=False, extra=features)
+            assert refused.get("error", {}).get("code") == -32001, "B's expiry lost A's idle grace"
         a, status = await reclaim(a_id)
         assert status["state"] == ("running" if a_has_turn else "idle")
-        (a_peer,) = server.connections.clients()
+        a_peer = server.connections.clients()[-1]
         disconnected[a_peer] = asyncio.Event()
         await await_or_fail(a.close(), what="disconnect reclaimed A")
         await await_or_fail(disconnected[a_peer].wait(), what="settle reclaimed A disconnect")
