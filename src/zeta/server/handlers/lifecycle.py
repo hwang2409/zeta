@@ -233,70 +233,142 @@ async def _new_session(
             closed = self.server.controllers.abort_session(acquisition)
             if closed is not None:
                 await asyncio.shield(closed)
-        if controller.runtime.state is None:
-            controller.control._active_host_commands = None
-            controller.control._host_binding_required = False
+        _clear_unopened_host_commands(controller)
         raise
+
+
+def _clear_unopened_host_commands(controller: SessionUse | SessionController) -> None:
+    if controller.runtime.state is None:
+        controller.control._active_host_commands = None
+        controller.control._host_binding_required = False
 
 
 async def _resume(
     self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
-    acquisition = None
-    target_use = None
-    resident_claimed = False
+    resident = None
     try:
         bindings = await mcp_bindings(self, params, controller)
         state = controller.runtime.state
         previous_session_id = state.metadata.session_id if state is not None else None
-        candidate = host_commands(self, params)
+        commands = host_commands(self, params)
         park = "session_park" in self.features
-        multi = self.server.controllers.controller_mode == "multi"
         session_id = None
-        if multi:
+        if self.server.controllers.controller_mode == "multi":
             session_id = await _resolve_session_id(self, params, controller)
-            await self.server.controllers.wait_closed(session_id)
-            exact_attach = "resume_attach" in self.features and params["session_id"] == session_id
-            resident = self.server.controllers.acquisition_target(self, session_id, reconnect=exact_attach)
-            if "resume_attach" in self.features and resident is not None and not resident.control.unhealthy():
-                with self.server.controllers.reserve_park(self, target=resident):
-                    acquisition = self.server.controllers.reserve_existing(self, session_id)
-                    target_use = self.server.controllers.use_acquisition(acquisition)
-                    if acquisition.previous is not acquisition.target:
-                        resident_claimed = True
-                        claimed = await target_use.control.controller_claimed(
-                            reconnect="approval_reconnect" in self.features,
-                            require_host_binding="session_host_commands" in self.features,
-                            deadline=control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS,
-                        )
-                        if not claimed:
-                            raise ProtocolError(
-                                ErrorDescriptor.CONNECTION_CAPACITY, "another client is already connected"
-                            )
-                    attached = await _attach_live_turn(
-                        self, bindings, candidate, controller=target_use
-                    )
-                    if acquisition.previous is not acquisition.target:
-                        await target_use.control.publish_session_grant_reset()
-                    self.server.controllers.commit_session(acquisition).release()
-                    resident_claimed = False
-                    await _release_previous(self, acquisition)
-                    return attached
+            resident = await _multi_resident(self, params, session_id, controller)
         else:
             attached, park = await _resume_live_or_parked(
-                self, params, bindings, candidate, park, controller
+                self, params, bindings, commands, park, controller
             )
             if attached is not None:
                 return attached
+    except BaseException:
+        _clear_unopened_host_commands(controller)
+        raise
+    if resident is not None:
+        return await _resume_resident(self, session_id, resident, bindings, commands, controller)
+    return await _resume_reopen(
+        self, params, session_id, bindings, commands, park, previous_session_id, controller
+    )
+
+
+async def _multi_resident(
+    self, params: dict[str, Any], session_id: str, controller: SessionUse | SessionController
+) -> SessionController | None:
+    """Return the healthy resident record a multi resume takes in place (one
+    record per session id); retire an unhealthy one so the resume reopens it."""
+    controllers = self.server.controllers
+    await controllers.wait_closed(session_id)
+    exact_attach = "resume_attach" in self.features and params["session_id"] == session_id
+    resident = controllers.acquisition_target(self, session_id, reconnect=exact_attach)
+    if resident is None:
+        return None
+    if resident.control.unhealthy():
+        if resident.control is not controller.control and controllers.owner_of(resident) in (None, self):
+            await asyncio.shield(controllers.retire_for_reopen(resident))
+        return None
+    if "resume_attach" not in self.features and resident.control.state_change_busy():
+        raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")
+    return resident
+
+
+async def _resume_resident(
+    self,
+    session_id: str,
+    resident: SessionController,
+    bindings: tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None,
+    commands: SessionHostCommands,
+    controller: SessionUse | SessionController,
+) -> dict[str, object]:
+    """Attach this multi controller to the session's resident record."""
+    acquisition = None
+    target_use = None
+    resident_claimed = False
+    try:
+        with self.server.controllers.reserve_park(self, target=resident):
+            acquisition = self.server.controllers.reserve_existing(self, session_id)
+            target_use = self.server.controllers.use_acquisition(acquisition)
+            if acquisition.previous is not acquisition.target:
+                resident_claimed = True
+                claimed = await target_use.control.controller_claimed(
+                    reconnect="approval_reconnect" in self.features,
+                    require_host_binding="session_host_commands" in self.features,
+                    deadline=control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS,
+                )
+                if not claimed:
+                    raise ProtocolError(
+                        ErrorDescriptor.CONNECTION_CAPACITY, "another client is already connected"
+                    )
+            attached = await _attach_live_turn(
+                self, bindings, commands, controller=target_use
+            )
+            if acquisition.previous is not acquisition.target:
+                await target_use.control.publish_session_grant_reset()
+            self.server.controllers.commit_session(acquisition).release()
+            resident_claimed = False
+            await _release_previous(self, acquisition)
+            return attached
+    except BaseException:
+        deferred_cancel = False
+        if resident_claimed and acquisition is not None:
+            deferred_cancel = await _settle_controller_release(
+                self, acquisition.target.control
+            )
+        if acquisition is not None:
+            closed = self.server.controllers.abort_session(acquisition)
+            if closed is not None:
+                await asyncio.shield(closed)
+        _clear_unopened_host_commands(controller)
+        if deferred_cancel:
+            raise asyncio.CancelledError
+        raise
+    finally:
+        if target_use is not None:
+            target_use.release()
+
+
+async def _resume_reopen(
+    self,
+    params: dict[str, Any],
+    session_id: str | None,
+    bindings: tuple[dict[str, dict[str, str]], dict[str, MCPServerConfig]] | None,
+    commands: SessionHostCommands,
+    park: bool,
+    previous_session_id: str | None,
+    controller: SessionUse | SessionController,
+) -> dict[str, object]:
+    """Open the session from disk, in place or in a new pair."""
+    acquisition = None
+    multi = self.server.controllers.controller_mode == "multi"
+    try:
         async with _session_swap(self, park, controller) as incoming:
             if session_id is None:
                 session_id = await _resolve_session_id(self, params, controller)
                 await self.server.controllers.wait_closed(session_id)
-            acquisition = None
             if multi:
-                candidate = incoming or controller.record
                 acquisition = self.server.controllers.reserve_session(
-                    self, session_id, candidate
+                    self, session_id, incoming or controller.record
                 )
             unhealthy_same_session = (
                 incoming is None
@@ -347,7 +419,7 @@ async def _resume(
                 controller.control._active_mcp_bindings = {}
                 controller.control._mcp_binding_servers = frozenset()
                 controller.control._mcp_binding_required = False
-            controller.control._active_host_commands = candidate
+            controller.control._active_host_commands = commands
             controller.control._host_binding_required = (
                 "session_host_commands" in self.features
             )
@@ -365,24 +437,12 @@ async def _resume(
                 await _release_previous(self, acquisition)
             return snapshot
     except BaseException:
-        deferred_cancel = False
-        if resident_claimed and acquisition is not None:
-            deferred_cancel = await _settle_controller_release(
-                self, acquisition.target.control
-            )
         if acquisition is not None:
             closed = self.server.controllers.abort_session(acquisition)
             if closed is not None:
                 await asyncio.shield(closed)
-        if controller.runtime.state is None:
-            controller.control._active_host_commands = None
-            controller.control._host_binding_required = False
-        if deferred_cancel:
-            raise asyncio.CancelledError
+        _clear_unopened_host_commands(controller)
         raise
-    finally:
-        if target_use is not None:
-            target_use.release()
 
 
 async def _resume_live_or_parked(
