@@ -788,7 +788,7 @@ async def test_multi_parking_is_connection_local(
     tmp_path: Path, transport: Transport, parked_count: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     text = TextContent("held")
-    backend = GatedBackend([([text, HOLD], [text])] * (parked_count + 1))
+    backend = GatedBackend([([text, HOLD], [text])] * (parked_count + 2))
     server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
     await await_or_fail(server.start(), what="start parking server")
     clients = []
@@ -828,6 +828,9 @@ async def test_multi_parking_is_connection_local(
                 "message": "too many parked sessions are running",
                 "data": {"reason": "parked_limit", "parked": parked[:-1]},
             }
+            # only a swap that parks counts: keep A's current session busy
+            assert "result" in await a.request(39, "send", {"text": "hold"})
+            await await_or_fail(backend.held[parked_count + 1].wait(), what="busy current turn")
             denied = await a.request(41, "new_session", {})
             assert denied.get("error") == expected_error, denied
             closing_record = server.parking.get(parked[0])
