@@ -88,8 +88,11 @@ async def _session_swap(
         return
     # Keep the outgoing charge and incoming use across setup and rollback.
     with (
-        # as in legacy: without session_park a busy session is never left behind
-        outgoing.reserve_session_swap() if not park else contextlib.nullcontext(),
+        # as in legacy: without session_park a busy session is never left behind;
+        # the shared sessionless record has nothing to cut, so it is not reserved
+        outgoing.reserve_session_swap()
+        if not park and outgoing.runtime.opened is not None
+        else contextlib.nullcontext(),
         server.controllers.reserve_park(self),
         (server.new_pair(controller, connection=self) if multi else server.new_pair()) as reservation,
     ):
@@ -317,7 +320,9 @@ async def _resume_resident(
     try:
         with (
             controller.control.reserve_session_swap()
-            if "session_park" not in self.features and resident.control is not controller.control
+            if "session_park" not in self.features
+            and resident.control is not controller.control
+            and controller.runtime.opened is not None
             else contextlib.nullcontext(),
             self.server.controllers.reserve_park(self, target=resident),
         ):
@@ -535,14 +540,13 @@ async def _attach_live_turn(
     bindings are re-supplied."""
     control = (parked or controller).control
     reattach = None
-    servers = (control._mcp_binding_servers, control._mcp_binding_required)
+    rebound = None
     if bindings is not None:
         headers, configs = bindings
         # an idle session takes new bindings, as a reopen does
         idle = not control.holds_work()
         if idle:
-            control._mcp_binding_servers = frozenset(headers)
-            control._mcp_binding_required = bool(headers)
+            rebound = frozenset(headers)
         elif (
             not control._mcp_binding_required
             or frozenset(headers) != control._mcp_binding_servers
@@ -571,6 +575,10 @@ async def _attach_live_turn(
         try:
             if reattach is not None:
                 await control.reattach_mcp_bindings(*reattach)
+            if rebound is not None:
+                # with the new headers bound: a failed rebind keeps the old server set
+                control._mcp_binding_servers = rebound
+                control._mcp_binding_required = bool(rebound)
             if parked is not None:
                 # the attached session changed, as on any resume
                 await control.publish_session_grant_reset()
@@ -582,8 +590,6 @@ async def _attach_live_turn(
             return {"session": session_snapshot(self, controller), "attached": "live_turn"}
         except BaseException:
             control._active_host_commands, control._host_binding_required = previous
-            # a failed rebind leaves the old bindings active, so the old server set stays
-            control._mcp_binding_servers, control._mcp_binding_required = servers
             raise
 
 

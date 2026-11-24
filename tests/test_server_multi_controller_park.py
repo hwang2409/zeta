@@ -24,6 +24,7 @@ from tests.test_server_multi_controller_resume import _legacy_resident
 from zeta.protocol.types import TextContent, ToolCall, ToolUseContent
 from zeta.server.control import ServeControl
 from zeta.server.delivery import DeliveryRequests
+from zeta.server.runtime import ServerRuntime
 
 PARK = ("multi_controller", "session_park", "resume_attach")
 RECONNECT = (*PARK, "approval_reconnect", "turn_reconnect")
@@ -300,6 +301,52 @@ async def test_swap_refuses_pending_end_of_turn_step(
         if owner is not None:
             await owner.close()
         await await_or_fail(server.close(), what="close swap server")
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_concurrent_first_opens_without_park(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Connections without a session share one unopened record: one connection's
+    first open does not make another's refuse as busy."""
+    entered, gate = asyncio.Event(), asyncio.Event()
+    original = ServerRuntime.create_session
+    calls: list[None] = []
+
+    async def held_first(*args: Any, **kwargs: Any) -> Any:
+        calls.append(None)
+        if len(calls) == 1:
+            entered.set()
+            await await_or_fail(gate.wait(), what="first open gate")
+        return await original(*args, **kwargs)
+
+    # test-contract: seam the first connection's setup await is held open by the test
+    monkeypatch.setattr(ServerRuntime, "create_session", held_first)
+    backend = GatedBackend([NEXT])
+    server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
+    await await_or_fail(server.start(), what="start open server")
+    clients: list[ReplayClient] = []
+    try:
+        first = await connect_replay(server, transport)
+        second = await connect_replay(server, transport)
+        clients += [first, second]
+        assert "result" in await negotiate(first, replay=False, extra=("multi_controller",))
+        assert "result" in await negotiate(second, replay=False, extra=("multi_controller",))
+        await first.send(2, "new_session", SETTINGS)
+        await await_or_fail(entered.wait(), what="first open in setup")
+
+        opened = await second.request(2, "new_session", SETTINGS)
+
+        assert "result" in opened, f"a concurrent first open was refused: {opened.get('error')}"
+        gate.set()
+        assert "result" in await first.response(2)
+        await _turn_end(second, 3, opened["result"]["session"]["session_id"])
+    finally:
+        gate.set()
+        for client in clients:
+            await client.close()
+        await await_or_fail(server.close(), what="close open server")
 
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
