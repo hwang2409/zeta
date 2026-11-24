@@ -37,7 +37,7 @@ from .protocol import (
 )
 
 if TYPE_CHECKING:
-    from .account_operations import AccountOperations
+    from .accounts import AccountOperations
 
 LOGIN_PUBLICATION_TIMEOUT_SECONDS = 60.0
 

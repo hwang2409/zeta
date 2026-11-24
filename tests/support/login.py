@@ -17,7 +17,7 @@ from zeta.providers import login as provider_login
 
 
 def isolated_logins(home: Path):
-    from zeta.server.account_operations import AccountOperations
+    from zeta.server.accounts import AccountOperations
     from zeta.server.login import Logins
 
     owner = AccountOperations(tuple, lambda: False, lambda: iter(()), lambda _control: False)

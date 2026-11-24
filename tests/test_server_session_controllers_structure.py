@@ -213,12 +213,13 @@ def test_multi_controller_lifecycle_has_no_semantic_server_slot_or_global_bypass
             called = ast.unparse(node.func)
             if (
                 called.endswith(("server.controls", "server.parking.claim"))
-                or called == "_resume_live_or_parked"
+                or called in {"_resume_live_or_parked", "self._legacy_controls"}
             ) and not legacy_only:
                 problems.append(f"unguarded legacy owner path: {called}:{node.lineno}")
         for child in ast.iter_child_nodes(node):
             check_legacy_only_calls(child, legacy_only=legacy_only)
 
+    check_legacy_only_calls(ast.parse((ROOT / "accounts.py").read_text()))
     check_legacy_only_calls(ast.parse((ROOT / "server.py").read_text()))
     check_legacy_only_calls(ast.parse((ROOT / "handlers" / "lifecycle.py").read_text()))
     assert problems == []

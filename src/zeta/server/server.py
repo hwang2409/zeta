@@ -39,7 +39,7 @@ from . import (
     login,
 )
 from . import control as control_module
-from .account_operations import AccountOperations
+from .accounts import AccountOperations
 from .connections import Admission, ConnectionRegistry
 from .control import (
     NotificationPresentation,
