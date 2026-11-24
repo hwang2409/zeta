@@ -8,6 +8,9 @@ from dataclasses import dataclass, replace
 
 from ..protocol.types import Message, TextContent
 
+# Child-only ownership; never serialized into session metadata.
+CHILD_PROFILE_BODY = "child_profile_body"
+
 
 @dataclass(frozen=True, slots=True)
 class OwnedSpan:
@@ -32,6 +35,10 @@ class RuntimePrompt:
 
     system_prompt: str | Message
     prompt_components: dict[str, dict[str, int | str]]
+
+
+def child_profile_contribution(body: str) -> str:
+    return f"\n\n{body}" if body else ""
 
 
 def owned_span(text: str, offset: int = 0, length: int | None = None) -> OwnedSpan:

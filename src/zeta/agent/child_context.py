@@ -25,13 +25,17 @@ from ..protocol.types import (
     Message,
     MessageRole,
     TextContent,
+    assistant_text,
     is_owned_completion_backend,
 )
 from ..providers.factory import build_backend, child_credential_error, credential_store
 from ..runtime.prompt import (
+    CHILD_PROFILE_BODY,
     PromptFragment,
     RuntimePrompt,
+    child_profile_contribution,
     owned_fragment,
+    owned_span,
     replace_owned_fragment,
 )
 from ..tools import ToolRegistry
@@ -242,20 +246,27 @@ def _compose_child_project_context(
         preset,
         explicit_finish=explicit_finish,
     )
-    if not isinstance(prompt, str):
-        return replace(
-            context,
-            system_prompt=cast(str, prompt),
-            prompt_components={},
-        )
-    shift = len(preset.preamble) + 2 if preset.preamble else 0
+    shift = (
+        len(preset.preamble) + 2 if preset.preamble and isinstance(prompt, str) else 0
+    )
     components = {
         key: {**component, "offset": int(component["offset"]) + shift}
         for key, component in context.prompt_components.items()
+        if key != CHILD_PROFILE_BODY and isinstance(prompt, str)
     }
+    if preset.path is not None and preset.prompt_suffix:
+        text = prompt if isinstance(prompt, str) else assistant_text(prompt)
+        length = len(child_profile_contribution(preset.prompt_suffix))
+        finish_length = len(_EXPLICIT_FINISH_GUIDANCE) + 2 if explicit_finish else 0
+        span = owned_span(text, len(text) - finish_length - length, length)
+        components[CHILD_PROFILE_BODY] = {
+            "offset": span.offset,
+            "length": span.length,
+            "digest": span.digest,
+        }
     return replace(
         context,
-        system_prompt=prompt,
+        system_prompt=cast(str, prompt),
         memory_offset=(
             context.memory_offset + shift if context.memory_offset is not None else None
         ),
@@ -310,19 +321,17 @@ def _compose_child_system_prompt(
     """Apply the preset preamble and custom body to the child prompt."""
 
     composed = compose_system_prompt(system_prompt, preset.preamble)
-    body = preset.prompt_suffix
+    body = child_profile_contribution(preset.prompt_suffix)
     if explicit_finish:
-        body = (
-            f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}"
-            if body
-            else _EXPLICIT_FINISH_GUIDANCE
-        )
+        body += "\n\n" + _EXPLICIT_FINISH_GUIDANCE
     if not body:
         return composed
     if isinstance(composed, Message):
+        if preset.path is None:
+            body = body.removeprefix("\n\n")
         return Message(
             MessageRole.SYSTEM,
             [*composed.content, TextContent(body)],
             metadata=dict(composed.metadata),
         )
-    return composed + "\n\n" + body
+    return composed + body

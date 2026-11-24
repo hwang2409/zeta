@@ -17,6 +17,7 @@ from ...project_registry import ProjectRegistry
 from ..offload import await_joined_offload
 from ..project_registry_state import ProjectRegistryState
 from ..prompt import (
+    CHILD_PROFILE_BODY,
     PromptFragment,
     RuntimePrompt,
     owned_fragment,
@@ -77,6 +78,16 @@ class ProjectContextRecoveryMixin:
             prompt = replace_runtime_prompt(
                 base, context.system_prompt, context.prompt_components
             )
+            if (
+                CHILD_PROFILE_BODY in base.prompt_components
+                and CHILD_PROFILE_BODY in prompt.prompt_components
+            ):
+                # A child with its own cwd rebuilds context from its spawn recipe.
+                prompt = replace_owned_fragment(
+                    prompt,
+                    CHILD_PROFILE_BODY,
+                    owned_fragment(base, CHILD_PROFILE_BODY),
+                )
         elif component not in base.prompt_components:
             # Like a fresh inheriting child, keep the prompt if it has no owned slot.
             prompt = base
