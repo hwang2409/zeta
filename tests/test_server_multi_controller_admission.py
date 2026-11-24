@@ -1036,7 +1036,7 @@ async def test_multi_resident_limit_includes_setup_and_closing(
         for _ in range(3):
             clients.append(await await_or_fail(connect_replay(server, transport), what="resident socket"))
         a, b, c = clients
-        features = ("multi_controller", "approval_reconnect", "turn_reconnect")
+        features = ("multi_controller", "session_park", "resume_attach", "approval_reconnect", "turn_reconnect")
         for client in clients:
             assert "result" in await negotiate(client, replay=False, extra=features)
             assert "result" in await client.request(2, "new_session", {})
