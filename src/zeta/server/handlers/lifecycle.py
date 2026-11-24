@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from ...core.session_execution import SessionOwnedError
@@ -28,7 +29,7 @@ from .telemetry import live_view
 if TYPE_CHECKING:
     from ...runtime.loop import AgentLoop
     from ..control import ServeControl
-    from ..session_controllers import SessionAcquisition, SessionController, SessionUse
+    from ..session_controllers import SessionController, SessionUse
 
 
 _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
@@ -69,37 +70,88 @@ async def _publish_project_registry_notice(self, controller: SessionUse | Sessio
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _Outgoing:
+    """What a multi swap does with the connection's current session: nothing
+    (``record`` None), park it, or close it."""
+
+    record: SessionController | None = None
+    park: bool = False
+
+    async def leave(self, client: Any) -> None:
+        """Run the decision once the swap target is committed."""
+        if self.record is None:
+            return
+        # storage that failed during setup closes it too: never park an unhealthy session
+        if self.park and not self.record.control.unhealthy():
+            # a swap is not a disconnect: park as legacy attach does; grace starts at disconnect
+            client.server.parking.leave(self.record, client)
+            return
+        try:
+            cancelled = await _settle_controller_release(client, self.record.control)
+        finally:
+            client.server.controllers.retire(self.record)
+        if cancelled:
+            raise asyncio.CancelledError
+
+
+@contextmanager
+def _outgoing(
+    self: Any, target_id: str | None, target: SessionController | None = None
+) -> Iterator[_Outgoing]:
+    """Decide once what a multi swap does with the connection's current session
+    and hold that decision's reservation until the swap ends:
+
+    - nothing: no open session (the shared sessionless record), or it is the target;
+    - park: with ``session_park``, a healthy session of another id that holds
+      work; only this case needs parked room, and ``target`` does not count;
+    - close: anything else, as legacy does in place; its background children and
+      tasks stop. A busy turn refuses the swap with -32004 first, unless
+      ``session_park`` closes an unhealthy or same-id session."""
+    controllers = self.server.controllers
+    record = controllers.session_of(self)
+    if record is None or record is target or record.runtime.opened is None:
+        yield _Outgoing()
+        return
+    control = record.control
+    session_park = "session_park" in self.features
+    retire = control.unhealthy() or record.runtime.session_id == target_id
+    if session_park and not retire and control.holds_work():
+        with controllers.reserve_park(self, record, target=target):
+            yield _Outgoing(record, park=True)
+        return
+    with contextlib.nullcontext() if session_park and retire else control.reserve_session_swap():
+        yield _Outgoing(record)
+
+
 @asynccontextmanager
 async def _session_swap(
-    self, park: bool, controller: SessionUse | SessionController
-) -> AsyncIterator[SessionController | None]:
-    """Hold a session swap. Yield None to swap the attached pair in place, as
-    without ``session_park``; or, when ``park`` and the attached pair holds work,
-    yield a new pair to set up beside it. The caller commits that pair with
-    ``server.attach`` right after its setup returns; a setup that fails first is
-    closed here."""
+    self, park: bool, controller: SessionUse | SessionController, target_id: str | None = None
+) -> AsyncIterator[tuple[SessionController | None, _Outgoing]]:
+    """Hold a session swap and yield ``(incoming, outgoing)``. ``incoming`` is
+    None to swap the attached pair in place, as without ``session_park``; or,
+    in multi mode or when ``park`` and the attached pair holds work, a new pair
+    to set up beside it. The caller commits that pair (``server.attach``, or
+    the multi acquisition) right after its setup returns; a setup that fails
+    first is closed here. ``outgoing`` is the multi decision for the
+    connection's current session against ``target_id`` (empty in legacy)."""
     server = self.server
     outgoing = controller.control
     multi = server.controllers.controller_mode == "multi"
     if not multi and (not park or not outgoing.holds_work()):
         with outgoing.reserve_session_swap():
             server.connections.replay_session_replaced()
-            yield None
+            yield None, _Outgoing()
         return
     # Keep the outgoing charge and incoming use across setup and rollback.
     with (
-        # as in legacy: without session_park a busy session is never left behind;
-        # the shared sessionless record has nothing to cut, so it is not reserved
-        outgoing.reserve_session_swap()
-        if not park and outgoing.runtime.opened is not None
-        else contextlib.nullcontext(),
-        server.controllers.reserve_park(self),
+        _outgoing(self, target_id) if multi else contextlib.nullcontext(_Outgoing()) as leaving,
         (server.new_pair(controller, connection=self) if multi else server.new_pair()) as reservation,
     ):
         incoming = reservation.record
         with incoming.control.reserve_session_swap():
             try:
-                yield incoming
+                yield incoming, leaving
             except BaseException:
                 if (
                     not incoming.control.attached
@@ -151,26 +203,6 @@ async def _settle_controller_release(
             cancelled = True
 
 
-async def _release_previous(
-    self: Any, acquisition: SessionAcquisition
-) -> None:
-    previous = acquisition.previous
-    if previous is None or previous is acquisition.target:
-        return
-    if "session_park" in self.features and previous.control.holds_work():
-        # a swap is not a disconnect: park as legacy attach does; grace starts at disconnect
-        self.server.parking.leave(previous, self)
-        return
-    try:
-        cancelled = await _settle_controller_release(self, previous.control)
-    except BaseException:
-        self.server.controllers.retire(previous)
-        raise
-    self.server.parking.leave(previous, self)
-    if cancelled:
-        raise asyncio.CancelledError
-
-
 async def _new_session(
     self, params: dict[str, Any], controller: SessionUse | SessionController
 ) -> dict[str, object]:
@@ -185,7 +217,7 @@ async def _new_session(
                 initial_model = validation.required_string(params, "model")
             model_selection.validate(initial_model, initial_mode)
         candidate = host_commands(self, params)
-        async with _session_swap(self, "session_park" in self.features, controller) as incoming:
+        async with _session_swap(self, "session_park" in self.features, controller) as (incoming, leaving):
             cwd = None
             if "cwd" in params:
                 validation.require_feature(self, "session_cwd", "cwd")
@@ -236,7 +268,7 @@ async def _new_session(
             snapshot = {"session": session_snapshot(self, controller)}
             if acquisition is not None:
                 self.server.controllers.commit_session(acquisition).release()
-                await _release_previous(self, acquisition)
+                await leaving.leave(self)
             return snapshot
     except BaseException:
         if acquisition is not None:
@@ -318,14 +350,7 @@ async def _resume_resident(
     target_use = None
     resident_claimed = False
     try:
-        with (
-            controller.control.reserve_session_swap()
-            if "session_park" not in self.features
-            and resident.control is not controller.control
-            and controller.runtime.opened is not None
-            else contextlib.nullcontext(),
-            self.server.controllers.reserve_park(self, target=resident),
-        ):
+        with _outgoing(self, session_id, resident) as leaving:
             acquisition = self.server.controllers.reserve_existing(self, session_id)
             target_use = self.server.controllers.use_acquisition(acquisition)
             if acquisition.previous is not acquisition.target:
@@ -346,7 +371,7 @@ async def _resume_resident(
                 await target_use.control.publish_session_grant_reset()
             self.server.controllers.commit_session(acquisition).release()
             resident_claimed = False
-            await _release_previous(self, acquisition)
+            await leaving.leave(self)
             return attached
     except BaseException:
         deferred_cancel = False
@@ -381,7 +406,7 @@ async def _resume_reopen(
     acquisition = None
     multi = self.server.controllers.controller_mode == "multi"
     try:
-        async with _session_swap(self, park, controller) as incoming:
+        async with _session_swap(self, park, controller, session_id) as (incoming, leaving):
             if session_id is None:
                 session_id = await _resolve_session_id(self, params, controller)
                 await self.server.controllers.wait_closed(session_id)
@@ -453,7 +478,7 @@ async def _resume_reopen(
             snapshot = {"session": session_snapshot(self, controller)}
             if acquisition is not None:
                 self.server.controllers.commit_session(acquisition).release()
-                await _release_previous(self, acquisition)
+                await leaving.leave(self)
             return snapshot
     except BaseException:
         if acquisition is not None:

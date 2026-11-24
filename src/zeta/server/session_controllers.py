@@ -634,19 +634,21 @@ class SessionControllers:
     def require_legacy_parked_room(self) -> None:
         self._require_parked_room([*self._parked, *self.closing_session_ids()])
 
+    def session_of(self, connection: object) -> SessionController | None:
+        """The connection's committed session record, or None."""
+        return self._by_connection.get(connection)
+
     @contextmanager
     def reserve_park(
-        self, connection: object, *, target: SessionController | None = None
+        self, connection: object, record: SessionController, *, target: SessionController | None
     ) -> Iterator[None]:
+        """Hold parked room for ``record``, which this swap parks; ``target``,
+        the session the swap attaches, leaves the parked list."""
         self._require_open()
-        record = self._by_connection.get(connection)
-        if self._controller_mode != "multi" or record is None or record is target:
-            yield
-            return
         assert record.parked_by is None
         self._require_parked_room([
             held.closing_session_id if held.closing_session_id is not None else held.runtime.session_id
-            for held in self._records.values() if held.parked_by is connection
+            for held in self._records.values() if held.parked_by is connection and held is not target
         ])
         record.parked_by = connection
         try:
