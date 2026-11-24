@@ -10,13 +10,19 @@ import pytest
 
 from tests.support.owned import await_or_fail
 from tests.support.replay_transport import (
+    ReplayClient,
     Transport,
     connect_replay,
     negotiate,
     replay_server,
     short_socket_path,
 )
+from tests.test_server_in_flight_replay import HOLD, GatedBackend
 from tests.test_server_replay_table import _backend_factory
+from zeta.protocol.types import TextContent
+from zeta.server import connections as connection_module
+from zeta.server.handlers import lifecycle
+from zeta.server.protocol import EventDescriptor
 from zeta.server.server import ZetaServer, _Client
 
 
@@ -656,7 +662,12 @@ async def test_four_multi_controllers_keep_distinct_session_ownership(
             created = await client.request(request_id, "new_session", {})
             session_ids.append(created["result"]["session"]["session_id"])
         assert len(set(session_ids)) == 4
-        for request_id, (client, session_id) in enumerate(zip(clients, session_ids), 10):
+        fifth = await await_or_fail(connect_replay(server, transport), what="fifth socket")
+        clients.append(fifth)
+        refused = await negotiate(fifth, replay=False, extra=("multi_controller",))
+        assert refused.get("error") == {"code": -32001, "message": "another client is already connected"}
+        assert await fifth.closed(42) == []
+        for request_id, (client, session_id) in enumerate(zip(clients[:4], session_ids, strict=True), 10):
             status = await client.request(request_id, "status", {})
             assert status["result"]["session"]["session_id"] == session_id
     finally:
@@ -811,6 +822,92 @@ async def test_target_is_reserved_before_one_awaited_open(
 
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.parametrize("parked_count", (1, 3), ids=("isolation", "global_three"))
+@pytest.mark.asyncio
+async def test_multi_parking_is_connection_local(
+    tmp_path: Path, transport: Transport, parked_count: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = TextContent("held")
+    backend = GatedBackend([([text, HOLD], [text])] * (parked_count + 1))
+    server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
+    await await_or_fail(server.start(), what="start parking server")
+    clients = []
+    closing, release = asyncio.Event(), asyncio.Event()
+    try:
+        for _ in range(3):
+            clients.append(await await_or_fail(connect_replay(server, transport), what="parking connection"))
+        a, b, observer = clients
+        features = ("multi_controller", "session_park", "resume_attach", "approval_reconnect", "turn_reconnect")
+        for client in (a, b):
+            assert "result" in await negotiate(client, replay=False, extra=features)
+            assert "result" in await client.request(2, "new_session", {})
+        assert "result" in await negotiate(observer, observer=True, extra=features)
+        parked = []
+        for index, client in enumerate([a] * parked_count + [b]):
+            offset = 10 + 4 * index
+            status = await client.request(offset, "status", {})
+            sid = status["result"]["session"]["session_id"]
+            assert "result" in await client.request(offset + 1, "send", {"text": "hold"})
+            await await_or_fail(backend.held[index].wait(), what="start parked turn")
+            swapped = await client.request(offset + 2, "new_session", {})
+            assert "result" in swapped, swapped
+            event = await client.event("parked_session_changed", {"session_id": sid})
+            assert event["data"]["session_id"] == sid
+            parked.append(sid)
+
+        statuses = [await client.request(40, "status", {}) for client in clients]
+        for client, expected in zip(clients, (parked[:-1], parked[-1:], []), strict=True):
+            events = [frame["params"]["session_id"] for frame in client.wire_received
+                      if frame.get("params", {}).get("event") == "parked_session_changed"]
+            assert events == expected
+        for status, expected in zip(statuses[:2], (parked[:-1], parked[-1:]), strict=True):
+            assert [row["session_id"] for row in status["result"]["parked_sessions"]] == expected
+        if parked_count == 3:
+            expected_error = {
+                "code": -32004,
+                "message": "too many parked sessions are running",
+                "data": {"reason": "parked_limit", "parked": parked[:-1]},
+            }
+            denied = await a.request(41, "new_session", {})
+            assert denied.get("error") == expected_error, denied
+            closing_record = server.parking.get(parked[0])
+            assert closing_record is not None
+            _gate_async(monkeypatch, closing_record.runtime, "close", closing, release, after=False)
+            backend.gates[0].set()
+            await await_or_fail(closing.wait(), what="parked turn enters close")
+            status = await a.request(42, "status", {})
+            assert [row["session_id"] for row in status["result"]["parked_sessions"]] == parked[1:-1]
+            denied = await a.request(43, "new_session", {})
+            assert denied.get("error") == expected_error, denied
+            release.set()
+            assert closing_record.close_task is not None
+            await await_or_fail(closing_record.close_task, what="settle parked close")
+            assert "result" in await a.request(44, "new_session", {})
+            owner = server.connections.clients()[0]
+            disconnected = asyncio.Event()
+            unregister = server.connections.unregister
+
+            def record_disconnect(connection):
+                unregister(connection)
+                if connection is owner:
+                    disconnected.set()
+
+            # test-contract: seam waits for A's physical loss before checking its parked charge.
+            monkeypatch.setattr(server.connections, "unregister", record_disconnect)
+            await await_or_fail(a.close(), what="disconnect parked owner")
+            await await_or_fail(disconnected.wait(), what="retire parked owner's transport")
+            for session_id in parked[1:-1]:
+                record = server.parking.get(session_id)
+                assert record is not None and record.parked_by is owner
+            status = await b.request(45, "status", {})
+            assert [row["session_id"] for row in status["result"]["parked_sessions"]] == parked[-1:]
+    finally:
+        release.set()
+        backend.open_all()
+        await await_or_fail(_close_server(server, clients), what="close parking server")
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
 @pytest.mark.parametrize(
     "row",
     (
@@ -940,10 +1037,7 @@ async def test_public_multi_controller_owner_state_table(
             hello = await negotiate(newcomer, replay=False, extra=("multi_controller",))
             assert "result" in hello
             status = await survivor.request(3, "status", {})
-            assert any(
-                parked["session_id"] == target_id
-                for parked in status["result"]["parked_sessions"]
-            )
+            assert status["result"]["parked_sessions"] == []
             assert not record.closing
     finally:
         await _close_server(
@@ -965,14 +1059,14 @@ async def test_public_multi_controller_shutdown_state_table(
 
     server = replay_server(tmp_path, transport, _backend_factory)
     await server.start()
-    clients = [await connect_replay(server, transport) for _ in range(5)]
+    clients = [await connect_replay(server, transport) for _ in range(4)]
     provisional_request = None
     release = asyncio.Event()
     try:
         features = ("multi_controller", "session_park", "resume_attach")
         for client in clients:
             assert "result" in await negotiate(client, replay=False, extra=features)
-        for request_id, client in enumerate(clients[:4], 2):
+        for request_id, client in enumerate(clients[:-1], 2):
             assert "result" in await client.request(request_id, "new_session", {})
 
         entered = asyncio.Event()
@@ -984,7 +1078,7 @@ async def test_public_multi_controller_shutdown_state_table(
             return await original_create(runtime, *args, **kwargs)
 
         monkeypatch.setattr(ServerRuntime, "create_session", gated_create)
-        provisional_request = asyncio.create_task(clients[4].request(9, "new_session", {}))
+        provisional_request = asyncio.create_task(clients[-1].request(9, "new_session", {}))
         await await_or_fail(entered.wait(), what="provisional create entered")
         physical_clients = server.connections.clients()
         records = server.controllers.records()
@@ -1073,3 +1167,205 @@ async def test_public_multi_controller_shutdown_state_table(
             await client.close()
         if server.connections is not None:
             await server.close()
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_multi_resident_limit_includes_setup_and_closing(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = TextContent("held")
+    backend = GatedBackend([([text, HOLD], [text])] * 3)
+    server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
+    await await_or_fail(server.start(), what="start resident server")
+    clients: list[ReplayClient] = []
+    setup_started, setup_gate, closing, close_gate = (asyncio.Event() for _ in range(4))
+    try:
+        for _ in range(3):
+            clients.append(await await_or_fail(connect_replay(server, transport), what="resident socket"))
+        a, b, c = clients
+        features = ("multi_controller", "approval_reconnect", "turn_reconnect")
+        for client in clients:
+            assert "result" in await negotiate(client, replay=False, extra=features)
+            assert "result" in await client.request(2, "new_session", {})
+        for index, held in enumerate(backend.held):
+            assert "result" in await a.request(3 + index * 2, "send", {"text": "hold"})
+            await await_or_fail(held.wait(), what="start resident turn")
+            assert "result" in await a.request(4 + index * 2, "new_session", {})
+        # Count the initial placeholder, three attached records and three parked ones.
+        b_record = server.controllers.controller_for(server.connections.clients()[1])
+        assert b_record is not None
+        _gate_async(monkeypatch, b_record.runtime, "close", closing, close_gate, after=False)
+        sibling = b_record.runtime.sibling
+
+        def held_sibling():
+            incoming = sibling()
+            _gate_async(monkeypatch, incoming, "create_session", setup_started, setup_gate, after=False)
+            return incoming
+
+        monkeypatch.setattr(b_record.runtime, "sibling", held_sibling)
+        await b.send(10, "new_session", {})
+        await await_or_fail(setup_started.wait(), what="eighth record in setup")
+        expected = {"code": -32004, "message": "too many resident sessions", "data": {"reason": "resident_limit"}}
+        refused = await c.request(10, "new_session", {})
+        assert refused.get("error") == expected, refused
+        setup_gate.set()
+        assert "result" in await b.response(10)
+        await await_or_fail(closing.wait(), what="eighth record closing")
+        refused = await c.request(11, "new_session", {})
+        assert refused.get("error") == expected, refused
+        close_gate.set()
+        assert b_record.close_task is not None
+        await await_or_fail(b_record.close_task, what="settle eighth record")
+        assert "result" in await c.request(12, "new_session", {})
+    finally:
+        setup_gate.set()
+        close_gate.set()
+        backend.open_all()
+        await await_or_fail(_close_server(server, clients), what="close resident server")
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_multi_observer_limit_counts_pending_join_in_its_session(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await await_or_fail(server.start(), what="start observer server")
+    clients: list[ReplayClient] = []
+    entered, release = asyncio.Event(), asyncio.Event()
+    try:
+        for _ in range(12):
+            clients.append(await await_or_fail(connect_replay(server, transport), what="observer socket"))
+        ids = []
+        for client in clients[:2]:
+            assert "result" in await negotiate(client, extra=("multi_controller",))
+            created = await client.request(2, "new_session", {})
+            ids.append(created["result"]["session"]["session_id"])
+        a, b = ({"session_id": session_id} for session_id in ids)
+        method = "session_history_and_subscribe"
+        assert "result" in await clients[0].request(3, method, a)
+        observers = clients[2:]
+        for observer in observers:
+            assert "result" in await negotiate(observer, observer=True)
+        for observer in observers[:7]:
+            assert "result" in await observer.request(2, method, a)
+        pending, refused, other = observers[7:]
+        pending_server = server.connections.clients()[9]
+        baseline = lifecycle.live_status_baseline
+
+        async def hold_pending(client, controller):
+            if client is pending_server:
+                entered.set()
+                await await_or_fail(release.wait(), what="release pending observer join")
+            return await baseline(client, controller)
+
+        # test-contract: seam holds the eighth join after reservation, before history or status returns.
+        monkeypatch.setattr(lifecycle, "live_status_baseline", hold_pending)
+        await pending.send(2, method, a)
+        await await_or_fail(entered.wait(), what="eighth observer pending")
+        denied = await refused.request(2, method, a)
+        assert denied.get("error") == {"code": -32001, "message": "observer limit reached"}, denied
+        assert "result" in await other.request(2, method, b)
+        release.set()
+        assert "result" in await pending.response(2)
+        denied = await refused.request(3, method, a)
+        assert denied.get("error") == {"code": -32001, "message": "observer limit reached"}, denied
+        assert "result" in await pending.request(3, method, b)
+        assert "result" in await refused.request(4, method, a)
+    finally:
+        release.set()
+        await await_or_fail(_close_server(server, clients), what="close observer server")
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_physical_limit_includes_unclaimed_sockets(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await await_or_fail(server.start(), what="start physical capacity server")
+    clients: list[ReplayClient] = []
+    admitted = asyncio.Event()
+    register = server.connections.register
+
+    def signal_registration(connection):
+        register(connection)
+        admitted.set()
+
+    # test-contract: seam waits for registration without sending a hello.
+    monkeypatch.setattr(server.connections, "register", signal_registration)
+    try:
+        for _ in range(32):
+            admitted.clear()
+            clients.append(await await_or_fail(connect_replay(server, transport), what="unclaimed socket"))
+            await await_or_fail(admitted.wait(), what="register unclaimed socket")
+        extra = await await_or_fail(connect_replay(server, transport), what="33rd socket")
+        clients.append(extra)
+        with contextlib.suppress(ConnectionError):
+            await extra.send(1, "hello", {"protocol_version": "1.1"})
+        assert await extra._read_or_eof(what="33rd socket must close without JSON") is None
+        assert "result" in await negotiate(clients[0], replay=False)
+    finally:
+        await await_or_fail(_close_server(server, clients), what="close physical capacity server")
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_multi_overflow_settles_only_its_connection(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await await_or_fail(server.start(), what="start overflow server")
+    clients: list[ReplayClient] = []
+    entered, settling, settle, released = (asyncio.Event() for _ in range(4))
+    try:
+        for _ in range(4):
+            clients.append(await await_or_fail(connect_replay(server, transport), what="overflow socket"))
+        for client in clients:
+            assert "result" in await negotiate(client, replay=False, extra=("multi_controller",))
+        a, b = clients[:2]
+        a_id = (await a.request(2, "new_session", {}))["result"]["session"]["session_id"]
+        b_id = (await b.request(2, "new_session", {}))["result"]["session"]["session_id"]
+        owner = server.connections.clients()[0]
+        dispatch = owner._dispatch
+        release = server.controllers.release_connection
+
+        async def held_dispatch(*args, **kwargs):
+            try:
+                entered.set()
+                await await_or_fail(settle.wait(), what="overflow request body")
+            finally:
+                settling.set()
+                await await_or_fail(settle.wait(), what="settle overflow request")
+            return await dispatch(*args, **kwargs)
+
+        def record_release(connection, *args):
+            release(connection, *args)
+            if connection is owner:
+                released.set()
+
+        # test-contract: seam holds the request finalizer after overflow stops its transport.
+        monkeypatch.setattr(owner, "_dispatch", held_dispatch)
+        monkeypatch.setattr(server.controllers, "release_connection", record_release)
+        await a.send(3, "status", {})
+        await await_or_fail(entered.wait(), what="overflow request started")
+        for _ in range(connection_module.OUTPUT_MAX_FRAMES + 1):
+            server.connections.publish_session(owner, EventDescriptor.ASSISTANT_DELTA, a_id, delta="queued")
+        overflow = await a._read_wire(what="controller overflow error")
+        assert overflow.get("error", {}).get("code") == -32011, overflow
+        # Close the peer after reading the overflow frame, including the WebSocket close handshake.
+        await await_or_fail(a.close(), what="acknowledge overflow close")
+        await await_or_fail(settling.wait(), what="overflow request finalizer")
+        extra = await await_or_fail(connect_replay(server, transport), what="overflow contender")
+        clients.append(extra)
+        assert (await negotiate(extra, replay=False, extra=("multi_controller",)))["error"]["code"] == -32001
+        assert (await b.request(3, "status", {}))["result"]["session"]["session_id"] == b_id
+        settle.set()
+        await await_or_fail(released.wait(), what="release settled overflow controller")
+        next_client = await await_or_fail(connect_replay(server, transport), what="replacement controller")
+        clients.append(next_client)
+        assert "result" in await negotiate(next_client, replay=False, extra=("multi_controller",))
+    finally:
+        settle.set()
+        await await_or_fail(_close_server(server, clients), what="close overflow server")

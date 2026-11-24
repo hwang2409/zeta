@@ -206,6 +206,8 @@ class ReplayOutput:
         else:
             store = validation.active(controller.runtime, {"session_id": scope.value})
         self.invalidate_replay_connection(connection, reason="rejoined")
+        if connection.role == "observer" and connection.server.controllers.controller_mode == "multi":
+            self.require_observer_room(controller.runtime.session_id)
         pending = self.replay.begin_join(
             connection,
             scope,

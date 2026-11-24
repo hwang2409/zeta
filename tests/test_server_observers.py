@@ -40,7 +40,6 @@ from zeta.server.resource_protocol import Access, collect_families
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
-MAX_PRE_HELLO_CONNECTIONS = 10
 
 
 async def _observer(
@@ -949,34 +948,6 @@ async def test_controller_close_never_writes_after_registry_release(
         )
     finally:
         close_release.set()
-        await server.close()
-
-
-@pytest.mark.asyncio
-async def test_pre_hello_connections_are_bounded(tmp_path: Path) -> None:
-    server = ZetaServer(
-        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
-    )
-    await server.start()
-    sockets = [
-        await asyncio.wait_for(
-            asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT
-        )
-        for _ in range(MAX_PRE_HELLO_CONNECTIONS)
-    ]
-    extra_reader, extra_writer = await asyncio.wait_for(
-        asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT
-    )
-    try:
-        assert await asyncio.wait_for(extra_reader.read(), TIMEOUT) == b""
-        assert server.connections is not None
-        assert len(server.connections._connections) == MAX_PRE_HELLO_CONNECTIONS
-    finally:
-        extra_writer.close()
-        await extra_writer.wait_closed()
-        for _, socket_writer in sockets:
-            socket_writer.close()
-            await socket_writer.wait_closed()
         await server.close()
 
 

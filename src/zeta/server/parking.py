@@ -7,7 +7,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from .connections import last_turn_outcome
-from .protocol import ErrorDescriptor, EventDescriptor, ProtocolError
+from .protocol import EventDescriptor
 
 if TYPE_CHECKING:
     from .connections import ConnectionRegistry
@@ -23,27 +23,9 @@ class ParkedPairs:
         self,
         connections: Callable[[], ConnectionRegistry | None],
         controllers: SessionControllers,
-        limit: int = 3,
     ) -> None:
         self._connections = connections
         self._controllers = controllers
-        # parked plus closing pairs; each holds a loop, its store, and its MCP servers
-        self.limit = limit
-        # the last parked_session_changed data sent per parked session
-        self._sent: dict[str, dict[str, object]] = {}
-        self._parked_by: dict[ServeControl, object] = {}
-
-    def require_room(self) -> None:
-        held = [
-            *(control.runtime.session_id for control in self._controllers.parked_controls()),
-            *self._controllers.closing_session_ids(),
-        ]
-        if len(held) >= self.limit:
-            raise ProtocolError(
-                ErrorDescriptor.OPERATION_BUSY,
-                "too many parked sessions are running",
-                {"reason": "parked_limit", "parked": held},
-            )
 
     def pairs(self) -> tuple[ServeControl, ...]:
         return self._controllers.parked_controls()
@@ -51,37 +33,17 @@ class ParkedPairs:
     def get(self, session_id: str) -> SessionController | None:
         return self._controllers.parked_record(session_id)
 
-    def rows(self) -> list[dict[str, object]]:
+    def rows(self, connection: object) -> list[dict[str, object]]:
         """``status.parked_sessions``."""
-        return [control.parked_row() for control in self._controllers.parked_controls()]
+        return [record.control.parked_row() for record in self._controllers.parked_records(connection)]
 
-    def forget(self, record: SessionController) -> None:
-        """Forget the presentation state after an exact owner claims a record."""
-        self._controllers.unpark(record)
-        self._parked_by.pop(record.control, None)
-        if record.runtime.opened is not None:
-            self._sent.pop(record.runtime.session_id, None)
-
-    def unpark(self, incoming: ServeControl) -> bool:
-        """Take ``incoming`` out of the parked set when it is parked."""
-        session_id = incoming.runtime.session_id
-        record = self._controllers.parked_record(session_id)
-        if record is None or record.control is not incoming:
-            return False
-        assert self._controllers.unpark(record) is not None
-        self._sent.pop(session_id, None)
-        self._parked_by.pop(incoming, None)
-        return True
-
-    def leave(self, outgoing: ServeControl, parked_by: object | None) -> None:
+    def leave(self, outgoing: SessionController, connection: object) -> None:
         """The client left ``outgoing``: park it while it holds work, else close it."""
-        if outgoing.holds_work():
-            self._controllers.park(self._controllers.record_for(outgoing))
-            if parked_by is not None:
-                self._parked_by[outgoing] = parked_by
-            self.changed(outgoing)
+        if outgoing.control.holds_work():
+            self._controllers.park(outgoing, connection)
+            self.changed(outgoing.control)
         else:
-            self._controllers.retire(self._controllers.record_for(outgoing))
+            self._controllers.retire(outgoing)
 
     def changed(self, control: ServeControl) -> None:
         """Report this parked pair's state and close it once idle; a no-op for a
@@ -111,6 +73,7 @@ class ParkedPairs:
     def _publish(self, control: ServeControl, row: dict[str, object]) -> None:
         """Send ``parked_session_changed`` when the row differs from the last one
         sent. The parked control's own frames stay dropped."""
+        record = self._controllers.record_for(control)
         assert control.runtime.opened is not None
         session_id = control.runtime.session_id
         data = {
@@ -118,10 +81,10 @@ class ParkedPairs:
             "last_turn_outcome": last_turn_outcome(control.runtime.opened.store),
         }
         connections = self._connections()
-        if self._sent.get(session_id) == data or connections is None:
+        if record.parked_last_sent == data or connections is None:
             return
-        self._sent[session_id] = data
-        if (parked_by := self._parked_by.get(control)) is not None:
+        record.parked_last_sent = data
+        if (parked_by := record.parked_by) is not None:
             connections.publish_connection(
                 parked_by, EventDescriptor.PARKED_SESSION_CHANGED, session_id, data=data
             )
@@ -137,8 +100,6 @@ class ParkedPairs:
                 control,
                 {"session_id": session_id, "state": "closed", "pending_approvals": 0},
             )
-            self._parked_by.pop(control, None)
-            self._sent.pop(session_id, None)
 
     async def claim(
         self, keep: bool, *, reconnect: bool, require_host_binding: bool

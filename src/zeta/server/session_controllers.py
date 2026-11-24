@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 import logging
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Self
 
@@ -18,6 +19,10 @@ if TYPE_CHECKING:
     from .runtime import ServerRuntime
 
 logger = logging.getLogger(__name__)
+
+MAX_MULTI_CONTROLLERS = 4
+MAX_RESIDENT_RECORDS = 8
+MAX_PARKED_RECORDS = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +59,8 @@ class SessionController:
     close_task: asyncio.Task[None] | None = None
     # the session the record held when its close began
     closing_session_id: str | None = None
+    parked_by: object | None = None
+    parked_last_sent: dict[str, object] | None = None
 
     @property
     def runtime(self) -> ServerRuntime:
@@ -189,7 +196,7 @@ class SessionControllers:
                     "another client is already connected",
                 )
         elif self._controller_mode != requested or (
-            requested == "legacy" and self._controller_members
+            requested == "legacy" or len(self._controller_members) >= MAX_MULTI_CONTROLLERS
         ):
             raise ProtocolError(
                 ErrorDescriptor.CONNECTION_CAPACITY,
@@ -307,9 +314,15 @@ class SessionControllers:
         # Empty mode also covers legacy observers waiting without a controller.
         return self._controller_mode != "multi" and self.event_record(source) is self._attached
 
-    def register(self, control: ServeControl) -> SessionUse:
+    def register(self, make_control: Callable[[], ServeControl]) -> SessionUse:
         """A new generation for ``control``, reserved by the returned use until
         its setup ends."""
+        if self._controller_mode == "multi" and len(self._records) >= MAX_RESIDENT_RECORDS:
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY, "too many resident sessions",
+                {"reason": "resident_limit"},
+            )
+        control = make_control()
         record = SessionController(control, next(self._generations))
         self._records[control] = record
         return self._use(record)
@@ -425,7 +438,8 @@ class SessionControllers:
         self._by_session[acquisition.session_id] = acquisition.target
         self._by_connection[acquisition.connection] = acquisition.target
         self._hello_records.pop(acquisition.connection, None)
-        self._parked.pop(acquisition.session_id, None)
+        if acquisition.target.runtime.opened is not None:
+            self.unpark(acquisition.target)
         return self._use(acquisition.target)
 
     def abort_session(self, acquisition: SessionAcquisition) -> asyncio.Task[None] | None:
@@ -451,8 +465,47 @@ class SessionControllers:
         self.bind_retention_planner()
         return record
 
-    def park(self, record: SessionController) -> SessionController:
+    @staticmethod
+    def _require_parked_room(held: list[str]) -> None:
+        if len(held) >= MAX_PARKED_RECORDS:
+            raise ProtocolError(
+                ErrorDescriptor.OPERATION_BUSY,
+                "too many parked sessions are running",
+                {"reason": "parked_limit", "parked": held},
+            )
+
+    def require_legacy_parked_room(self) -> None:
+        self._require_parked_room([*self._parked, *self.closing_session_ids()])
+
+    @contextmanager
+    def reserve_park(
+        self, connection: object, *, target: SessionController | None = None
+    ) -> Iterator[None]:
+        record = self._by_connection.get(connection)
+        if self._controller_mode != "multi" or record is None or record is target:
+            yield
+            return
+        assert record.parked_by is None
+        self._require_parked_room([
+            held.closing_session_id if held.closing_session_id is not None else held.runtime.session_id
+            for held in self._records.values() if held.parked_by is connection
+        ])
+        record.parked_by = connection
+        try:
+            yield
+        finally:
+            if not record.closing and self._parked.get(record.runtime.session_id) is not record:
+                record.parked_by = None
+
+    def parked_records(self, connection: object) -> Iterator[SessionController]:
+        return (
+            record for record in self._parked.values()
+            if self._controller_mode != "multi" or record.parked_by is connection
+        )
+
+    def park(self, record: SessionController, connection: object | None = None) -> SessionController:
         assert not record.closing
+        record.parked_by = connection
         self._parked[record.runtime.session_id] = record
         return record
 
@@ -461,6 +514,8 @@ class SessionControllers:
         if self._parked.get(session_id) is not record:
             return None
         del self._parked[session_id]
+        record.parked_by = None
+        record.parked_last_sent = None
         return record
 
     def parked_controls(self) -> tuple[ServeControl, ...]:
@@ -470,8 +525,7 @@ class SessionControllers:
         return self._parked.get(session_id)
 
     def closing_session_ids(self) -> list[str]:
-        """The sessions of detached records still closing; each counts toward
-        the resident limit."""
+        """The sessions of detached records still closing."""
         return [
             record.closing_session_id
             for record in self._records.values()
@@ -540,6 +594,7 @@ class SessionControllers:
                     await control.wait_for_approval_settlement(settlement_timeout)
         finally:
             del self._records[control]
+            record.parked_by = None
             for session_id, owner in tuple(self._by_session.items()):
                 if owner is record:
                     del self._by_session[session_id]
