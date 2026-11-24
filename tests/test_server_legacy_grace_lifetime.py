@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from tests.support.replay_transport import (
     negotiate,
     replay_server,
 )
+from tests.support.storage_homes import initialize_storage_home
 from tests.test_server_in_flight_replay import HOLD, GatedBackend
 from zeta.protocol.types import TextContent
 from zeta.server.runtime import ServerRuntime
@@ -155,3 +157,61 @@ async def test_public_legacy_grace_lifetime(
         for client in clients:
             await await_or_fail(client.close(), what="close test peer")
         await await_or_fail(server.close(), what="close grace server")
+
+
+@pytest.mark.asyncio
+async def test_retention_eligibility_during_multi_record_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initialize_storage_home(tmp_path)
+    server = replay_server(tmp_path, "unix", lambda *_: (GatedBackend([]), "offline"))
+    owner = server._retention_owner
+    assert owner is not None
+    loop = asyncio.get_running_loop()
+    checking = asyncio.Event()
+    resume_check = threading.Event()
+    loop_thread = threading.get_ident()
+    opened = ServerRuntime.opened.fget
+    assert opened is not None
+
+    def pause_check() -> None:
+        loop.call_soon_threadsafe(checking.set)
+        assert resume_check.wait(timeout=10), "retention check was not released"
+
+    def opened_during_check(runtime):
+        if threading.get_ident() != loop_thread:
+            # On the buggy path this pauses the scan after its first item.
+            pause_check()
+        return opened(runtime)
+
+    def read_eligibility() -> int:
+        days = owner._days()
+        # With the snapshot, pause after the old value has been read instead.
+        pause_check()
+        return days
+
+    # test-contract: seam force a loop mutation between the worker's first
+    # eligibility read and its return, without starting an independent episode.
+    monkeypatch.setattr(ServerRuntime, "opened", property(opened_during_check))
+    monkeypatch.setattr(owner, "start", lambda: None)
+    await await_or_fail(server.start(), what="start retention test serve")
+    client = None
+    worker = None
+    try:
+        client = await await_or_fail(connect_replay(server, "unix"), what="connect retention peer")
+        assert "result" in await negotiate(client, replay=False, extra=MULTI)
+        worker = asyncio.create_task(asyncio.to_thread(read_eligibility))
+        await await_or_fail(checking.wait(), what="worker reading retention eligibility")
+        assert "result" in await client.request(2, "new_session", {})
+        resume_check.set()
+        assert await await_or_fail(asyncio.shield(worker), what="old retention sample") == 0
+        after = await await_or_fail(asyncio.to_thread(owner._days), what="new retention sample")
+        assert after > 0, "retention must see the newly opened multi session"
+    finally:
+        resume_check.set()
+        if worker is not None:
+            await await_or_fail(asyncio.gather(worker, return_exceptions=True), what="join retention worker")
+        if client is not None:
+            await await_or_fail(client.close(), what="close retention peer")
+        await await_or_fail(server.close(), what="close retention test serve")
+    assert await await_or_fail(asyncio.to_thread(owner._days), what="retired retention sample") == 0

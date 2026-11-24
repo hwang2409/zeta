@@ -179,6 +179,9 @@ class SessionControllers:
         self._multi_graces: dict[SessionController, _MultiGrace] = {}
         # close waiters per record, woken when its last use settles
         self._drains: dict[SessionController, list[asyncio.Future[None]]] = {}
+        if self._retention_owner is not None:
+            control.runtime.set_session_changed_sink(self._snapshot_retention_eligibility)
+        self._snapshot_retention_eligibility()
 
     @property
     def controller_mode(self) -> Literal["empty", "legacy", "multi"]:
@@ -211,6 +214,7 @@ class SessionControllers:
                 with self.register(lambda: source.server._make_sibling_control(source.runtime)) as use:
                     self._sessionless = use.record
             self._controller_mode = requested
+            self._snapshot_retention_eligibility()
             self.bind_retention_planner()
         elif not self._controller_members:
             if self._controller_mode != requested:
@@ -250,7 +254,9 @@ class SessionControllers:
             for record in self._records.values()
         ):
             return
-        self._controller_mode = "empty"
+        if self._controller_mode != "empty":
+            self._controller_mode = "empty"
+            self._snapshot_retention_eligibility()
 
     def commit_hello(self, admission: HelloAdmission) -> None:
         self._require_open()
@@ -406,6 +412,9 @@ class SessionControllers:
         control = make_control()
         record = SessionController(control, next(self._generations), setup_by=connection)
         self._records[control] = record
+        if self._retention_owner is not None:
+            control.runtime.set_session_changed_sink(self._snapshot_retention_eligibility)
+            self._snapshot_retention_eligibility()
         return self._use(record, setup=True)
 
     def attached(self) -> SessionController:
@@ -573,9 +582,17 @@ class SessionControllers:
         return None
 
     def has_open_session(self) -> bool:
+        return self._retention_eligible
+
+    def _snapshot_retention_eligibility(self) -> None:
+        # Only the event loop reads records; the retention worker reads this bool.
         if self._controller_mode == "multi":
-            return any(not record.closing and record.runtime.opened is not None for record in self._records.values())
-        return self._attached.runtime.opened is not None
+            self._retention_eligible = any(
+                not record.closing and record.runtime.opened is not None
+                for record in self._records.values()
+            )
+        else:
+            self._retention_eligible = self._attached.runtime.opened is not None
 
     def bind_retention_planner(self) -> None:
         # Bind at startup and legacy swaps, not when the planner publishes.
@@ -587,6 +604,7 @@ class SessionControllers:
         assert not record.closing
         self._parked.pop(record.runtime.session_id, None)
         self._attached = record
+        self._snapshot_retention_eligibility()
         self.bind_retention_planner()
         return record
 
@@ -680,6 +698,7 @@ class SessionControllers:
         assert self._records.get(record.control) is record, "retire of a foreign record"
         runtime = record.runtime
         record.closing = True
+        self._snapshot_retention_eligibility()
         record.closing_session_id = runtime.session_id if runtime.opened is not None else None
         self._parked = {key: item for key, item in self._parked.items() if item is not record}
         task = asyncio.create_task(self._close(record, settlement_timeout))
@@ -722,6 +741,9 @@ class SessionControllers:
                 raise first
         finally:
             del self._records[control]
+            if self._retention_owner is not None:
+                record.runtime.set_session_changed_sink(None)
+                self._snapshot_retention_eligibility()
             self._clear_grace(record)
             record.parked_by = None
             record.setup_by = None

@@ -248,6 +248,7 @@ class ServerRuntime:
         self._memory_notice_sink: MemoryNoticeSink | None = None
         self._run_work_event_sink: RunWorkEventSink | None = None
         self._work_changed_sink: Callable[[], None] | None = None
+        self._session_changed_sink: Callable[[], None] | None = None
         self._setup_reapers: set[asyncio.Task[None]] = set()
         # process telemetry is owned elsewhere (ZetaServer or the borrowed loop);
         # the runtime only reads it through this getter
@@ -732,6 +733,14 @@ class ServerRuntime:
             else:
                 logger.info("canceled session setup was cleaned up")
 
+    def set_session_changed_sink(self, sink: Callable[[], None] | None) -> None:
+        self._session_changed_sink = sink
+
+    def _set_state(self, state: SessionState | None) -> None:
+        self._state = state
+        if self._session_changed_sink is not None:
+            self._session_changed_sink()
+
     async def close(self) -> None:
         state = self._state
         if state is not None:
@@ -760,7 +769,7 @@ class ServerRuntime:
             )
             raise asyncio.CancelledError
         if self._state is state:
-            self._state = None
+            self._set_state(None)
 
     def _release_state_without_close_failure(
         self, state: SessionState, background_tasks: Any, failure_generation: int
@@ -769,7 +778,7 @@ class ServerRuntime:
             background_tasks.close_failure_generation() == failure_generation
             and self._state is state
         ):
-            self._state = None
+            self._set_state(None)
 
     async def _wait_for_setup_reapers(self) -> None:
         if not self._setup_reapers:
@@ -789,7 +798,7 @@ class ServerRuntime:
         state = SessionState.from_composition(composition)
         try:
             await self.close()
-            self._state = state
+            self._set_state(state)
             self.attachment_generation += 1
             if self._approval_control_binder is not None:
                 self._approval_control_binder(state.policy)
@@ -800,7 +809,7 @@ class ServerRuntime:
                 state.loop.require_allowed_tools()
         except BaseException:
             if self._state is state:
-                self._state = None
+                self._set_state(None)
             await self._close_state(state)
             raise
 
