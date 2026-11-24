@@ -463,9 +463,13 @@ class ServeControl:
         return self._grace_task
 
     def begin_controller_release(
-        self, *, reconnect: bool = False, keep_turn: bool = False
+        self, *, reconnect: bool = False, keep_turn: bool = False, preserve_grace: bool = False
     ) -> asyncio.Task[None]:
         previous = self._controller_release_task
+        # A parked turn may already be released with a live work deadline.
+        if (preserve_grace and reconnect and not self._controller_attached
+                and self._grace_task is not None and previous is not None):
+            return previous
         # Establish approval grace before the physical controller slot is released.
         operation = (
             None

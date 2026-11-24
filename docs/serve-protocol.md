@@ -141,12 +141,15 @@ bindings.
 
 Reconnect must name the exact session being reclaimed and pass its binding and
 approval checks. an unattached negotiated connection does not infer reconnect
-from another session's grace record. each detached record has its own admission
-grace. when no controllers are connected, a negotiated controller hello must
-name a session whose grace is still live. reattaching one record or settling
-its grace work does not end another record's grace. a failed reconnect does not
-consume the admission grace. an idle detached record uses the configured approval reconnect grace;
-when that time runs out, the record closes and releases its admission slot.
+from another session's grace record. On disconnect, each record charged to
+that connection, including its parked sessions, keeps its own admission grace.
+A parked turn's running work deadline starts at the swap and is not restarted
+at disconnect. An idle detached record uses the configured approval reconnect
+grace from disconnect. When no controllers are connected, a negotiated controller
+hello must name a session whose grace is still live. Reclaiming one record or
+failing to reclaim it does not end another record's grace. At expiry, each
+record closes normally and releases its charge after settlement. A legacy
+controller hello is refused while the multi records are in grace or closing.
 
 Multi-controller mode admits four controllers. A fifth hello receives `-32001`
 and closes the connection. Each session admits eight pending or active observer
@@ -665,8 +668,8 @@ the swap is the same as without the feature.
   `parked_session_changed` event. Observers do not get this event. After a
   reconnect, read `status.parked_sessions`; events only report changes after
   that.
-- On a controller disconnect, each parked session follows the same rules as
-  the attached one (approval grace, `turn_reconnect`). A reclaiming `hello`
+- In legacy mode, on controller disconnect each parked session follows the same
+  rules as the attached one (approval grace, `turn_reconnect`). A reclaiming `hello`
   with `session_park` takes over every parked session. A reclaiming `hello`
   without `session_park` closes every parked session: its turn ends with
   reason `disconnect` and its approvals end. After a reclaim, parked sessions

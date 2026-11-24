@@ -361,7 +361,9 @@ class ZetaServer:
         yield self.controllers.attached().control
         yield from self.parking.pairs()
 
-    def new_pair(self, owner: SessionUse | SessionController | None = None) -> SessionUse:
+    def new_pair(
+        self, owner: SessionUse | SessionController | None = None, *, connection: object | None = None
+    ) -> SessionUse:
         """Create a pair beside the owner's record, sharing its manager."""
         if self.controllers.controller_mode != "multi":
             self.controllers.require_legacy_parked_room()
@@ -376,7 +378,7 @@ class ZetaServer:
             self._bind_pair(control)
             return control
 
-        return self.controllers.register(make_control)
+        return self.controllers.register(make_control, connection=connection)
 
     def attach(self, incoming: SessionController, connection: _Client) -> SessionController:
         """Make ``incoming`` the attached pair in one step (no await): park the
@@ -945,8 +947,8 @@ class _Client:
                 and self.role == "controller"
                 and "approval_reconnect" in self.features
             ):
-                record = self.server.controllers.controller_for(self)
                 if self.server.controllers.controller_mode == "multi":
+                    record = self.server.controllers.controller_for(self)
                     if record is None:
                         raise RuntimeError("multi controller has no session owner")
                     await record.control.controller_ready(reconnect=True)

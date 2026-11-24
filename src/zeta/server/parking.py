@@ -67,7 +67,7 @@ class ParkedPairs:
         if control not in self._controllers.parked_controls():
             return
         self._publish(control, control.parked_row())
-        if not control.holds_work():
+        if not control.holds_work() and not self._controllers.parked_in_grace(control):
             self.close(control)
 
     def _publish(self, control: ServeControl, row: dict[str, object]) -> None:
@@ -106,7 +106,7 @@ class ParkedPairs:
     ) -> None:
         """Reclaim each parked pair for a returning controller; close the ones it
         cannot see (no ``session_park``) or cannot claim."""
-        pairs = self._controllers.parked_controls()
+        pairs = tuple(record.control for record in self._controllers.parked_records(None))
         claimed = (
             await asyncio.gather(
                 *(
