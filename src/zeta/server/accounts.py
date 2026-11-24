@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -19,23 +19,6 @@ from ..core.session import account_home
 from .protocol import ErrorDescriptor, ProtocolError
 from .resource_protocol import run_owner
 from .runtime import ServerRuntime
-
-
-async def run_owned_switch(owner: Any, operation: Awaitable[object]) -> object:
-    task = asyncio.create_task(operation)
-    owner._account_switch_task = task
-    try:
-        return await task
-    finally:
-        owner._account_switch_task = None
-
-
-async def cancel_owned_switch(owner: Any) -> None:
-    task = getattr(owner, "_account_switch_task", None)
-    if task is not None and not task.done():
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-    owner._account_switch_task = None
 
 
 async def migrate(home: Path) -> tuple[str, ...]:
@@ -100,11 +83,7 @@ async def list_account_catalog(client: Any, runtime: ServerRuntime) -> dict[str,
     )
 
 
-async def refresh(runtime: ServerRuntime) -> dict[str, object]:
-    return await refresh_accounts(runtime)
-
-
-def _account(runtime: ServerRuntime, params: dict[str, object]) -> AccountId:
+def parse_account(params: dict[str, object]) -> AccountId:
     raw = params.get("account")
     if not isinstance(raw, str) or ":" not in raw:
         raise ProtocolError(
@@ -115,11 +94,8 @@ def _account(runtime: ServerRuntime, params: dict[str, object]) -> AccountId:
 
 async def logout(
     runtime: ServerRuntime,
-    require_idle: Callable[[], Awaitable[None]],
-    params: dict[str, object],
+    account: AccountId,
 ) -> dict[str, object]:
-    await require_idle()
-    account = _account(runtime, params)
     try:
         message = await asyncio.to_thread(
             runtime.loop.account_context.store.logout,
@@ -133,11 +109,9 @@ async def logout(
 
 async def switch(
     runtime: ServerRuntime,
-    require_idle: Callable[[], Awaitable[None]],
-    params: dict[str, object],
+    account: AccountId,
+    authorize_commit: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
-    await require_idle()
-    account = _account(runtime, params)
     loop = runtime.loop
     context = loop.account_context
     provider = runtime.metadata.provider
@@ -162,6 +136,7 @@ async def switch(
         boundary=loop.store.active_branch_head_sequence(),
         provider=provider,
         build_backend=prepare_backend,
+        authorize_commit=authorize_commit,
     )
     return {
         "account": str(account),
@@ -170,7 +145,7 @@ async def switch(
     }
 
 
-async def refresh_accounts(runtime: ServerRuntime) -> dict[str, object]:
+async def refresh(runtime: ServerRuntime) -> dict[str, object]:
     refreshed = await asyncio.to_thread(
         lambda: asyncio.run(
             AccountUsage(runtime.loop.account_context.store).refresh_stale()

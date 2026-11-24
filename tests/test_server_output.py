@@ -19,7 +19,6 @@ from tests.test_server import TIMEOUT
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.server import ZetaServer
-from zeta.server import accounts as accounts_module
 from zeta.server import connections as connections_module
 from zeta.server import control as control_module
 from zeta.server import server as server_module
@@ -230,7 +229,8 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
     old_publish: asyncio.Task[bool] | None = None
     fenced = False
     raw_after_fence: list[tuple[object, dict[str, Any]]] = []
-    original_cancel = accounts_module.cancel_owned_switch
+    logins = old_state.connection.logins
+    original_close = logins.close
     original_claim = server.connections._claim
     original_write = _Client._write_physical
 
@@ -246,11 +246,10 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
             raw_after_fence.append((client, frame))
         return await original_write(client, payload)
 
-    async def gated_cancel(owner: object) -> None:
-        if owner is old_state.connection:
-            cleanup_entered.set()
-            await asyncio.wait_for(cleanup_release.wait(), 10)
-        await original_cancel(owner)
+    async def gated_close() -> None:
+        cleanup_entered.set()
+        await asyncio.wait_for(cleanup_release.wait(), 10)
+        await original_close()
 
     def tracked_claim(
         connection: object,
@@ -263,7 +262,7 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
         original_claim(connection, role, protocol_version, features)
 
     # test-contract: seam hold real disconnect cleanup after physical release
-    monkeypatch.setattr(accounts_module, "cancel_owned_switch", gated_cancel)
+    monkeypatch.setattr(logins, "close", gated_close)
     # test-contract: seam observe raw transport writes around the replacement fence
     monkeypatch.setattr(_Client, "_write_physical", gated_write)
     # test-contract: seam observe the replacement claim without timing assumptions

@@ -13,7 +13,10 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
-from tests.support.login import block_loop_until_publication_decision_expires
+from tests.support.login import (
+    block_loop_until_publication_decision_expires,
+    isolated_logins,
+)
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.storage_homes import initialize_storage_home
@@ -27,7 +30,6 @@ from zeta.providers import login as providers
 from zeta.providers.factory import credential_store
 from zeta.server import ZetaServer
 from zeta.server import login as server_login
-from zeta.server.login import Logins
 from zeta.server.protocol import MethodDescriptor
 
 LOGIN_REQUESTS = tuple(
@@ -407,7 +409,7 @@ async def test_serve_login_publication_does_not_block_event_loop(
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
     assert lock_ready.wait(timeout=5)
-    manager = Logins(tmp_path / "zeta")
+    manager = isolated_logins(tmp_path / "zeta")
     url = asyncio.get_running_loop().create_future()
     task = asyncio.create_task(manager._run("claude", url))
     try:
@@ -556,7 +558,7 @@ async def test_cancelled_serve_login_never_publishes_and_releases_locks(
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
     assert lock_ready.wait(timeout=5)
-    manager = Logins(home)
+    manager = isolated_logins(home)
     first_url = asyncio.get_running_loop().create_future()
     first = asyncio.create_task(manager._run("claude", first_url))
     try:
@@ -598,7 +600,7 @@ async def test_login_port_conflict_has_specific_failure(tmp_path, monkeypatch):
         raise LoginPortInUseError("codex", 1455)
 
     monkeypatch.setattr(server_login, "run_login", raise_port_conflict)
-    manager = Logins(tmp_path / "zeta")
+    manager = isolated_logins(tmp_path / "zeta")
 
     result = await manager._run("codex", asyncio.get_running_loop().create_future())
 

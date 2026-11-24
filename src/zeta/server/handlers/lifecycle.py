@@ -476,24 +476,25 @@ async def _attach_live_turn(
         controller = self.server.attach(parked)
     # Bind host commands before the await, so a turn that ends meanwhile never
     # sees a half-attached session. The running turn keeps its snapshot.
-    previous = (control._active_host_commands, control._host_binding_required)
-    control._active_host_commands = candidate
-    control._host_binding_required = "session_host_commands" in self.features
-    try:
-        if reattach is not None:
-            await control.reattach_mcp_bindings(*reattach)
-        if parked is not None:
-            # the attached session changed, as on any resume
-            await control.publish_session_grant_reset()
-        if not control.state_change_busy():
-            # the turn ended during the rebind, or a parked pair only held background
-            # work: this is a plain resume of an idle session
-            await control.controller_ready()
-            return {"session": session_snapshot(self, controller)}
-        return {"session": session_snapshot(self, controller), "attached": "live_turn"}
-    except BaseException:
-        control._active_host_commands, control._host_binding_required = previous
-        raise
+    with control.hold_binding_transition():
+        previous = (control._active_host_commands, control._host_binding_required)
+        control._active_host_commands = candidate
+        control._host_binding_required = "session_host_commands" in self.features
+        try:
+            if reattach is not None:
+                await control.reattach_mcp_bindings(*reattach)
+            if parked is not None:
+                # the attached session changed, as on any resume
+                await control.publish_session_grant_reset()
+            if not control.state_change_busy():
+                # the turn ended during the rebind, or a parked pair only held background
+                # work: this is a plain resume of an idle session
+                await control.controller_ready()
+                return {"session": session_snapshot(self, controller)}
+            return {"session": session_snapshot(self, controller), "attached": "live_turn"}
+        except BaseException:
+            control._active_host_commands, control._host_binding_required = previous
+            raise
 
 
 async def mcp_bindings(

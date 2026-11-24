@@ -266,6 +266,7 @@ async def run_login(
     on_authorization_url: Callable[[str], None] | None = None,
     publication_timeout_seconds: float | None = None,
     on_publication_commit: Callable[[], bool] | None = None,
+    publication_owner: Callable[[Callable[[], Awaitable[object]]], Awaitable[object]] | None = None,
 ) -> str | None:
     """Run one provider login and return its optional account handle."""
 
@@ -352,12 +353,15 @@ async def run_login(
                 verifier,
                 redirect_uri,
             )
-        await _publish_credentials(
-            provider,
-            tokens,
-            publication_timeout_seconds,
-            on_publication_commit,
-        )
+        async def publish() -> object:
+            return await _publish_credentials(
+                provider, tokens, publication_timeout_seconds, on_publication_commit,
+            )
+
+        if publication_owner is None:
+            await publish()
+        else:
+            await publication_owner(publish)
         published = True
         return provider.token_handle(tokens)
     finally:

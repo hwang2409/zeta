@@ -154,6 +154,8 @@ class ServeControl:
         self._no_state_change = asyncio.Event()
         self._no_state_change.set()
         self._session_swap_active = False
+        self._binding_transitions = 0
+        self._binding_clear_task: asyncio.Task[None] | None = None
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
@@ -332,6 +334,22 @@ class ServeControl:
             )
         )
 
+    def account_snapshot_transition(self) -> bool:
+        context = getattr(self.runtime.loop, "account_context", None)
+        return bool(
+            self._session_swap_active or self._binding_transitions
+            or (context is not None and context.transition_active())
+            or (self._binding_clear_task is not None and not self._binding_clear_task.done())
+        )
+
+    @contextmanager
+    def hold_binding_transition(self) -> Iterator[None]:
+        self._binding_transitions += 1
+        try:
+            yield
+        finally:
+            self._binding_transitions -= 1
+
     def state_change_busy(self) -> bool:
         """Report a turn a state-changing request must wait for."""
         task = self._turn_task
@@ -503,10 +521,11 @@ class ServeControl:
         """Re-bind the active session's released MCP headers for a returning client."""
         loop = self.runtime.loop
         assert loop is not None
-        await loop.rebind_mcp(headers, configs)
-        self._end_grace_deadline()
-        await loop._ensure_mcp_servers()
-        self._active_mcp_bindings = headers
+        with self.hold_binding_transition():
+            await loop.rebind_mcp(headers, configs)
+            self._end_grace_deadline()
+            await loop._ensure_mcp_servers()
+            self._active_mcp_bindings = headers
 
     async def controller_ready(self, *, reconnect: bool = False) -> None:
         if reconnect:
@@ -543,6 +562,8 @@ class ServeControl:
             if loop is not None:
                 await loop.clear_mcp_bindings(hold=hold)
         clear_task = asyncio.create_task(clear_mcp()) if had_mcp_bindings else None
+        if clear_task is not None:
+            self._binding_clear_task = clear_task
         if grace_running:
 
             async def wait_for_grace() -> None:

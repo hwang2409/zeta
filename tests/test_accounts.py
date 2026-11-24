@@ -38,7 +38,7 @@ from tests.support.account_processes import (
 )
 from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
-from tests.support.login import reject_provider_token_exchange
+from tests.support.login import isolated_logins, reject_provider_token_exchange
 from tests.support.owned import await_or_fail
 from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import (
@@ -74,7 +74,6 @@ from zeta.providers.completion import (
 )
 from zeta.providers.factory import build_backend, credential_store
 from zeta.runtime.loop import AgentLoop
-from zeta.server.login import Logins
 from zeta.skills import SkillCatalog
 from zeta.tools import websearch
 from zeta.tools.websearch import codex as websearch_codex
@@ -2137,7 +2136,7 @@ def test_cli_and_serve_login_share_provider_lock(
     assert cli_entered.wait(timeout=5)
 
     async def run_serve_login() -> dict:
-        return await Logins(tmp_path)._run(
+        return await isolated_logins(tmp_path)._run(
             "claude", asyncio.get_running_loop().create_future()
         )
 
