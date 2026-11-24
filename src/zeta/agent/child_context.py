@@ -33,6 +33,7 @@ from ..runtime.prompt import (
     CHILD_PROFILE_BODY,
     PromptFragment,
     RuntimePrompt,
+    child_profile_contribution,
     owned_fragment,
     owned_span,
     replace_owned_fragment,
@@ -253,9 +254,9 @@ def _compose_child_project_context(
         for key, component in context.prompt_components.items()
         if key != CHILD_PROFILE_BODY and isinstance(prompt, str)
     }
-    if preset.path is not None and preset.prompt_suffix:
+    if preset.path is not None:
         text = prompt if isinstance(prompt, str) else assistant_text(prompt)
-        length = len(preset.prompt_suffix)
+        length = len(child_profile_contribution(preset.prompt_suffix))
         finish_length = len(_EXPLICIT_FINISH_GUIDANCE) + 2 if explicit_finish else 0
         span = owned_span(text, len(text) - finish_length - length, length)
         components[CHILD_PROFILE_BODY] = {
@@ -320,22 +321,17 @@ def _compose_child_system_prompt(
     """Apply the preset preamble and custom body to the child prompt."""
 
     composed = compose_system_prompt(system_prompt, preset.preamble)
-    body = preset.prompt_suffix
+    body = child_profile_contribution(preset.prompt_suffix)
     if explicit_finish:
-        body = (
-            f"{body}\n\n{_EXPLICIT_FINISH_GUIDANCE}"
-            if body
-            else _EXPLICIT_FINISH_GUIDANCE
-        )
+        body += "\n\n" + _EXPLICIT_FINISH_GUIDANCE
     if not body:
         return composed
     if isinstance(composed, Message):
-        if preset.path is not None and preset.prompt_suffix:
-            # Keep the body separate even when prompt replacement joins text blocks.
-            body = "\n\n" + body
+        if preset.path is None:
+            body = body.removeprefix("\n\n")
         return Message(
             MessageRole.SYSTEM,
             [*composed.content, TextContent(body)],
             metadata=dict(composed.metadata),
         )
-    return composed + "\n\n" + body
+    return composed + body

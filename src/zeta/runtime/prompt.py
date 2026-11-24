@@ -37,6 +37,10 @@ class RuntimePrompt:
     prompt_components: dict[str, dict[str, int | str]]
 
 
+def child_profile_contribution(body: str) -> str:
+    return f"\n\n{body}" if body else ""
+
+
 def owned_span(text: str, offset: int = 0, length: int | None = None) -> OwnedSpan:
     """Describe one exact slice of text."""
 
@@ -68,6 +72,8 @@ def _validate_span(text: str, key: str, span: OwnedSpan) -> None:
 def _strictly_contains(outer: OwnedSpan, inner: OwnedSpan) -> bool:
     return (
         outer.offset <= inner.offset
+        # An empty span at the end belongs after the preceding component.
+        and inner.offset < outer.offset + outer.length
         and inner.offset + inner.length <= outer.offset + outer.length
         and (outer.offset, outer.length) != (inner.offset, inner.length)
     )

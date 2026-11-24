@@ -98,7 +98,7 @@ def parse_frontmatter(
 
 
 def read_markdown(path: Path, kind: str) -> tuple[dict[str, object], str]:
-    """Read common frontmatter and a non-empty markdown body."""
+    """Read common frontmatter and the markdown body."""
 
     return _parse_markdown(path.read_bytes(), path, kind)
 
@@ -124,7 +124,7 @@ def _parse_markdown(raw: bytes, path: Path, kind: str) -> tuple[dict[str, object
         raise ValueError(f"{kind} {path} has unterminated YAML frontmatter") from exc
     metadata = parse_frontmatter(lines[1:end], path, kind)
     body = "\n".join(lines[end + 1 :]).strip()
-    if not body:
+    if not body and kind != "agent":
         raise ValueError(f"{kind} {path} has an empty prompt body")
     return metadata, body
 

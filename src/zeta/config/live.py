@@ -12,6 +12,7 @@ from ..runtime.prompt import (
     CHILD_PROFILE_BODY,
     PromptFragment,
     RuntimePrompt,
+    child_profile_contribution,
     owned_span,
     replace_owned_fragment,
 )
@@ -200,13 +201,12 @@ def _prepare_prompt(
         selected = next(
             (agent for agent in agents.agents if agent.name == base.agent_profile), None
         )
-        if (
-            selected is not None
-            and owned_span(selected.prompt_suffix).digest != span["digest"]
-        ):
-            prompt = replace_owned_fragment(
-                prompt, CHILD_PROFILE_BODY, PromptFragment(selected.prompt_suffix, {})
-            )
+        if selected is not None:
+            contribution = child_profile_contribution(selected.prompt_suffix)
+            if owned_span(contribution).digest != span["digest"]:
+                prompt = replace_owned_fragment(
+                    prompt, CHILD_PROFILE_BODY, PromptFragment(contribution, {})
+                )
     displayed = (
         RuntimePrompt(plan_mode_prompt(prompt.system_prompt), prompt.prompt_components)
         if base.plan_mode and prompt is not base.prompt_base

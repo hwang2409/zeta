@@ -212,8 +212,13 @@ async def test_live_added_profile_remains_hidden_and_blocked_at_depth_cap(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("old_body", "new_body"), [
+    ("old profile body", "new worker profile body"),
+    ("", "new worker profile body"),
+    ("old profile body", ""),
+])
 async def test_running_child_refreshes_selected_profile_before_next_request(
-    tmp_path: Path,
+    tmp_path: Path, old_body: str, new_body: str,
 ) -> None:
     spawn = ToolCall(
         "worker-1", "agent",
@@ -241,7 +246,7 @@ async def test_running_child_refreshes_selected_profile_before_next_request(
     profile = home / "agents" / "worker.md"
     profile.parent.mkdir(parents=True)
     header = "---\nname: worker\ndescription: worker\naccepts_follow_ups: true\n---\n"
-    profile.write_text(header + "old profile body\n", encoding="utf-8")
+    profile.write_text(header + old_body + "\n", encoding="utf-8")
     peer = tmp_path / "worker-link.md"
     os.link(profile, peer)
     inode = profile.stat().st_ino
@@ -252,7 +257,7 @@ async def test_running_child_refreshes_selected_profile_before_next_request(
     try:
         await await_or_fail(start(), what="worker spawn")
         await await_or_fail(backend.child_started["work"].wait(), what="first worker request")
-        peer.write_text(header + "new worker profile body\n", encoding="utf-8")
+        peer.write_text(header + new_body + "\n", encoding="utf-8")
         assert profile.stat().st_ino == inode
         _write_agent(home / "agents" / "delegate.md", "delegate", "delegated specialist")
         handle, = loop.store.agent_children()
@@ -265,13 +270,17 @@ async def test_running_child_refreshes_selected_profile_before_next_request(
         await wait_background_owner(loop)
 
         first, second, third = backend.children["work"].calls
-        assert "old profile body" in assistant_text(first[0][0])
+        old_contribution = f"\n\n{old_body}" if old_body else ""
+        new_contribution = f"\n\n{new_body}" if new_body else ""
+        base_prompt = assistant_text(backend.parent.calls[0][0][0])
+        assert assistant_text(first[0][0]) == base_prompt + old_contribution
         assert any(
             message.role is MessageRole.USER and assistant_text(message) == "also check the tests"
             for message in second[0]
         ), "follow-up did not reach the next model request"
-        assert "new worker profile body" in assistant_text(second[0][0]), "next worker request kept the old profile"
-        assert "old profile body" not in assistant_text(second[0][0])
+        assert assistant_text(second[0][0]) == base_prompt + new_contribution, (
+            "next worker request did not replace the whole profile contribution"
+        )
         assert "delegate" in _agent_enums(second[1])[0]
         assert backend.children["delegate"].calls, "running child rejected the new delegate profile"
         assert second[0][0] == third[0][0]
