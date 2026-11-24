@@ -1232,11 +1232,12 @@ class ConnectionRegistry(ReplayOutput):
     async def stop_producers(self) -> None:
         self._unregister_child_run_sink()
 
-    async def drain_reads(self) -> None:
+    async def stop_reads(self) -> None:
+        """Abandon read results; transferred uses still track worker completion."""
         try:
             self.state_reader.close()
         finally:
-            await self._reads.aclose()
+            self._reads.close()
 
     async def drain_record_events(self, record: SessionController) -> None:
         """Settle replay output while its record is still readable."""
@@ -1289,7 +1290,7 @@ class ConnectionRegistry(ReplayOutput):
             await self.stop_producers()
         finally:
             try:
-                await self.drain_reads()
+                await self.stop_reads()
             finally:
                 await self.stop_workers(self.clients())
 

@@ -617,15 +617,15 @@ class ZetaServer:
         releases = tuple(asyncio.create_task(client.release_controller()) for client in clients)
         logins = tuple(asyncio.create_task(client.logins.close()) for client in clients)
         await drain(logins)
+        if registry is not None:
+            await attempt(registry.stop_reads())
         for handler in handlers:
             handler.cancel()
         await drain(handlers)
         await drain(releases)
         await attempt(self.account_operations.drain())
-        if registry is not None:
-            await attempt(registry.drain_reads())
 
-        # Setup aborts and existing retire tasks join the same record drain.
+        # The record owner waits for setup and transferred read completions.
         await attempt(self.controllers.close(records, approval_settlement_timeout))
         if registry is not None:
             for client in clients:

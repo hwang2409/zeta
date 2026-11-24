@@ -23,6 +23,11 @@ negotiated approval and turn reconnect grace and defaults to `90`. Set
 served sessions must use a shared provider account store while all other state
 remains under `ZETA_HOME`.
 
+On shutdown, serve stops accepting requests and cancels outstanding reads.
+It drops queued reads and discards late results from detached snapshot reads.
+It waits for reads that still use a live session, then settles approvals before
+closing the session runtime. Client transports and listeners close last.
+
 ### WebSocket transport
 
 `zeta serve --ws PORT` adds an RFC 6455 WebSocket listener on
