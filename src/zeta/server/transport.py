@@ -245,7 +245,10 @@ class WebSocketConnection:
         if self._pending is None:
             return
         payload, self._pending = self._pending, None
-        await self._connection.send(payload, text=True)
+        try:
+            await self._connection.send(payload, text=True)
+        except ConnectionClosed as exc:
+            raise BrokenPipeError("WebSocket peer closed") from exc
 
     def close(self) -> None:
         if self._close_task is None:

@@ -34,6 +34,7 @@ async def test_public_multi_controller_shutdown_state_table(
     clients = [await connect_replay(server, transport) for _ in range(4)]
     provisional_request = None
     release = asyncio.Event()
+    shutdown_gate = asyncio.Event()
     try:
         features = ("multi_controller", "session_park", "resume_attach")
         for client in clients:
@@ -75,7 +76,6 @@ async def test_public_multi_controller_shutdown_state_table(
                     raise error
                 return await original_flush(connection, *args, **kwargs)
             monkeypatch.setattr(server.connections, "flush", fail_flush)
-        shutdown_gate = asyncio.Event()
         shutdown_entered = asyncio.Event()
         if boundary == "workers":
             original_workers = server.connections.stop_workers
@@ -118,6 +118,12 @@ async def test_public_multi_controller_shutdown_state_table(
             close_task = asyncio.create_task(server.close())
             await await_or_fail(shutdown_entered.wait(), what="shutdown remains gated")
             close_task.cancel()
+            delivered = asyncio.Event()
+            # The cancel wake is queued before this callback. Keep the drain held
+            # until the caller has had a chance to return out of order.
+            asyncio.get_running_loop().call_soon(delivered.set)
+            await await_or_fail(delivered.wait(), what="deliver caller cancellation")
+            assert not close_task.done(), "caller cancellation escaped before shutdown drained"
             shutdown_gate.set()
             release.set()
             with pytest.raises(asyncio.CancelledError):
@@ -139,6 +145,7 @@ async def test_public_multi_controller_shutdown_state_table(
         assert set(closes.values()) == {1}
         await server.close()
     finally:
+        shutdown_gate.set()
         release.set()
         if provisional_request is not None and not provisional_request.done():
             provisional_request.cancel()
