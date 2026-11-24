@@ -145,14 +145,14 @@ async def test_observer_view_table(tmp_path: Path, transport: Transport, mode: s
             # The current catalog is static; an absent view below still distinguishes resolution.
             assert result == (await a.request(6, method, params))["result"], reply
         elif method in {"skill_catalog", "agent_profile_catalog"}:
-            item, = result["data"]["items"]
-            assert item["description"] == ("alpha skills" if method == "skill_catalog" else "alpha agents"), reply
+            description = "alpha skills" if method == "skill_catalog" else "alpha agents"
+            assert [item["description"] for item in result["data"]["items"]] == [description], reply
         elif method in {"skill_read", "agent_profile_read"}:
             assert result["data"]["body"].strip() == "Body from alpha.", reply
         elif method == "mcp_server_list":
-            item, = result["data"]["items"]
-            assert item["name"] == "alpha", reply
-            assert item["config"]["headers"] == {"Authorization": "<redacted>"}, reply
+            items = result["data"]["items"]
+            assert [item["name"] for item in items] == ["alpha"], reply
+            assert items[0]["config"]["headers"] == {"Authorization": "<redacted>"}, reply
             assert "synthetic-disk-value" not in json.dumps(result), reply
         elif method == "session_history_read":
             assert "archived alpha prompt" in json.dumps(result), reply
