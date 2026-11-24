@@ -99,6 +99,11 @@ async def _drain_released_leases() -> None:
             logger.exception("draining released leases failed")
 
 
+class ServerAlreadyListeningError(RuntimeError):
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"a server is already listening on {path}")
+
+
 class _UnixSocketListener:
     def __init__(
         self,
@@ -129,7 +134,7 @@ class _UnixSocketListener:
                 with socket_lock():
                     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise RuntimeError(f"a server is already listening on {path}") from exc
+                raise ServerAlreadyListeningError(path) from exc
             cls._prepare_path(path)
             unix_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             identity: tuple[int, int] | None = None
@@ -185,7 +190,7 @@ class _UnixSocketListener:
             if exc.errno not in {errno.ECONNREFUSED, errno.ENOENT}:
                 raise RuntimeError(f"could not inspect socket: {path}") from exc
         else:
-            raise RuntimeError(f"a server is already listening on {path}")
+            raise ServerAlreadyListeningError(path)
         finally:
             probe.close()
         cls._unlink_if_owned(path, (path_stat.st_dev, path_stat.st_ino))
