@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from functools import partial
+from threading import Lock
+from time import perf_counter
 from typing import Protocol
 
 from ...context_accounting import cooperative_call
@@ -13,6 +19,52 @@ from .types import _AssemblyPreparation
 
 PreparationKey = tuple[str | None, bool, int, str, int]
 Prepared = tuple[tuple[ConversationEntry, ...], _AssemblyPreparation]
+
+logger = logging.getLogger(__name__)
+_executor: ThreadPoolExecutor | None = None
+_executor_lock = Lock()
+
+
+def _preparation_executor() -> ThreadPoolExecutor:
+    global _executor
+    with _executor_lock:
+        if _executor is None:
+            # ThreadPoolExecutor joins its workers at interpreter shutdown.
+            _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="zeta-context")
+        return _executor
+
+
+async def _run_preparation_job[T](
+    session_id: str, phase: str, job: Callable[[], T]
+) -> T:
+    executor = _preparation_executor()
+    context = copy_context()
+    submitted = perf_counter()
+    started: float | None = None
+
+    def log_timing(start: float | None, outcome: str) -> None:
+        now = perf_counter()
+        queue_ms = ((now if start is None else start) - submitted) * 1000
+        run_ms = 0.0 if start is None else (now - start) * 1000
+        logger.log(
+            logging.WARNING if max(queue_ms, run_ms) >= 1000 else logging.DEBUG,
+            "context preparation %s %s session=%s queue_ms=%.1f run_ms=%.1f",
+            phase, outcome, session_id, queue_ms, run_ms,
+        )
+
+    def run() -> T:
+        nonlocal started
+        started = perf_counter()
+        try:
+            return context.run(job)
+        finally:
+            log_timing(started, "ended")
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(executor, run)
+    except asyncio.CancelledError:
+        log_timing(started, "await cancelled")
+        raise
 
 
 class PrepareAssembly(Protocol):
@@ -113,21 +165,27 @@ class ContextPreparation:
                     if force
                     else self._store.context_refs()
                 )
-                branch = await asyncio.to_thread(
-                    lambda refs=refs: tuple(self._store.stream_rows(refs))
+                branch = await _run_preparation_job(
+                    self._store.session_id,
+                    "load rows",
+                    lambda refs=refs: tuple(self._store.stream_rows(refs)),
                 )
                 active_source_seqs = self._store.context_source_seqs()
                 branch_id = self._store.active_branch_head_id()
                 prompt_generation, system_prompt = self._prompt_state()
-                preparation = await asyncio.to_thread(
-                    cooperative_call,
-                    self._prepare,
-                    branch,
-                    active_source_seqs=active_source_seqs,
-                    force=force,
-                    assembly_budget=assembly_budget,
-                    system_append=system_append,
-                    system_prompt=system_prompt,
+                preparation = await _run_preparation_job(
+                    self._store.session_id,
+                    "account context",
+                    partial(
+                        cooperative_call,
+                        self._prepare,
+                        branch,
+                        active_source_seqs=active_source_seqs,
+                        force=force,
+                        assembly_budget=assembly_budget,
+                        system_append=system_append,
+                        system_prompt=system_prompt,
+                    ),
                 )
                 await asyncio.sleep(0)
                 current_budget = self.budget(reserved_estimator_tokens)
