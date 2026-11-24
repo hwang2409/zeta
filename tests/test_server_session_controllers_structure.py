@@ -165,7 +165,8 @@ def test_record_indexes_have_one_owner() -> None:
                             "_controller_members",
                             "_hello_records",
                             "_hello_generations",
-                            "_grace_session_id",
+                            "_legacy_grace",
+                            "_multi_graces",
                         )
                     )
                     and (
@@ -178,7 +179,8 @@ def test_record_indexes_have_one_owner() -> None:
                         or "_controller_members" in attrs
                         or "_hello_records" in attrs
                         or "_hello_generations" in attrs
-                        or "_grace_session_id" in attrs
+                        or "_legacy_grace" in attrs
+                        or "_multi_graces" in attrs
                     )
                 ):
                     assert path.name == "session_controllers.py", f"{path}:{node.lineno}: {text}"

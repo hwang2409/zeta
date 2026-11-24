@@ -457,6 +457,11 @@ class ServeControl:
         else:
             await self._approvals.wait_for_approval_settlement(timeout)
 
+    @property
+    def reconnect_grace_task(self) -> asyncio.Task[None] | None:
+        """The current grace work, for admission to observe its settlement."""
+        return self._grace_task
+
     def begin_controller_release(
         self, *, reconnect: bool = False, keep_turn: bool = False
     ) -> asyncio.Task[None]:
