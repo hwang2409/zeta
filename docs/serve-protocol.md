@@ -12,9 +12,11 @@ newline. Messages are limited to 1 MiB on every transport.
 - `1.1` adds the session extensions and optional feature negotiation below.
 - `1.0` is the legacy base protocol.
 
-The server accepts one controller plus up to eight negotiated read-only
-observers. A second controller or ninth observer receives a JSON-RPC error with
-code `-32001`, then closes. The limits are shared by all enabled transports.
+In legacy mode the server accepts one controller plus up to eight negotiated
+read-only observers. A second controller or ninth observer receives `-32001`
+during `hello`, then the connection closes. Clients that negotiate
+[`multi_controller`](#multi_controller) use the limits below. All transport
+listeners share the same limits.
 The server uses a Unix socket by default: `$ZETA_HOME/run/serve.sock`.
 `zeta serve --socket PATH` selects another Unix socket. `zeta serve --port N`
 selects `127.0.0.1:N`. `zeta serve --approval-reconnect-grace SECONDS` sets the
@@ -123,54 +125,68 @@ receives no echo uses no feature. A `features` value that is not an array of
 strings returns `-32602` and closes the connection. A 1.0 negotiation ignores
 `features`.
 
-### `multi_controller` (dormant)
+### `multi_controller`
 
-`multi_controller` is the negotiated capability for the later multi-controller
-serve mode. it is documented here so clients can prepare for that mode, but this
-slice does not advertise it in production. a private in-process test server
-can negotiate it to exercise the multi-controller rules.
+A protocol 1.1 or 1.2 client requests `multi_controller` in `hello.features`.
+The server echoes it in `result.capabilities.features`. Use multi-controller
+mode only after that echo. Controllers that do not negotiate it use the
+exclusive legacy slot. Legacy and multi-controller modes cannot mix; a
+controller `hello` for the other mode returns `-32001` and closes the connection.
 
-When enabled in a later slice, controller mode is exclusive: a serve process is
-in either legacy mode (one controller) or negotiated multi-controller mode; the
-two modes cannot mix. each negotiated controller controls at most one session,
-and each session has at most one controller. a second controller for an attached
-session receives `session_controlled` (`-32014`) with the socket left open.
-the bounded diagnostic `holder` may contain only safe client version and
-connection duration fields; it never contains credentials, addresses, cwd, or
-bindings.
+Each controller can attach to at most one session, and each session has at most
+one controller. There is no automatic or forced handoff. If another controller
+already owns the requested session, the request returns `-32014` with
+`data.code: "session_controlled"` and `data.session_id` set to the requested
+session. The connection stays open. If present, `data.holder` contains only
+bounded client version and connection duration (`client_version` and
+`connected_for_ms`), never credentials, addresses, cwd, or bindings.
 
-Reconnect must name the exact session being reclaimed and pass its binding and
-approval checks. an unattached negotiated connection does not infer reconnect
-from another session's grace record. each detached record has its own admission
-grace. when no controllers are connected, a negotiated controller hello must
-name a session whose grace is still live. reattaching one record or settling
-its grace work does not end another record's grace. a failed reconnect does not
-consume the admission grace. an idle detached record uses the configured approval reconnect grace;
-when that time runs out, the record closes and releases its admission slot.
+The limits are fixed, not settings:
 
-Multi-controller mode admits four controllers. A fifth hello receives `-32001`
-and closes the connection. Each session admits eight pending or active observer
-subscriptions, including child streams for that session. A ninth join returns
-`-32001` without closing the connection. An observer without a subscription
-does not occupy a session bucket.
+- Four multi controllers: the fifth controller `hello` gets `-32001` and closes.
+- Eight resident records, including unattached, setup, parked, closing, and
+  reconnect-grace records: an operation that would allocate a ninth gets
+  `-32004` with `data.reason: "resident_limit"`.
+- Eight pending or active observer subscriptions per session, including child
+  streams for that session: the ninth join gets `-32001` and the connection
+  stays open. An observer with no subscription does not count toward a session.
+- Three parked or closing sessions per connection: an operation that would park
+  a fourth gets `-32004` with `data.reason: "parked_limit"`. Its `data.parked`
+  list contains only sessions charged to that connection.
+- 32 physical connections across all transports, including connections that
+  have not sent `hello`. This replaces the previous limit of 10 for all clients;
+  legacy role limits and refusal behavior are unchanged. The 33rd connection
+  closes without a JSON-RPC response.
 
-The eight resident records include setup, parked, closing, and reconnect-grace
-records. A ninth record is refused with `-32004` and `reason: "resident_limit"`.
-Each connection can charge three parked or closing records. The existing
-`-32004` `parked_limit` response lists only that connection's charged sessions.
-`status.parked_sessions` and `parked_session_changed` show only the requesting
-controller's parked records. Closing records stay charged until settlement.
+`status.parked_sessions` and `parked_session_changed` are scoped to the owning
+connection. Closing records count against capacity until cleanup settles.
 
-The shared physical limit is 32 connections (previously 10) across all
-transports, including clients that have not sent hello. The legacy role limits
-are unchanged. Excess transports close without a JSON-RPC response. The
-existing 256-frame / 4 MiB per-connection output bounds remain in force. These
-are fixed limits, not settings.
+A detached session has its own reconnect grace. To reclaim it, `hello` must
+name the exact `session_id` and pass the existing binding and approval checks.
+If only grace records keep the server in multi-controller mode, only a `hello`
+that names a session with live grace can enter. A failed reconnect does not
+consume the record's grace, and reclaim or settlement for one session does not
+end another session's grace. An idle record still reserves resident capacity:
+its grace is bounded by `approval_reconnect_grace`
+(`--approval-reconnect-grace`, default 90 seconds). At expiry it closes and
+frees capacity after settlement; zero starts retirement on release. Legacy
+reconnect grace is unchanged.
 
-The compatibility trace for this capability covers legacy hello, resume, park,
-refusal, reconnect, and close on both Unix and WebSocket transports. until the
-capability is activated, legacy traces remain unchanged: a controller at
-capacity receives `-32001` and the connection closes.
+Each connection retains at most 256 output frames or 4 MiB. Overflow affects
+only that connection: the server attempts to send the typed `-32011` error
+before closing it and aborts a blocked transport at the 1-second overflow
+deadline. See [read-only observers](#read-only-observers) for the error messages.
+
+On shutdown the server first stops admitting connections and resolving sessions
+for new work. It drains controller, observer, unattached, parked, closing,
+grace, and setup state, including request cleanup transferred from disconnected
+clients. Cleanup failure or cancellation does not skip later cleanup. Listeners
+close and the Unix socket path and WebSocket discovery are removed last.
+Repeated close is idempotent; there is no new shutdown notice.
+
+Only processes running the new code can advertise this capability. Restart
+existing Zeta sessions, their child processes, and `zeta serve` processes to pick
+up the new code.
 
 `model_catalog`, `session_settings`, `set_settings`, and `send_images` are
 request methods listed in hello `capabilities.requests`, not feature names in
@@ -647,7 +663,8 @@ the swap is the same as without the feature.
 - A parked session closes when it no longer holds work. A parked approval has
   no deadline while the controller stays connected. `resume` of a session that
   is closing waits for the close to end, then opens the session from disk.
-- At most 3 sessions can be parked or closing at a time. A swap that would park
+- At most 3 sessions per connection can be parked or closing at a time. A swap
+  that would park
   one more returns `-32004` with
   `data: {"reason": "parked_limit", "parked": [session ids]}`, listing the
   parked and closing sessions. `resume` of a parked session never returns this
@@ -2858,8 +2875,9 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
    negotiated `approval_reconnect`: then they stay pending for the grace. Aborted
    approvals are not pending after reconnect, and an approve request cannot run
    an aborted tool.
-9. SIGINT, SIGTERM, and orderly close use one path. The server closes clients
-   and turns, closes the listener, and removes the Unix socket.
+9. SIGINT, SIGTERM, and orderly close use one path. The server settles clients
+   and session work before closing listeners and removing endpoint discovery.
+   See [`multi_controller`](#multi_controller) for the multi-record drain.
 10. Match responses by `id`. Continue processing notifications until the
     matching response arrives.
 11. A session replacement closes the old loop before publishing the new
@@ -2872,8 +2890,8 @@ fields, as with the other 1.1 extensions. No feature negotiation is required.
     request from it, including any request already buffered behind the running
     one. On unix and tcp this is a half-close: the server does not close the
     write side, so the reply to the request that is still running and any
-    already-buffered reply are still written. A controller that lost its
-    connection keeps its controller slot until its running request ends; a new
+    already-buffered reply are still written. In legacy mode, a controller that
+    lost its connection keeps its slot until its running request ends; a new
     controller `hello` then waits up to one handoff deadline (10 s) for that
     slot and succeeds, instead of being refused at once. A controller slot held
     by a *live* holder still refuses a second controller `hello` immediately
@@ -3379,7 +3397,8 @@ negotiate a feature sees the behavior from before the feature existed.
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 | `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
 | `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
-| `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 are parked or closing (`-32004` with `data.reason: "parked_limit"`), `status` adds `parked_sessions`, and the controller gets `parked_session_changed` events (see "parking a busy session") |
+| `multi_controller` | enables up to four controllers with exclusive ownership of each attached session, per-connection parking, and independent per-session reconnect grace; see [`multi_controller`](#multi_controller) for limits and refusals |
+| `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 per connection are parked or closing (`-32004` with `data.reason: "parked_limit"`), `status` adds `parked_sessions`, and the controller gets `parked_session_changed` events (see "parking a busy session") |
 | `in_flight_replay` | requires `session_replay_seq`; a `session_history_and_subscribe` join during a reply starts its stream with the reply text, thinking, and running-tool output streamed so far, as ordinary `assistant_delta` and `tool_output` events (see "joining during a reply") |
 
 These features are available on protocol 1.1 and 1.2. `content_read` row handles are stateless locators. They remain valid across reconnect, reattach, and restart while the row exists, but clients must treat them as opaque and session-scoped. A 1.2 client that sends
@@ -3396,7 +3415,10 @@ filtering and response-size limits apply before the response is sent.
 
 ## read-only observers
 
-protocol 1.1 and later clients can request `role: "observer"` in `hello`. an observer must negotiate the `serve_observers` feature. the first controller remains the only mutable client; a second controller receives `-32001` after it completes `hello`. observers do not promote to controller, and the controller slot is released only after controller cleanup.
+Protocol 1.1 and later clients can request `role: "observer"` in `hello`.
+An observer must negotiate `serve_observers` and cannot promote to controller.
+The legacy controller slot is released only after controller cleanup. For
+multi-controller role limits, see [`multi_controller`](#multi_controller).
 
 observers are limited to `list_sessions`, `status`, `session_tree`, `session_history`, `session_history_and_subscribe`, `child_run_history`, `child_run_events`, `model_catalog`, `session_settings`, `ping`, and `delivery_status`, plus `session_grants` when that feature is negotiated, `content_read` when both `serve_observers` and `content_read` are negotiated, `child_run_list` when `child_runs` is negotiated, and `telemetry_*` and read-only `state_*` methods when their respective read features are negotiated. `child_run_history` and `child_run_events` are available only when their respective features are negotiated. all project and account methods, `path_complete`, `slash_list`, `login_status`, and `list_sessions` with `project_id` return `-32008` with data `{ "code": "observer_read_only", "method": "..." }`. `session_snapshot` is not available until the durable continuation slice.
 

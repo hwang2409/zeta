@@ -16,7 +16,7 @@ from tests.support.replay_transport import (
 from tests.test_server_replay_table import _backend_factory
 from zeta.protocol.types import StreamEvent, StreamEventType
 from zeta.server.connections import EVENT_FEATURES
-from zeta.server.protocol import DORMANT_FEATURES, FEATURES, EventDescriptor
+from zeta.server.protocol import EventDescriptor
 
 
 @pytest.mark.parametrize(("transport", "case"), [
@@ -27,7 +27,6 @@ from zeta.server.protocol import DORMANT_FEATURES, FEATURES, EventDescriptor
 ])
 @pytest.mark.asyncio
 async def test_event_routing_table(tmp_path: Path, transport: Transport, case: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    assert "multi_controller" not in FEATURES and "multi_controller" in DORMANT_FEATURES
     assert set(EVENT_FEATURES) == set(EventDescriptor) and len(EVENT_FEATURES) == 45
     assert Counter(route.destination for route in EVENT_FEATURES.values()) == {
         "session": 42, "connection": 2, "global": 1,

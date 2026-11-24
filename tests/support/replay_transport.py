@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 from tests.support.owned import await_or_fail
 from tests.support.sockets import short_socket_path
 from zeta.server import ZetaServer
-from zeta.server.protocol import DORMANT_FEATURES, FEATURES, MAX_FRAME_BYTES
+from zeta.server.protocol import MAX_FRAME_BYTES
 
 Transport = Literal["unix", "websocket"]
 
@@ -215,7 +215,6 @@ def replay_server(home: Path, transport: Transport, backend_factory: Any) -> Zet
         "home": home,
         "provider": "codex",
         "backend_factory": backend_factory,
-        "_supported_features_for_test": frozenset((*FEATURES, *DORMANT_FEATURES)),
     }
     if transport == "unix":
         options["socket_path"] = short_socket_path(home)

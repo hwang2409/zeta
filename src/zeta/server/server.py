@@ -57,7 +57,6 @@ from .handlers.resources._mcp_auth import MCPAuth
 from .parking import ParkedPairs
 from .protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,
-    DORMANT_FEATURES,
     FEATURES,
     MAX_FRAME_BYTES,
     ErrorDescriptor,
@@ -231,7 +230,6 @@ class ZetaServer:
         max_role: str = "controller",
         prebound_socket: socket.socket | None = None,
         telemetry: Telemetry | None = None,
-        _supported_features_for_test: frozenset[str] | None = None,
     ) -> None:
         if socket_path is not None and port is not None:
             raise ValueError("choose socket_path or port, not both")
@@ -259,11 +257,6 @@ class ZetaServer:
         # after the cancel, log the stuck-holder task dump at this interval.
         self.lost_request_cancel_bound = 1.0
         self._borrowed = runtime is not None
-        if self._borrowed and _supported_features_for_test is not None:
-            raise ValueError("borrowed observer hosts cannot override supported features")
-        self._supported_features = frozenset(
-            FEATURES if _supported_features_for_test is None else _supported_features_for_test
-        )
         # a borrowed server shows its host's telemetry; an owning server configures its own in start()
         self.telemetry = telemetry or Telemetry.disabled()
         runtime = runtime or ServerRuntime(
@@ -1332,8 +1325,8 @@ class _Client:
         accepted = (
             [
                 item
-                for item in (*FEATURES, *DORMANT_FEATURES)
-                if item in self.server._supported_features and item in (requested or ())
+                for item in FEATURES
+                if item in (requested or ())
             ]
             if extended
             else []
