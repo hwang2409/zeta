@@ -1169,25 +1169,23 @@ class _Client:
         acquisition = None
         try:
             admission = self._admit_controller_hello(hello, params)
-            with contextlib.ExitStack() as uses:
-                controller = None
-                if admission is not None and admission.mode == "multi" and self.max_role != "observer":
-                    requested_id = params.get("session_id")
-                    session_id = requested_id if isinstance(requested_id, str) else None
-                    # Refuse a conflicting hello before claiming its physical output queue.
-                    controller = uses.enter_context(self.server.controllers.owned(self, session_id))
+            multi = admission is not None and admission.mode == "multi" and self.max_role != "observer"
+            # Multi must refuse a conflicting hello before claiming its output queue.
+            role = "controller" if multi else self._claim_hello_role(hello)
+            result = self._hello_result(hello, role)
+            if role == "controller":
+                requested_id = params.get("session_id")
+                session_id = requested_id if multi and isinstance(requested_id, str) else None
+                with self.server.controllers.owned(self, session_id) as controller:
                     acquisition = controller.acquisition
-                role = self._claim_hello_role(hello)
-                result = self._hello_result(hello, role)
-                if role == "controller":
-                    if controller is None:
-                        controller = uses.enter_context(self.server.controllers.owned(self))
+                    if multi:
+                        self._claim_hello_role(hello)
                     await self._setup_controller_hello(params, deadline, controller)
-                elif "mcp_bindings" in params:
-                    raise ProtocolError(
-                        ErrorDescriptor.INVALID_PARAMS,
-                        "mcp_bindings require a controller connection",
-                    )
+            elif "mcp_bindings" in params:
+                raise ProtocolError(
+                    ErrorDescriptor.INVALID_PARAMS,
+                    "mcp_bindings require a controller connection",
+                )
             if admission is not None:
                 self.server.controllers.commit_hello(admission)
             if acquisition is not None:
