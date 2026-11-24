@@ -23,6 +23,11 @@ negotiated approval and turn reconnect grace and defaults to `90`. Set
 served sessions must use a shared provider account store while all other state
 remains under `ZETA_HOME`.
 
+On shutdown, serve stops accepting requests and cancels outstanding reads.
+It drops queued reads and discards late results from detached snapshot reads.
+It waits for reads that still use a live session, then settles approvals before
+closing the session runtime. Client transports and listeners close last.
+
 ### WebSocket transport
 
 `zeta serve --ws PORT` adds an RFC 6455 WebSocket listener on
@@ -140,8 +145,8 @@ from another session's grace record. each detached record has its own admission
 grace. when no controllers are connected, a negotiated controller hello must
 name a session whose grace is still live. reattaching one record or settling
 its grace work does not end another record's grace. a failed reconnect does not
-consume the admission grace. an idle detached record has no grace timer yet;
-its admission grace lasts until it is reattached or the record closes.
+consume the admission grace. an idle detached record uses the configured approval reconnect grace;
+when that time runs out, the record closes and releases its admission slot.
 
 Multi-controller mode admits four controllers. A fifth hello receives `-32001`
 and closes the connection. Each session admits eight pending or active observer

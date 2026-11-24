@@ -384,7 +384,7 @@ def test_a_closing_record_stays_resident_until_its_close_ends() -> None:
         assert (events, record in owner.records()) == ([], True)
         completion.set_result(None)
         await await_or_fail(owner.wait_closed("s"), what="close after the use settles")
-        assert events == ["control", "runtime", "settled"]
+        assert events == ["control", "settled", "runtime"]
         assert record not in owner.records()
 
     asyncio.run(main())

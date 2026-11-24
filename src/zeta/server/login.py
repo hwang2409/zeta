@@ -82,6 +82,7 @@ class Logins:
     ) -> None:
         self.home = home
         self.timeout = timeout
+        self._closed = False
         self._publication_owner = partial(account_operations.run, "login_publication", None)
         self.tasks: dict[str, asyncio.Task[dict]] = {}
         self.operations: dict[str, _LoginOperation] = {}
@@ -119,6 +120,8 @@ class Logins:
         account = "default"
         if named_accounts and "account" in params:
             account = await asyncio.to_thread(self._resolve_account, provider, params["account"])
+        if self._closed:
+            raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "server is closing")
         url = asyncio.get_running_loop().create_future()
         operation = _LoginOperation()
         task = asyncio.create_task(self._run(
@@ -281,6 +284,7 @@ class Logins:
         return result
 
     async def close(self) -> None:
+        self._closed = True
         for provider, task in self.tasks.items():
             if not task.done():
                 self.operations[provider].cancel(task)

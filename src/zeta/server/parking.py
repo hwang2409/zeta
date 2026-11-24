@@ -122,7 +122,3 @@ class ParkedPairs:
         for control, kept in zip(pairs, claimed, strict=True):
             if not kept:
                 self.close(control)
-
-    def close_all(self, settlement_timeout: float | None) -> None:
-        for control in self._controllers.parked_controls():
-            self.close(control, settlement_timeout)

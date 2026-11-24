@@ -33,7 +33,7 @@ from .protocol import (
     _Frame,
 )
 from .read_catalog import ReadCatalog
-from .session_controllers import SessionUse
+from .session_controllers import SessionController, SessionUse
 from .session_replay import (
     DeferredFrame,
     ReplayScopeId,
@@ -224,6 +224,10 @@ class ConnectionRegistry(ReplayOutput):
         self._child_reader_lock = threading.Lock()
         self._reads = ThreadCallWorkers(loop, workers=2, name="zeta-read")
         self.state_reader = ReadCatalog(self.run_blocking)
+
+    @property
+    def frozen(self) -> bool:
+        return self._closed
 
     @property
     def legacy_controller_holder(self) -> _Connection | None:
@@ -478,9 +482,12 @@ class ConnectionRegistry(ReplayOutput):
         covers: int | None = None,
         legacy_observers: bool = False,
         wait_for_write: bool = False,
+        finalizer: bool = False,
         **fields: object,
     ) -> Admission:
         """Admit once per target. Only the owner may receive a plain frame."""
+        if self._closed and not finalizer:
+            return Admission("not_writable")
         route = EVENT_FEATURES.get(event)
         if route is None or route.destination != "session":
             return Admission("feature_rejected")
@@ -529,6 +536,8 @@ class ConnectionRegistry(ReplayOutput):
         self, connection: Any, event: EventDescriptor, session_id: str | None,
         *, wait_for_write: bool = False, **fields: object,
     ) -> Admission:
+        if self._closed:
+            return Admission("not_writable")
         state = self._connections.get(connection)
         outcome, frame, output = self._event_preflight(
             state, event, session_id, required_feature=None, fields=fields,
@@ -985,6 +994,8 @@ class ConnectionRegistry(ReplayOutput):
 
     async def run_blocking(self, callable: Callable[[], Any]) -> Any:
         """Run one store or observer read away from the event loop."""
+        if self._closed:
+            raise RuntimeError("reads are closed")
         return await self._reads.run(callable)
 
     async def run_read(
@@ -999,7 +1010,7 @@ class ConnectionRegistry(ReplayOutput):
         its record cannot close under a read whose waiter was cancelled; with
         ``fence``, fail if that record no longer holds the session it held
         before the read."""
-        if connection not in self._connections:
+        if self._closed or connection not in self._connections:
             raise RuntimeError("connection is not connected")
         if use is None:
             return await self.run_blocking(callable)
@@ -1215,52 +1226,73 @@ class ConnectionRegistry(ReplayOutput):
         )
 
     def stop_admission(self) -> None:
-        """Refuse every later connection; server shutdown calls this first."""
+        """Freeze new peers, requests and ordinary publications, not finalizers."""
         self._closed = True
 
-    async def stop_workers(self) -> None:
-        """Stop registry-owned work without owning physical client lifetime."""
-        first: BaseException | None = None
-        self._closed = True
-        try:
-            self._unregister_child_run_sink()
-        except BaseException as exc:  # noqa: BLE001
-            first = exc
-        try:
-            await asyncio.to_thread(self.close_child_reader)
-        except BaseException as exc:  # noqa: BLE001
-            if first is None:
-                first = exc
+    async def stop_producers(self) -> None:
+        self._unregister_child_run_sink()
+
+    async def stop_reads(self) -> None:
+        """Abandon read results; transferred uses still track worker completion."""
         try:
             self.state_reader.close()
-        except BaseException as exc:  # noqa: BLE001
-            if first is None:
-                first = exc
-        try:
+        finally:
             self._reads.close()
-        except BaseException as exc:  # noqa: BLE001
-            if first is None:
-                first = exc
-        states = tuple(self._connections.values())
-        for state in states:
-            if state.output is not None:
-                try:
-                    self._settle_output(state.output)
-                except BaseException as exc:  # noqa: BLE001
-                    if first is None:
-                        first = exc
-        await asyncio.gather(
-            *(state.output.writer_task for state in states
-              if state.output is not None and state.output.writer_task is not None),
-            return_exceptions=True,
+
+    async def drain_record_events(self, record: SessionController) -> None:
+        """Settle replay output while its record is still readable."""
+        async def drain(client: Any) -> None:
+            try:
+                await self.flush(client)
+            finally:
+                self.invalidate_replay_connection(client)
+
+        clients = tuple(client for client in self.clients() if self.replay.controller_for(client) is record)
+        results = await asyncio.gather(*(drain(client) for client in clients), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def stop_workers(self, clients: tuple[Any, ...]) -> None:
+        """Drain the frozen peers without owning their physical lifetime."""
+        first: BaseException | None = None
+
+        async def attempt(operation: Awaitable[object]) -> None:
+            nonlocal first
+            try:
+                await operation
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
+
+        async def settle_output(client: Any) -> None:
+            if (state := self._connections.get(client)) is not None and state.output is not None:
+                self._settle_output(state.output)
+
+        await attempt(asyncio.to_thread(self.close_child_reader))
+        writers = tuple(
+            output.writer_task for client in clients
+            if (output := self.output_state(client)) is not None and output.writer_task is not None
         )
-        self._observers.clear()
+        for client in clients:
+            await attempt(settle_output(client))
+        await asyncio.gather(*writers, return_exceptions=True)
+        for writer in writers:
+            if not writer.cancelled():
+                await attempt(writer)
+        self.clear_replay_scopes()
         if first is not None:
             raise first
 
     async def aclose(self) -> None:
-        """Stop registry workers; physical clients unregister themselves."""
-        await self.stop_workers()
+        self.stop_admission()
+        try:
+            await self.stop_producers()
+        finally:
+            try:
+                await self.stop_reads()
+            finally:
+                await self.stop_workers(self.clients())
 
 
 def perform_child_history_read(

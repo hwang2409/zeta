@@ -171,6 +171,7 @@ class AccountOperations:
         self._legacy_controls = legacy_controls
         self._is_closing = is_closing
         self._lock = asyncio.Lock()
+        self._frozen = False
 
     @overload
     async def run(
@@ -190,6 +191,8 @@ class AccountOperations:
         operation: dict[str, object] | Callable[[], Awaitable[object]],
     ) -> object:
         async with self._lock:
+            if self._frozen:
+                raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "server is closing")
             if kind == "login_publication":
                 assert use is None and callable(operation)
                 # The arbiter decides on the loop and drains the worker on cancel.
@@ -228,6 +231,9 @@ class AccountOperations:
                 assert account is not None
                 return await self._finish(logout(use.runtime, account))
             return await self._finish(refresh(use.runtime))
+
+    def freeze(self) -> None:
+        self._frozen = True
 
     async def drain(self) -> None:
         async with self._lock:
