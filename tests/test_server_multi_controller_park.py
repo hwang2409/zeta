@@ -2,6 +2,7 @@
 refuses a busy session as legacy does, and is never a disconnect."""
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -20,8 +21,9 @@ from tests.support.replay_transport import (
 from tests.test_server_in_flight_replay import HOLD, GatedBackend
 from tests.test_server_mcp_bindings import LocalMCP, allow_local_http
 from tests.test_server_multi_controller_resume import _legacy_resident
-from zeta.protocol.types import TextContent, ToolCall
+from zeta.protocol.types import TextContent, ToolCall, ToolUseContent
 from zeta.server.control import ServeControl
+from zeta.server.delivery import DeliveryRequests
 
 PARK = ("multi_controller", "session_park", "resume_attach")
 RECONNECT = (*PARK, "approval_reconnect", "turn_reconnect")
@@ -249,3 +251,114 @@ async def test_unhealthy_parked_reopen_sends_closed(
         if owner is not None:
             await owner.close()
         await await_or_fail(server.close(), what="close park server")
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.parametrize("row", ("new_session", "resume_resident"))
+@pytest.mark.asyncio
+async def test_swap_refuses_pending_end_of_turn_step(
+    tmp_path: Path, transport: Transport, row: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without session_park a swap reserves the outgoing session as legacy
+    ``reserve_session_swap`` does: a turn's end step still running refuses it."""
+    entered, gate, left = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = DeliveryRequests.continue_after_turn
+
+    async def held_end_step(*args: Any, **kwargs: Any) -> None:
+        entered.set()
+        await await_or_fail(gate.wait(), what="end-of-turn gate")
+        await original(*args, **kwargs)
+        left.set()
+
+    backend = GatedBackend([NEXT, NEXT])
+    server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
+    await await_or_fail(server.start(), what="start swap server")
+    owner = None
+    try:
+        target = None
+        if row == "resume_resident":
+            target = await _legacy_resident(server, transport, monkeypatch=monkeypatch)
+        owner = await connect_replay(server, transport)
+        assert "result" in await negotiate(owner, replay=False, extra=("multi_controller", "served_turn_end"))
+        outgoing = (await owner.request(2, "new_session", SETTINGS))["result"]["session"]["session_id"]
+        # test-contract: seam the finished turn's end step is held open by the test
+        monkeypatch.setattr(DeliveryRequests, "continue_after_turn", held_end_step)
+        await _turn_end(owner, 3, outgoing)
+        await await_or_fail(entered.wait(), what="the end-of-turn step")
+        request: tuple[str, dict[str, Any]] = (
+            ("new_session", SETTINGS) if target is None else ("resume", {"session_id": target})
+        )
+
+        refused = await owner.request(4, *request)
+
+        assert refused.get("error", {}).get("code") == -32004, f"the swap cut the end-of-turn step: {refused.get('error')}"
+        gate.set()
+        await await_or_fail(left.wait(), what="the end-of-turn step ends")
+        await _turn_end(owner, 5, outgoing)
+    finally:
+        gate.set()
+        if owner is not None:
+            await owner.close()
+        await await_or_fail(server.close(), what="close swap server")
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_failed_idle_rebind_keeps_old_bindings(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allow_local_http(monkeypatch)
+    mcp = LocalMCP()
+    port = await mcp.start()
+    config = {"transport": "streamable-http", "url": f"http://127.0.0.1:{port}"}
+    (tmp_path / "mcp.json").write_text(json.dumps({"servers": {"page": config, "other": config}}))
+    def echo(call_id: str) -> ToolUseContent:
+        return ToolUseContent(ToolCall(call_id, "page__echo", {}))
+
+    backend = GatedBackend([
+        ([], [echo("call-1")]), NEXT,
+        ([TextContent("held"), HOLD], [TextContent("held"), echo("call-2")]), NEXT,
+    ])
+    server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
+    await await_or_fail(server.start(), what="start binding server")
+    client = None
+    try:
+        client = await connect_replay(server, transport)
+        features = ("multi_controller", "resume_attach", "new_session_settings", "session_mcp_bindings")
+        assert "result" in await negotiate(client, replay=False, extra=features)
+        old = {"server": "page", "headers": {"Authorization": "Bearer old"}}
+        created = await client.request(2, "new_session", {
+            **SETTINGS, "approval_mode": "allow", "mcp_bindings": [old],
+        })
+        session_id = created["result"]["session"]["session_id"]
+        await _turn_end(client, 3, session_id)
+        resident = server.controllers.resident(session_id)
+        assert resident is not None and resident.runtime.loop is not None
+
+        async def failed_rebind(*_args: object) -> None:
+            raise RuntimeError("rebind failed")
+
+        # test-contract: seam the loop's rebind fails on the real resume path
+        with monkeypatch.context() as patch:
+            patch.setattr(resident.runtime.loop, "rebind_mcp", failed_rebind)
+            new = {"server": "other", "headers": {"Authorization": "Bearer new"}}
+            failed = await client.request(4, "resume", {"session_id": session_id, "mcp_bindings": [new]})
+        assert "error" in failed, failed
+
+        assert "result" in await client.request(5, "send", {"text": "hold"})
+        await await_or_fail(backend.held[0].wait(), what="the held turn")
+        attached = await client.request(6, "resume", {"session_id": session_id, "mcp_bindings": [old]})
+
+        assert attached.get("result", {}).get("attached") == "live_turn", (
+            f"the failed rebind changed the session's MCP servers: {attached}"
+        )
+        backend.open_all()
+        await await_or_fail(client.event("agent_end", {"session_id": session_id}), what="held turn end")
+        calls = [header for method, header in zip(mcp.methods, mcp.headers, strict=False) if method == "tools/call"]
+        assert calls == ["Bearer old", "Bearer old"]
+    finally:
+        backend.open_all()
+        if client is not None:
+            await client.close()
+        await await_or_fail(server.close(), what="close binding server")
+        await mcp.close()

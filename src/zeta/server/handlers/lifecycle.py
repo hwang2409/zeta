@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -80,16 +81,15 @@ async def _session_swap(
     server = self.server
     outgoing = controller.control
     multi = server.controllers.controller_mode == "multi"
-    if multi and not park:
-        # as in legacy: without session_park a busy session is never left behind
-        await outgoing.require_idle()
-    if (not park and not multi) or (not outgoing.holds_work() and not multi):
+    if not multi and (not park or not outgoing.holds_work()):
         with outgoing.reserve_session_swap():
             server.connections.replay_session_replaced()
             yield None
         return
     # Keep the outgoing charge and incoming use across setup and rollback.
     with (
+        # as in legacy: without session_park a busy session is never left behind
+        outgoing.reserve_session_swap() if not park else contextlib.nullcontext(),
         server.controllers.reserve_park(self),
         (server.new_pair(controller, connection=self) if multi else server.new_pair()) as reservation,
     ):
@@ -315,9 +315,12 @@ async def _resume_resident(
     target_use = None
     resident_claimed = False
     try:
-        if "session_park" not in self.features and resident.control is not controller.control:
-            await controller.control.require_idle()
-        with self.server.controllers.reserve_park(self, target=resident):
+        with (
+            controller.control.reserve_session_swap()
+            if "session_park" not in self.features and resident.control is not controller.control
+            else contextlib.nullcontext(),
+            self.server.controllers.reserve_park(self, target=resident),
+        ):
             acquisition = self.server.controllers.reserve_existing(self, session_id)
             target_use = self.server.controllers.use_acquisition(acquisition)
             if acquisition.previous is not acquisition.target:
@@ -532,6 +535,7 @@ async def _attach_live_turn(
     bindings are re-supplied."""
     control = (parked or controller).control
     reattach = None
+    servers = (control._mcp_binding_servers, control._mcp_binding_required)
     if bindings is not None:
         headers, configs = bindings
         # an idle session takes new bindings, as a reopen does
@@ -578,6 +582,8 @@ async def _attach_live_turn(
             return {"session": session_snapshot(self, controller), "attached": "live_turn"}
         except BaseException:
             control._active_host_commands, control._host_binding_required = previous
+            # a failed rebind leaves the old bindings active, so the old server set stays
+            control._mcp_binding_servers, control._mcp_binding_required = servers
             raise
 
 
