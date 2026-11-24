@@ -168,9 +168,13 @@ reopen does; while it holds work, the rules of attaching to a live turn apply.
 A session swap (`new_session`, or `resume` of another session) is not a
 disconnect. With `session_park`, a session that holds work parks as in legacy
 mode; its approvals, turn, MCP bindings, and host commands stay as they are, and
-no reconnect deadline runs while the controller stays connected. Without
+no reconnect deadline runs while the controller stays connected. A session whose
+approval storage failed, or one of the session id being resumed, closes instead
+(its turn ends with reason `disconnect`); it never parks. Without
 `session_park`, the swap returns `-32004` while the attached session has a busy
-turn, and that turn keeps running. A session that holds no work closes.
+turn, and that turn keeps running. Otherwise the session closes, as a legacy
+swap replaces it in place: its background children and background tasks stop,
+and a pending approval of a child is terminated.
 
 The limits are fixed, not settings:
 
@@ -181,9 +185,11 @@ The limits are fixed, not settings:
 - Eight pending or active observer subscriptions per session, including child
   streams for that session: the ninth join gets `-32001` and the connection
   stays open. An observer with no subscription does not count toward a session.
-- Three parked or closing sessions per connection: an operation that would park
-  a fourth gets `-32004` with `data.reason: "parked_limit"`. Its `data.parked`
-  list contains only sessions charged to that connection.
+- Three parked or closing sessions per connection: only a swap that parks the
+  outgoing session counts; one that parks a fourth gets `-32004` with
+  `data.reason: "parked_limit"`. A swap that closes the outgoing session, or
+  switches to one of the connection's parked sessions, never gets this error.
+  Its `data.parked` list contains only sessions charged to that connection.
 - 32 physical connections across all transports, including connections that
   have not sent `hello`. This replaces the previous limit of 10 for all clients;
   legacy role limits and refusal behavior are unchanged. The 33rd connection
@@ -515,6 +521,9 @@ Params: optional `provider` and `model`, both non-empty strings. The result has
 `session`, containing the session metadata shape above. Settings provide
 defaults when either field is absent. With `session_park`, a busy attached
 session is parked instead of refused (see "parking a busy session").
+Without `session_park`, a swap (`new_session`, or `resume` of another session)
+closes the attached session when no turn is busy: its background children and
+background tasks stop, and a pending approval of a child is terminated.
 
 With the `session_cwd` feature, optional `cwd` selects the session working
 directory. It must be an absolute path to an existing directory; the server
@@ -720,12 +729,13 @@ the swap is the same as without the feature.
 - A parked session closes when it no longer holds work. A parked approval has
   no deadline while the controller stays connected. `resume` of a session that
   is closing waits for the close to end, then opens the session from disk.
-- At most 3 sessions per connection can be parked or closing at a time. A swap
-  that would park
-  one more returns `-32004` with
+- At most 3 sessions per connection can be parked or closing at a time. Only a
+  swap that parks the outgoing session counts: one that would park one more
+  returns `-32004` with
   `data: {"reason": "parked_limit", "parked": [session ids]}`, listing the
-  parked and closing sessions. `resume` of a parked session never returns this
-  error, because it swaps one session for one.
+  parked and closing sessions. A swap that closes an idle outgoing session never
+  returns this error, and neither does `resume` of a parked session, because it
+  swaps one session for one.
 - `status.parked_sessions` lists the parked sessions (see `status`). In
   multi-controller mode, rows and events are visible only to the owning
   connection. A disconnect preserves grace per parked session; see
