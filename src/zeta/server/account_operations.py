@@ -21,10 +21,12 @@ class AccountOperations:
         records: Callable[[], tuple[SessionController, ...]],
         is_multi: Callable[[], bool],
         legacy_controls: Callable[[], Iterator[ServeControl]],
+        is_closing: Callable[[ServeControl], bool],
     ) -> None:
         self._records = records
         self._is_multi = is_multi
         self._legacy_controls = legacy_controls
+        self._is_closing = is_closing
         self._lock = asyncio.Lock()
 
     @overload
@@ -116,11 +118,10 @@ class AccountOperations:
             or (context is not None and context.snapshot().get(account.provider) == account)
         )
 
-    @staticmethod
-    def _require_stable(record: SessionController) -> None:
+    def _require_stable(self, record: SessionController) -> None:
         control = record.control
         if (
-            record.closing or control.account_snapshot_transition()
+            self._is_closing(control) or control.account_snapshot_transition()
             or control.state_change_busy() or control.holds_work()
         ):
             raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")

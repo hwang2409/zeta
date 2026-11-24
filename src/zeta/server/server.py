@@ -349,6 +349,7 @@ class ZetaServer:
             self.controllers.records,
             lambda: self.controllers.controller_mode == "multi",
             self.controls,
+            self.controllers.is_closing,
         )
         self._borrowed_source = (control.event_source(runtime.session_id if runtime.opened is not None else None)
                                  if foreground_event_publisher is not None else None)

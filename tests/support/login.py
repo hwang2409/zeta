@@ -20,7 +20,8 @@ def isolated_logins(home: Path):
     from zeta.server.account_operations import AccountOperations
     from zeta.server.login import Logins
 
-    return Logins(home, account_operations=AccountOperations(tuple, lambda: False, lambda: iter(())))
+    owner = AccountOperations(tuple, lambda: False, lambda: iter(()), lambda _control: False)
+    return Logins(home, account_operations=owner)
 
 
 def reject_provider_token_exchange(
