@@ -289,6 +289,10 @@ class ThreadCallWorkers:
         for call in queued:
             self._complete(call)
 
+    async def aclose(self) -> None:
+        self.close()
+        await asyncio.gather(*tuple(self._calls.values()))
+
     def _result_done(self, call: _OwnedCall[Any], result: asyncio.Future[Any]) -> None:
         if not result.cancelled():
             return

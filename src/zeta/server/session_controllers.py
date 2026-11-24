@@ -43,6 +43,12 @@ class SessionAcquisition:
 
 
 @dataclass(slots=True, eq=False)
+class _MultiGrace:
+    session_id: str
+    idle_deadline: asyncio.Task[None] | None = None
+
+
+@dataclass(slots=True, eq=False)
 class SessionController:
     """The persistent runtime/control pair for one resident session. Only
     ``SessionControllers`` changes ``uses`` and the close state."""
@@ -72,18 +78,20 @@ class SessionUse:
     or the completion it was handed to settles. A close of the record waits
     until it holds no use."""
 
-    __slots__ = ("_owner", "_state", "acquisition", "generation", "record")
+    __slots__ = ("_owner", "_state", "acquisition", "generation", "record", "setup")
 
     def __init__(
         self,
         owner: SessionControllers,
         record: SessionController,
         acquisition: SessionAcquisition | None = None,
+        *, setup: bool = False,
     ) -> None:
         self._owner = owner
         self._state: Literal["held", "transferred", "released"] = "held"
         self.record = record
         self.acquisition = acquisition
+        self.setup = setup
         self.generation = record.generation
 
     @property
@@ -139,7 +147,11 @@ class SessionControllers:
     def __init__(
         self, control: ServeControl, *, owns_runtime: bool = True,
         retention_owner: RetentionActivationOwner | None = None,
+        drain_events: Callable[[SessionController], Awaitable[None]] | None = None,
     ) -> None:
+        self._frozen = False
+        self._record_drain = asyncio.Event()
+        self._drain_events = drain_events
         self._retention_owner = retention_owner
         self._generations = itertools.count(1)
         self._records: dict[ServeControl, SessionController] = {
@@ -159,14 +171,20 @@ class SessionControllers:
         self._hello_records: dict[Any, SessionController] = {}
         self._hello_generations = itertools.count(1)
         self._legacy_grace = False
-        # Only admission identity: ServeControl owns the grace work and deadline.
-        self._multi_graces: dict[SessionController, tuple[str, int]] = {}
+        self._multi_graces: dict[SessionController, _MultiGrace] = {}
         # close waiters per record, woken when its last use settles
         self._drains: dict[SessionController, list[asyncio.Future[None]]] = {}
 
     @property
     def controller_mode(self) -> Literal["empty", "legacy", "multi"]:
         return self._controller_mode
+
+    def freeze(self) -> None:
+        self._frozen = True
+
+    def _require_open(self) -> None:
+        if self._frozen:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
 
     def admit_hello(
         self,
@@ -176,6 +194,7 @@ class SessionControllers:
         reconnect_session_id: str | None = None,
     ) -> HelloAdmission:
         """Reserve process controller mode before claiming the physical socket."""
+        self._require_open()
         requested: Literal["legacy", "multi"] = "multi" if negotiated_multi else "legacy"
         if self._controller_mode == "empty":
             self._controller_mode = requested
@@ -186,8 +205,8 @@ class SessionControllers:
                     "another client is already connected",
                 )
             if requested == "multi" and not any(
-                not record.closing and session_id == reconnect_session_id
-                for record, (session_id, _) in self._multi_graces.items()
+                not record.closing and grace.session_id == reconnect_session_id
+                for record, grace in self._multi_graces.items()
             ):
                 raise ProtocolError(
                     ErrorDescriptor.CONNECTION_CAPACITY,
@@ -217,6 +236,7 @@ class SessionControllers:
         self._controller_mode = "empty"
 
     def commit_hello(self, admission: HelloAdmission) -> None:
+        self._require_open()
         if self._controller_members.get(admission.connection) != admission.generation:
             raise RuntimeError("hello admission is no longer current")
 
@@ -249,26 +269,48 @@ class SessionControllers:
         record = self.controller_for(connection)
         if record is None or record.closing:
             return None
-        release = record.control.begin_controller_release(reconnect=reconnect, keep_turn=keep_turn)
-        generation = self._controller_members[connection]
-        if record.runtime.opened is not None and (
+        release = record.control.begin_controller_release(
+            reconnect=reconnect and not self._frozen, keep_turn=keep_turn,
+        )
+        if not self._frozen and record.runtime.opened is not None and (
             self._by_connection.get(connection) is record or record in self._multi_graces
         ):
-            grace = (record.runtime.session_id, generation)
+            self._clear_grace(record)
+            grace = _MultiGrace(record.runtime.session_id)
             self._multi_graces[record] = grace
             work = record.control.reconnect_grace_task
-            if work is not None:
-                work.add_done_callback(lambda done: self._expire_multi_grace(record, grace, done))
+            idle = work is None
+            if idle:
+                work = release
+                if record.control.server.approval_reconnect_grace != 0:
+                    async def idle_deadline() -> None:
+                        await record.control._grace_deadline()
+                        await asyncio.wait((release,))
+
+                    work = grace.idle_deadline = asyncio.create_task(idle_deadline())
+            assert work is not None
+            work.add_done_callback(
+                lambda done: self._expire_multi_grace(record, grace, done, idle=idle)
+            )
         return release
 
-    def _expire_multi_grace(
-        self, record: SessionController, grace: tuple[str, int], work: asyncio.Task[None]
-    ) -> None:
-        # A claim cancels work before its hello commits. Only commit consumes
-        # that marker; a closing record keeps its charge until close settles.
-        if not work.cancelled() and not record.closing and self._multi_graces.get(record) == grace:
-            del self._multi_graces[record]
+    def _clear_grace(self, record: SessionController) -> None:
+        grace = self._multi_graces.pop(record, None)
+        if grace is not None:
             self._refresh_controller_mode()
+            if grace.idle_deadline is not None:
+                grace.idle_deadline.cancel()
+
+    def _expire_multi_grace(
+        self, record: SessionController, grace: _MultiGrace, work: asyncio.Task[None], *, idle: bool
+    ) -> None:
+        if (work.cancelled() or self._frozen or record.closing
+                or self._multi_graces.get(record) is not grace):
+            return
+        if idle:
+            self.retire(record)
+        else:
+            self._clear_grace(record)
 
     def release_connection(self, connection: Any, reason: str = "eof") -> None:
         del reason
@@ -276,7 +318,7 @@ class SessionControllers:
         generation = self._controller_members.pop(connection, None)
         if generation is not None:
             self._by_connection.pop(connection, None)
-            if self._controller_mode == "legacy":
+            if not self._frozen and self._controller_mode == "legacy":
                 self._legacy_grace = True
         self._refresh_controller_mode()
 
@@ -315,6 +357,7 @@ class SessionControllers:
     def register(self, make_control: Callable[[], ServeControl]) -> SessionUse:
         """A new generation for ``control``, reserved by the returned use until
         its setup ends."""
+        self._require_open()
         if self._controller_mode == "multi" and len(self._records) >= MAX_RESIDENT_RECORDS:
             raise ProtocolError(
                 ErrorDescriptor.OPERATION_BUSY, "too many resident sessions",
@@ -323,17 +366,18 @@ class SessionControllers:
         control = make_control()
         record = SessionController(control, next(self._generations))
         self._records[control] = record
-        return self._use(record)
+        return self._use(record, setup=True)
 
     def attached(self) -> SessionController:
         return self._attached
 
     def owned(self, connection: Any, session_id: str | None = None) -> SessionUse:
         """A use of the persistent record controlled by ``connection``."""
+        self._require_open()
         if session_id is not None:
             acquisition = self.reserve_existing(connection, session_id)
             self._hello_records[connection] = acquisition.target
-            return self._use(acquisition.target, acquisition)
+            return self._use(acquisition.target, acquisition, setup=True)
         record = self._by_connection.get(connection, self._attached)
         if self._controller_mode == "multi" and connection not in self._by_connection:
             self._hello_records[connection] = record
@@ -352,6 +396,7 @@ class SessionControllers:
 
         ``unattached_error`` replaces the absence error while no session is
         attached, for an operation whose legacy wire text differs."""
+        self._require_open()
         current = self._by_connection.get(connection, self._attached)
         attached = current.runtime
         if (
@@ -379,6 +424,8 @@ class SessionControllers:
 
     def resident(self, session_id: str) -> SessionController | None:
         """Return the live record for ``session_id`` without changing ownership."""
+        if self._frozen:
+            return None
         owner = self._by_session.get(session_id)
         if isinstance(owner, SessionAcquisition):
             return owner.target
@@ -405,6 +452,7 @@ class SessionControllers:
         self, connection: Any, session_id: str, candidate: SessionController
     ) -> SessionAcquisition:
         """Reserve a session synchronously, before opening its runtime."""
+        self._require_open()
         existing = self._by_session.get(session_id)
         target = existing.target if isinstance(existing, SessionAcquisition) else existing
         holder = next((
@@ -427,16 +475,18 @@ class SessionControllers:
 
     def use_acquisition(self, acquisition: SessionAcquisition) -> SessionUse:
         """Hold the exact target reserved by ``acquisition`` during setup."""
+        self._require_open()
         if self._by_session.get(acquisition.session_id) is not acquisition:
             raise RuntimeError("session acquisition is no longer current")
         return self._use(acquisition.target)
 
     def commit_session(self, acquisition: SessionAcquisition) -> SessionUse:
+        self._require_open()
         if self._by_session.get(acquisition.session_id) is not acquisition:
             raise RuntimeError("session acquisition is no longer current")
         self._by_session[acquisition.session_id] = acquisition.target
         self._by_connection[acquisition.connection] = acquisition.target
-        self._multi_graces.pop(acquisition.target, None)
+        self._clear_grace(acquisition.target)
         self._hello_records.pop(acquisition.connection, None)
         if acquisition.target.runtime.opened is not None:
             self.unpark(acquisition.target)
@@ -459,6 +509,7 @@ class SessionControllers:
             self._retention_owner.set_publish(self._attached.runtime.retention_event_sink)
 
     def attach(self, record: SessionController) -> SessionController:
+        self._require_open()
         assert not record.closing
         self._parked.pop(record.runtime.session_id, None)
         self._attached = record
@@ -481,6 +532,7 @@ class SessionControllers:
     def reserve_park(
         self, connection: object, *, target: SessionController | None = None
     ) -> Iterator[None]:
+        self._require_open()
         record = self._by_connection.get(connection)
         if self._controller_mode != "multi" or record is None or record is target:
             yield
@@ -504,12 +556,14 @@ class SessionControllers:
         )
 
     def park(self, record: SessionController, connection: object | None = None) -> SessionController:
+        self._require_open()
         assert not record.closing
         record.parked_by = connection
         self._parked[record.runtime.session_id] = record
         return record
 
     def unpark(self, record: SessionController) -> SessionController | None:
+        self._require_open()
         session_id = record.runtime.session_id
         if self._parked.get(session_id) is not record:
             return None
@@ -540,65 +594,56 @@ class SessionControllers:
     def retire(
         self, record: SessionController, settlement_timeout: float | None = None
     ) -> asyncio.Task[None]:
-        """The one close of a resident record; a second call returns the same
-        close. Resolution stops now; the control closes, then the runtime, only
-        once no use holds the record; approval settlement is verified last;
-        only then does the record leave ``records()``. A failed close is
-        logged, since nobody need await it."""
-        return self._begin_close(record, settlement_timeout, None)
-
-    def _begin_close(
-        self,
-        record: SessionController,
-        settlement_timeout: float | None,
-        before_runtime_close: Callable[[], Awaitable[None]] | None,
-        *,
-        report: bool = True,
-    ) -> asyncio.Task[None]:
+        """Reject resolution now and finish the record once its work settles."""
         if record.close_task is not None:
             return record.close_task
         assert self._records.get(record.control) is record, "retire of a foreign record"
         runtime = record.runtime
         record.closing = True
         record.closing_session_id = runtime.session_id if runtime.opened is not None else None
-        # by identity: a record whose setup failed has no session id
         self._parked = {key: item for key, item in self._parked.items() if item is not record}
-        task = asyncio.create_task(
-            self._close(record, settlement_timeout, before_runtime_close)
-        )
-        if report:
+        task = asyncio.create_task(self._close(record, settlement_timeout))
+        if not self._frozen:
             task.add_done_callback(lambda done: _report_close(done, record.closing_session_id))
         record.close_task = task
         return task
 
-    async def _close(
-        self,
-        record: SessionController,
-        settlement_timeout: float | None,
-        before_runtime_close: Callable[[], Awaitable[None]] | None,
-    ) -> None:
+    async def _close(self, record: SessionController, settlement_timeout: float | None) -> None:
+        first: BaseException | None = None
+
+        async def attempt(operation: Awaitable[object]) -> None:
+            nonlocal first
+            try:
+                await operation
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
+
         control = record.control
         try:
-            try:
-                await self._drained(record)
-                await control.close()
-            finally:
-                try:
-                    try:
-                        if before_runtime_close is not None:
-                            await before_runtime_close()
-                    finally:
-                        if record.owns_runtime:
-                            await record.runtime.close()
-                finally:
-                    await control.wait_for_approval_settlement(settlement_timeout)
+            if self._frozen:
+                await self._record_drain.wait()
+            await self._drained(record)
+            await attempt(control.close())
+            await attempt(control.wait_for_approval_settlement(settlement_timeout))
+            if self._frozen:
+                await self._record_drain.wait()
+            if self._drain_events is not None and (self._frozen or self._controller_mode == "multi"):
+                await attempt(self._drain_events(record))
+            grace = self._multi_graces.get(record)
+            if grace is not None and grace.idle_deadline is not None:
+                grace.idle_deadline.cancel()
+                await attempt(asyncio.gather(grace.idle_deadline, return_exceptions=True))
+            if record.owns_runtime:
+                await attempt(record.runtime.close())
+            if first is not None:
+                raise first
         finally:
             del self._records[control]
-            if self._multi_graces.pop(record, None) is not None:
-                self._refresh_controller_mode()
+            self._clear_grace(record)
             record.parked_by = None
             for session_id, owner in tuple(self._by_session.items()):
-                if owner is record:
+                if owner is record or isinstance(owner, SessionAcquisition) and owner.target is record:
                     del self._by_session[session_id]
             for connection, owner in tuple(self._by_connection.items()):
                 if owner is record:
@@ -613,52 +658,28 @@ class SessionControllers:
                 await asyncio.shield(record.close_task)
 
     async def close(
-        self,
-        settlement_timeout: float | None,
-        before_attached_runtime_close: Callable[[], Awaitable[None]],
+        self, records: tuple[SessionController, ...], settlement_timeout: float | None
     ) -> None:
-        """Server shutdown: close every resident record and wait for every close.
-        ``before_attached_runtime_close`` runs just before the attached record's
-        runtime would close (owned or not), and that close's error propagates;
-        the others are logged by their close. A cancel of the shutdown does not
-        cancel a close."""
-        committed = {
-            *self._parked.values(),
-            *self._by_connection.values(),
-            *self._multi_graces,
-            *(record for record in self._records.values() if not record.uses),
-        }
-        for record in committed:
-            if record is not self._attached:
-                self.retire(record, settlement_timeout)
-        done = self._attached.close_task
-        if done is not None and done.done():
-            # a repeated shutdown: the first one already reported this close
-            await asyncio.gather(
-                *(record.close_task for record in self._records.values() if record.close_task),
-                return_exceptions=True,
-            )
-            return
-        # its close error reaches the caller, so it is not logged as well
-        attached = self._begin_close(
-            self._attached, settlement_timeout, before_attached_runtime_close, report=False
+        """Drain the frozen generations in snapshot order, including active retires."""
+        self._record_drain.set()
+        results = await asyncio.gather(
+            *(self.retire(record, settlement_timeout) for record in records),
+            return_exceptions=True,
         )
-        others = [
-            record.close_task
-            for record in self._records.values()
-            if record.close_task is not None and record.close_task is not attached
-        ]
-        try:
-            await asyncio.shield(attached)
-        finally:
-            await asyncio.gather(*others, return_exceptions=True)
+        self._controller_members.clear()
+        self._hello_records.clear()
+        self._legacy_grace = False
+        self._refresh_controller_mode()
+        for record, result in zip(records, results, strict=True):
+            if isinstance(result, BaseException):
+                # gather fabricates a CancelledError; result() preserves the original.
+                assert record.close_task is not None
+                record.close_task.result()
 
     async def _drained(self, record: SessionController) -> None:
-        """Wait until no use of ``record`` is held by a completion. A use its
-        request still holds does not delay the close: that request may wait on
-        the registry close that follows, and its finalizer work, if any, already
-        owns a transferred use."""
-        while self._transferred(record):
+        # An ordinary request may be waiting on a close. Only setup and work
+        # transferred to a completion can still use a record after cancellation.
+        while self._holds_work(record):
             waiter = asyncio.get_running_loop().create_future()
             self._drains.setdefault(record, []).append(waiter)
             await waiter
@@ -667,22 +688,23 @@ class SessionControllers:
         self,
         record: SessionController,
         acquisition: SessionAcquisition | None = None,
+        *, setup: bool = False,
     ) -> SessionUse:
-        use = SessionUse(self, record, acquisition)
+        use = SessionUse(self, record, acquisition, setup=setup)
         record.uses.add(use)
         return use
 
     def _settle(self, use: SessionUse) -> None:
         record = use.record
         record.uses.discard(use)
-        if not self._transferred(record):
+        if not self._holds_work(record):
             for waiter in self._drains.pop(record, ()):
                 if not waiter.done():
                     waiter.set_result(None)
 
     @staticmethod
-    def _transferred(record: SessionController) -> bool:
-        return any(use._state == "transferred" for use in record.uses)
+    def _holds_work(record: SessionController) -> bool:
+        return any(use.setup or use._state == "transferred" for use in record.uses)
 
     def require_current(
         self, connection: Any, use: SessionUse, session_id: str | None
@@ -692,7 +714,7 @@ class SessionControllers:
         del connection
         record = use.record
         runtime = record.runtime
-        if record.closing or record not in self._records.values() or record.generation != use.generation or (
+        if self._frozen or record.closing or record not in self._records.values() or record.generation != use.generation or (
             session_id is not None
             and (runtime.opened is None or runtime.session_id != session_id)
         ):

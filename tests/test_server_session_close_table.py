@@ -553,6 +553,29 @@ async def success(run: Run) -> None:
     await run.finish()
 
 
+async def approval_settlement_before_runtime_close(run: Run) -> None:
+    server = await run.serve()
+    client = await run.open()
+    await run.new(client)
+    record = server.controllers.attached()
+    run.watch("a", record)
+    original_wait = record.control.wait_for_approval_settlement
+
+    async def held_settlement(*args: Any) -> None:
+        await run.hold()
+        await original_wait(*args)
+
+    # test-contract: hold the settlement drain at the control/runtime seam.
+    run.monkeypatch.setattr(record.control, "wait_for_approval_settlement", held_settlement)
+    closing = asyncio.create_task(server.close())
+    try:
+        await run.hold.wait_entered()
+        assert run.closes == [("a", "control", False)], "runtime closed before approval settlement drained"
+    finally:
+        run.hold.opened.set()
+        await await_or_fail(closing, what="close after approval settlement")
+
+
 ROWS: dict[str, Callable[[Run], Awaitable[None]]] = {
     "success": success,
     "delivery_after_commit": delivery_after_commit,
@@ -560,6 +583,7 @@ ROWS: dict[str, Callable[[Run], Awaitable[None]]] = {
     "delivery_duplicate": delivery_duplicate,
     "delivery_restart": delivery_restart,
     "approval_after_decision": approval_after_decision,
+    "approval_settlement_before_runtime_close": approval_settlement_before_runtime_close,
     "approval_publication_fails": approval_publication_fails,
     "approval_duplicate": approval_duplicate,
     "setup_failure_stays_reserved": setup_failure_stays_reserved,

@@ -731,9 +731,9 @@ class ServeControl:
             connections.release_deferred_replay(session_id, close=True)
 
     async def _run_blocking(self, job: Callable[[], object]) -> object:
-        if self.server.controllers.is_closing(self):
-            return await asyncio.to_thread(job)
         registry = self.server.connections
+        if self.server.controllers.is_closing(self) or (registry is not None and registry.frozen):
+            return await asyncio.to_thread(job)
         if registry is None:
             raise RuntimeError("serve control worker is unavailable")
         return await registry.run_blocking(job)
@@ -1362,7 +1362,11 @@ class ServeControl:
     ) -> object:
         if not self.attached:
             self._maybe_idle()  # a parked approval can change the summary without a live frame
-        return self.server.publish_session_event(self.event_source(session_id), event, **fields)
+        return self.server.publish_session_event(
+            self.event_source(session_id), event, finalizer=event in {
+                EventDescriptor.APPROVAL_END, EventDescriptor.TOOL_END,
+            }, **fields,
+        )
 
     async def _notify(
         self, event: EventDescriptor, session_id: str | None = None, *, admitted: bool = False,

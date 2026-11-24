@@ -11,7 +11,15 @@ from typing import TYPE_CHECKING, Any
 from .. import event_contract
 from ..handlers import lifecycle, validation
 from ..handlers.history import replay_history
-from ..protocol import EVENT_ACCESS, Access, EventDescriptor, FrameCodec, _Frame
+from ..protocol import (
+    EVENT_ACCESS,
+    Access,
+    ErrorDescriptor,
+    EventDescriptor,
+    FrameCodec,
+    ProtocolError,
+    _Frame,
+)
 from . import (
     DROP,
     EVICT,
@@ -201,6 +209,8 @@ class ReplayOutput:
     ) -> None:
         """Begin a join on ``controller``, the use the request selected; the
         stream keeps its record, not the use."""
+        if self.frozen:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         if scope.kind == "child":
             store = self.child_runs.live_store(scope.value)
         else:
@@ -336,6 +346,10 @@ class ReplayOutput:
             connection, EventDescriptor.REPLAY_STREAM_ENDED, ended.scope.value,
             stream_id=ended.stream_id, reason=reason,
         )
+
+    def clear_replay_scopes(self) -> None:
+        for scope in self.replay.scopes():
+            self.replay.invalidate_scope(scope, keep_deferred=False)
 
     def replay_session_replaced(self) -> None:
         for scope in self.replay.scopes():
