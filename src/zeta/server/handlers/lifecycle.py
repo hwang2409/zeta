@@ -80,6 +80,9 @@ async def _session_swap(
     server = self.server
     outgoing = controller.control
     multi = server.controllers.controller_mode == "multi"
+    if multi and not park:
+        # as in legacy: without session_park a busy session is never left behind
+        await outgoing.require_idle()
     if (not park and not multi) or (not outgoing.holds_work() and not multi):
         with outgoing.reserve_session_swap():
             server.connections.replay_session_replaced()
@@ -150,6 +153,10 @@ async def _release_previous(
 ) -> None:
     previous = acquisition.previous
     if previous is None or previous is acquisition.target:
+        return
+    if "session_park" in self.features and previous.control.holds_work():
+        # a swap is not a disconnect: park as legacy attach does; grace starts at disconnect
+        self.server.parking.leave(previous, self)
         return
     try:
         cancelled = await _settle_controller_release(self, previous.control)
@@ -286,6 +293,8 @@ async def _multi_resident(
         return None
     if resident.control.unhealthy():
         if resident.control is not controller.control and controllers.owner_of(resident) in (None, self):
+            # a parked one also gets its closed row, as on the legacy path
+            self.server.parking.close(resident.control)
             await asyncio.shield(controllers.retire_for_reopen(resident))
         return None
     if "resume_attach" not in self.features and resident.control.state_change_busy():
@@ -306,6 +315,8 @@ async def _resume_resident(
     target_use = None
     resident_claimed = False
     try:
+        if "session_park" not in self.features and resident.control is not controller.control:
+            await controller.control.require_idle()
         with self.server.controllers.reserve_park(self, target=resident):
             acquisition = self.server.controllers.reserve_existing(self, session_id)
             target_use = self.server.controllers.use_acquisition(acquisition)
@@ -523,7 +534,12 @@ async def _attach_live_turn(
     reattach = None
     if bindings is not None:
         headers, configs = bindings
-        if (
+        # an idle session takes new bindings, as a reopen does
+        idle = not control.holds_work()
+        if idle:
+            control._mcp_binding_servers = frozenset(headers)
+            control._mcp_binding_required = bool(headers)
+        elif (
             not control._mcp_binding_required
             or frozenset(headers) != control._mcp_binding_servers
         ):
@@ -531,7 +547,7 @@ async def _attach_live_turn(
                 ErrorDescriptor.INVALID_PARAMS,
                 "mcp_bindings must match the active session",
             )
-        if not control._active_mcp_bindings:
+        if not control._active_mcp_bindings or (idle and control._active_mcp_bindings != headers):
             reattach = (headers, configs)
         elif control._active_mcp_bindings != headers:
             # A running tool call may hold the current headers; swap them only when idle.

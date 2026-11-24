@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from tests.support.replay_transport import (
     ReplayClient,
@@ -871,7 +872,8 @@ async def test_multi_parking_is_connection_local(
     "row",
     (
         "live_owner_refusal",
-        "disconnected_resume",
+        "disconnected_exact_attach_reclaim",
+        "disconnected_plain_resume",
         "parked_resume",
         "resident_setup_failure",
         "resident_setup_cancel",
@@ -885,7 +887,10 @@ async def test_public_multi_controller_owner_state_table(
     row: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    server = replay_server(tmp_path, transport, _backend_factory)
+    def backend_factory(_provider: str, model: str | None, _home: Path) -> tuple[FakeBackend, str]:
+        return FakeBackend([ScriptedTurn([TextContent("ok")])]), model or "offline"
+
+    server = replay_server(tmp_path, transport, backend_factory)
     await server.start()
     owner = await connect_replay(server, transport)
     survivor = await connect_replay(server, transport)
@@ -912,7 +917,18 @@ async def test_public_multi_controller_owner_state_table(
             return
         await owner.close()
 
-        if row == "disconnected_resume":
+        if row == "disconnected_plain_resume":
+            # only the exact id with resume_attach (or an exact hello) reclaims a grace session
+            newcomer = await connect_replay(server, transport)
+            assert "result" in await negotiate(newcomer, replay=False, extra=("multi_controller",))
+            plain = await newcomer.request(2, "resume", {"session_id": target_id})
+            prefix = await survivor.request(3, "resume", {"session_id": target_id[:8]})
+            for refused in (plain, prefix):
+                assert refused.get("error", {}).get("code") == -32014, refused
+            assert "result" in await survivor.request(4, "send", {"text": "still mine"})
+            end = await await_or_fail(survivor.event("turn_end", {"session_id": old_id}), what="turn end")
+            assert end["session_id"] == old_id
+        elif row == "disconnected_exact_attach_reclaim":
             resumed = await survivor.request(3, "resume", {"session_id": target_id})
             status = await survivor.request(4, "status", {})
             assert "result" in resumed, resumed
