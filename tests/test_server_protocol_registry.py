@@ -178,7 +178,6 @@ def test_request_ownership_is_exhaustive() -> None:
     for path, tree in sources.items():
         scan(tree, path)
     assert sorted(accesses["attached"]) == sorted([
-        ("server.py", "ZetaServer.__init__"),  # retention startup eligibility
         ("server.py", "ZetaServer.controls"),  # legacy attached + parked iteration
         ("server.py", "ZetaServer.new_pair"),  # legacy path without an explicit source
         ("server.py", "ZetaServer.attach"),  # legacy attached/parked swap
