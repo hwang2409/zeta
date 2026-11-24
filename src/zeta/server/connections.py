@@ -979,7 +979,8 @@ class ConnectionRegistry(ReplayOutput):
         # Close admission before joining the writer, and don't let it wait again.
         output.phase = "closed"
         self._clear_output(output, result=False)
-        if output.writer_task is not None:
+        # an overflow close runs inside the writer; it returns on the closed phase
+        if output.writer_task is not None and output.writer_task is not asyncio.current_task():
             output.writer_task.cancel()
         self._cancel_overflow_deadline(output)
         self._finish_future(output.ready, False)
