@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from tests.support.owned import await_or_fail
+from tests.support.replay_transport import replay_server
 from tests.support.server_client import event, frames_until_event, read, send
 from tests.test_server import _connect
 from tests.test_server_in_flight_replay import HOLD, GatedBackend, _server
@@ -180,10 +181,10 @@ async def test_parked_approval_is_read_from_join_after_resume(tmp_path: Path) ->
         ([TextContent("beta")], [TextContent("beta")]),
         ([TextContent("written")], [TextContent("written")]),
     ])
-    server = _server(tmp_path, backend)
+    server = replay_server(tmp_path, "unix", lambda *_: (backend, "offline"))
     client = None
     try:
-        client = await _open(server, FEATURES)
+        client = await _open(server, [*FEATURES, "state_read_v1"])
         a = await client.new(mode="ask")
         await client.call("send", {"text": "write"})
         await await_or_fail(backend.held[0].wait(), what="A mid-reply")
@@ -205,6 +206,9 @@ async def test_parked_approval_is_read_from_join_after_resume(tmp_path: Path) ->
             for frame in seen
             if frame.get("params", {}).get("event") == "parked_session_changed"
         ]
+
+        rows = (await client.call("state_sessions"))["items"]
+        assert {row["session_id"]: row["status"] for row in rows} == {a: "approval", b: "idle"}
 
         resume = await client.frames("resume", {"session_id": a})
         seen += resume

@@ -339,6 +339,7 @@ class ZetaServer:
         control = ServeControl(self, runtime, self.foreground_event_publisher)
         # every pair shares this manager; sessionless reads use it with no record
         self.manager = runtime.manager
+        self.projects: ProjectRequests | None = None
         self.controllers = SessionControllers(
             control, owns_runtime=not self._borrowed, retention_owner=self._retention_owner,
         )
@@ -381,7 +382,13 @@ class ZetaServer:
         return incoming
 
     async def require_all_idle(self) -> None:
-        for control in self.controls():
+        # Slice 5b owns the account operation's idle policy and serialization.
+        controls = (
+            (record.control for record in self.controllers.records())
+            if self.controllers.controller_mode == "multi"
+            else self.controls()
+        )
+        for control in controls:
             await control.require_idle()
 
     def _bind_pair(self, control: ServeControl) -> None:
@@ -485,6 +492,9 @@ class ZetaServer:
         if not self._borrowed:
             await self.controllers.attached().runtime.initialize_project_registry()
             self._account_warnings = await accounts.migrate(self.home)
+        registry = self.manager.project_registry
+        if registry is not None:
+            self.projects = ProjectRequests(home=self.home, manager=self.manager, registry=registry)
         await self.controllers.attached().runtime.capture_launch_scope()
         self.connections = ConnectionRegistry(
             asyncio.get_running_loop(), self._publish_child_lifecycle
@@ -695,9 +705,6 @@ class _Client:
         self._hello_claim_attempted = False
         self._hello_claim_result: bool | None = None
         self.codec = FrameCodec()
-        self.projects = ProjectRequests.for_runtime(
-            home=server.home, runtime=server.controllers.attached().runtime, codec=self.codec
-        )
 
     async def run(self) -> None:
         graceful = True
@@ -1302,7 +1309,8 @@ class _Client:
         )
         if "state_read_v1" in accepted and not state_read_available():
             accepted.remove("state_read_v1")
-        accepted = self.server.controllers.attached().runtime.available_project_features(accepted)
+        if self.server.projects is None:
+            accepted = [item for item in accepted if not item.startswith("projects")]
         if "projects-memory-v2" in accepted and "projects" not in accepted:
             accepted.remove("projects-memory-v2")
         if "turn_reconnect" in accepted and "approval_reconnect" not in accepted:
@@ -1341,10 +1349,11 @@ class _Client:
         }
         if hello.extended and hello.requested_features:
             capabilities["features"] = list(hello.features)
+        unavailable = self.server.manager.project_registry_unavailable
         result = hello_result(
             hello.protocol_version,
             capabilities,
-            self.server.controllers.attached().runtime.project_registry_warning,
+            unavailable.warning if unavailable is not None else None,
         )
         if self.server._account_warnings:
             notices = result.setdefault("notices", [])

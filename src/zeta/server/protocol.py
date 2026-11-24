@@ -390,7 +390,7 @@ class MethodDescriptor(Enum):
         "projects",
         Access.CONTROLLER_READ,
     )
-    PROJECT_INBOX = ("project_inbox", "1.1", "projects", Access.CONTROLLER_WRITE)
+    PROJECT_INBOX = ("project_inbox", "1.1", "projects", Access.CONTROLLER_READ)
     CLEAR_STEERING = ("clear_steering", None, "abort_scope", Access.SESSION_MUTATION)
     DELIVERY_STATUS = ("delivery_status", None, "delivery_id", Access.READ)
     SESSION_GRANTS = ("session_grants", "1.1", "session_grants", Access.READ)

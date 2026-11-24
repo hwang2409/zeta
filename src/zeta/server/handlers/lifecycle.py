@@ -772,8 +772,8 @@ def _list_sessions(
     limit = validation.integer(params, "limit", None, minimum=1)
     if "project_id" in params:
         validation.require_feature(self, "projects", "project_id")
-        assert self.projects is not None
-        available = self.projects.project_sessions(params["project_id"])
+        assert self.server.projects is not None
+        available = self.server.projects.project_sessions(params["project_id"])
     else:
         available = self.server.manager.list_sessions_read_only()
     metadata = available[offset : None if limit is None else offset + limit]

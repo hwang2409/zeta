@@ -1452,11 +1452,10 @@ def test_project_inbox_omits_too_deep_unknown_field(tmp_path: Path) -> None:
 
     requests = ProjectRequests(
         home=server.home,
-        runtime=server.controllers.attached().runtime,
-        codec=FrameCodec(),
+        manager=server.manager,
         registry=registry,
     )
-    projected = requests._bounded_message("request", record)
+    projected = requests._bounded_message(lambda result: FrameCodec().response_fits("request", result), record)
 
     assert "future_metadata" not in projected
     assert projected["truncated_fields"] == ["future_metadata"]
