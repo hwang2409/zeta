@@ -748,7 +748,9 @@ async def test_access_token_times_out_when_another_process_holds_registry_lock(
     operation: asyncio.Task[str] | None = None
     progress_future: asyncio.Future[None] | None = None
     try:
-        assert await asyncio.to_thread(ready.wait, 5)
+        await await_or_fail(
+            asyncio.to_thread(ready.wait), timeout=60, what="registry lock holder ready"
+        )
         async with httpx.AsyncClient() as client:
             operation = asyncio.create_task(credential.access_token(client))
             assert await await_or_fail(
@@ -785,6 +787,8 @@ async def test_access_token_times_out_when_another_process_holds_registry_lock(
             with pytest.raises(AccountCredentialLockTimeoutError):
                 await await_or_fail(operation, what="access token")
     finally:
+        # Unblock the readiness thread even if the holder never signaled.
+        ready.set()
         # unpark the worker thread before draining, so cancel/drain cannot hang.
         progress_seen.set()
         if progress_future is not None and not progress_future.done():
