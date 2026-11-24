@@ -40,6 +40,7 @@ class SessionAcquisition:
     previous: SessionController | None
     target: SessionController
     created: bool
+    previous_index: SessionController | None
 
 
 @dataclass(slots=True, eq=False)
@@ -245,6 +246,7 @@ class SessionControllers:
         if self._controller_members.get(admission.connection) != admission.generation:
             return
         del self._controller_members[admission.connection]
+        self._hello_records.pop(admission.connection, None)
         self._refresh_controller_mode()
 
     def is_controller(self, connection: Any) -> bool:
@@ -255,15 +257,27 @@ class SessionControllers:
 
     def records_charged_to(self, connection: object) -> tuple[SessionController, ...]:
         """Snapshot every attached, provisional, parked, or reserved record once."""
-        charged = {
-            self._by_connection.get(connection),
-            self._hello_records.get(connection),
-            *(owner.target for owner in self._by_session.values()
-              if isinstance(owner, SessionAcquisition) and owner.connection is connection),
-        }
         return tuple(
             record for record in self._records.values()
-            if record in charged or record.parked_by is connection or record.setup_by is connection
+            if any(holder is connection for holder in self._charges(record))
+        )
+
+    def _charges(self, record: SessionController) -> Iterator[object]:
+        for bindings in (self._by_connection, self._hello_records):
+            yield from (connection for connection, target in bindings.items() if target is record)
+        for reservation in self._by_session.values():
+            if isinstance(reservation, SessionAcquisition) and reservation.target is record:
+                yield reservation.connection
+        if record.parked_by is not None:
+            yield record.parked_by
+        if record.setup_by is not None:
+            yield record.setup_by
+
+    def owner_of(self, record: SessionController) -> object | _MultiGrace | None:
+        """Return the live controller, reconnect grace, or None for a free record."""
+        return next(
+            (connection for connection in self._charges(record) if connection in self._controller_members),
+            self._multi_graces.get(record),
         )
 
     def begin_controller_release(
@@ -393,6 +407,8 @@ class SessionControllers:
             return self._use(acquisition.target, acquisition, setup=True)
         record = self._by_connection.get(connection, self._attached)
         if self._controller_mode == "multi" and connection not in self._by_connection:
+            if record.runtime.opened is not None:
+                self._require_acquirable(connection, record, record.runtime.session_id, reconnect=False)
             self._hello_records[connection] = record
         if record.closing:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
@@ -421,11 +437,7 @@ class SessionControllers:
         record = self._by_session.get(session_id)
         if isinstance(record, SessionAcquisition):
             if record.connection is not connection:
-                raise ProtocolError(
-                    ErrorDescriptor.SESSION_CONTROLLED,
-                    "session is controlled by another client",
-                    {"session_id": session_id},
-                )
+                raise self._controlled(session_id)
             record = record.target
         if record is None:
             record = self._parked.get(session_id)
@@ -454,34 +466,58 @@ class SessionControllers:
             and not record.closing
         ), None)
 
+    @staticmethod
+    def _controlled(session_id: str) -> ProtocolError:
+        return ProtocolError(
+            ErrorDescriptor.SESSION_CONTROLLED,
+            "session is controlled by another client",
+            {"session_id": session_id},
+        )
+
+    def acquisition_target(
+        self, connection: object, session_id: str, *, reconnect: bool,
+    ) -> SessionController | None:
+        """Find a resident target, refusing another controller's charge before setup."""
+        self._require_open()
+        record = self.resident(session_id)
+        if record is not None:
+            self._require_acquirable(connection, record, session_id, reconnect=reconnect)
+        return record
+
+    def _require_acquirable(
+        self, connection: object, record: SessionController, session_id: str, *, reconnect: bool,
+    ) -> None:
+        owner = self.owner_of(record)
+        if isinstance(owner, _MultiGrace):
+            if not reconnect:
+                raise self._controlled(session_id)
+        elif owner is not None and owner is not connection:
+            raise self._controlled(session_id)
+
     def reserve_existing(self, connection: Any, session_id: str) -> SessionAcquisition:
         """Reserve an existing resident session for an exact reconnect."""
-        record = self.resident(session_id)
-        if record is None or record.closing:
-            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
-        return self.reserve_session(connection, session_id, record)
+        return self._reserve_session(connection, session_id, None)
 
     def reserve_session(
         self, connection: Any, session_id: str, candidate: SessionController
     ) -> SessionAcquisition:
-        """Reserve a session synchronously, before opening its runtime."""
-        self._require_open()
+        return self._reserve_session(connection, session_id, candidate)
+
+    def _reserve_session(
+        self, connection: Any, session_id: str, candidate: SessionController | None
+    ) -> SessionAcquisition:
+        """Reserve a session synchronously, before any target setup can await."""
+        resident = self.acquisition_target(connection, session_id, reconnect=candidate is None)
         existing = self._by_session.get(session_id)
-        target = existing.target if isinstance(existing, SessionAcquisition) else existing
-        holder = next((
-            owner for owner, record in self._by_connection.items()
-            if record is target and owner is not connection
-        ), None)
-        if isinstance(existing, SessionAcquisition) or holder is not None:
-            raise ProtocolError(
-                ErrorDescriptor.SESSION_CONTROLLED,
-                "session is controlled by another client",
-                {"session_id": session_id},
-            )
+        if isinstance(existing, SessionAcquisition):
+            raise self._controlled(session_id)
+        target = candidate if candidate is not None else resident
+        if target is None or target.closing:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         previous = self._by_connection.get(connection)
         acquisition = SessionAcquisition(
             connection, session_id, next(self._session_generations), previous,
-            candidate, existing is None and candidate is not previous,
+            target, target is not resident and target is not previous, existing,
         )
         self._by_session[session_id] = acquisition
         return acquisition
@@ -509,12 +545,12 @@ class SessionControllers:
     def abort_session(self, acquisition: SessionAcquisition) -> asyncio.Task[None] | None:
         if self._by_session.get(acquisition.session_id) is not acquisition:
             return None
-        if acquisition.created:
+        if acquisition.previous_index is None:
             del self._by_session[acquisition.session_id]
-            if self._records.get(acquisition.target.control) is acquisition.target:
-                return self.retire(acquisition.target)
         else:
-            self._by_session[acquisition.session_id] = acquisition.target
+            self._by_session[acquisition.session_id] = acquisition.previous_index
+        if acquisition.created and self._records.get(acquisition.target.control) is acquisition.target:
+            return self.retire(acquisition.target)
         return None
 
     def bind_retention_planner(self) -> None:

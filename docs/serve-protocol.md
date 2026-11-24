@@ -133,14 +133,20 @@ can negotiate it to exercise the multi-controller rules.
 When enabled in a later slice, controller mode is exclusive: a serve process is
 in either legacy mode (one controller) or negotiated multi-controller mode; the
 two modes cannot mix. each negotiated controller controls at most one session,
-and each session has at most one controller. a second controller for an attached
-session receives `session_controlled` (`-32014`) with the socket left open.
+and each session has at most one controller. another controller cannot take an
+attached or parked session from a connected controller. attempts to acquire it
+receive `session_controlled` (`-32014`) with the socket left open. after a
+refused `hello`, the client can send another `hello` on that socket.
 the bounded diagnostic `holder` may contain only safe client version and
 connection duration fields; it never contains credentials, addresses, cwd, or
 bindings.
 
 Reconnect must name the exact session being reclaimed and pass its binding and
-approval checks. an unattached negotiated connection does not infer reconnect
+approval checks. only `hello` with an exact id or `resume` with an exact id and
+`resume_attach` can reclaim a resident session in grace. plain `resume` and
+prefix matches that resolve to a session in grace receive `session_controlled`;
+after expiry and settlement, normal `resume` can reopen the session. an
+unattached negotiated connection does not infer reconnect
 from another session's grace record. On disconnect, each record charged to
 that connection, including its parked sessions, keeps its own admission grace.
 A parked turn's running work deadline starts at the swap and is not restarted
