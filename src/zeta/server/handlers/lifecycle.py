@@ -82,7 +82,8 @@ class _Outgoing:
         """Run the decision once the swap target is committed."""
         if self.record is None:
             return
-        if self.park:
+        # storage that failed during setup closes it too: never park an unhealthy session
+        if self.park and not self.record.control.unhealthy():
             # a swap is not a disconnect: park as legacy attach does; grace starts at disconnect
             client.server.parking.leave(self.record, client)
             return
@@ -127,11 +128,13 @@ def _outgoing(
 async def _session_swap(
     self, park: bool, controller: SessionUse | SessionController, target_id: str | None = None
 ) -> AsyncIterator[tuple[SessionController | None, _Outgoing]]:
-    """Hold a session swap. Yield None to swap the attached pair in place, as
-    without ``session_park``; or, when ``park`` and the attached pair holds work,
-    yield a new pair to set up beside it. The caller commits that pair with
-    ``server.attach`` right after its setup returns; a setup that fails first is
-    closed here. In multi mode, also yield the outgoing decision for ``target_id``."""
+    """Hold a session swap and yield ``(incoming, outgoing)``. ``incoming`` is
+    None to swap the attached pair in place, as without ``session_park``; or,
+    in multi mode or when ``park`` and the attached pair holds work, a new pair
+    to set up beside it. The caller commits that pair (``server.attach``, or
+    the multi acquisition) right after its setup returns; a setup that fails
+    first is closed here. ``outgoing`` is the multi decision for the
+    connection's current session against ``target_id`` (empty in legacy)."""
     server = self.server
     outgoing = controller.control
     multi = server.controllers.controller_mode == "multi"

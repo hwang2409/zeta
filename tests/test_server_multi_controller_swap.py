@@ -51,6 +51,7 @@ class Row:
     outgoing_kept: bool = False  # the outgoing session still has its record
     inject: tuple[str, str] | None = None  # (cancel | fail, seam)
     duplicate: bool = False
+    sicken: bool = False  # the outgoing's storage fails during the swap's setup
 
 
 ROWS = {
@@ -75,6 +76,7 @@ ROWS = {
     # minor 2: an unhealthy outgoing closes, never parks beside the new record
     "unhealthy_work_park_resume_own": Row(PARK, "unhealthy_work", "resume_own"),
     "unhealthy_busy_park_new": Row(PARK, "unhealthy_busy", "new_session"),
+    "busy_park_new_unhealthy_in_setup": Row(PARK, "busy", "new_session", sicken=True),
     # cancel at each await, failure at each publish step
     **{
         f"{action}_park_new_{seam}": Row(
@@ -237,6 +239,16 @@ async def test_multi_swap_outgoing_table(
             return
 
         (old,) = _records(server, outgoing)
+        if row.sicken:
+            create = ServerRuntime.create_session
+
+            async def sicken_outgoing(*args: Any, **kwargs: Any) -> Any:
+                # stands in for approval storage of the outgoing failing mid-swap
+                monkeypatch.setattr(old.control, "unhealthy", lambda: True)
+                return await create(*args, **kwargs)
+
+            # test-contract: seam the outgoing turns unhealthy while the new session is created
+            monkeypatch.setattr(ServerRuntime, "create_session", sicken_outgoing)
         if row.duplicate:
             await client.send(90, *request)
             await client.send(91, *request)
