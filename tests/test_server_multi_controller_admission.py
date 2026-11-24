@@ -1369,3 +1369,106 @@ async def test_multi_overflow_settles_only_its_connection(
     finally:
         settle.set()
         await await_or_fail(_close_server(server, clients), what="close overflow server")
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.parametrize("row", ("two-turns", "idle-and-turn", "eof-without-reconnect"))
+@pytest.mark.asyncio
+async def test_multi_reconnect_grace_is_independent(
+    tmp_path: Path, transport: Transport, row: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a_has_turn = row != "idle-and-turn"
+    eof_only = row == "eof-without-reconnect"
+    text = TextContent("held")
+    backend = GatedBackend([([text, HOLD], [text])] * (1 + a_has_turn))
+    server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
+    await await_or_fail(server.start(), what="start reconnect server")
+    clients: list[ReplayClient] = []
+    features = ("multi_controller", "approval_reconnect", "turn_reconnect")
+    expire_b = asyncio.Event()
+
+    async def connect() -> ReplayClient:
+        client = await await_or_fail(connect_replay(server, transport), what="grace socket")
+        clients.append(client)
+        return client
+
+    async def reclaim(session_id: str) -> tuple[ReplayClient, dict[str, Any]]:
+        client = await connect()
+        result = await client.request(1, "hello", {
+            "protocol_version": "1.1", "features": list(features), "session_id": session_id,
+        })
+        assert "result" in result, f"exact reconnect for {session_id} was refused: {result}"
+        status = await client.request(2, "status", {})
+        assert status["result"]["session"]["session_id"] == session_id
+        return client, status["result"]
+
+    try:
+        a, b = await connect(), await connect()
+        session_ids = []
+        for client in (a, b):
+            extra = ("multi_controller",) if eof_only and client is a else features
+            assert "result" in await negotiate(client, replay=False, extra=extra)
+            created = await client.request(2, "new_session", {})
+            session_ids.append(created["result"]["session"]["session_id"])
+        a_id, b_id = session_ids
+        a_peer, b_peer = server.connections.clients()
+        disconnected = {peer: asyncio.Event() for peer in (a_peer, b_peer)}
+        unregister = server.connections.unregister
+
+        def record_disconnect(connection):
+            unregister(connection)
+            if connection in disconnected:
+                disconnected[connection].set()
+
+        b_record = server.controllers.resident(b_id)
+        assert b_record is not None
+
+        async def b_deadline() -> None:
+            await await_or_fail(expire_b.wait(), what="B grace deadline")
+
+        # test-contract: seam observe completed disconnects and trigger the real B expiry on demand.
+        monkeypatch.setattr(server.connections, "unregister", record_disconnect)
+        # test-contract: seam use an event in place of the wall-clock deadline.
+        monkeypatch.setattr(b_record.control, "_grace_deadline", b_deadline)
+        for client, held in zip((a, b) if a_has_turn else (b,), backend.held, strict=True):
+            assert "result" in await client.request(3, "send", {"text": "hold"})
+            await await_or_fail(held.wait(), what="start turn before disconnect")
+        await await_or_fail(a.close(), what="disconnect A by peer EOF")
+        await await_or_fail(disconnected[a_peer].wait(), what="settle A disconnect")
+        if eof_only:
+            _, status = await reclaim(a_id)
+            assert status["state"] == "idle", "peer EOF left A's non-reconnect turn running"
+            return
+        # Use the server-initiated transport loss path for B; it starts release
+        # with the binding still present even on the slice base.
+        b_peer.stop_transport()
+        await await_or_fail(disconnected[b_peer].wait(), what="settle B disconnect")
+        if not a_has_turn:
+            # B expires while no member is connected. A has only its idle admission grace.
+            grace = b_record.control._grace_task
+            assert grace is not None
+            expire_b.set()
+            await await_or_fail(asyncio.shield(grace), what="settle B's grace")
+            unrelated = await connect()
+            refused = await negotiate(unrelated, replay=False, extra=features)
+            assert refused.get("error", {}).get("code") == -32001, "B's expiry lost A's idle grace"
+        a, status = await reclaim(a_id)
+        assert status["state"] == ("running" if a_has_turn else "idle")
+        a_peer = server.connections.clients()[-1]
+        disconnected[a_peer] = asyncio.Event()
+        await await_or_fail(a.close(), what="disconnect reclaimed A")
+        await await_or_fail(disconnected[a_peer].wait(), what="settle reclaimed A disconnect")
+        if a_has_turn:
+            # With no live members, B must still have its own admission grace.
+            _, status = await reclaim(b_id)
+            assert status["state"] == "running"
+        else:
+            expired = await connect()
+            refused = await expired.request(1, "hello", {
+                "protocol_version": "1.1", "features": list(features), "session_id": b_id,
+            })
+            assert refused.get("error", {}).get("code") == -32001, refused
+    finally:
+        expire_b.set()
+        backend.open_all()
+        await await_or_fail(_close_server(server, clients), what="close reconnect server")

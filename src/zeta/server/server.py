@@ -1051,10 +1051,8 @@ class _Client:
             reconnect = "approval_reconnect" in self.features
             keep_turn = "turn_reconnect" in self.features
             if self.server.controllers.controller_mode == "multi":
-                self._controller_release = asyncio.ensure_future(
-                    self.server.controllers.begin_controller_release(
-                        self, reconnect=reconnect, keep_turn=keep_turn
-                    )
+                self._controller_release = self.server.controllers.begin_controller_release(
+                    self, reconnect=reconnect, keep_turn=keep_turn
                 )
             else:
                 self._controller_release = asyncio.gather(*(

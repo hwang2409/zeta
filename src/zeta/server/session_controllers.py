@@ -158,11 +158,9 @@ class SessionControllers:
         self._controller_members: dict[Any, int] = {}
         self._hello_records: dict[Any, SessionController] = {}
         self._hello_generations = itertools.count(1)
-        # a reconnect grace keeps the negotiated mode alive after its member
-        # closes.  admission state follows one table: tokens (provisional or
-        # committed) keep the mode; then exact grace does; otherwise it is empty.
-        self._grace_session_id: str | None = None
-        self._grace_generation: int | None = None
+        self._legacy_grace = False
+        # Only admission identity: ServeControl owns the grace work and deadline.
+        self._multi_graces: dict[SessionController, tuple[str, int]] = {}
         # close waiters per record, woken when its last use settles
         self._drains: dict[SessionController, list[asyncio.Future[None]]] = {}
 
@@ -187,9 +185,9 @@ class SessionControllers:
                     ErrorDescriptor.CONNECTION_CAPACITY,
                     "another client is already connected",
                 )
-            if requested == "multi" and (
-                reconnect_session_id is None
-                or reconnect_session_id != self._grace_session_id
+            if requested == "multi" and not any(
+                not record.closing and session_id == reconnect_session_id
+                for record, (session_id, _) in self._multi_graces.items()
             ):
                 raise ProtocolError(
                     ErrorDescriptor.CONNECTION_CAPACITY,
@@ -214,7 +212,7 @@ class SessionControllers:
         Resident and closing records are session state, not controller tokens;
         they do not keep an unattached mode alive.
         """
-        if self._controller_members or self._grace_generation is not None:
+        if self._controller_members or self._legacy_grace or self._multi_graces:
             return
         self._controller_mode = "empty"
 
@@ -244,42 +242,42 @@ class SessionControllers:
             if isinstance(owner, SessionAcquisition) and owner.connection is connection
         ), None)
 
-    async def begin_controller_release(
+    def begin_controller_release(
         self, connection: Any, *, reconnect: bool, keep_turn: bool
-    ) -> None:
-        """Release only this connection's semantic controller state."""
+    ) -> asyncio.Task[None] | None:
+        """Capture this record before EOF removes the connection's binding."""
         record = self.controller_for(connection)
-        if record is not None:
-            await record.control.begin_controller_release(
-                reconnect=reconnect, keep_turn=keep_turn
-            )
+        if record is None or record.closing:
+            return None
+        release = record.control.begin_controller_release(reconnect=reconnect, keep_turn=keep_turn)
+        generation = self._controller_members[connection]
+        if record.runtime.opened is not None and (
+            self._by_connection.get(connection) is record or record in self._multi_graces
+        ):
+            grace = (record.runtime.session_id, generation)
+            self._multi_graces[record] = grace
+            work = record.control.reconnect_grace_task
+            if work is not None:
+                work.add_done_callback(lambda done: self._expire_multi_grace(record, grace, done))
+        return release
+
+    def _expire_multi_grace(
+        self, record: SessionController, grace: tuple[str, int], work: asyncio.Task[None]
+    ) -> None:
+        # A claim cancels work before its hello commits. Only commit consumes
+        # that marker; a closing record keeps its charge until close settles.
+        if not work.cancelled() and not record.closing and self._multi_graces.get(record) == grace:
+            del self._multi_graces[record]
+            self._refresh_controller_mode()
 
     def release_connection(self, connection: Any, reason: str = "eof") -> None:
         del reason
-        previous = self._by_connection.get(connection)
         self._hello_records.pop(connection, None)
         generation = self._controller_members.pop(connection, None)
-        if generation is None:
-            self._refresh_controller_mode()
-            return
-        self._by_connection.pop(connection, None)
-        if not self._controller_members:
-            session_id = (
-                previous.runtime.session_id
-                if previous is not None and previous.runtime.opened is not None
-                else None
-            )
-            if session_id is None:
-                for record in self._records.values():
-                    if record.runtime.opened is not None:
-                        session_id = record.runtime.session_id
-                        break
-            self._grace_session_id = session_id
-            # legacy has a reconnect grace without a session id; dormant multi
-            # does not. the mode selected by the released token distinguishes them.
-            self._grace_generation = (
-                generation if self._controller_mode == "legacy" or session_id is not None else None
-            )
+        if generation is not None:
+            self._by_connection.pop(connection, None)
+            if self._controller_mode == "legacy":
+                self._legacy_grace = True
         self._refresh_controller_mode()
 
     def records(self) -> tuple[SessionController, ...]:
@@ -334,6 +332,7 @@ class SessionControllers:
         """A use of the persistent record controlled by ``connection``."""
         if session_id is not None:
             acquisition = self.reserve_existing(connection, session_id)
+            self._hello_records[connection] = acquisition.target
             return self._use(acquisition.target, acquisition)
         record = self._by_connection.get(connection, self._attached)
         if self._controller_mode == "multi" and connection not in self._by_connection:
@@ -437,6 +436,7 @@ class SessionControllers:
             raise RuntimeError("session acquisition is no longer current")
         self._by_session[acquisition.session_id] = acquisition.target
         self._by_connection[acquisition.connection] = acquisition.target
+        self._multi_graces.pop(acquisition.target, None)
         self._hello_records.pop(acquisition.connection, None)
         if acquisition.target.runtime.opened is not None:
             self.unpark(acquisition.target)
@@ -594,6 +594,8 @@ class SessionControllers:
                     await control.wait_for_approval_settlement(settlement_timeout)
         finally:
             del self._records[control]
+            if self._multi_graces.pop(record, None) is not None:
+                self._refresh_controller_mode()
             record.parked_by = None
             for session_id, owner in tuple(self._by_session.items()):
                 if owner is record:
@@ -623,6 +625,7 @@ class SessionControllers:
         committed = {
             *self._parked.values(),
             *self._by_connection.values(),
+            *self._multi_graces,
             *(record for record in self._records.values() if not record.uses),
         }
         for record in committed:
