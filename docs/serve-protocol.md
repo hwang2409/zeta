@@ -212,8 +212,9 @@ controller that presents the exact id this way reclaims it, not only the one
 that disconnected: the server has no client identity, and the trust model is
 the same local user. Existing binding and approval checks still apply. Plain
 `resume` (without `resume_attach`), or `resume` by a prefix that resolves to a
-grace session, returns `session_controlled` and leaves the connection open. After grace expires and cleanup settles, normal
-`resume` can reopen the session from disk.
+grace session, returns `session_controlled` and leaves the connection open.
+After grace expires and cleanup settles, normal `resume` can reopen the
+session from disk.
 
 Reclaiming or settling one session does not end another session's grace. An
 unattached controller does not infer a target from someone else's grace. If
@@ -225,7 +226,8 @@ mode clears, including while its grace or closing records remain.
 An idle session still reserves capacity while detached. Its grace is bounded
 by `approval_reconnect_grace` (`--approval-reconnect-grace`, default 90 seconds)
 from disconnect; zero starts retirement without an idle grace window. For a
-parked session the work deadline also starts at disconnect, not at the swap. Expired records release capacity only after cleanup settles.
+parked session the work deadline also starts at disconnect, not at the swap.
+Expired records release capacity only after cleanup settles.
 
 Each connection retains at most 256 output frames or 4 MiB. Overflow affects
 only that connection: the server attempts to send the typed `-32011` error
