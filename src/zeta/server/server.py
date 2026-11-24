@@ -9,9 +9,10 @@ import os
 import socket
 import stat
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from ..config.settings import load_settings
@@ -390,6 +391,21 @@ class ZetaServer:
         )
         for control in controls:
             await control.require_idle()
+
+    def session_statuses(self) -> Mapping[str, str]:
+        """Snapshot resident status before a sessionless metadata read goes off-loop."""
+        statuses = {}
+        for record in self.controllers.records():
+            active = record.runtime.state
+            if active is None:
+                continue
+            status = active.status
+            if record.control.has_pending_approvals():
+                status = "approval"
+            elif record.control.turn_busy() or status == "tool":
+                status = "running"
+            statuses[active.metadata.session_id] = status
+        return MappingProxyType(statuses)
 
     def _bind_pair(self, control: ServeControl) -> None:
         """Point the runtime's sinks at its control; a borrowed runtime keeps its owner's."""

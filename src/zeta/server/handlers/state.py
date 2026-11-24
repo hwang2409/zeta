@@ -1,7 +1,5 @@
 """Read-only methods negotiated under ``state_read_v1``."""
 
-from types import MappingProxyType
-
 from ...read_page import InvalidParams, TooLarge
 from ..protocol import ErrorDescriptor, MethodDescriptor, ProtocolError
 from ..read_home_state import (
@@ -48,18 +46,7 @@ state_attention = _project_state_handler("attention")
 
 async def _session_read(client, request_id, params, method, *, collection=None, detail=False):
     server = client.server
-    statuses = {}
-    for record in server.controllers.records():
-        active = record.runtime.state
-        if active is None:
-            continue
-        status = active.status
-        if record.control.has_pending_approvals():
-            status = "approval"
-        elif record.control.turn_busy() or status == "tool":
-            status = "running"
-        statuses[active.metadata.session_id] = status
-    snapshot = MappingProxyType(statuses)
+    snapshot = server.session_statuses()
     try:
         return await client.connections.run_blocking(lambda: read_session_page(
             server.home, method, params, lambda result: client.codec.response_fits(request_id, result), snapshot,
