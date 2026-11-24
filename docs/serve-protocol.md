@@ -155,6 +155,13 @@ while a negotiated controller starts without a session and can explicitly
 resume the resident session. Once acquired by multi, it is no longer the
 legacy default, including after the multi record closes.
 
+A session has at most one resident record. In multi-controller mode, `resume`
+of a resident session that the connection may take (no controller holds it, or
+this connection does) takes that record instead of opening a second one. Without
+`resume_attach`, it returns `-32004` while that session has a busy turn. A
+resident session whose approval storage failed is closed first, and `resume`
+opens it again from disk.
+
 The limits are fixed, not settings:
 
 - Four multi controllers: the fifth controller `hello` gets `-32001` and closes.

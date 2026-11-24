@@ -32,6 +32,27 @@ async def _close_server(server, clients) -> None:
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
 @pytest.mark.asyncio
+async def test_ordinary_server_negotiates_multi_controller(
+    tmp_path: Path, transport: Transport
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    first = await connect_replay(server, transport)
+    second = await connect_replay(server, transport)
+    try:
+        hello = await negotiate(first, replay=False, extra=("multi_controller",))
+        assert "multi_controller" in hello["result"]["capabilities"]["features"]
+
+        admitted = await negotiate(second, replay=False, extra=("multi_controller",))
+        assert "multi_controller" in admitted["result"]["capabilities"]["features"]
+    finally:
+        await first.close()
+        await second.close()
+        await server.close()
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
 async def test_unattached_multi_close_releases_mode_for_legacy(
     tmp_path: Path, transport: Transport
 ) -> None:

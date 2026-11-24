@@ -362,8 +362,7 @@ class SessionControllers:
             return
         self.retire(record)
 
-    def release_connection(self, connection: Any, reason: str = "eof") -> None:
-        del reason
+    def release_connection(self, connection: Any) -> None:
         self._hello_records.pop(connection, None)
         generation = self._controller_members.pop(connection, None)
         if generation is not None:
@@ -703,6 +702,13 @@ class SessionControllers:
         """``control`` has begun its close (or ended it): no wake or new work."""
         record = self._records.get(control)
         return record is None or record.closing
+
+    def retire_for_reopen(self, record: SessionController) -> asyncio.Task[None]:
+        """Retire a free resident record that a multi resume reopens from disk."""
+        if record is self._attached:
+            # as in commit_session: once multi takes it, it is not the legacy default
+            self._attached = self._sessionless
+        return self.retire(record)
 
     def retire(
         self, record: SessionController, settlement_timeout: float | None = None
