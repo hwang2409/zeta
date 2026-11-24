@@ -97,7 +97,10 @@ def test_exit_watchdog_ends_a_hung_exit_with_a_traceback(
     output = "\n".join(result.outlines + result.errlines)
     assert "Timeout (0:00:01)!" in output, output
     assert f"in {hanging_frame}" in output, output
-    assert result.ret != pytest.ExitCode.OK, output
+    if extra_args:
+        assert "node down:" in output, output
+    else:
+        assert result.ret != pytest.ExitCode.OK, output
 
 
 # A test fails at its timeout guard while a task re-shields every cancellation,
