@@ -33,6 +33,8 @@ RETIRE_CALLERS = {
     "parking.py:ParkedPairs.leave",
     "parking.py:ParkedPairs.close",
     "handlers/lifecycle.py:_session_swap",
+    "handlers/lifecycle.py:_release_previous",
+
 }
 # close state that only `SessionControllers` holds
 CLOSE_STATE = {"closing", "close_task", "closing_session_id", "_closing", "_close_pair", "closing_tasks"}
