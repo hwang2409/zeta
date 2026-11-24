@@ -207,6 +207,8 @@ class ConnectionRegistry(ReplayOutput):
     ) -> None:
         self.loop = loop
         self._connections: dict[Any, _Connection] = {}
+        # Writers of unregistered clients, held until they finish so shutdown can join them.
+        self._retired_writers: set[asyncio.Task[None]] = set()
         # Rate-limit state for the contended-slot refusal log: the holder a
         # refusal was last logged against, that log's time, and how many later
         # refusals against the same holder were suppressed. The clock is an
@@ -571,8 +573,16 @@ class ConnectionRegistry(ReplayOutput):
         state.role = None
 
     def unregister(self, connection: Any) -> None:
-        """Remove a physically closed client from shutdown enumeration."""
-        self._connections.pop(connection, None)
+        """Remove a physically closed client and settle its output writer."""
+        state = self._connections.pop(connection, None)
+        output = None if state is None else state.output
+        if output is None:
+            return
+        self._settle_output(output)
+        writer = output.writer_task
+        if writer is not None and not writer.done():
+            self._retired_writers.add(writer)
+            writer.add_done_callback(self._retired_writers.discard)
 
     async def send(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)
@@ -1270,10 +1280,10 @@ class ConnectionRegistry(ReplayOutput):
                 self._settle_output(state.output)
 
         await attempt(asyncio.to_thread(self.close_child_reader))
-        writers = tuple(
+        writers = (*self._retired_writers, *(
             output.writer_task for client in clients
             if (output := self.output_state(client)) is not None and output.writer_task is not None
-        )
+        ))
         for client in clients:
             await attempt(settle_output(client))
         await asyncio.gather(*writers, return_exceptions=True)
