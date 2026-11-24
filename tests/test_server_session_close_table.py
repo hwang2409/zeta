@@ -554,11 +554,9 @@ async def success(run: Run) -> None:
 
 
 async def approval_settlement_before_runtime_close(run: Run) -> None:
-    server = await run.serve()
-    client = await run.open()
-    await run.new(client)
-    record = server.controllers.attached()
-    run.watch("a", record)
+    record, _client, _request_id = await _approval(run)
+    server = run.server
+    assert server is not None
     original_wait = record.control.wait_for_approval_settlement
 
     async def held_settlement(*args: Any) -> None:

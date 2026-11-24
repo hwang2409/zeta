@@ -478,12 +478,12 @@ class SessionControllers:
         self._require_open()
         if self._by_session.get(acquisition.session_id) is not acquisition:
             raise RuntimeError("session acquisition is no longer current")
-        return self._use(acquisition.target)
+        return self._use(acquisition.target, setup=True)
 
     def commit_session(self, acquisition: SessionAcquisition) -> SessionUse:
         self._require_open()
-        if self._by_session.get(acquisition.session_id) is not acquisition:
-            raise RuntimeError("session acquisition is no longer current")
+        if self._by_session.get(acquisition.session_id) is not acquisition or acquisition.target.closing:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         self._by_session[acquisition.session_id] = acquisition.target
         self._by_connection[acquisition.connection] = acquisition.target
         self._clear_grace(acquisition.target)

@@ -605,19 +605,22 @@ class ZetaServer:
             await asyncio.gather(self._idle_drain, return_exceptions=True)
             self._idle_drain = None
 
+        async def drain(tasks: tuple[asyncio.Task[None], ...]) -> None:
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for task in tasks:
+                if not task.cancelled():
+                    await attempt(task)
+
         handlers = tuple(
             client._run_task for client in clients if client._run_task is not None
         )
-        for client in clients:
-            await attempt(client.release_controller())
-        for client in clients:
-            await attempt(client.logins.close())
+        releases = tuple(asyncio.create_task(client.release_controller()) for client in clients)
+        logins = tuple(asyncio.create_task(client.logins.close()) for client in clients)
+        await drain(logins)
         for handler in handlers:
             handler.cancel()
-        await asyncio.gather(*handlers, return_exceptions=True)
-        for handler in handlers:
-            if not handler.cancelled():
-                await attempt(handler)
+        await drain(handlers)
+        await drain(releases)
         await attempt(self.account_operations.drain())
         if registry is not None:
             await attempt(registry.drain_reads())
@@ -1056,7 +1059,7 @@ class _Client:
             and self._hello_admission is not None
             and self.connections.is_controller(self)
         ):
-            reconnect = "approval_reconnect" in self.features
+            reconnect = "approval_reconnect" in self.features and not self.connections.frozen
             keep_turn = "turn_reconnect" in self.features
             if self.server.controllers.controller_mode == "multi":
                 self._controller_release = self.server.controllers.begin_controller_release(

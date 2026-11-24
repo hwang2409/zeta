@@ -174,9 +174,18 @@ async def test_idle_multi_grace_expires(
             deadline.set()
             await await_or_fail(expire.wait(), what="idle grace clock expires")
 
-        # test-contract: advance the existing deadline explicitly, not by elapsed time.
+        # test-contract: seam advance the existing deadline explicitly, not by elapsed time.
         monkeypatch.setattr(record.control, "_grace_deadline", clock)
         registry = server.connections
+        retiring = asyncio.Event()
+        close_runtime = record.runtime.close
+
+        async def runtime_close():
+            retiring.set()
+            await close_runtime()
+
+        # test-contract: seam wait for expiry to enter the real close path.
+        monkeypatch.setattr(record.runtime, "close", runtime_close)
         peer, = registry.clients()
         unregistered = asyncio.Event()
         unregister = registry.unregister
@@ -195,6 +204,7 @@ async def test_idle_multi_grace_expires(
             assert record.runtime.opened is not None
             assert server.controllers.controller_mode == "multi"
             expire.set()
+            await await_or_fail(retiring.wait(), what="idle expiry starts retirement")
         await await_or_fail(server.controllers.wait_closed(session_id), what="idle record close")
         fresh = await connect_replay(server, transport)
         clients.append(fresh)
@@ -309,6 +319,7 @@ async def test_frozen_shutdown_drains_all_owners(
     login_gate, publishing, login_cancelled, published = (asyncio.Event() for _ in range(4))
     use_gate, replay_gate, replay_entered = (asyncio.Event() for _ in range(3))
     idle_clock = asyncio.Event()
+    approval_gate, approval_entered = asyncio.Event(), asyncio.Event()
     record_error = RuntimeError("record close failed")
     writer_error = RuntimeError("writer close failed")
     failures = []
@@ -327,7 +338,7 @@ async def test_frozen_shutdown_drains_all_owners(
             async def held_idle_deadline():
                 await await_or_fail(idle_clock.wait(), what="idle grace clock")
 
-            # test-contract: replace the grace clock, not the owner or expiry path.
+            # test-contract: seam replace the grace clock, not the owner or expiry path.
             monkeypatch.setattr(record.control, "_grace_deadline", held_idle_deadline)
             await detach(detached, peer)
             detached, peer = await connect(reconnect=sid)
@@ -362,6 +373,18 @@ async def test_frozen_shutdown_drains_all_owners(
         assert "result" in joined, joined
         assert registry.replay.scope_for(observer_peer) == ReplayScopeId.top(sid_a)
 
+        active_a = server.controllers.controller_for(a_peer)
+        assert active_a is not None
+        original_settle = active_a.control.wait_for_approval_settlement
+
+        async def settle_approval(*args):
+            approval_entered.set()
+            await await_or_fail(approval_gate.wait(), what="finish approval settlement")
+            await original_settle(*args)
+
+        # test-contract: hold the approval drain at the control/runtime seam.
+        monkeypatch.setattr(active_a.control, "wait_for_approval_settlement", settle_approval)
+
         original_drain = registry.drain_record_events
 
         async def gated_replay(record):
@@ -394,7 +417,7 @@ async def test_frozen_shutdown_drains_all_owners(
 
                 await publication_owner(publish)
 
-        # test-contract: synthetic provider, real Logins and AccountOperations owners.
+        # test-contract: seam synthetic provider, real Logins and AccountOperations owners.
         monkeypatch.setattr(login.Logins, "_prepare", lambda self, provider, account: provider)
         monkeypatch.setattr(login, "run_login", provider_login)
         assert (await a.request(5, "login_start", {"provider": "codex"}))["result"]["state"] == "pending"
@@ -461,9 +484,14 @@ async def test_frozen_shutdown_drains_all_owners(
         await await_or_fail(setup_cancelled.wait(), what="cancel setup after the login owners settle")
         assert records[-1] not in closes
         setup_gate.set()
+        await await_or_fail(approval_entered.wait(), what="approval drain is held")
+        assert active_a not in closes, "runtime closed before approval settlement"
+        approval_gate.set()
         await await_or_fail(replay_entered.wait(), what="replay finalizer is held")
         assert registry.replay.scope_for(observer_peer) == ReplayScopeId.top(sid_a)
-        assert all(record not in closes for record in (use.record, old_b, server.controllers.controller_for(a_peer)))
+        assert active_a not in closes, "runtime closed before replay drained"
+        assert use.record not in closes, "runtime closed before transferred use settled"
+        assert old_b not in closes, "an already retiring runtime was closed twice"
         assert not closing.done()
         waiter = asyncio.create_task(server.close())
         waiter_entered = asyncio.Event()
@@ -484,12 +512,13 @@ async def test_frozen_shutdown_drains_all_owners(
         assert len(closes) == len(records) and set(closes) == set(records)
         assert registry.clients() == () and registry._observers == []
         assert registry.replay.scopes() == ()
+        assert all(peer._closed for peer in peers)
         assert server.controllers.records() == () and server.controllers.controller_mode == "empty"
         assert server._server is None
         await await_or_fail(server.close(), what="repeat close is a no-op")
         assert failures == [record_error, writer_error] and len(closes) == len(records)
     finally:
-        for gate in (close_gate, setup_gate, login_gate, use_gate, replay_gate, idle_clock):
+        for gate in (close_gate, setup_gate, login_gate, use_gate, replay_gate, idle_clock, approval_gate):
             gate.set()
         backend.open_all()
         if closing is not None:
