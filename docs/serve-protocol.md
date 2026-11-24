@@ -134,12 +134,17 @@ exclusive legacy slot. Legacy and multi-controller modes cannot mix; a
 controller `hello` for the other mode returns `-32001` and closes the connection.
 
 Each controller can attach to at most one session, and each session has at most
-one controller. There is no automatic or forced handoff. If another controller
-already owns the requested session, the request returns `-32014` with
-`data.code: "session_controlled"` and `data.session_id` set to the requested
-session. The connection stays open. If present, `data.holder` contains only
-bounded client version and connection duration (`client_version` and
-`connected_for_ms`), never credentials, addresses, cwd, or bindings.
+one controller. There is no automatic or forced handoff. Another connection
+cannot take a session that a connected controller holds, attached or parked.
+A `hello` that passes controller admission and names that session, or a
+`resume` targeting it (with or without `resume_attach`), returns `-32014`
+with `data.code: "session_controlled"` and `data.session_id` set to the resolved
+session id. The connection stays open.
+If `hello` returns `session_controlled`, send another `hello` before sending
+other requests.
+If present, `data.holder` contains only bounded client version and connection
+duration (`client_version` and `connected_for_ms`), never credentials,
+addresses, cwd, or bindings.
 
 The limits are fixed, not settings:
 
@@ -161,16 +166,28 @@ The limits are fixed, not settings:
 `status.parked_sessions` and `parked_session_changed` are scoped to the owning
 connection. Closing records count against capacity until cleanup settles.
 
-A detached session has its own reconnect grace. To reclaim it, `hello` must
-name the exact `session_id` and pass the existing binding and approval checks.
-If only grace records keep the server in multi-controller mode, only a `hello`
-that names a session with live grace can enter. A failed reconnect does not
-consume the record's grace, and reclaim or settlement for one session does not
-end another session's grace. An idle record still reserves resident capacity:
-its grace is bounded by `approval_reconnect_grace`
-(`--approval-reconnect-grace`, default 90 seconds). At expiry it closes and
-frees capacity after settlement; zero starts retirement on release. Legacy
-reconnect grace is unchanged.
+On controller disconnect, each session that connection holds, including every
+parked session, keeps its own reconnect grace. While in grace, a resident
+session can be reclaimed in place only by `hello` with its exact `session_id`
+or by `resume` with `resume_attach` negotiated and that exact id. Existing
+binding and approval checks still apply. Plain `resume`, or `resume` by a
+prefix that resolves to a grace session, returns `session_controlled` and
+leaves the connection open. After grace expires and cleanup settles, normal
+`resume` can reopen the session from disk.
+
+Reclaiming or settling one session does not end another session's grace. An
+unattached controller does not infer a target from someone else's grace. If
+no controllers are connected and only grace or cleanup keeps multi-controller
+mode active, a controller `hello` can succeed only by naming a session with
+live grace. Legacy controller `hello` is refused until the multi-controller
+mode clears, including while its grace or closing records remain.
+
+An idle session still reserves capacity while detached. Its grace is bounded
+by `approval_reconnect_grace` (`--approval-reconnect-grace`, default 90 seconds)
+from disconnect; zero starts retirement without an idle grace window. For a
+parked turn the work deadline starts at the swap and is not restarted on
+disconnect. Expired records release capacity only after cleanup settles.
+Legacy reconnect grace is unchanged.
 
 Each connection retains at most 256 output frames or 4 MiB. Overflow affects
 only that connection: the server attempts to send the typed `-32011` error
@@ -669,7 +686,10 @@ the swap is the same as without the feature.
   `data: {"reason": "parked_limit", "parked": [session ids]}`, listing the
   parked and closing sessions. `resume` of a parked session never returns this
   error, because it swaps one session for one.
-- `status.parked_sessions` lists the parked sessions (see `status`).
+- `status.parked_sessions` lists the parked sessions (see `status`). In
+  multi-controller mode, rows and events are visible only to the owning
+  connection. A disconnect preserves grace per parked session; see
+  [`multi_controller`](#multi_controller) for how to reclaim each one.
 - The controller gets one `parked_session_changed` event when a session is
   parked, each time its `state`, `pending_approvals`, or `last_turn_outcome`
   changes while it is parked, and when it closes (`state: "closed"`). The
@@ -682,8 +702,8 @@ the swap is the same as without the feature.
   `parked_session_changed` event. Observers do not get this event. After a
   reconnect, read `status.parked_sessions`; events only report changes after
   that.
-- On a controller disconnect, each parked session follows the same rules as
-  the attached one (approval grace, `turn_reconnect`). A reclaiming `hello`
+- In legacy mode, on controller disconnect each parked session follows the same
+  rules as the attached one (approval grace, `turn_reconnect`). A reclaiming `hello`
   with `session_park` takes over every parked session. A reclaiming `hello`
   without `session_park` closes every parked session: its turn ends with
   reason `disconnect` and its approvals end. After a reclaim, parked sessions
@@ -1831,6 +1851,9 @@ session after a running child starts answering a staged `agent_send`; its data
 contains the child label and the bounded one-line message preview.
 
 ### reconnecting sessions and background completions
+
+In multi-controller mode these reconnect features apply per session, with the
+exact-id reclaim rules in [`multi_controller`](#multi_controller).
 
 When a controller negotiated `approval_reconnect`, a disconnect keeps its live
 approval wait for the configured grace. The first replacement controller that
@@ -3397,7 +3420,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 | `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
 | `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
-| `multi_controller` | enables up to four controllers with exclusive ownership of each attached session, per-connection parking, and independent per-session reconnect grace; see [`multi_controller`](#multi_controller) for limits and refusals |
+| `multi_controller` | enables up to four controllers with exclusive ownership of attached and parked sessions, connection-local parking, and exact-id reclaim of independent per-session reconnect grace; see [`multi_controller`](#multi_controller) for limits and refusals |
 | `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 per connection are parked or closing (`-32004` with `data.reason: "parked_limit"`), `status` adds `parked_sessions`, and the controller gets `parked_session_changed` events (see "parking a busy session") |
 | `in_flight_replay` | requires `session_replay_seq`; a `session_history_and_subscribe` join during a reply starts its stream with the reply text, thinking, and running-tool output streamed so far, as ordinary `assistant_delta` and `tool_output` events (see "joining during a reply") |
 

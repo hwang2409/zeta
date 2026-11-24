@@ -354,7 +354,9 @@ class ZetaServer:
         yield self.controllers.attached().control
         yield from self.parking.pairs()
 
-    def new_pair(self, owner: SessionUse | SessionController | None = None) -> SessionUse:
+    def new_pair(
+        self, owner: SessionUse | SessionController | None = None, *, connection: object | None = None
+    ) -> SessionUse:
         """Create a pair beside the owner's record, sharing its manager."""
         if self.controllers.controller_mode != "multi":
             self.controllers.require_legacy_parked_room()
@@ -369,7 +371,7 @@ class ZetaServer:
             self._bind_pair(control)
             return control
 
-        return self.controllers.register(make_control)
+        return self.controllers.register(make_control, connection=connection)
 
     def attach(self, incoming: SessionController, connection: _Client) -> SessionController:
         """Make ``incoming`` the attached pair in one step (no await): park the
@@ -753,7 +755,7 @@ class _Client:
                     graceful = False
                     break
                 self._run_task = None
-                if not self.handshaken:
+                if not self.handshaken and not handling.result():
                     break
         finally:
             # a cancel of the connection task (server teardown) must also stop an
@@ -767,7 +769,7 @@ class _Client:
             if not self.connections.frozen:
                 await self.close(graceful=graceful and not self._transport_failed)
 
-    async def _run_request(self, handling: asyncio.Task[None]) -> bool:
+    async def _run_request(self, handling: asyncio.Task[bool]) -> bool:
         """Run one request to completion while reading the socket ahead.
 
         Dispatch stays serial: the next request is not parsed until this one
@@ -790,7 +792,7 @@ class _Client:
         await handling
         return False
 
-    async def _handle_loss(self, handling: asyncio.Task[None]) -> None:
+    async def _handle_loss(self, handling: asyncio.Task[bool]) -> None:
         """Peer EOF while a request runs: start no new request, hold the slot
         until the handler ends, and cancel it only once another controller
         contends for the slot."""
@@ -830,7 +832,7 @@ class _Client:
             await handling
         self._release_dead_connection()
 
-    async def _await_handler_held(self, handling: asyncio.Task[None]) -> None:
+    async def _await_handler_held(self, handling: asyncio.Task[bool]) -> None:
         """Hold the slot until the cancelled handler ends; dump the stuck holder
         at each cancel-bound interval so a swallowed cancel stays visible."""
         while True:
@@ -845,7 +847,9 @@ class _Client:
                 reason="controller slot held; lost holder's request did not end after cancel",
             )
 
-    async def _handle(self, request: dict[str, Any]) -> None:
+    async def _handle(self, request: dict[str, Any]) -> bool:
+        """Return whether a rejected hello may be retried on this socket."""
+        retry_hello = False
         request_id = request["id"]
         self._request = (request["method"], request_id, time.monotonic())
         await self.connections.wait_until_settled(self)
@@ -855,18 +859,17 @@ class _Client:
                     request_id, request["method"], request["params"]
                 )
         except ProtocolError as exc:
-            await self._write(
-                self.codec.error_response(
-                    exc.request_id
-                    if exc.request_id is not None
-                    else request_id,
-                    exc.descriptor,
-                    exc.message,
-                    exc.data,
-                )
+            frame = self.codec.error_response(
+                exc.request_id if exc.request_id is not None else request_id,
+                exc.descriptor, exc.message, exc.data,
             )
-            if not self.handshaken:
-                self.connections.release(self)
+            if not self.handshaken and exc.descriptor is ErrorDescriptor.SESSION_CONTROLLED:
+                # Don't promote the output queue to ready on a refused hello.
+                retry_hello = await self._write_physical(frame)
+            else:
+                await self._write(frame)
+                if not self.handshaken:
+                    self.connections.release(self)
         except PROJECT_REQUEST_EXCEPTIONS as exc:
             descriptor, message, data = project_request_error(exc)
             await self._write(
@@ -938,8 +941,8 @@ class _Client:
                 and self.role == "controller"
                 and "approval_reconnect" in self.features
             ):
-                record = self.server.controllers.controller_for(self)
                 if self.server.controllers.controller_mode == "multi":
+                    record = self.server.controllers.controller_for(self)
                     if record is None:
                         raise RuntimeError("multi controller has no session owner")
                     await record.control.controller_ready(reconnect=True)
@@ -947,6 +950,7 @@ class _Client:
                     for control in self.server.controls():
                         await control.controller_ready(reconnect=True)
         self._request = None
+        return retry_hello
 
     @contextlib.contextmanager
     def _traced(self, request: dict[str, Any]) -> Iterator[None]:
@@ -1157,26 +1161,24 @@ class _Client:
         admission = None
         acquisition = None
         try:
-            role, admission = self._claim_hello_role(hello, params)
+            admission = self._admit_controller_hello(hello, params)
+            multi = admission is not None and admission.mode == "multi" and self.max_role != "observer"
+            # Multi must refuse a conflicting hello before claiming its output queue.
+            role = "controller" if multi else self._claim_hello_role(hello)
             result = self._hello_result(hello, role)
-            if "mcp_bindings" in params and role != "controller":
+            if role == "controller":
+                requested_id = params.get("session_id")
+                session_id = requested_id if multi and isinstance(requested_id, str) else None
+                with self.server.controllers.owned(self, session_id) as controller:
+                    acquisition = controller.acquisition
+                    if multi:
+                        self._claim_hello_role(hello)
+                    await self._setup_controller_hello(params, deadline, controller)
+            elif "mcp_bindings" in params:
                 raise ProtocolError(
                     ErrorDescriptor.INVALID_PARAMS,
                     "mcp_bindings require a controller connection",
                 )
-            if role == "controller":
-                requested_session_id = params.get("session_id")
-                session_id = (
-                    requested_session_id
-                    if (
-                        self.server.controllers.controller_mode == "multi"
-                        and isinstance(requested_session_id, str)
-                    )
-                    else None
-                )
-                with self.server.controllers.owned(self, session_id) as controller:
-                    acquisition = controller.acquisition
-                    await self._setup_controller_hello(params, deadline, controller)
             if admission is not None:
                 self.server.controllers.commit_hello(admission)
             if acquisition is not None:
@@ -1191,38 +1193,35 @@ class _Client:
             raise
         return True, result
 
-    def _claim_hello_role(
+    def _admit_controller_hello(
         self, hello: _HelloNegotiation, params: dict[str, Any]
-    ) -> tuple[str, HelloAdmission | None]:
-        admission = None
-        if hello.role == "controller":
-            try:
-                admission = self.server.controllers.admit_hello(
-                    self,
-                    negotiated_multi="multi_controller" in self.features,
-                    reconnect_session_id=params.get("session_id")
-                    if isinstance(params.get("session_id"), str)
-                    else None,
-                )
-            except ProtocolError as exc:
-                if exc.code == ErrorDescriptor.CONNECTION_CAPACITY.code:
-                    self.connections.log_controller_refusal(self)
-                raise
+    ) -> HelloAdmission | None:
+        if hello.role != "controller":
+            return None
         try:
-            role = self.connections.negotiate_role(
+            admission = self.server.controllers.admit_hello(
                 self,
-                hello.role,
-                self.protocol_version,
-                self.features,
-                max_role=self.max_role,
-                multi_mode=self.server.controllers.controller_mode == "multi",
+                negotiated_multi="multi_controller" in self.features,
+                reconnect_session_id=params.get("session_id")
+                if isinstance(params.get("session_id"), str)
+                else None,
             )
-        except BaseException:
-            if admission is not None:
-                self.server.controllers.abort_hello(admission)
+        except ProtocolError as exc:
+            if exc.code == ErrorDescriptor.CONNECTION_CAPACITY.code:
+                self.connections.log_controller_refusal(self)
             raise
         self._hello_admission = admission
-        return role, admission
+        return admission
+
+    def _claim_hello_role(self, hello: _HelloNegotiation) -> str:
+        return self.connections.negotiate_role(
+            self,
+            hello.role,
+            self.protocol_version,
+            self.features,
+            max_role=self.max_role,
+            multi_mode=self.server.controllers.controller_mode == "multi",
+        )
 
     async def _rollback_hello(self, admission: HelloAdmission | None) -> None:
         release = (

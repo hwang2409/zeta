@@ -40,11 +40,13 @@ class SessionAcquisition:
     previous: SessionController | None
     target: SessionController
     created: bool
+    previous_index: SessionController | None
 
 
 @dataclass(slots=True, eq=False)
 class _MultiGrace:
     session_id: str
+    release: asyncio.Future[None]
     idle_deadline: asyncio.Task[None] | None = None
 
 
@@ -65,7 +67,9 @@ class SessionController:
     close_task: asyncio.Task[None] | None = None
     # the session the record held when its close began
     closing_session_id: str | None = None
+    setup_by: object | None = None
     parked_by: object | None = None
+    parked_scoped: bool = False
     parked_last_sent: dict[str, object] | None = None
 
     @property
@@ -224,14 +228,12 @@ class SessionControllers:
         return HelloAdmission(connection, requested, generation)
 
     def _refresh_controller_mode(self) -> None:
-        """Apply the admission state table after every token or release change.
-
-        ``tokens`` includes both provisional and committed hello reservations.
-        An exact reconnect grace is the only state that survives without one.
-        Resident and closing records are session state, not controller tokens;
-        they do not keep an unattached mode alive.
-        """
         if self._controller_members or self._legacy_grace or self._multi_graces:
+            return
+        if self._controller_mode == "multi" and any(
+            record.closing or record.parked_scoped
+            for record in self._records.values()
+        ):
             return
         self._controller_mode = "empty"
 
@@ -244,55 +246,81 @@ class SessionControllers:
         if self._controller_members.get(admission.connection) != admission.generation:
             return
         del self._controller_members[admission.connection]
+        self._hello_records.pop(admission.connection, None)
         self._refresh_controller_mode()
 
     def is_controller(self, connection: Any) -> bool:
         return connection in self._controller_members
 
     def controller_for(self, connection: Any) -> SessionController | None:
-        """Return the exact committed or provisional record for ``connection``."""
-        record = self._by_connection.get(connection)
-        if record is not None:
-            return record
-        record = self._hello_records.get(connection)
-        if record is not None:
-            return record
-        return next((
-            owner.target for owner in self._by_session.values()
-            if isinstance(owner, SessionAcquisition) and owner.connection is connection
-        ), None)
+        return self._by_connection.get(connection, self._hello_records.get(connection))
+
+    def records_charged_to(self, connection: object) -> tuple[SessionController, ...]:
+        """Snapshot every attached, provisional, parked, or reserved record once."""
+        return tuple(
+            record for record in self._records.values()
+            if any(holder is connection for holder in self._charges(record))
+        )
+
+    def _charges(self, record: SessionController) -> Iterator[object]:
+        for bindings in (self._by_connection, self._hello_records):
+            yield from (connection for connection, target in bindings.items() if target is record)
+        for reservation in self._by_session.values():
+            if isinstance(reservation, SessionAcquisition) and reservation.target is record:
+                yield reservation.connection
+        if record.parked_by is not None:
+            yield record.parked_by
+        if record.setup_by is not None:
+            yield record.setup_by
+
+    def owner_of(self, record: SessionController) -> object | _MultiGrace | None:
+        """Return the live controller, reconnect grace, or None for a free record."""
+        return next(
+            (connection for connection in self._charges(record) if connection in self._controller_members),
+            self._multi_graces.get(record),
+        )
 
     def begin_controller_release(
-        self, connection: Any, *, reconnect: bool, keep_turn: bool
-    ) -> asyncio.Task[None] | None:
-        """Capture this record before EOF removes the connection's binding."""
-        record = self.controller_for(connection)
-        if record is None or record.closing:
-            return None
-        release = record.control.begin_controller_release(
-            reconnect=reconnect and not self._frozen, keep_turn=keep_turn,
-        )
-        if not self._frozen and record.runtime.opened is not None and (
-            self._by_connection.get(connection) is record or record in self._multi_graces
-        ):
-            self._clear_grace(record)
-            grace = _MultiGrace(record.runtime.session_id)
-            self._multi_graces[record] = grace
-            work = record.control.reconnect_grace_task
-            idle = work is None
-            if idle:
-                work = release
-                if record.control.server.approval_reconnect_grace != 0:
-                    async def idle_deadline() -> None:
-                        await record.control._grace_deadline()
-                        await asyncio.wait((release,))
+        self, connection: object, *, reconnect: bool, keep_turn: bool
+    ) -> asyncio.Task[None]:
+        """Start all per-record releases before the physical slot is freed."""
+        releases: list[asyncio.Future[None]] = []
+        for record in self.records_charged_to(connection):
+            if record.closing:
+                continue
+            try:
+                release = record.control.begin_controller_release(
+                    reconnect=reconnect and not self._frozen, keep_turn=keep_turn,
+                    preserve_grace=True,
+                )
+            except BaseException as exc:  # noqa: BLE001 - settle the other records too
+                release = asyncio.get_running_loop().create_future()
+                release.set_exception(exc)
+            releases.append(release)
+            if not self._frozen and record.runtime.opened is not None:
+                self._watch_multi_grace(record, release)
 
-                    work = grace.idle_deadline = asyncio.create_task(idle_deadline())
-            assert work is not None
-            work.add_done_callback(
-                lambda done: self._expire_multi_grace(record, grace, done, idle=idle)
-            )
-        return release
+        async def settle() -> None:
+            await asyncio.gather(*releases, return_exceptions=True)
+            for release in releases:
+                release.result()
+
+        return asyncio.create_task(settle())
+
+    def _watch_multi_grace(self, record: SessionController, release: asyncio.Future[None]) -> None:
+        self._clear_grace(record)
+        grace = _MultiGrace(record.runtime.session_id, release)
+        self._multi_graces[record] = grace
+        work: asyncio.Future[None] | None = record.control.reconnect_grace_task
+        if work is None:
+            work = release
+            if record.control.server.approval_reconnect_grace != 0:
+                async def idle_deadline() -> None:
+                    await record.control._grace_deadline()
+                    await asyncio.wait((release,))
+
+                work = grace.idle_deadline = asyncio.create_task(idle_deadline())
+        work.add_done_callback(lambda done: self._expire_multi_grace(record, grace, done))
 
     def _clear_grace(self, record: SessionController) -> None:
         grace = self._multi_graces.pop(record, None)
@@ -302,15 +330,12 @@ class SessionControllers:
                 grace.idle_deadline.cancel()
 
     def _expire_multi_grace(
-        self, record: SessionController, grace: _MultiGrace, work: asyncio.Task[None], *, idle: bool
+        self, record: SessionController, grace: _MultiGrace, work: asyncio.Future[None]
     ) -> None:
         if (work.cancelled() or self._frozen or record.closing
                 or self._multi_graces.get(record) is not grace):
             return
-        if idle:
-            self.retire(record)
-        else:
-            self._clear_grace(record)
+        self.retire(record)
 
     def release_connection(self, connection: Any, reason: str = "eof") -> None:
         del reason
@@ -354,7 +379,9 @@ class SessionControllers:
         # Empty mode also covers legacy observers waiting without a controller.
         return self._controller_mode != "multi" and self.event_record(source) is self._attached
 
-    def register(self, make_control: Callable[[], ServeControl]) -> SessionUse:
+    def register(
+        self, make_control: Callable[[], ServeControl], *, connection: object | None = None
+    ) -> SessionUse:
         """A new generation for ``control``, reserved by the returned use until
         its setup ends."""
         self._require_open()
@@ -364,7 +391,7 @@ class SessionControllers:
                 {"reason": "resident_limit"},
             )
         control = make_control()
-        record = SessionController(control, next(self._generations))
+        record = SessionController(control, next(self._generations), setup_by=connection)
         self._records[control] = record
         return self._use(record, setup=True)
 
@@ -380,6 +407,8 @@ class SessionControllers:
             return self._use(acquisition.target, acquisition, setup=True)
         record = self._by_connection.get(connection, self._attached)
         if self._controller_mode == "multi" and connection not in self._by_connection:
+            if record.runtime.opened is not None:
+                self._require_acquirable(connection, record, record.runtime.session_id, reconnect=False)
             self._hello_records[connection] = record
         if record.closing:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
@@ -408,11 +437,7 @@ class SessionControllers:
         record = self._by_session.get(session_id)
         if isinstance(record, SessionAcquisition):
             if record.connection is not connection:
-                raise ProtocolError(
-                    ErrorDescriptor.SESSION_CONTROLLED,
-                    "session is controlled by another client",
-                    {"session_id": session_id},
-                )
+                raise self._controlled(session_id)
             record = record.target
         if record is None:
             record = self._parked.get(session_id)
@@ -441,34 +466,58 @@ class SessionControllers:
             and not record.closing
         ), None)
 
+    @staticmethod
+    def _controlled(session_id: str) -> ProtocolError:
+        return ProtocolError(
+            ErrorDescriptor.SESSION_CONTROLLED,
+            "session is controlled by another client",
+            {"session_id": session_id},
+        )
+
+    def acquisition_target(
+        self, connection: object, session_id: str, *, reconnect: bool,
+    ) -> SessionController | None:
+        """Find a resident target, refusing another controller's charge before setup."""
+        self._require_open()
+        record = self.resident(session_id)
+        if record is not None:
+            self._require_acquirable(connection, record, session_id, reconnect=reconnect)
+        return record
+
+    def _require_acquirable(
+        self, connection: object, record: SessionController, session_id: str, *, reconnect: bool,
+    ) -> None:
+        owner = self.owner_of(record)
+        if isinstance(owner, _MultiGrace):
+            if not reconnect:
+                raise self._controlled(session_id)
+        elif owner is not None and owner is not connection:
+            raise self._controlled(session_id)
+
     def reserve_existing(self, connection: Any, session_id: str) -> SessionAcquisition:
         """Reserve an existing resident session for an exact reconnect."""
-        record = self.resident(session_id)
-        if record is None or record.closing:
-            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
-        return self.reserve_session(connection, session_id, record)
+        return self._reserve_session(connection, session_id, None)
 
     def reserve_session(
         self, connection: Any, session_id: str, candidate: SessionController
     ) -> SessionAcquisition:
-        """Reserve a session synchronously, before opening its runtime."""
-        self._require_open()
+        return self._reserve_session(connection, session_id, candidate)
+
+    def _reserve_session(
+        self, connection: Any, session_id: str, candidate: SessionController | None
+    ) -> SessionAcquisition:
+        """Reserve a session synchronously, before any target setup can await."""
+        resident = self.acquisition_target(connection, session_id, reconnect=candidate is None)
         existing = self._by_session.get(session_id)
-        target = existing.target if isinstance(existing, SessionAcquisition) else existing
-        holder = next((
-            owner for owner, record in self._by_connection.items()
-            if record is target and owner is not connection
-        ), None)
-        if isinstance(existing, SessionAcquisition) or holder is not None:
-            raise ProtocolError(
-                ErrorDescriptor.SESSION_CONTROLLED,
-                "session is controlled by another client",
-                {"session_id": session_id},
-            )
+        if isinstance(existing, SessionAcquisition):
+            raise self._controlled(session_id)
+        target = candidate if candidate is not None else resident
+        if target is None or target.closing:
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         previous = self._by_connection.get(connection)
         acquisition = SessionAcquisition(
             connection, session_id, next(self._session_generations), previous,
-            candidate, existing is None and candidate is not previous,
+            target, target is not resident and target is not previous, existing,
         )
         self._by_session[session_id] = acquisition
         return acquisition
@@ -486,6 +535,7 @@ class SessionControllers:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         self._by_session[acquisition.session_id] = acquisition.target
         self._by_connection[acquisition.connection] = acquisition.target
+        acquisition.target.setup_by = None
         self._clear_grace(acquisition.target)
         self._hello_records.pop(acquisition.connection, None)
         if acquisition.target.runtime.opened is not None:
@@ -495,12 +545,12 @@ class SessionControllers:
     def abort_session(self, acquisition: SessionAcquisition) -> asyncio.Task[None] | None:
         if self._by_session.get(acquisition.session_id) is not acquisition:
             return None
-        if acquisition.created:
+        if acquisition.previous_index is None:
             del self._by_session[acquisition.session_id]
-            if self._records.get(acquisition.target.control) is acquisition.target:
-                return self.retire(acquisition.target)
         else:
-            self._by_session[acquisition.session_id] = acquisition.target
+            self._by_session[acquisition.session_id] = acquisition.previous_index
+        if acquisition.created and self._records.get(acquisition.target.control) is acquisition.target:
+            return self.retire(acquisition.target)
         return None
 
     def bind_retention_planner(self) -> None:
@@ -552,13 +602,15 @@ class SessionControllers:
     def parked_records(self, connection: object) -> Iterator[SessionController]:
         return (
             record for record in self._parked.values()
-            if self._controller_mode != "multi" or record.parked_by is connection
+            if (record.parked_scoped and record.parked_by is connection)
+            or (not record.parked_scoped and self._controller_mode != "multi")
         )
 
     def park(self, record: SessionController, connection: object | None = None) -> SessionController:
         self._require_open()
         assert not record.closing
         record.parked_by = connection
+        record.parked_scoped = self._controller_mode == "multi"
         self._parked[record.runtime.session_id] = record
         return record
 
@@ -569,11 +621,15 @@ class SessionControllers:
             return None
         del self._parked[session_id]
         record.parked_by = None
+        record.parked_scoped = False
         record.parked_last_sent = None
         return record
 
     def parked_controls(self) -> tuple[ServeControl, ...]:
         return tuple(record.control for record in self._parked.values())
+
+    def parked_in_grace(self, control: ServeControl) -> bool:
+        return self._records.get(control) in self._multi_graces
 
     def parked_record(self, session_id: str) -> SessionController | None:
         return self._parked.get(session_id)
@@ -624,13 +680,15 @@ class SessionControllers:
             if self._frozen:
                 await self._record_drain.wait()
             await self._drained(record)
+            grace = self._multi_graces.get(record)
+            if grace is not None:
+                await asyncio.wait((grace.release,))
             await attempt(control.close())
             await attempt(control.wait_for_approval_settlement(settlement_timeout))
             if self._frozen:
                 await self._record_drain.wait()
             if self._drain_events is not None and (self._frozen or self._controller_mode == "multi"):
                 await attempt(self._drain_events(record))
-            grace = self._multi_graces.get(record)
             if grace is not None and grace.idle_deadline is not None:
                 grace.idle_deadline.cancel()
                 await attempt(asyncio.gather(grace.idle_deadline, return_exceptions=True))
@@ -642,12 +700,14 @@ class SessionControllers:
             del self._records[control]
             self._clear_grace(record)
             record.parked_by = None
+            record.setup_by = None
             for session_id, owner in tuple(self._by_session.items()):
                 if owner is record or isinstance(owner, SessionAcquisition) and owner.target is record:
                     del self._by_session[session_id]
             for connection, owner in tuple(self._by_connection.items()):
                 if owner is record:
                     del self._by_connection[connection]
+            self._refresh_controller_mode()
 
     async def wait_closed(self, session_id: str) -> None:
         """Wait until every closing record of ``session_id`` has closed."""

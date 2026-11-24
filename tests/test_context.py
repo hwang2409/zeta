@@ -11,6 +11,7 @@ import json
 import threading
 from tempfile import TemporaryDirectory
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -171,6 +172,60 @@ async def test_prepared_context_is_consumed_once(owned_context_store, monkeypatc
 
     assert first.messages == second.messages
     assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_context_preparation_completes_with_saturated_default_executor(
+    owned_context_store, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    logger_name = "zeta.core.context_parts.preparation"
+    caplog.set_level("DEBUG", logger=logger_name)
+    store = owned_context_store
+    store.append_message(text(MessageRole.USER, "hello"))
+    assembler = ContextAssembler(store, token_budget=10_000)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    occupied = asyncio.Event()
+    release = threading.Event()
+    queued_on_default = asyncio.Event()
+    run_in_executor = loop.run_in_executor
+
+    def occupy_worker() -> None:
+        loop.call_soon_threadsafe(occupied.set)
+        assert release.wait(timeout=30), "default executor worker was not released"
+
+    def observe_submit(executor, func, *args):  # type: ignore[no-untyped-def]
+        future = run_in_executor(executor, func, *args)
+        if executor is None:
+            queued_on_default.set()
+        return future
+
+    blocker = run_in_executor(None, occupy_worker)
+    tasks = []
+    try:
+        await asyncio.wait_for(occupied.wait(), 10)
+        # test-contract: seam signals a losing submission without a timing race.
+        monkeypatch.setattr(loop, "run_in_executor", observe_submit)
+        preparation = asyncio.create_task(assembler.prepare_context())
+        queued = asyncio.create_task(asyncio.wait_for(queued_on_default.wait(), 15))
+        tasks = [preparation, queued]
+        done, _ = await asyncio.wait(tasks, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        assert done, "neither preparation nor default executor submission made progress"
+        assert preparation.done() and not queued_on_default.is_set(), (
+            "context preparation must finish while the default executor is blocked"
+        )
+        assert preparation.result() is False
+        timings = [record.getMessage() for record in caplog.records if record.name == logger_name]
+        assert len(timings) == 2
+        for phase, message in zip(("load rows", "account context"), timings, strict=True):
+            assert f"{phase} ended" in message
+            assert "queue_ms=" in message and "run_ms=" in message
+    finally:
+        for task in tasks:
+            task.cancel()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(blocker, *tasks, return_exceptions=True), 10)
+    blocker.result()
 
 
 @pytest.mark.asyncio

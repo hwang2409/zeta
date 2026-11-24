@@ -88,7 +88,7 @@ async def _session_swap(
     # Keep the outgoing charge and incoming use across setup and rollback.
     with (
         server.controllers.reserve_park(self),
-        (server.new_pair(controller) if multi else server.new_pair()) as reservation,
+        (server.new_pair(controller, connection=self) if multi else server.new_pair()) as reservation,
     ):
         incoming = reservation.record
         with incoming.control.reserve_session_swap():
@@ -256,17 +256,23 @@ async def _resume(
         if multi:
             session_id = await _resolve_session_id(self, params, controller)
             await self.server.controllers.wait_closed(session_id)
-            resident = self.server.controllers.resident(session_id)
+            exact_attach = "resume_attach" in self.features and params["session_id"] == session_id
+            resident = self.server.controllers.acquisition_target(self, session_id, reconnect=exact_attach)
             if "resume_attach" in self.features and resident is not None and not resident.control.unhealthy():
                 with self.server.controllers.reserve_park(self, target=resident):
                     acquisition = self.server.controllers.reserve_existing(self, session_id)
                     target_use = self.server.controllers.use_acquisition(acquisition)
                     if acquisition.previous is not acquisition.target:
-                        resident_claimed = await target_use.control.controller_claimed(
+                        resident_claimed = True
+                        claimed = await target_use.control.controller_claimed(
                             reconnect="approval_reconnect" in self.features,
                             require_host_binding="session_host_commands" in self.features,
                             deadline=control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS,
                         )
+                        if not claimed:
+                            raise ProtocolError(
+                                ErrorDescriptor.CONNECTION_CAPACITY, "another client is already connected"
+                            )
                     attached = await _attach_live_turn(
                         self, bindings, candidate, controller=target_use
                     )
@@ -285,7 +291,7 @@ async def _resume(
         async with _session_swap(self, park, controller) as incoming:
             if session_id is None:
                 session_id = await _resolve_session_id(self, params, controller)
-            await self.server.controllers.wait_closed(session_id)
+                await self.server.controllers.wait_closed(session_id)
             acquisition = None
             if multi:
                 candidate = incoming or controller.record
