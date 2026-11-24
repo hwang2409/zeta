@@ -97,10 +97,10 @@ async def test_multi_park_outlives_grace_while_connected(
     async def expired_deadline(_control: ServeControl) -> None:
         return None  # injected clock: any grace deadline has already passed
 
+    # test-contract: seam the grace deadline is the injected clock; no sleep as proof.
     monkeypatch.setattr(ServeControl, "_grace_deadline", expired_deadline)
     backend = GatedBackend([HELD, NEXT])
     server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
-    server.approval_reconnect_grace = 1
     await await_or_fail(server.start(), what="start park server")
     owner = None
     try:
