@@ -88,7 +88,7 @@ async def _session_swap(
     # Keep the outgoing charge and incoming use across setup and rollback.
     with (
         server.controllers.reserve_park(self),
-        (server.new_pair(controller) if multi else server.new_pair()) as reservation,
+        (server.new_pair(controller, connection=self) if multi else server.new_pair()) as reservation,
     ):
         incoming = reservation.record
         with incoming.control.reserve_session_swap():
