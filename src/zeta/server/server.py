@@ -315,7 +315,7 @@ class ZetaServer:
                 runtime.manager._storage_lease,
                 lambda: (
                     0
-                    if self.controllers.attached().runtime.opened is None
+                    if not self.controllers.has_open_session()
                     else load_settings(home=self.home).settings.retention_days
                 ),
                 session_available=False,
@@ -369,16 +369,15 @@ class ZetaServer:
             self.controllers.require_legacy_parked_room()
         source = owner.record if isinstance(owner, SessionUse) else owner
         if source is None:
+            assert self.controllers.controller_mode != "multi"
             source = self.controllers.attached()
 
-        def make_control() -> ServeControl:
-            control = ServeControl(
-                self, source.runtime.sibling(), self.foreground_event_publisher
-            )
-            self._bind_pair(control)
-            return control
+        return self.controllers.register(lambda: self._make_sibling_control(source.runtime), connection=connection)
 
-        return self.controllers.register(make_control, connection=connection)
+    def _make_sibling_control(self, runtime: ServerRuntime) -> ServeControl:
+        control = ServeControl(self, runtime.sibling(), self.foreground_event_publisher)
+        self._bind_pair(control)
+        return control
 
     def attach(self, incoming: SessionController, connection: _Client) -> SessionController:
         """Make ``incoming`` the attached pair in one step (no await): park the

@@ -59,10 +59,10 @@ def _seed_secrets(home):
     }))
 
 
-def _server(home, monkeypatch):
+def _server(home, monkeypatch, **options):
     monkeypatch.setenv("ZETA_ACCOUNT_HOME", str(home))
     return ZetaServer(home=home, socket_path=short_socket_path(home), ws_port=0,
-                      ws_discovery=home.parent / "ws.json", provider="codex")
+                      ws_discovery=home.parent / "ws.json", provider="codex", **options)
 
 
 @pytest.mark.asyncio
@@ -205,8 +205,13 @@ async def test_state_storage_operation_cap(tmp_path, monkeypatch, fill_other_are
 
 
 @pytest.mark.asyncio
-async def test_state_port_gate(tmp_path, monkeypatch):
-    server = _server(tmp_path / "home", monkeypatch)
+@pytest.mark.parametrize("multi", (False, True), ids=("dormant", "multi"))
+async def test_state_port_gate(tmp_path, monkeypatch, multi):
+    features = (*protocol.FEATURES, "multi_controller") if multi else protocol.FEATURES
+    server = _server(
+        tmp_path / "home", monkeypatch,
+        _supported_features_for_test=frozenset(features) if multi else None,
+    )
     await await_or_fail(server.start(), what="serve start")
     try:
         async with _connect(server, negotiated=False) as client:
@@ -220,12 +225,13 @@ async def test_state_port_gate(tmp_path, monkeypatch):
             assert ws is not None
             async with connect(f"ws://127.0.0.1:{ws.port}/", subprotocols=["zeta.v1", f"zeta.bearer.{ws.controller_token}"]) as socket:
                 return (await ServeClient(websocket=socket).request("hello", "hello", {
-                    "protocol_version": "1.2", "features": list(protocol.FEATURES),
+                    "protocol_version": "1.2", "features": list(features),
                 }))["result"]["capabilities"]
 
         caps = await negotiate()
         requests = set(caps["requests"])
         assert "state_read_v1" in caps["features"]
+        assert ("multi_controller" in caps["features"]) is multi
         expected = {"state_catalog", *PROJECT_METHODS, *SESSION_METHODS, *HOME_METHODS}
         assert {method.wire for method in HANDLERS if method.feature == "state_read_v1"} == expected
         assert {wire for wire, feature in docs_rows if feature == "state_read_v1"} == expected

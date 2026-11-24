@@ -113,8 +113,7 @@ class SessionUse:
             return False
         if self.is_view:
             return connection.connections.replay.controller_for(connection) is self.record
-        owner = self._owner
-        return owner._by_connection.get(connection, owner._attached) is self.record
+        return self._owner._request_record(connection) is self.record
 
     def __enter__(self) -> Self:
         return self
@@ -167,6 +166,8 @@ class SessionControllers:
             control: SessionController(control, next(self._generations), owns_runtime)
         }
         self._attached = self._records[control]
+        # Unbound multi requests share an unopened record, never the legacy default.
+        self._sessionless = self._attached
         self._parked: dict[str, SessionController] = {}
         # These maps are the sole semantic ownership state.  A reservation is
         # installed before any target runtime operation can await.
@@ -179,13 +180,17 @@ class SessionControllers:
         self._controller_members: dict[Any, int] = {}
         self._hello_records: dict[Any, SessionController] = {}
         self._hello_generations = itertools.count(1)
-        self._legacy_grace = False
         self._multi_graces: dict[SessionController, _MultiGrace] = {}
         # close waiters per record, woken when its last use settles
         self._drains: dict[SessionController, list[asyncio.Future[None]]] = {}
+        if self._retention_owner is not None:
+            control.runtime.set_session_changed_sink(self._snapshot_retention_eligibility)
+        self._snapshot_retention_eligibility()
 
     @property
     def controller_mode(self) -> Literal["empty", "legacy", "multi"]:
+        # ServeControl can finish grace without a connection transition.
+        self._refresh_controller_mode()
         return self._controller_mode
 
     def freeze(self) -> None:
@@ -205,8 +210,16 @@ class SessionControllers:
         """Reserve process controller mode before claiming the physical socket."""
         self._require_open()
         requested: Literal["legacy", "multi"] = "multi" if negotiated_multi else "legacy"
-        if self._controller_mode == "empty":
+        if self.controller_mode == "empty":
+            if requested == "multi" and (
+                self._sessionless.closing or self._sessionless.runtime.opened is not None
+            ):
+                source = self._sessionless.control
+                with self.register(lambda: source.server._make_sibling_control(source.runtime)) as use:
+                    self._sessionless = use.record
             self._controller_mode = requested
+            self._snapshot_retention_eligibility()
+            self.bind_retention_planner()
         elif not self._controller_members:
             if self._controller_mode != requested:
                 raise ProtocolError(
@@ -233,14 +246,21 @@ class SessionControllers:
         return HelloAdmission(connection, requested, generation)
 
     def _refresh_controller_mode(self) -> None:
-        if self._controller_members or self._legacy_grace or self._multi_graces:
+        if self._controller_members or self._multi_graces:
+            return
+        if self._controller_mode == "legacy" and any(
+            (work := record.control.reconnect_grace_task) is not None and not work.done()
+            for record in self._records.values()
+        ):
             return
         if self._controller_mode == "multi" and any(
             record.closing or record.parked_scoped
             for record in self._records.values()
         ):
             return
-        self._controller_mode = "empty"
+        if self._controller_mode != "empty":
+            self._controller_mode = "empty"
+            self._snapshot_retention_eligibility()
 
     def commit_hello(self, admission: HelloAdmission) -> None:
         self._require_open()
@@ -348,8 +368,6 @@ class SessionControllers:
         generation = self._controller_members.pop(connection, None)
         if generation is not None:
             self._by_connection.pop(connection, None)
-            if not self._frozen and self._controller_mode == "legacy":
-                self._legacy_grace = True
         self._refresh_controller_mode()
 
     def records(self) -> tuple[SessionController, ...]:
@@ -398,9 +416,17 @@ class SessionControllers:
         control = make_control()
         record = SessionController(control, next(self._generations), setup_by=connection)
         self._records[control] = record
+        if self._retention_owner is not None:
+            control.runtime.set_session_changed_sink(self._snapshot_retention_eligibility)
+            self._snapshot_retention_eligibility()
         return self._use(record, setup=True)
 
     def attached(self) -> SessionController:
+        return self._attached
+
+    def _request_record(self, connection: Any) -> SessionController:
+        if self._controller_mode == "multi":
+            return self._by_connection.get(connection, self._sessionless)
         return self._attached
 
     def owned(self, connection: Any, session_id: str | None = None) -> SessionUse:
@@ -410,10 +436,8 @@ class SessionControllers:
             acquisition = self.reserve_existing(connection, session_id)
             self._hello_records[connection] = acquisition.target
             return self._use(acquisition.target, acquisition, setup=True)
-        record = self._by_connection.get(connection, self._attached)
+        record = self._request_record(connection)
         if self._controller_mode == "multi" and connection not in self._by_connection:
-            if record.runtime.opened is not None:
-                self._require_acquirable(connection, record, record.runtime.session_id, reconnect=False)
             self._hello_records[connection] = record
         if record.closing:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
@@ -442,7 +466,7 @@ class SessionControllers:
         ``unattached_error`` replaces the absence error while no session is
         attached, for an operation whose legacy wire text differs."""
         self._require_open()
-        current = self._by_connection.get(connection, self._attached)
+        current = self._request_record(connection)
         attached = current.runtime
         if (
             not current.closing
@@ -551,6 +575,9 @@ class SessionControllers:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         self._by_session[acquisition.session_id] = acquisition.target
         self._by_connection[acquisition.connection] = acquisition.target
+        if acquisition.target is self._attached:
+            # Once multi owns this record, its release may retire it.
+            self._attached = self._sessionless
         acquisition.target.setup_by = None
         self._clear_grace(acquisition.target)
         self._hello_records.pop(acquisition.connection, None)
@@ -569,16 +596,30 @@ class SessionControllers:
             return self.retire(acquisition.target)
         return None
 
+    def has_open_session(self) -> bool:
+        return self._retention_eligible
+
+    def _snapshot_retention_eligibility(self) -> None:
+        # Only the event loop reads records; the retention worker reads this bool.
+        if self._controller_mode == "multi":
+            self._retention_eligible = any(
+                not record.closing and record.runtime.opened is not None
+                for record in self._records.values()
+            )
+        else:
+            self._retention_eligible = self._attached.runtime.opened is not None
+
     def bind_retention_planner(self) -> None:
         # Bind at startup and legacy swaps, not when the planner publishes.
         if self._retention_owner is not None:
-            self._retention_owner.set_publish(self._attached.runtime.retention_event_sink)
+            self._retention_owner.set_publish(self._request_record(None).runtime.retention_event_sink)
 
     def attach(self, record: SessionController) -> SessionController:
         self._require_open()
         assert not record.closing
         self._parked.pop(record.runtime.session_id, None)
         self._attached = record
+        self._snapshot_retention_eligibility()
         self.bind_retention_planner()
         return record
 
@@ -672,6 +713,7 @@ class SessionControllers:
         assert self._records.get(record.control) is record, "retire of a foreign record"
         runtime = record.runtime
         record.closing = True
+        self._snapshot_retention_eligibility()
         record.closing_session_id = runtime.session_id if runtime.opened is not None else None
         self._parked = {key: item for key, item in self._parked.items() if item is not record}
         task = asyncio.create_task(self._close(record, settlement_timeout))
@@ -714,6 +756,9 @@ class SessionControllers:
                 raise first
         finally:
             del self._records[control]
+            if self._retention_owner is not None:
+                record.runtime.set_session_changed_sink(None)
+                self._snapshot_retention_eligibility()
             self._clear_grace(record)
             record.parked_by = None
             record.setup_by = None
@@ -744,7 +789,6 @@ class SessionControllers:
         )
         self._controller_members.clear()
         self._hello_records.clear()
-        self._legacy_grace = False
         self._refresh_controller_mode()
         for record, result in zip(records, results, strict=True):
             if isinstance(result, BaseException):
@@ -796,7 +840,7 @@ class SessionControllers:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
 
     def is_attached(self, control: ServeControl) -> bool:
-        return self._attached.control is control
+        return self._controller_mode != "multi" and self._attached.control is control
 
 
 def _report_close(task: asyncio.Task[None], session_id: str | None) -> None:
