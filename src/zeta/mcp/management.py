@@ -25,8 +25,8 @@ from .config import (
     MCPConfig,
     MCPServerConfig,
     home_config_path,
-    load_mcp_config,
-    load_mcp_config_overlay,
+    overlay_mcp_configs,
+    parse_mcp_config,
     project_config_path,
 )
 from .envelope import MCPCallLimits
@@ -47,6 +47,8 @@ if TYPE_CHECKING:
 Scope = Literal["user", "project", "effective"]
 _ConfigScope = Literal["user", "project"]
 _LOCK_TIMEOUT_SECONDS = 1.0
+_DiskSnapshot = dict[Path | None, bytes | None]
+_Mutation = Callable[[Path, Path | None, Path, _DiskSnapshot], None]
 
 
 class MCPManagementError(RuntimeError):
@@ -275,12 +277,27 @@ class MCPManagementService:
         return MCPManagementError(f"invalid JSON file: {path}")
 
     @classmethod
-    def _read_object(cls, path: Path) -> dict[str, object]:
-        if not path.exists():
+    def _read_snapshot(cls, paths: tuple[Path | None, ...]) -> _DiskSnapshot:
+        files: _DiskSnapshot = dict.fromkeys(paths)
+        for path in files:
+            if path is None:
+                continue
+            try:
+                files[path] = path.read_bytes()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise cls._invalid_json_error(path) from exc
+        return files
+
+    @classmethod
+    def _parse_object(cls, path: Path, files: _DiskSnapshot) -> dict[str, object]:
+        data = files[path]
+        if data is None:
             return {}
         try:
-            value = json.loads(path.read_text())
-        except (OSError, ValueError) as exc:
+            value = json.loads(data.decode("utf-8"))
+        except ValueError as exc:
             raise cls._invalid_json_error(path) from exc
         if type(value) is not dict:
             raise cls._invalid_json_error(path)
@@ -528,11 +545,11 @@ class MCPManagementService:
         )
 
     def _candidate_locked(
-        self, home_path: Path, project_path: Path | None, trust_path: Path
+        self, home_path: Path, project_path: Path | None, trust_path: Path, files: _DiskSnapshot
     ) -> _ManagementCandidate:
-        user_document = self._read_object(home_path)
-        project_document = self._read_object(project_path) if project_path else {}
-        trust = self._read_object(trust_path)
+        user_document = self._parse_object(home_path, files)
+        project_document = self._parse_object(project_path, files) if project_path else {}
+        trust = self._parse_object(trust_path, files)
         user_entries = tuple(
             self._managed(name, "user", raw, trust, project_path)
             for name, raw in self._servers(user_document, home_path).items()
@@ -545,10 +562,9 @@ class MCPManagementService:
             if project_path is not None
             else ()
         )
-        config = load_mcp_config_overlay(
-            home=home_path.parent,
-            project_dir=project_path.parent.parent if project_path else None,
-        )
+        config = parse_mcp_config(home_path, user_document)
+        if project_path is not None and project_path != home_path:
+            config = overlay_mcp_configs(config, parse_mcp_config(project_path, project_document))
         allowed: set[str] = set()
         sources: dict[str, Path] = {}
         project_servers = (
@@ -556,7 +572,7 @@ class MCPManagementService:
         )
         user_servers = self._servers(user_document, home_path)
         for name, server in config.configured_servers.items():
-            source = config.sources.get(name, config.path).resolve()
+            source = config.sources.get(name, config.path)
             is_project = project_path is not None and source == project_path
             raw = (
                 project_servers.get(name, {})
@@ -612,21 +628,24 @@ class MCPManagementService:
         )
 
     @staticmethod
-    def _content_revision(paths: tuple[Path | None, ...]) -> str:
+    def _content_revision(paths: tuple[Path | None, ...], files: _DiskSnapshot) -> str:
         digest = hashlib.sha256()
         for path in paths:
             identity = os.fsencode(path) if path is not None else b""
             digest.update(len(identity).to_bytes(8, "big"))
             digest.update(identity)
-            try:
-                data = path.read_bytes() if path is not None else None
-            except FileNotFoundError:
-                data = None
+            data = files[path]
             digest.update(b"\x00" if data is None else b"\x01")
             if data is not None:
                 digest.update(len(data).to_bytes(8, "big"))
                 digest.update(data)
         return digest.hexdigest()
+
+    def _check_revision(
+        self, revision: str | None, paths: tuple[Path | None, ...], files: _DiskSnapshot
+    ) -> None:
+        if revision is not None and revision != self._content_revision(paths, files):
+            raise MCPManagementError("MCP revision is stale", code="stale_revision")
 
     def read_disk(self, *, require_project: bool = False) -> tuple[str, tuple[ManagedServer, ...]]:
         """Read disk state under the writer locks, without reconciling any mount."""
@@ -647,7 +666,7 @@ class MCPManagementService:
 
     def _transaction(
         self,
-        mutation: Callable[[Path, Path | None, Path], None] | None = None,
+        mutation: _Mutation | None = None,
         *,
         revision: str | None = None,
         snapshot: bool = False,
@@ -657,12 +676,13 @@ class MCPManagementService:
             if require_project and usable_project is None:
                 raise self._no_project_error()
             revision_paths = (home_path, usable_project, trust_path)
-            if revision is not None and revision != self._content_revision(revision_paths):
-                raise MCPManagementError("MCP revision is stale", code="stale_revision")
+            files = self._read_snapshot(revision_paths)
+            self._check_revision(revision, revision_paths, files)
             if mutation is not None:
-                mutation(home_path, usable_project, trust_path)
-            candidate = self._candidate_locked(home_path, usable_project, trust_path)
-            current = self._content_revision(revision_paths) if snapshot or revision is not None else None
+                mutation(home_path, usable_project, trust_path, files)
+                files = self._read_snapshot(revision_paths)
+            candidate = self._candidate_locked(home_path, usable_project, trust_path, files)
+            current = self._content_revision(revision_paths, files) if snapshot or revision is not None else None
             return replace(candidate, project_path=project_path, revision=current)
 
     def _with_runtime(
@@ -702,7 +722,7 @@ class MCPManagementService:
 
     async def _run_transaction_locked(
         self,
-        mutation: Callable[[Path, Path | None, Path], None] | None = None,
+        mutation: _Mutation | None = None,
         *,
         revision: str | None = None,
     ) -> _ManagementCandidate:
@@ -777,7 +797,7 @@ class MCPManagementService:
 
     async def _transact_reconcile_publish(
         self,
-        mutation: Callable[[Path, Path | None, Path], None] | None = None,
+        mutation: _Mutation | None = None,
         *,
         revision: str | None = None,
     ) -> _MCPManagerView:
@@ -819,14 +839,14 @@ class MCPManagementService:
         self,
         scope: _ConfigScope,
         change: Callable[[dict[str, object]], None],
-    ) -> Callable[[Path, Path | None, Path], None]:
+    ) -> _Mutation:
         def mutate(
-            home_path: Path, project_path: Path | None, _trust_path: Path
+            home_path: Path, project_path: Path | None, _trust_path: Path, files: _DiskSnapshot
         ) -> None:
             path = project_path if scope == "project" else home_path
             if path is None:
                 raise self._no_project_error()
-            document = self._read_object(path)
+            document = self._parse_object(path, files)
             servers = copy.deepcopy(self._servers(document, path))
             change(servers)
             document["servers"] = servers
@@ -835,7 +855,7 @@ class MCPManagementService:
         return mutate
 
     async def _commit(
-        self, mutation: Callable[[Path, Path | None, Path], None], *, revision: str | None
+        self, mutation: _Mutation, *, revision: str | None
     ) -> _MCPManagerView:
         return await self._transact_reconcile_publish(mutation, revision=revision)
 
@@ -917,14 +937,14 @@ class MCPManagementService:
     async def set_trusted(
         self, name: str, *, trusted: bool, revision: str | None = None
     ) -> _MCPManagerView:
-        def mutate(_home: Path, project_path: Path | None, trust_path: Path) -> None:
+        def mutate(_home: Path, project_path: Path | None, trust_path: Path, files: _DiskSnapshot) -> None:
             if project_path is None:
                 raise self._no_project_error()
-            project = self._servers(self._read_object(project_path), project_path)
+            project = self._servers(self._parse_object(project_path, files), project_path)
             raw = project.get(name)
             if type(raw) is not dict:
                 raise MCPManagementError(f"unknown project MCP server: {name}", code="invalid_params")
-            data = self._read_object(trust_path)
+            data = self._parse_object(trust_path, files)
             key = self._trust_key(name, project_path)
             if trusted:
                 data[key] = self.trust_fingerprint(raw)
@@ -979,26 +999,37 @@ class MCPManagementService:
     def _policy_registry(self) -> ToolRegistry | None:
         return getattr(self.mount, "registry", None)
 
-    def _command_target(self, name: str, scope: Scope) -> tuple[ManagedServer, MCPServerConfig | None]:
-        # Trust and the config used to connect must come from the same lock acquisition.
+    async def action_target(
+        self, name: str, *, scope: Scope, revision: str | None = None,
+    ) -> tuple[ManagedServer, MCPServerConfig | None]:
+        return await asyncio.to_thread(self._command_target, name, scope, revision)
+
+    def _command_target(
+        self, name: str, scope: Scope, revision: str | None,
+    ) -> tuple[ManagedServer, MCPServerConfig | None]:
+        # The writer locks cannot stop external edits; validate and parse the same bytes.
         with self._locked_paths() as (home, project, trust_path, _):
+            paths = (home, project, trust_path)
+            files = self._read_snapshot(paths)
+            self._check_revision(revision, paths, files)
             if scope == "project" and project is None:
                 raise self._no_project_error()
             for selected, path in (("project", project), ("user", home)):
                 if path is None or scope not in ("effective", selected):
                     continue
-                servers = self._servers(self._read_object(path), path)
+                document = self._parse_object(path, files)
+                servers = self._servers(document, path)
                 if name in servers:
-                    item = self._managed(name, selected, servers[name], self._read_object(trust_path), project)
-                    return item, load_mcp_config(path).configured_servers.get(name)
+                    item = self._managed(name, selected, servers[name], self._parse_object(trust_path, files), project)
+                    return item, parse_mcp_config(path, document).configured_servers.get(name)
         raise MCPManagementError("unknown MCP server", code="invalid_params")
 
     async def test(
         self, name: str, *, scope: Scope = "effective", wire: bool = False,
-        registry: ToolRegistry | None = None,
+        registry: ToolRegistry | None = None, revision: str | None = None,
     ) -> dict[str, object]:
         registry = registry if registry is not None else self._policy_registry()
-        item, config = await asyncio.to_thread(self._command_target, name, scope)
+        item, config = await self.action_target(name, scope=scope, revision=revision)
         if not mcp_connection.mcp_server_allowed(registry, name):
             return {
                 "name": name,
@@ -1045,11 +1076,12 @@ class MCPManagementService:
         launch_ready: Callable[[str], None] | None = None,
         before_commit: Callable[[], None] | None = None,
         registry: ToolRegistry | None = None,
+        target: tuple[ManagedServer, MCPServerConfig | None] | None = None,
     ) -> None:
         from .oauth import authorize
 
         registry = registry if registry is not None else self._policy_registry()
-        item, config = await asyncio.to_thread(self._command_target, name, scope)
+        item, config = target if target is not None else await self.action_target(name, scope=scope)
         if not mcp_connection.mcp_server_allowed(registry, name):
             raise MCPManagementError("skipped by tool policy")
         if config is None or item.config.get("transport") != "streamable-http":
@@ -1094,8 +1126,13 @@ class MCPManagementService:
             raise MCPManagementError("credentials changed during login")
         return saved.snapshot.token
 
-    async def logout(self, name: str, *, scope: Scope = "effective") -> None:
-        await asyncio.to_thread(self._command_target, name, scope)
+    async def logout(
+        self, name: str, *, scope: Scope = "effective", revision: str | None = None,
+        before_delete: Callable[[], Awaitable[object]] | None = None,
+    ) -> None:
+        await self.action_target(name, scope=scope, revision=revision)
+        if before_delete is not None:
+            await before_delete()
         await self._credential_store.delete(name)
         self._credential_status[name] = "unauthorized"
         self.credential_store_error = None
