@@ -141,6 +141,15 @@ the bounded diagnostic `holder` may contain only safe client version and
 connection duration fields; it never contains credentials, addresses, cwd, or
 bindings.
 
+A disconnected legacy controller holds legacy mode only while an approval or
+protected turn is in reconnect grace. That grace uses the existing approval
+reconnect deadline and ends on reclaim, settlement, or server shutdown. A
+legacy disconnect without live grace leaves the mode empty. An idle legacy
+session remains resident: a returning legacy controller reattaches as before,
+while a negotiated controller starts without a session and can explicitly
+resume the resident session. Once acquired by multi, it is no longer the
+legacy default, including after the multi record closes.
+
 Reconnect must name the exact session being reclaimed and pass its binding and
 approval checks. only `hello` with an exact id or `resume` with an exact id and
 `resume_attach` can reclaim a resident session in grace. plain `resume` and
