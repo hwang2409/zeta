@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -104,6 +105,33 @@ def _message_texts(messages: list[dict[str, object]], role: str) -> list[str]:
         if message["role"] == role
         for block in message["content"]
         if block["type"] == "text"
+    ]
+
+
+def test_installed_serve_refuses_held_socket_lock_without_traceback(tmp_path: Path) -> None:
+    socket_path = tmp_path / "run" / "serve.sock"
+    socket_path.parent.mkdir()
+    with socket_path.with_suffix(".sock.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = subprocess.run(
+            [_entrypoint(), "serve", "--provider", "codex", "--no-auto-memory"],
+            env={
+                **os.environ,
+                "ZETA_HOME": str(tmp_path),
+                "ZETA_TEST_SCRIPTED_PROVIDER": "1",
+            },
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    assert result.returncode == 1, result.stderr
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    assert result.stderr.splitlines() == [
+        f"zeta serve: a server is already listening on {socket_path}. "
+        "Connect your client to that socket, or stop the running server before retrying."
     ]
 
 
