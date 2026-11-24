@@ -192,7 +192,7 @@ async def test_context_preparation_completes_with_saturated_default_executor(
 
     def occupy_worker() -> None:
         loop.call_soon_threadsafe(occupied.set)
-        release.wait()
+        assert release.wait(timeout=30), "default executor worker was not released"
 
     def observe_submit(executor, func, *args):  # type: ignore[no-untyped-def]
         future = run_in_executor(executor, func, *args)
@@ -207,12 +207,10 @@ async def test_context_preparation_completes_with_saturated_default_executor(
         # test-contract: seam signals a losing submission without a timing race.
         monkeypatch.setattr(loop, "run_in_executor", observe_submit)
         preparation = asyncio.create_task(assembler.prepare_context())
-        queued = asyncio.create_task(queued_on_default.wait())
+        queued = asyncio.create_task(asyncio.wait_for(queued_on_default.wait(), 15))
         tasks = [preparation, queued]
-        await await_or_fail(
-            asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED),
-            what="context preparation or submission to the blocked executor",
-        )
+        done, _ = await asyncio.wait(tasks, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+        assert done, "neither preparation nor default executor submission made progress"
         assert preparation.done() and not queued_on_default.is_set(), (
             "context preparation must finish while the default executor is blocked"
         )
@@ -227,6 +225,7 @@ async def test_context_preparation_completes_with_saturated_default_executor(
             task.cancel()
         release.set()
         await asyncio.wait_for(asyncio.gather(blocker, *tasks, return_exceptions=True), 10)
+    blocker.result()
 
 
 @pytest.mark.asyncio
