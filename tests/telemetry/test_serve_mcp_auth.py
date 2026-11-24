@@ -19,10 +19,144 @@ from tests.telemetry.test_serve_propagation import (
 from tests.test_mcp_oauth import _FakeAuthServer, _fire_redirect
 from zeta.mcp import oauth
 from zeta.mcp.envelope import MCPCallLimits
-from zeta.mcp.oauth_store import MCPCredentialStore
+from zeta.mcp.management import MCPManagementService
+from zeta.mcp.oauth_store import MCPCredentialStore, MCPOAuthToken
 from zeta.server.handlers.resources import mcp_management
 from zeta.skills.catalog import SkillCatalog
 from zeta.tools.registry import ToolRegistry
+
+
+@pytest.mark.parametrize("method", ["mcp_server_test", "mcp_auth_start", "mcp_auth_logout"])
+@pytest.mark.asyncio
+@pytest.mark.parametrize("edit_after_read", [False, True], ids=["before-confirm", "interleaved"])
+async def test_mcp_action_revision_rejects_transport_edit(
+    tmp_path, traced, monkeypatch, method, edit_after_read,
+):
+    telemetry, _ = traced
+    wire = Wire(_server(tmp_path, "unix", telemetry, monkeypatch), "unix")
+    config = tmp_path / "action-mcp.json"
+    monkeypatch.setenv("ZETA_MCP_CONFIG", str(config))
+    provider = _FakeAuthServer()
+    requests, listeners, spawns = [], [], []
+    real_client = httpx.AsyncClient
+    start_server = asyncio.start_server
+
+    async def handle(request):
+        requests.append(request)
+        if method != "mcp_server_test":
+            return await provider.handle(request)
+        rpc = json.loads(request.content)
+        if rpc["method"] == "notifications/initialized":
+            return httpx.Response(202)
+        result = (
+            {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {}}
+            if rpc["method"] == "initialize" else {"tools": []}
+        )
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": rpc["id"], "result": result})
+
+    async def listen(*args, **kwargs):
+        server = await start_server(*args, **kwargs)
+        listeners.append(server)
+        return server
+
+    async def unexpected_spawn(*args, **kwargs):
+        spawns.append(args)
+        pytest.fail("HTTP definition must not spawn a process")
+
+    async def call(rpc, params=None):
+        return json.loads(await wire.rpc(rpc, rpc, params))
+
+    def write_definition(definition):
+        config.write_text(json.dumps({"servers": {"example": definition}}))
+
+    async def confirm(revision, replacement):
+        params = {**target, "revision": revision}
+        if not edit_after_read:
+            return await call(method, params)
+        content_revision = MCPManagementService._content_revision
+        edited = False
+
+        def edit_after_revision(*args):
+            nonlocal edited
+            result = content_revision(*args)
+            if not edited:
+                edited = True
+                config.write_bytes(replacement)
+            return result
+
+        with monkeypatch.context() as patch:
+            # test-contract: seam inject a direct edit after hashing and before target parsing.
+            patch.setattr(MCPManagementService, "_content_revision", staticmethod(edit_after_revision))
+            response = await call(method, params)
+        assert edited
+        return response
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real_client(transport=httpx.MockTransport(handle), **kw))
+    await wire.open()
+    try:
+        monkeypatch.setattr(asyncio, "start_server", listen)
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_spawn)
+        feature = "mcp_action_revision_v1"
+        hello = await call("hello", {"protocol_version": "1.2", "features": ["mcp_management_v1", feature]})
+        write_definition({"command": sys.executable})
+        reviewed_bytes = config.read_bytes()
+        reviewed = (await call("mcp_server_list"))["result"]
+        assert "command" in reviewed["data"]["items"][0]["config"]
+        write_definition({
+            "transport": "streamable-http", "url": provider.server_url,
+            **({"auth": {"type": "oauth", "client_id": "fixture-client"}} if method != "mcp_server_test" else {}),
+        })
+        current_bytes = config.read_bytes()
+        current = (await call("mcp_server_list"))["result"]
+        assert current["revision"] != reviewed["revision"]
+        assert "url" in current["data"]["items"][0]["config"]
+        target = {"name": "example", "scope": "user"}
+        store = MCPCredentialStore(home=tmp_path)
+        token = MCPOAuthToken(
+            "fixture-access", None, None, "Bearer", None, provider.authorization_server,
+            "https://auth.test/token", "https://auth.test/authorize", "fixture-client", None,
+            "http://127.0.0.1/callback", provider.resource,
+        )
+        if method == "mcp_auth_logout":
+            await store.save_login("example", token)
+        before = await store.load("example")
+
+        # Even if the reviewed bytes reappear just after the read, the action is stale.
+        stale = (await confirm(reviewed["revision"], reviewed_bytes))["error"]
+        assert stale["code"] == -32009
+        assert stale["data"] == {"code": "stale_mcp_revision", "reason": "stale_mcp_revision"}
+        assert requests == listeners == spawns == []
+        assert await store.load("example") == before
+        assert (await call("mcp_auth_status", {"name": "example"}))["result"] == {"data": {"state": "idle"}}
+        assert feature in hello["result"]["capabilities"]["features"]
+        assert (await call(method, {**target, "revision": None}))["error"]["code"] == -32602
+
+        for revision in (current["revision"], None):
+            config.write_bytes(current_bytes)
+            requests.clear()
+            listeners.clear()
+            if method == "mcp_auth_logout":
+                await store.save_login("example", token)
+            # Without the snapshot, probe/auth would see stdio and logout would see no target.
+            replacement = b'{"servers": {}}' if method == "mcp_auth_logout" else reviewed_bytes
+            response = await confirm(revision, replacement) if revision is not None else await call(method, target)
+            assert "result" in response, response
+            result = response["result"]["data"]
+            if method == "mcp_server_test":
+                assert result == {"status": "ok", "tool_count": 0}
+                assert requests and all(str(req.url) == provider.server_url for req in requests)
+            elif method == "mcp_auth_start":
+                assert result["state"] == "pending"
+                assert requests[0].url.host == urlparse(provider.server_url).hostname
+                assert len(listeners) == 1 and listeners[0].is_serving()
+                cancelled = await call("mcp_auth_cancel", {"name": "example"})
+                assert cancelled["result"]["data"] == {"state": "cancelled"}
+            else:
+                assert result == {"state": "unauthorized"}
+                assert (await store.load("example")).token is None
+        assert not spawns
+    finally:
+        await close_serve(wire.server, wire.writer)
 
 
 async def _launch(url):
