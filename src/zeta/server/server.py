@@ -53,7 +53,7 @@ from .handlers.projects import (
 )
 from .handlers.registry import dispatch as _dispatch_request
 from .handlers.registry import state_read_available
-from .handlers.resources._mcp_auth import MCPAuth
+from .handlers.resources._mcp_auth import MCPAuth, MCPAuthConnection
 from .parking import ParkedPairs
 from .protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,
@@ -700,6 +700,7 @@ class _Client:
             server.connections.register(self)
         self.connections = server.connections
         self.logins = login.Logins(server.home, account_operations=server.account_operations)
+        self.mcp_auth_connection = MCPAuthConnection()
         self.handshaken = False
         self.role: str | None = None
         self.max_role = getattr(reader, "max_role", server._max_role)
@@ -812,6 +813,9 @@ class _Client:
             with contextlib.suppress(BaseException):
                 await handling
             return
+        if "multi_controller" in self.features:
+            # Discovery can be pending before start returns its launch URL.
+            await self.server._mcp_auth.close_connection(self.mcp_auth_connection)
         contended = self.connections.mark_lost(self)
         if contended is None:
             with contextlib.suppress(BaseException):
@@ -1111,6 +1115,8 @@ class _Client:
 
             had_physical_controller = self.connections.is_controller(self)
             if not self.connections.frozen:
+                if "multi_controller" in self.features:
+                    await attempt(self.server._mcp_auth.close_connection(self.mcp_auth_connection))
                 await attempt(self.release_controller())
                 await attempt(self.logins.close())
             if graceful:
