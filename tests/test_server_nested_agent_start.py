@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,12 @@ from tests.support.replay_transport import (
     negotiate,
     replay_server,
 )
+from tests.test_server import TIMEOUT, _connect, _request
+from zeta.agent import runner
 from zeta.protocol.types import TextContent, ToolCall
+from zeta.runtime.loop import AgentLoop
+from zeta.server import ZetaServer
+from zeta.tools.agent.approval import ChildApprovalPolicy
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -78,3 +84,72 @@ async def test_nested_foreground_child_forwards_agent_start(
         await observer.close()
         await controller.close()
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_during_foreground_child_cleanup_closes_owners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cleanup_entered = asyncio.Event()
+    cleanup_cancelled = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    child_loop: AgentLoop | None = None
+    build_child_loop = runner._build_child_loop
+    cleanup = ChildApprovalPolicy.cleanup
+
+    async def capture_child(*args: Any, **kwargs: Any) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
+        nonlocal child_loop
+        child_loop, policy = await build_child_loop(*args, **kwargs)
+        return child_loop, policy
+
+    async def gate_cleanup(policy: ChildApprovalPolicy) -> None:
+        cleanup_entered.set()
+        try:
+            await asyncio.wait_for(release_cleanup.wait(), TIMEOUT)
+        except asyncio.CancelledError:
+            cleanup_cancelled.set()
+            raise
+        await cleanup(policy)
+
+    # test-contract: seam capture the owned loop and pause only its approval cleanup.
+    monkeypatch.setattr(runner, "_build_child_loop", capture_child)
+    monkeypatch.setattr(ChildApprovalPolicy, "cleanup", gate_cleanup)
+    call = ToolCall(
+        "child", "agent",
+        {"prompt": "child-work", "description": "child", "background": False},
+    )
+    backend = PerActorFakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("parent done")])],
+        {"child-work": [ScriptedTurn([TextContent("child done")])]},
+        parent_prompt="delegate",
+        gated_child_prompts=(),
+        parent_waits_for_children=False,
+    )
+    server = ZetaServer(
+        home=tmp_path, port=0, provider="codex",
+        backend_factory=lambda *_: (backend, "offline"),
+    )
+    try:
+        reader, writer = await _connect(server)
+        try:
+            await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+            await _request(reader, writer, 2, "new_session", {"provider": "codex"})
+            await _request(reader, writer, 3, "send", {"text": "delegate"})
+            await asyncio.wait_for(cleanup_entered.wait(), TIMEOUT)
+            writer.close()
+            await asyncio.wait_for(cleanup_cancelled.wait(), TIMEOUT)
+        finally:
+            release_cleanup.set()
+            writer.close()
+            await writer.wait_closed()
+            await server.close()
+        assert child_loop is not None
+        # test-contract: seam the owners expose no public closed-state check.
+        assert child_loop._closed, "foreground child loop left open after disconnect"
+        assert child_loop.tool_registry.background_tasks._closed, (
+            "foreground child task registry left open after disconnect"
+        )
+    finally:
+        await server.close()
+        if child_loop is not None and not child_loop._closed:
+            await child_loop.close(cancel_background=False)

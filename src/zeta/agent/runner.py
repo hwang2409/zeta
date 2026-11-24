@@ -1443,18 +1443,22 @@ async def _run_child(
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         loop._background_owner.project_context_loops.pop(child_store.session_id, None)
         loop._background_owner.unregister(child_instance_id)
-        if child_policy is not None:
-            await child_policy.cleanup()
-        if not abort_task.done():
-            abort_task.cancel()
-        await asyncio.gather(abort_task, return_exceptions=True)
-        close_task = asyncio.create_task(
-            child_loop.close(
-                cancel_background=False,
-                background_task_cause=child_cleanup_details(
-                    "foreground", child_task.cancelled()
-                )[0],
-            )
-        )
-        if await _complete_despite_cancellation(close_task):
-            raise asyncio.CancelledError()
+        try:
+            if child_policy is not None:
+                await child_policy.cleanup()
+        finally:
+            if not abort_task.done():
+                abort_task.cancel()
+            try:
+                await asyncio.gather(abort_task, return_exceptions=True)
+            finally:
+                close_task = asyncio.create_task(
+                    child_loop.close(
+                        cancel_background=False,
+                        background_task_cause=child_cleanup_details(
+                            "foreground", child_task.cancelled()
+                        )[0],
+                    )
+                )
+                if await _complete_despite_cancellation(close_task):
+                    raise asyncio.CancelledError()
