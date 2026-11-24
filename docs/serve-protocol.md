@@ -2197,7 +2197,8 @@ closes the transport, reaps any stdio child, and returns
 `{data:{status:"failed",tool_count:0}}`.
 Only the controller can run a test. A project stdio definition must be trusted.
 
-`mcp_auth_start` starts one headless HTTP OAuth attempt per serve process.
+`mcp_auth_start` starts a headless HTTP OAuth attempt. Without
+`multi_controller`, only one attempt can be pending per serve process.
 It returns `{data:{state:"pending",authorization_url}}` after opening the
 loopback callback listener. The `authorization_url` field is an opaque,
 one-use launch URL on that same `127.0.0.1` listener, not the provider's URL.
@@ -2223,6 +2224,16 @@ credential, returning `{data:{state:"unauthorized"}}`. A concurrent logout
 fences earlier OAuth attempts even across serve processes. Only the controller
 can start, cancel, or log out. Another pending start returns `-32004
 operation_busy`.
+
+With the dormant `multi_controller` capability, one attempt can be pending
+per MCP server name across serve. A start for that name is still busy; a
+start for another name can proceed. Attempt status and cancellation belong
+to the connection that started the attempt. Without an attempt of its own,
+another connection sees `idle`. Logout cancels only the caller's attempt,
+but can still delete the shared credential and fence an earlier login.
+Disconnect cancels that connection's pending attempts; shutdown closes all
+attempts. A successful login stores credentials for the whole serve home,
+not for one connection or session.
 
 ### accounts
 

@@ -282,6 +282,7 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
         features=frozenset(),
         connections=SimpleNamespace(run_blocking=run_blocking, run_read=run_read),
         logins=isolated_logins(tmp_path),
+        mcp_auth_owner=None,
         server=SimpleNamespace(
             home=tmp_path, _mcp_auth=MCPAuth(),
             projects=ProjectRequests(home=tmp_path, manager=manager, registry=registry),

@@ -184,31 +184,32 @@ async def mcp_auth_start(client, request_id, params, controller):
         # Reject stale requests before creating or replacing an OAuth attempt.
         with owner_errors(**_error_rules()), private_management_io():
             target = await owner.action_target(name, scope=scope, revision=params["revision"])
-    return {"data": await client.server._mcp_auth.start(name, lambda ready, commit: owner.login(
+    return {"data": await client.server._mcp_auth.start(client.mcp_auth_owner, name, lambda ready, commit: owner.login(
         name, scope=scope, launch_ready=ready, before_commit=commit, registry=registry, target=target,
     ))}
 
 
 async def mcp_auth_status(client, request_id, params, controller):
     name, _ = _target(params, scoped=False)
-    return {"data": client.server._mcp_auth.status(name)}
+    return {"data": client.server._mcp_auth.status(client.mcp_auth_owner, name)}
 
 
 async def mcp_auth_cancel(client, request_id, params, controller):
     name, _ = _target(params, scoped=False)
-    return {"data": await client.server._mcp_auth.cancel(name)}
+    return {"data": await client.server._mcp_auth.cancel(client.mcp_auth_owner, name)}
 
 
 async def mcp_auth_logout(client, request_id, params, controller):
     name, scope = _target(params)
     auth = client.server._mcp_auth
+    owner = client.mcp_auth_owner
     revision = params.get("revision")
     if revision is None:
-        await auth.cancel(name)
+        await auth.cancel(owner, name)
     with owner_errors(**_error_rules()), private_management_io():
         work = asyncio.create_task(_owner(client, controller.runtime).logout(
             name, scope=scope, revision=revision,
-            before_delete=(lambda: auth.cancel(name)) if revision is not None else None,
+            before_delete=(lambda: auth.cancel(owner, name)) if revision is not None else None,
         ))
         cancelled = False
         # Every cancellation waits for the credential delete before unwinding.
@@ -222,7 +223,7 @@ async def mcp_auth_logout(client, request_id, params, controller):
                 work.exception()  # Mark it retrieved; a cancelled request never relays it.
             raise asyncio.CancelledError
         work.result()
-    auth.forget(name)
+    auth.forget(owner, name)
     return {"data": {"state": "unauthorized"}}
 
 
