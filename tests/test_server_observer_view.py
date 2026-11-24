@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import threading
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from tests.support.replay_transport import (
 )
 from tests.support.server_backend import ServerFakeBackend
 from tests.test_server_content_read import _PNG
+from zeta.server.handlers import settings
 
 _READS = (
     "status", "content_read", "model_catalog", "session_settings", "delivery_status", "session_grants",
@@ -48,11 +51,56 @@ def _project(tmp_path: Path, name: str) -> Path:
     return root
 
 
+async def _read_during_replay_eviction(
+    monkeypatch: pytest.MonkeyPatch, observer: ReplayClient, a: ReplayClient, sid: str, other: str,
+    b_model: str,
+) -> None:
+    loop = asyncio.get_running_loop()
+    entered, release = asyncio.Event(), threading.Event()
+    original = settings.settings
+
+    def held(*args, **kwargs):
+        result = original(*args, **kwargs)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10), "settings worker was not released"
+        return result
+
+    try:
+        with monkeypatch.context() as patch:
+            # test-contract: seam hold the real worker after it computes A's settings.
+            patch.setattr(settings, "settings", held)
+            await observer.send(3, "session_settings", {})
+            await await_or_fail(entered.wait(), what="observer settings computed")
+            # A's send publishes replay frames. The production replay budget evicts
+            # the observer stream, but A's controller and record stay live.
+            patch.setattr("zeta.server.session_replay.REPLAY_MAX_RECORDS", 0)
+            sent = await a.request(5, "send", {"text": "evict alpha replay"})
+            assert "result" in sent, sent
+            ended = await observer.event("replay_stream_ended")
+            assert ended["session_id"] == sid and ended["reason"] == "evicted", ended
+            await a.event("agent_end")
+            await observer.send(4, "session_history_and_subscribe", {"session_id": other})
+            release.set()
+            stale = await observer.response(3)
+            assert stale.get("error") == _NO_VIEW, stale
+    finally:
+        release.set()
+    joined = await observer.response(4)
+    assert "result" in joined, joined
+    reply = await observer.request(5, "session_settings", {})
+    assert reply.get("result") == {"model": b_model, "approval_mode": "ask"}, reply
+
+
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
-@pytest.mark.parametrize("mode", ("multi", "legacy"))
-@pytest.mark.parametrize("method", (*_READS, "write_refusals"))
+@pytest.mark.parametrize(
+    ("method", "mode"),
+    [(method, mode) for method in (*_READS, "write_refusals") for mode in ("multi", "legacy")]
+    + [("read_during_replay_eviction", "multi")],
+)
 @pytest.mark.asyncio
-async def test_observer_view_table(tmp_path: Path, transport: Transport, mode: str, method: str) -> None:
+async def test_observer_view_table(
+    tmp_path: Path, transport: Transport, mode: str, method: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     project_a, project_b = (_project(tmp_path, name) for name in ("alpha", "beta"))
     server = replay_server(tmp_path / "home", transport, lambda _, model, __: (ServerFakeBackend(delay=0), model or "offline"))
     async with AsyncExitStack() as cleanup:
@@ -111,6 +159,9 @@ async def test_observer_view_table(tmp_path: Path, transport: Transport, mode: s
         observer = await connect(observer=True)
         joined = await observer.request(2, "session_history_and_subscribe", {"session_id": sid})
         assert "result" in joined, joined
+        if method == "read_during_replay_eviction":
+            await _read_during_replay_eviction(monkeypatch, observer, a, sid, other, b_model)
+            return
         if method == "write_refusals":
             for request_id, denied in enumerate(_READ_ONLY, start=3):
                 reply = await observer.request(request_id, denied, {"session_id": sid})
