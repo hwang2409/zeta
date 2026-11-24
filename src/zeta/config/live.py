@@ -8,7 +8,13 @@ from typing import Any, Protocol
 
 from ..agent.plan_mode import plan_mode_prompt
 from ..protocol.types import ToolSchema
-from ..runtime.prompt import PromptFragment, RuntimePrompt, replace_owned_fragment
+from ..runtime.prompt import (
+    CHILD_PROFILE_BODY,
+    PromptFragment,
+    RuntimePrompt,
+    owned_span,
+    replace_owned_fragment,
+)
 from ..skills.agent_catalog import AgentCatalog, discover_session_agents
 from ..skills.catalog import (
     SkillCatalog,
@@ -49,6 +55,7 @@ class LiveConfigBase:
     runtime_prompt: RuntimePrompt
     prompt_base: RuntimePrompt
     plan_mode: bool
+    agent_profile: str
     skill_catalog: SkillCatalog
     agent_catalog: AgentCatalog
     agent_definition: ToolDefinition | None
@@ -179,7 +186,7 @@ def _delta(old: tuple[Any, ...], new: tuple[Any, ...]) -> CatalogDelta:
 
 
 def _prepare_prompt(
-    base: LiveConfigBase, catalog: SkillCatalog
+    base: LiveConfigBase, catalog: SkillCatalog, agents: AgentCatalog
 ) -> tuple[RuntimePrompt, RuntimePrompt]:
     prompt = base.prompt_base
     if (
@@ -189,6 +196,17 @@ def _prepare_prompt(
         prompt = replace_owned_fragment(
             prompt, "skill_index", PromptFragment(catalog.index(), {})
         )
+    if (span := prompt.prompt_components.get(CHILD_PROFILE_BODY)) is not None:
+        selected = next(
+            (agent for agent in agents.agents if agent.name == base.agent_profile), None
+        )
+        if (
+            selected is not None
+            and owned_span(selected.prompt_suffix).digest != span["digest"]
+        ):
+            prompt = replace_owned_fragment(
+                prompt, CHILD_PROFILE_BODY, PromptFragment(selected.prompt_suffix, {})
+            )
     displayed = (
         RuntimePrompt(plan_mode_prompt(prompt.system_prompt), prompt.prompt_components)
         if base.plan_mode and prompt is not base.prompt_base
@@ -408,7 +426,7 @@ class LiveConfigWatcher:
         definition, schemas = _prepared_agent_definition(
             base, agents, agent_delta.changed
         )
-        prompt_base, runtime_prompt = _prepare_prompt(base, skills)
+        prompt_base, runtime_prompt = _prepare_prompt(base, skills, agents)
         notice, payload = _change_payload(skill_delta, agent_delta, diagnostics)
         listener_updates = tuple(
             (listener, listener.prepare_live_config(skills, agents))

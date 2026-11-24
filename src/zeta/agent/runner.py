@@ -17,7 +17,6 @@ from ..core.abort import AbortSignal as ToolAbortSignal
 from ..core.agent_state import LoadedAgentLifecycle, MissingAgentLifecycle
 from ..core.checkpoints.mutation import AppendConversationRows, ConversationRow
 from ..core.child_runs import TERMINAL_AGENT_STATES, read_child_lifecycle
-from ..core.session import env_home
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..core.store._child_runs import child_run_segments
 from ..media.image_policy import image_policy_for_provider
@@ -476,12 +475,6 @@ async def _build_child_loop(
             _child_base_system_prompt, loop, cwd_override, child_registry
         )
         child_scope = getattr(loop, "_live_config_scope", None)
-        child_home = Path(loop.active_home) if loop.active_home else env_home()
-        child_project_dir = (
-            child_scope.project_dir
-            if child_scope is not None
-            else Path(child_registry.cwd)
-        )
         child_context = _compose_child_project_context(
             child_context,
             preset,
@@ -512,12 +505,15 @@ async def _build_child_loop(
             background_owner=loop._background_owner,
             usage_sink=record_child_usage,
             child_turn_control=child_turn_control,
-            live_config_home=child_home,
-            live_config_project_dir=child_project_dir,
+            live_config_home=child_scope.home if child_scope is not None else None,
+            live_config_project_dir=(
+                child_scope.project_dir if child_scope is not None else None
+            ),
             freeze_live_config=child_scope is None,
             telemetry=loop.telemetry,
         )
 
+        child_loop.agent_profile = preset.name
         await child_loop.refresh_live_config(publish=False)
 
         inherited_prompt = cwd_override is None or same_physical_path(
@@ -935,7 +931,6 @@ async def _run_child(
         loop._background_owner.project_context_loops[child_store.session_id] = (
             child_loop
         )
-        child_loop.agent_profile = preset.name
         child_loop.agent_background = background
     except asyncio.CancelledError:
         await _complete_despite_cancellation(asyncio.create_task(cancel_setup()))

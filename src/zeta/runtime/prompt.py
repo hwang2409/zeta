@@ -8,6 +8,9 @@ from dataclasses import dataclass, replace
 
 from ..protocol.types import Message, TextContent
 
+# Child-only ownership; never serialized into session metadata.
+CHILD_PROFILE_BODY = "child_profile_body"
+
 
 @dataclass(frozen=True, slots=True)
 class OwnedSpan:

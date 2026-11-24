@@ -13,16 +13,21 @@ import pytest
 from rich.console import Console
 from rich.text import Text
 
+from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.branch_reads import branch_messages
-from tests.support.fake_backend import FakeBackend, ScriptedTurn
+from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
+from tests.support.owned import await_or_fail
+from zeta.agent.pending_delivery import send_to_run
 from zeta.core.slash import create_slash_registry
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     MessageOrigin,
+    MessageRole,
     StreamEvent,
     StreamEventType,
     TextContent,
     ToolCall,
+    assistant_text,
 )
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -59,7 +64,7 @@ def _agent_enums(schemas: tuple[dict[str, object], ...]) -> tuple[list[str], lis
 
 def _loop(
     tmp_path: Path,
-    backend: FakeBackend | None = None,
+    backend: FakeBackend | PerActorFakeBackend | None = None,
     *,
     explicit_schemas: bool = False,
     max_agent_depth: int = 3,
@@ -207,67 +212,79 @@ async def test_live_added_profile_remains_hidden_and_blocked_at_depth_cap(
 
 
 @pytest.mark.asyncio
-async def test_running_child_refreshes_delegation_catalog_without_changing_selected_profile(
+async def test_running_child_refreshes_selected_profile_before_next_request(
     tmp_path: Path,
 ) -> None:
-    loop, home, _project = _loop(tmp_path)
-    profile = home / "agents" / "specialist.md"
-    _write_agent(profile, "specialist", "focused specialist", "first body")
-    await _refresh(loop)
-    assert "specialist" in loop.tool_registry.agent_catalog.names(), (
-        "new profile was not adopted"
+    spawn = ToolCall(
+        "worker-1", "agent",
+        {"prompt": "work", "description": "worker", "preset": "worker", "background": True},
     )
-    selected = loop.tool_registry.agent_catalog.find("specialist")
-    delegate_call = ToolCall(
-        "delegate-1",
-        "agent",
+    delegate = ToolCall(
+        "delegate-1", "agent",
+        {"prompt": "delegate", "description": "delegate task", "preset": "delegate"},
+    )
+    backend = PerActorFakeBackend(
+        [ScriptedTurn(tool_calls=[spawn]), ScriptedTurn([TextContent("started")])],
         {
-            "prompt": "delegate",
-            "description": "delegate task",
-            "agent_type": "delegate",
+            "work": [
+                ScriptedTurn(tool_calls=[ToolCall("read-1", "read", {"path": "missing"})]),
+                ScriptedTurn(tool_calls=[delegate]),
+                ScriptedTurn([TextContent("worker done")]),
+            ],
+            "delegate": [ScriptedTurn([TextContent("delegate done")])],
         },
+        parent_prompt="start",
+        parent_waits_for_children=False,
+        gated_child_prompts={"work"},
     )
-    backend = FakeBackend(
-        [
-            ScriptedTurn(tool_calls=[delegate_call]),
-            ScriptedTurn([TextContent("delegate done")]),
+    loop, home, _project = _loop(tmp_path, backend)
+    profile = home / "agents" / "worker.md"
+    profile.parent.mkdir(parents=True)
+    header = "---\nname: worker\ndescription: worker\naccepts_follow_ups: true\n---\n"
+    profile.write_text(header + "old profile body\n", encoding="utf-8")
+    peer = tmp_path / "worker-link.md"
+    os.link(profile, peer)
+    inode = profile.stat().st_ino
+
+    async def start() -> None:
+        _ = [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
+
+    try:
+        await await_or_fail(start(), what="worker spawn")
+        await await_or_fail(backend.child_started["work"].wait(), what="first worker request")
+        peer.write_text(header + "new worker profile body\n", encoding="utf-8")
+        assert profile.stat().st_ino == inode
+        _write_agent(home / "agents" / "delegate.md", "delegate", "delegated specialist")
+        handle, = loop.store.agent_children()
+        owner = loop._background_owner
+        assert await send_to_run(
+            loop.store, handle, "also check the tests",
+            owner=owner, channel=owner.conversation_channel,
+        ) is None
+        backend.release_children.set()
+        await wait_background_owner(loop)
+
+        first, second, third = backend.children["work"].calls
+        assert "old profile body" in assistant_text(first[0][0])
+        assert any(
+            message.role is MessageRole.USER and assistant_text(message) == "also check the tests"
+            for message in second[0]
+        ), "follow-up did not reach the next model request"
+        assert "new worker profile body" in assistant_text(second[0][0]), "next worker request kept the old profile"
+        assert "old profile body" not in assistant_text(second[0][0])
+        assert "delegate" in _agent_enums(second[1])[0]
+        assert backend.children["delegate"].calls, "running child rejected the new delegate profile"
+        assert second[0][0] == third[0][0]
+        notices = [
+            assistant_text(message) for message in third[0]
+            if message.role is MessageRole.SYSTEM and "updated worker" in assistant_text(message)
         ]
-    )
-    project = Path(loop.store.cwd)
-    child_store = ConversationStore(tmp_path / "child-session", cwd=project)
-    child_registry = ToolRegistry(
-        project,
-        session_store=child_store,
-        skill_catalog=SkillCatalog.empty(),
-        agent_catalog=loop.tool_registry.agent_catalog,
-    )
-    child = AgentLoop(
-        backend,
-        child_store,
-        registry=child_registry,
-        skill_catalog=SkillCatalog.empty(),
-        agent_catalog=loop.tool_registry.agent_catalog,
-        live_config_home=home,
-        live_config_project_dir=project,
-        system_prompt=selected.prompt_suffix,
-    )
-
-    _write_agent(profile, "specialist", "focused specialist", "second body")
-    _write_agent(home / "agents" / "delegate.md", "delegate", "delegated specialist")
-    _ = [event async for event in child.run_turn("next", origin=MessageOrigin.USER)]
-
-    assert selected.prompt_suffix == "first body"
-    child_prompt = child._runtime_prompt.system_prompt
-    assert any(
-        isinstance(block, TextContent) and block.text == "first body"
-        for block in child_prompt.content
-    )
-    assert "delegate" in _agent_enums(backend.calls[0][1])[0]
-    assert len(backend.calls) >= 2, "running child rejected the new delegate profile"
-    child_store.close()
-    await child.close()
-    loop.store.close()
-    await loop.close()
+        assert len(notices) == 1
+        assert any(assistant_text(message) == notices[0] for message in second[0])
+    finally:
+        backend.release_children.set()
+        await loop.close()
+        loop.store.close()
 
 
 @pytest.mark.asyncio

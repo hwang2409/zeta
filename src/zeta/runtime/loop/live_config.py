@@ -1,4 +1,4 @@
-"""Live catalog refresh at agent turn boundaries."""
+"""Live catalog refresh at model-request boundaries."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from ..prompt import RuntimePrompt
 class LiveConfigMixin:
     """Keep one running loop's catalogs, prompt, schemas, and surfaces atomic."""
 
+    agent_profile: str
     tool_registry: Any
     context_assembler: Any
     tool_schemas: tuple[dict[str, Any], ...]
@@ -123,6 +124,7 @@ class LiveConfigMixin:
             runtime_prompt=self._runtime_prompt,
             prompt_base=self._live_prompt_base(),
             plan_mode=self._plan_mode,
+            agent_profile=self.agent_profile,
             skill_catalog=self.tool_registry.skill_catalog,
             agent_catalog=self.tool_registry.agent_catalog,
             agent_definition=self.tool_registry.definition_reference("agent"),
@@ -164,6 +166,7 @@ class LiveConfigMixin:
         return (
             base.generation == self._live_config_generation
             and base.prompt_generation == self._prompt_generation
+            and base.agent_profile == self.agent_profile
             and base.runtime_prompt is self._runtime_prompt
             and base.prompt_base is self._live_prompt_base()
             and base.skill_catalog is self.tool_registry.skill_catalog
@@ -175,7 +178,7 @@ class LiveConfigMixin:
         )
 
     async def _flush_live_config_notices(self) -> None:
-        """Persist queued notices only at a new-turn transcript boundary."""
+        """Persist queued notices only before a new model request."""
 
         if not self._live_config_notices:
             return
