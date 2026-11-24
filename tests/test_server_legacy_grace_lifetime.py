@@ -32,7 +32,6 @@ async def _hello_bytes(client: ReplayClient, *, session_id: str | None = None) -
     # test-contract: transport compare the actual serve payload and frame order.
     if not client.websocket:
         # test-contract: transport raw newline required to compare exact serve bytes.
-
         return await await_or_fail(client.reader.readline(), what="legacy hello bytes")
     header, size = await await_or_fail(client.reader.readexactly(2), what="legacy websocket header")
     assert header == 0x81 and size < 128
