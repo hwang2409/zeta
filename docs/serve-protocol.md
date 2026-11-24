@@ -3102,6 +3102,9 @@ error code and message. Provider status and origin remain internal.
   child, an unknown account, or unsafe account files return `-32005`. The disk
   operation runs off the server event loop; after cancellation, `account_list`
   reports its final persisted result.
+- Serve serializes account switch, logout, refresh (including the returned
+  account list), and the final credential publication after a successful login.
+  The login browser callback and provider exchange are not held in that queue.
 - With `session_park`, the idle requirement of `account_logout`,
   `account_refresh`, and `account_switch` also covers every parked session.
 - `account_refresh`: takes `session_id`, requires an idle session, and performs

@@ -39,6 +39,7 @@ from . import (
     login,
 )
 from . import control as control_module
+from .accounts import AccountOperations
 from .connections import Admission, ConnectionRegistry
 from .control import (
     NotificationPresentation,
@@ -344,6 +345,12 @@ class ZetaServer:
         self.controllers = SessionControllers(
             control, owns_runtime=not self._borrowed, retention_owner=self._retention_owner,
         )
+        self.account_operations = AccountOperations(
+            self.controllers.records,
+            lambda: self.controllers.controller_mode == "multi",
+            self.controls,
+            self.controllers.is_closing,
+        )
         self._borrowed_source = (control.event_source(runtime.session_id if runtime.opened is not None else None)
                                  if foreground_event_publisher is not None else None)
         self._bind_pair(control)
@@ -381,16 +388,6 @@ class ZetaServer:
         if outgoing.runtime.opened is not None:
             self.parking.leave(outgoing, parked_by)
         return incoming
-
-    async def require_all_idle(self) -> None:
-        # Slice 5b owns the account operation's idle policy and serialization.
-        controls = (
-            (record.control for record in self.controllers.records())
-            if self.controllers.controller_mode == "multi"
-            else self.controls()
-        )
-        for control in controls:
-            await control.require_idle()
 
     def session_statuses(self) -> Mapping[str, str]:
         """Snapshot resident status before a sessionless metadata read goes off-loop."""
@@ -616,6 +613,7 @@ class ZetaServer:
         await attempt(asyncio.gather(*handlers, return_exceptions=True))
         for client in clients:
             await attempt(client.close())
+        await attempt(self.account_operations.drain())
         await attempt(self._mcp_auth.aclose())
         try:
             self.parking.close_all(approval_settlement_timeout)
@@ -691,7 +689,7 @@ class _Client:
             )
             server.connections.register(self)
         self.connections = server.connections
-        self.logins = login.Logins(server.home)
+        self.logins = login.Logins(server.home, account_operations=server.account_operations)
         self.handshaken = False
         self.role: str | None = None
         self.max_role = getattr(reader, "max_role", server._max_role)
@@ -1092,7 +1090,6 @@ class _Client:
                 first = exc
             if release is not None:
                 await attempt(asyncio.shield(release))
-            await attempt(accounts.cancel_owned_switch(self))
             await attempt(self.logins.close())
             if graceful:
                 await attempt(self.connections.flush(self))

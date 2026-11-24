@@ -1,11 +1,11 @@
-"""Named-account requests for the native frontend protocol."""
+"""Serve account requests and the shared owner for account mutations."""
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from ..accounts import (
     AccountError,
@@ -20,22 +20,9 @@ from .protocol import ErrorDescriptor, ProtocolError
 from .resource_protocol import run_owner
 from .runtime import ServerRuntime
 
-
-async def run_owned_switch(owner: Any, operation: Awaitable[object]) -> object:
-    task = asyncio.create_task(operation)
-    owner._account_switch_task = task
-    try:
-        return await task
-    finally:
-        owner._account_switch_task = None
-
-
-async def cancel_owned_switch(owner: Any) -> None:
-    task = getattr(owner, "_account_switch_task", None)
-    if task is not None and not task.done():
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-    owner._account_switch_task = None
+if TYPE_CHECKING:
+    from .control import ServeControl
+    from .session_controllers import SessionController, SessionUse
 
 
 async def migrate(home: Path) -> tuple[str, ...]:
@@ -100,11 +87,7 @@ async def list_account_catalog(client: Any, runtime: ServerRuntime) -> dict[str,
     )
 
 
-async def refresh(runtime: ServerRuntime) -> dict[str, object]:
-    return await refresh_accounts(runtime)
-
-
-def _account(runtime: ServerRuntime, params: dict[str, object]) -> AccountId:
+def parse_account(params: dict[str, object]) -> AccountId:
     raw = params.get("account")
     if not isinstance(raw, str) or ":" not in raw:
         raise ProtocolError(
@@ -115,11 +98,8 @@ def _account(runtime: ServerRuntime, params: dict[str, object]) -> AccountId:
 
 async def logout(
     runtime: ServerRuntime,
-    require_idle: Callable[[], Awaitable[None]],
-    params: dict[str, object],
+    account: AccountId,
 ) -> dict[str, object]:
-    await require_idle()
-    account = _account(runtime, params)
     try:
         message = await asyncio.to_thread(
             runtime.loop.account_context.store.logout,
@@ -133,11 +113,9 @@ async def logout(
 
 async def switch(
     runtime: ServerRuntime,
-    require_idle: Callable[[], Awaitable[None]],
-    params: dict[str, object],
+    account: AccountId,
+    authorize_commit: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
-    await require_idle()
-    account = _account(runtime, params)
     loop = runtime.loop
     context = loop.account_context
     provider = runtime.metadata.provider
@@ -162,6 +140,7 @@ async def switch(
         boundary=loop.store.active_branch_head_sequence(),
         provider=provider,
         build_backend=prepare_backend,
+        authorize_commit=authorize_commit,
     )
     return {
         "account": str(account),
@@ -170,10 +149,122 @@ async def switch(
     }
 
 
-async def refresh_accounts(runtime: ServerRuntime) -> dict[str, object]:
+async def refresh(runtime: ServerRuntime) -> dict[str, object]:
     refreshed = await asyncio.to_thread(
         lambda: asyncio.run(
             AccountUsage(runtime.loop.account_context.store).refresh_stale()
         )
     )
     return await list_accounts(runtime, refreshed)
+
+
+class AccountOperations:
+    def __init__(
+        self,
+        records: Callable[[], tuple[SessionController, ...]],
+        is_multi: Callable[[], bool],
+        legacy_controls: Callable[[], Iterator[ServeControl]],
+        is_closing: Callable[[ServeControl], bool],
+    ) -> None:
+        self._records = records
+        self._is_multi = is_multi
+        self._legacy_controls = legacy_controls
+        self._is_closing = is_closing
+        self._lock = asyncio.Lock()
+
+    @overload
+    async def run(
+        self, kind: Literal["login_publication"], use: None,
+        operation: Callable[[], Awaitable[object]],
+    ) -> object: ...
+
+    @overload
+    async def run(
+        self, kind: Literal["switch", "logout", "refresh"], use: SessionUse,
+        operation: dict[str, object],
+    ) -> dict[str, object]: ...
+
+    async def run(
+        self, kind: Literal["switch", "logout", "refresh", "login_publication"],
+        use: SessionUse | None,
+        operation: dict[str, object] | Callable[[], Awaitable[object]],
+    ) -> object:
+        async with self._lock:
+            if kind == "login_publication":
+                assert use is None and callable(operation)
+                # The arbiter decides on the loop and drains the worker on cancel.
+                return await operation()
+            assert use is not None and isinstance(operation, dict)
+            multi = self._is_multi()
+            if not multi:
+                for control in self._legacy_controls():
+                    await control.require_idle()
+            if kind == "switch" and multi:
+                self._require_stable(use.record)
+            account = parse_account(operation) if kind != "refresh" else None
+            if kind == "logout" and multi:
+                assert account is not None
+                for record in self._records():
+                    if self._affected(record, account):
+                        self._require_stable(record)
+
+            request = asyncio.current_task()
+            assert request is not None
+
+            def authorize_commit() -> bool:
+                return not request.cancelling()
+
+            if kind == "switch":
+                assert account is not None
+                # Legacy cancellation can stop a pending write and mark state unknown.
+                if not multi:
+                    return await switch(use.runtime, account)
+                return await self._finish(switch(use.runtime, account, authorize_commit))
+
+            # Dispatch authorizes the entire worker, including refresh's final display snapshot.
+            if not authorize_commit():
+                raise asyncio.CancelledError
+            if kind == "logout":
+                assert account is not None
+                return await self._finish(logout(use.runtime, account))
+            return await self._finish(refresh(use.runtime))
+
+    async def drain(self) -> None:
+        async with self._lock:
+            pass
+
+    @staticmethod
+    async def _finish[T](work: Coroutine[object, object, T]) -> T:
+        completion = asyncio.create_task(work)
+        cancelled = None
+        while not completion.done():
+            try:
+                await asyncio.wait((completion,))
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        if cancelled is not None:
+            if not completion.cancelled():
+                completion.exception()
+            raise cancelled
+        return completion.result()
+
+    @staticmethod
+    def _affected(record: SessionController, account: AccountId) -> bool:
+        runtime = record.runtime
+        if record.control.account_snapshot_transition():
+            return True
+        if runtime.opened is None:
+            return False
+        context = runtime.loop.account_context
+        return (
+            account_provider(runtime.metadata.provider) == account.provider
+            or (context is not None and context.snapshot().get(account.provider) == account)
+        )
+
+    def _require_stable(self, record: SessionController) -> None:
+        control = record.control
+        if (
+            self._is_closing(control) or control.account_snapshot_transition()
+            or control.state_change_busy() or control.holds_work()
+        ):
+            raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "a turn is already running")

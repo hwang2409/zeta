@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.support.login import isolated_logins
 from tests.support.serve_contract import ServeContract
 from zeta.core.slash import create_slash_registry
 from zeta.project_registry import ProjectRegistry
@@ -16,7 +17,6 @@ from zeta.server.handlers.projects import ProjectRequests
 from zeta.server.handlers.registry import RESOLVE, Resolve
 from zeta.server.handlers.resources import FAMILIES
 from zeta.server.handlers.resources._mcp_auth import MCPAuth
-from zeta.server.login import Logins
 from zeta.server.protocol import (
     Access,
     ErrorDescriptor,
@@ -282,7 +282,7 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
     client = SimpleNamespace(
         features=frozenset(),
         connections=SimpleNamespace(run_blocking=run_blocking, run_read=run_read),
-        logins=Logins(tmp_path),
+        logins=isolated_logins(tmp_path),
         server=SimpleNamespace(
             home=tmp_path, _mcp_auth=MCPAuth(),
             projects=ProjectRequests(home=tmp_path, manager=manager, registry=registry),

@@ -12908,9 +12908,10 @@ async def test_serve_shutdown_with_switch_lock_held_exits_bounded(
     try:
         assert await asyncio.to_thread(commit_entered.wait, 10)
         client = next(iter(server.connections.clients()), None)
-        assert client is not None and client._account_switch_task is not None
+        assert client is not None and client._run_task is not None
+        handler = client._run_task
         await asyncio.wait_for(server.close(), 10)
-        assert client._account_switch_task is None
+        assert handler.done()
     finally:
         release.set()
         holder.join(timeout=10)
