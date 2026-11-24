@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +20,8 @@ from tests.support.fake_backend import (
 from tests.support.owned import await_or_fail
 from tests.test_accounts import _codex_hello_sse
 from tests.test_accounts_exhaustion import _account_context, _codex_token
+from zeta.agent.child_context import _compose_child_project_context
+from zeta.core.project_context import ProjectContext
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     MessageOrigin,
@@ -30,8 +33,10 @@ from zeta.protocol.types import (
 from zeta.providers.codex import CodexBackend
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
+from zeta.runtime.prompt import RuntimePrompt
 from zeta.server.control import ServeControl
 from zeta.skills import SkillCatalog
+from zeta.skills.agent_catalog import discover_session_agents
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
 
@@ -79,7 +84,21 @@ async def test_account_switch_ends_hold_and_probes_with_new_account(
         )
         for account in (first, second)
     }
-    loop = AgentLoop(backends[first], opened.store, skill_catalog=SkillCatalog.empty())
+    profile = context.home / "agents" / "worker.md"
+    profile.parent.mkdir(exist_ok=True)
+    header = "---\nname: worker\ndescription: worker\n---\n"
+    profile.write_text(header + "old worker body\n", encoding="utf-8")
+    agents = discover_session_agents(home=context.home, project_dir=tmp_path)
+    prompt = _compose_child_project_context(
+        ProjectContext("base prompt", ()), agents.find("worker")
+    )
+    loop = AgentLoop(
+        backends[first], opened.store, skill_catalog=SkillCatalog.empty(),
+        agent_catalog=agents, live_config_home=context.home,
+        live_config_project_dir=tmp_path,
+        runtime_prompt=RuntimePrompt(prompt.system_prompt, prompt.prompt_components),
+    )
+    loop.agent_profile = "worker"
     loop.manager = context.manager
     loop.session_metadata = context.metadata
     loop.account_context = context
@@ -87,6 +106,7 @@ async def test_account_switch_ends_hold_and_probes_with_new_account(
     async def switch_during_hold(delay: float) -> None:
         waits.append(delay)
         if len(waits) == 1:
+            profile.write_text(header + "new worker body during hold\n", encoding="utf-8")
             await context.switch_active(
                 loop,
                 second,
@@ -115,6 +135,13 @@ async def test_account_switch_ends_hold_and_probes_with_new_account(
         f"Bearer {_codex_token('first')}",
         f"Bearer {_codex_token('second')}",
     ]
+    first_body, retry_body = [json.loads(request.content) for request in requests]
+    assert "old worker body" in first_body["instructions"]
+    assert retry_body["instructions"] == first_body["instructions"], (
+        "account redispatch must keep the original system prompt"
+    )
+    assert b"updated worker" not in requests[1].content
+    assert sum(event.type is StreamEventType.TURN_START for event in events) == 1
     assert loop.backend is backends[second]
     assert any(event.delta == "hello" for event in events)
 

@@ -90,7 +90,7 @@ from ...tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from ...tools._shared.process import TaskExitInput
 from ...tools.registry import ToolExecutionContext, _validate_unique_tool_call_ids
 from ..backend_state import effective_backend_budget
-from ..prompt import RuntimePrompt
+from ..prompt import CHILD_PROFILE_BODY, RuntimePrompt
 from ._completion import (
     InferenceObservation,
     _error_info,
@@ -744,7 +744,9 @@ class AgentLoop(
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         self._advance_project_context_recovery()
-        await self.refresh_live_config()
+        reload_child_profile = CHILD_PROFILE_BODY in self._skill_prompt_base().prompt_components
+        if not reload_child_profile:
+            await self.refresh_live_config()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
         await self._await_project_inbox_turn_start()
@@ -773,7 +775,8 @@ class AgentLoop(
             raise ValueError("cannot reuse a user message that is not persisted")
         if system_message is None and persist_user_message:
             await self._append_turn_message(user_message)
-        await self._flush_live_config_notices()
+        if not reload_child_profile:
+            await self._flush_live_config_notices()
         setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()
@@ -811,7 +814,7 @@ class AgentLoop(
             return
         yield StreamEvent(StreamEventType.AGENT_START)
         turn_number = 0
-        retrying_context = False
+        redispatch: Literal["context", "account"] | None = None
         overflow_context_tokens: int | None = None
         self._turn_provider_retry_records = []
         recovery_state = EmptyTurnRecoveryState()
@@ -825,11 +828,13 @@ class AgentLoop(
             self.max_turns is None
             or turn_number < self.max_turns
             or step_delivery.has_pending_edge
-            or retrying_context
+            or redispatch is not None
             or nudge_turn_pending
             or recovering_output_limit
         ):
-            if not retrying_context:
+            new_request = redispatch is None
+            retrying_context = redispatch == "context"
+            if new_request:
                 if self._abort_admitted:
                     return
                 if self.child_turn_control is not None:
@@ -846,10 +851,13 @@ class AgentLoop(
                 nudge_turn_pending = False
                 self._turn_stop_reason = None
                 self._turn_output_tokens = None
+                if reload_child_profile:
+                    await self.refresh_live_config()
+                    await self._flush_live_config_notices()
                 self.tool_registry.start_batch()
             watchdog = PreDispatchWatchdog(self._pre_dispatch_clock, self._report_pre_dispatch_stall)
             self._set_pre_dispatch_step("preparing context")
-            if not retrying_context:
+            if new_request:
                 yield StreamEvent(
                     StreamEventType.TURN_START, data={"turn": turn_number}
                 )
@@ -961,7 +969,10 @@ class AgentLoop(
                         notice_sink=self._mcp_notice_sink,
                     )
                     if disposition == "dispatch":
-                        disposition = self._dispatch_progress.admit(self.store, prepared_delivery, step_delivery, retrying_context, waits_for_input=self.agent_instance_id is None or self.explicit_finish)
+                        disposition = self._dispatch_progress.admit(
+                            self.store, prepared_delivery, step_delivery, not new_request,
+                            waits_for_input=self.agent_instance_id is None or self.explicit_finish,
+                        )
                     if disposition == "deferred":
                         yield StreamEvent(StreamEventType.AGENT_END)
                         return
@@ -1086,7 +1097,10 @@ class AgentLoop(
                 except ProviderAccountSwitched as exc:  # redispatch through the new account's backend
                     inference.error = exc
                     await completion.aclose()  # type: ignore[union-attr]
-                    self._dispatch_progress.reset()
+                    if reload_child_profile:
+                        redispatch = redispatch or "account"
+                    else:
+                        self._dispatch_progress.reset()
                     continue
                 except Exception as exc:
                     if completion is not None:
@@ -1125,7 +1139,7 @@ class AgentLoop(
                 self.context_assembler.record_context_overflow(
                     provider_prompt_tokens(provider_error_source)
                 )
-                retrying_context = True
+                redispatch = "context"
                 yield StreamEvent(
                     StreamEventType.RETRY,
                     data={"text": "context limit reached; compacting and retrying"},
@@ -1181,7 +1195,7 @@ class AgentLoop(
                     await step_delivery.admit_terminal("foreground_end")
                 yield StreamEvent(StreamEventType.AGENT_END)
                 return
-            retrying_context = False
+            redispatch = None
             if provider_started and has_active_delivery:
                 async for publication in self._accepted_delivery_events(step_delivery):
                     yield publication
