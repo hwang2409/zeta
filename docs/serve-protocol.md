@@ -160,7 +160,17 @@ of a resident session that the connection may take (no controller holds it, or
 this connection does) takes that record instead of opening a second one. Without
 `resume_attach`, it returns `-32004` while that session has a busy turn. A
 resident session whose approval storage failed is closed first, and `resume`
-opens it again from disk.
+opens it again from disk; when it was parked, its controller gets
+`parked_session_changed` with `state: "closed"` first. While the taken session
+holds no work, `resume` may change its `mcp_bindings` (servers and headers), as a
+reopen does; while it holds work, the rules of attaching to a live turn apply.
+
+A session swap (`new_session`, or `resume` of another session) is not a
+disconnect. With `session_park`, a session that holds work parks as in legacy
+mode; its approvals, turn, MCP bindings, and host commands stay as they are, and
+no reconnect deadline runs while the controller stays connected. Without
+`session_park`, the swap returns `-32004` while the attached session has a busy
+turn, and that turn keeps running. A session that holds no work closes.
 
 The limits are fixed, not settings:
 
@@ -197,10 +207,12 @@ connection. Closing records count against capacity until cleanup settles.
 When a multi controller disconnects, each session that connection holds,
 including every parked session, keeps its own reconnect grace. While in grace, a resident
 session can be reclaimed in place only by `hello` with its exact `session_id`
-or by `resume` with `resume_attach` negotiated and that exact id. Existing
-binding and approval checks still apply. Plain `resume`, or `resume` by a
-prefix that resolves to a grace session, returns `session_controlled` and
-leaves the connection open. After grace expires and cleanup settles, normal
+or by `resume` with `resume_attach` negotiated and that exact id. Any
+controller that presents the exact id this way reclaims it, not only the one
+that disconnected: the server has no client identity, and the trust model is
+the same local user. Existing binding and approval checks still apply. Plain
+`resume` (without `resume_attach`), or `resume` by a prefix that resolves to a
+grace session, returns `session_controlled` and leaves the connection open. After grace expires and cleanup settles, normal
 `resume` can reopen the session from disk.
 
 Reclaiming or settling one session does not end another session's grace. An
@@ -213,8 +225,7 @@ mode clears, including while its grace or closing records remain.
 An idle session still reserves capacity while detached. Its grace is bounded
 by `approval_reconnect_grace` (`--approval-reconnect-grace`, default 90 seconds)
 from disconnect; zero starts retirement without an idle grace window. For a
-parked turn the work deadline starts at the swap and is not restarted on
-disconnect. Expired records release capacity only after cleanup settles.
+parked session the work deadline also starts at disconnect, not at the swap. Expired records release capacity only after cleanup settles.
 
 Each connection retains at most 256 output frames or 4 MiB. Overflow affects
 only that connection: the server attempts to send the typed `-32011` error
