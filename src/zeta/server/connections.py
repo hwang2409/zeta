@@ -1009,7 +1009,7 @@ class ConnectionRegistry(ReplayOutput):
         """Run one read off-loop. ``use`` passes to the worker's completion, so
         its record cannot close under a read whose waiter was cancelled; with
         ``fence``, fail if that record no longer holds the session it held
-        before the read."""
+        before the read. A replay view also has to remain selected."""
         if self._closed or connection not in self._connections:
             raise RuntimeError("connection is not connected")
         if use is None:
@@ -1019,7 +1019,7 @@ class ConnectionRegistry(ReplayOutput):
         handle = self._reads.submit(callable)
         use.transfer_to(handle.completed)
         result = await handle.result
-        if fence:
+        if fence or use.is_view:
             connection.server.controllers.require_current(connection, use, session_id)
         return result
 

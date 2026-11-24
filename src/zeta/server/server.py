@@ -53,7 +53,7 @@ from .handlers.projects import (
 )
 from .handlers.registry import dispatch as _dispatch_request
 from .handlers.registry import state_read_available
-from .handlers.resources._mcp_auth import MCPAuth
+from .handlers.resources._mcp_auth import MCPAuth, MCPAuthConnection
 from .parking import ParkedPairs
 from .protocol import (
     CHILD_RUN_EVENTS_PREREQUISITES,
@@ -308,7 +308,7 @@ class ZetaServer:
                 runtime.manager._storage_lease,
                 lambda: (
                     0
-                    if self.controllers.attached().runtime.opened is None
+                    if not self.controllers.has_open_session()
                     else load_settings(home=self.home).settings.retention_days
                 ),
                 session_available=False,
@@ -362,16 +362,15 @@ class ZetaServer:
             self.controllers.require_legacy_parked_room()
         source = owner.record if isinstance(owner, SessionUse) else owner
         if source is None:
+            assert self.controllers.controller_mode != "multi"
             source = self.controllers.attached()
 
-        def make_control() -> ServeControl:
-            control = ServeControl(
-                self, source.runtime.sibling(), self.foreground_event_publisher
-            )
-            self._bind_pair(control)
-            return control
+        return self.controllers.register(lambda: self._make_sibling_control(source.runtime), connection=connection)
 
-        return self.controllers.register(make_control, connection=connection)
+    def _make_sibling_control(self, runtime: ServerRuntime) -> ServeControl:
+        control = ServeControl(self, runtime.sibling(), self.foreground_event_publisher)
+        self._bind_pair(control)
+        return control
 
     def attach(self, incoming: SessionController, connection: _Client) -> SessionController:
         """Make ``incoming`` the attached pair in one step (no await): park the
@@ -693,6 +692,7 @@ class _Client:
             server.connections.register(self)
         self.connections = server.connections
         self.logins = login.Logins(server.home, account_operations=server.account_operations)
+        self._mcp_auth_connection = MCPAuthConnection()
         self.handshaken = False
         self.role: str | None = None
         self.max_role = getattr(reader, "max_role", server._max_role)
@@ -722,6 +722,12 @@ class _Client:
         self._hello_claim_attempted = False
         self._hello_claim_result: bool | None = None
         self.codec = FrameCodec()
+
+    @property
+    def mcp_auth_owner(self) -> MCPAuthConnection | None:
+        if self.server.controllers.controller_mode == "multi":
+            return self._mcp_auth_connection
+        return None
 
     async def run(self) -> None:
         graceful = True
@@ -805,6 +811,9 @@ class _Client:
             with contextlib.suppress(BaseException):
                 await handling
             return
+        if "multi_controller" in self.features:
+            # Discovery can be pending before start returns its launch URL.
+            await self.server._mcp_auth.close_connection(self._mcp_auth_connection)
         contended = self.connections.mark_lost(self)
         if contended is None:
             with contextlib.suppress(BaseException):
@@ -1104,6 +1113,8 @@ class _Client:
 
             had_physical_controller = self.connections.is_controller(self)
             if not self.connections.frozen:
+                if "multi_controller" in self.features:
+                    await attempt(self.server._mcp_auth.close_connection(self._mcp_auth_connection))
                 await attempt(self.release_controller())
                 await attempt(self.logins.close())
             if graceful:

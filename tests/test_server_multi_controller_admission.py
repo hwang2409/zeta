@@ -32,30 +32,6 @@ async def _close_server(server, clients) -> None:
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
 @pytest.mark.asyncio
-async def test_legacy_grace_rejects_multi_and_allows_legacy_reconnect(
-    tmp_path: Path, transport: Transport
-) -> None:
-    server = replay_server(tmp_path, transport, _backend_factory)
-    await server.start()
-    first = await connect_replay(server, transport)
-    await negotiate(first, replay=False)
-    await first.close()
-    multi = await connect_replay(server, transport)
-    legacy = await connect_replay(server, transport)
-    try:
-        refused = await negotiate(multi, replay=False, extra=("multi_controller",))
-        assert refused["error"] == {
-            "code": -32001,
-            "message": "another client is already connected",
-        }
-        admitted = await negotiate(legacy, replay=False)
-        assert "result" in admitted
-    finally:
-        await _close_server(server, (multi, legacy))
-
-
-@pytest.mark.parametrize("transport", ("unix", "websocket"))
-@pytest.mark.asyncio
 async def test_unattached_multi_close_releases_mode_for_legacy(
     tmp_path: Path, transport: Transport
 ) -> None:

@@ -146,6 +146,15 @@ If present, `data.holder` contains only bounded client version and connection
 duration (`client_version` and `connected_for_ms`), never credentials,
 addresses, cwd, or bindings.
 
+A disconnected legacy controller holds legacy mode only while an approval or
+protected turn is in reconnect grace. That grace uses the existing approval
+reconnect deadline and ends on reclaim, settlement, or server shutdown. A
+legacy disconnect without live grace leaves the mode empty. An idle legacy
+session remains resident: a returning legacy controller reattaches as before,
+while a negotiated controller starts without a session and can explicitly
+resume the resident session. Once acquired by multi, it is no longer the
+legacy default, including after the multi record closes.
+
 The limits are fixed, not settings:
 
 - Four multi controllers: the fifth controller `hello` gets `-32001` and closes.
@@ -163,11 +172,23 @@ The limits are fixed, not settings:
   legacy role limits and refusal behavior are unchanged. The 33rd connection
   closes without a JSON-RPC response.
 
+In multi-controller mode, an observer's `session_history_and_subscribe` join
+selects the session used by `status`, `content_read`, `model_catalog`,
+`session_settings`, `delivery_status`, `session_grants`, `skill_catalog`,
+`skill_read`, `agent_profile_catalog`, `agent_profile_read`, `mcp_server_list`,
+and `session_history_read`. Without a live view, those methods return
+`-32003` (`session is not active`); they do not fall back to another session.
+`session_history_read` still pages another session in the selected session's
+project. `delivery_status` returns `unknown` for a valid delivery ID because
+observers cannot send deliveries. `mcp_server_list` uses the selected project's
+redacted disk configuration, not the controller's live MCP mount or headers.
+Legacy observer reads and the observer write restrictions are unchanged.
+
 `status.parked_sessions` and `parked_session_changed` are scoped to the owning
 connection. Closing records count against capacity until cleanup settles.
 
-On controller disconnect, each session that connection holds, including every
-parked session, keeps its own reconnect grace. While in grace, a resident
+When a multi controller disconnects, each session that connection holds,
+including every parked session, keeps its own reconnect grace. While in grace, a resident
 session can be reclaimed in place only by `hello` with its exact `session_id`
 or by `resume` with `resume_attach` negotiated and that exact id. Existing
 binding and approval checks still apply. Plain `resume`, or `resume` by a
@@ -187,7 +208,6 @@ by `approval_reconnect_grace` (`--approval-reconnect-grace`, default 90 seconds)
 from disconnect; zero starts retirement without an idle grace window. For a
 parked turn the work deadline starts at the swap and is not restarted on
 disconnect. Expired records release capacity only after cleanup settles.
-Legacy reconnect grace is unchanged.
 
 Each connection retains at most 256 output frames or 4 MiB. Overflow affects
 only that connection: the server attempts to send the typed `-32011` error
@@ -2219,7 +2239,8 @@ closes the transport, reaps any stdio child, and returns
 `{data:{status:"failed",tool_count:0}}`.
 Only the controller can run a test. A project stdio definition must be trusted.
 
-`mcp_auth_start` starts one headless HTTP OAuth attempt per serve process.
+`mcp_auth_start` starts a headless HTTP OAuth attempt. Without
+`multi_controller`, only one attempt can be pending per serve process.
 It returns `{data:{state:"pending",authorization_url}}` after opening the
 loopback callback listener. The `authorization_url` field is an opaque,
 one-use launch URL on that same `127.0.0.1` listener, not the provider's URL.
@@ -2245,6 +2266,16 @@ credential, returning `{data:{state:"unauthorized"}}`. A concurrent logout
 fences earlier OAuth attempts even across serve processes. Only the controller
 can start, cancel, or log out. Another pending start returns `-32004
 operation_busy`.
+
+With `multi_controller` negotiated, one attempt can be pending
+per MCP server name across serve. A start for that name is still busy; a
+start for another name can proceed. Attempt status and cancellation belong
+to the connection that started the attempt. Without an attempt of its own,
+another connection sees `idle`. Logout cancels only the caller's attempt,
+but can still delete the shared credential and fence an earlier login.
+Disconnect cancels that connection's pending attempts; shutdown closes all
+attempts. A successful login stores credentials for the whole serve home,
+not for one connection or session.
 
 ### accounts
 

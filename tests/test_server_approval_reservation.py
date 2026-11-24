@@ -1152,15 +1152,15 @@ async def test_unhealthy_session_preserves_delivery_id_idempotency_before_mutati
                 await _deliver(server, method, params, features)
             assert error.value.code == -32010
         assert (
-            deliveries.status({"delivery_id": "retained-send"}, features)["status"]
+            deliveries.status({"delivery_id": "retained-send"}, features, lookup=True)["status"]
             == "delivered"
         )
         assert (
-            deliveries.status({"delivery_id": "evicted-id"}, features)["status"]
+            deliveries.status({"delivery_id": "evicted-id"}, features, lookup=True)["status"]
             == "evicted"
         )
         assert (
-            deliveries.status({"delivery_id": "unknown"}, features)["status"]
+            deliveries.status({"delivery_id": "unknown"}, features, lookup=True)["status"]
             == "unknown"
         )
         for params in (

@@ -480,11 +480,14 @@ class DeliveryRequests:
             )
 
     def status(
-        self, params: dict[str, Any], features: frozenset[str]
+        self, params: dict[str, Any], features: frozenset[str], *, lookup: bool
     ) -> dict[str, object]:
         control = self._control
         _require_feature(features, "delivery_id", "delivery_status")
         delivery_id = _required_delivery_id(params)
+        if not lookup:
+            # A joined observer cannot originate deliveries.
+            return {"delivery_id": delivery_id, "status": "unknown"}
         runtime = control.runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")

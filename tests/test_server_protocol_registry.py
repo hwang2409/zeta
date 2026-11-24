@@ -102,24 +102,25 @@ def test_method_registry_matches_documented_table() -> None:
 # Each key is either a legacy method or feature:method for a resource method.
 _EXPECTED_OWNERSHIP = {
     Resolve.OWNED: """
-        new_session resume send steer status delete_session content_read
-        model_catalog session_settings send_images slash_list account_list
-        account_logout account_refresh account_switch login_start
-        login_cancel delivery_status session_grants run_work_list
+        new_session resume send steer delete_session send_images slash_list account_list
+        account_logout account_refresh account_switch login_start login_cancel run_work_list
         child_run_send
         account_list_idle_v1:account_list account_list_idle_v1:login_start
         child_run_control_v1:child_run_spawn child_run_control_v1:child_run_cancel
-        home_settings_v1:home_settings_update library_read_v1:skill_catalog
-        library_read_v1:skill_read library_read_v1:agent_profile_catalog
-        library_read_v1:agent_profile_read library_write_v1:skill_write
+        home_settings_v1:home_settings_update library_write_v1:skill_write
         library_write_v1:skill_delete library_write_v1:agent_profile_write
-        library_write_v1:agent_profile_delete mcp_management_v1:mcp_server_list
+        library_write_v1:agent_profile_delete
         mcp_management_v1:mcp_server_add mcp_management_v1:mcp_server_remove
         mcp_management_v1:mcp_server_set_enabled mcp_management_v1:mcp_server_set_trusted
         mcp_management_v1:mcp_server_test mcp_management_v1:mcp_auth_start
         mcp_management_v1:mcp_auth_cancel mcp_management_v1:mcp_auth_logout
         project_writes_v1:project_memory_update project_writes_v1:project_inbox_send
-        session_history_read_v1:session_history_read
+    """,
+    Resolve.OBSERVER_VIEW: """
+        status content_read model_catalog session_settings delivery_status session_grants
+        library_read_v1:skill_catalog library_read_v1:skill_read
+        library_read_v1:agent_profile_catalog library_read_v1:agent_profile_read
+        mcp_management_v1:mcp_server_list session_history_read_v1:session_history_read
     """,
     Resolve.SELECTED: """
         session_tree session_history session_history_and_subscribe
@@ -178,7 +179,6 @@ def test_request_ownership_is_exhaustive() -> None:
     for path, tree in sources.items():
         scan(tree, path)
     assert sorted(accesses["attached"]) == sorted([
-        ("server.py", "ZetaServer.__init__"),  # retention startup eligibility
         ("server.py", "ZetaServer.controls"),  # legacy attached + parked iteration
         ("server.py", "ZetaServer.new_pair"),  # legacy path without an explicit source
         ("server.py", "ZetaServer.attach"),  # legacy attached/parked swap
@@ -283,6 +283,7 @@ async def test_collected_resource_handler_closes_unexpected_errors(method: str, 
         features=frozenset(),
         connections=SimpleNamespace(run_blocking=run_blocking, run_read=run_read),
         logins=isolated_logins(tmp_path),
+        mcp_auth_owner=None,
         server=SimpleNamespace(
             home=tmp_path, _mcp_auth=MCPAuth(),
             projects=ProjectRequests(home=tmp_path, manager=manager, registry=registry),
