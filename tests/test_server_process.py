@@ -124,15 +124,17 @@ def test_installed_serve_refuses_held_socket_lock_without_traceback(tmp_path: Pa
             capture_output=True,
             text=True,
             timeout=30,
+            check=False,
         )
 
     assert result.returncode == 1, result.stderr
     assert result.stdout == ""
     assert "Traceback" not in result.stderr
-    assert result.stderr.splitlines() == [
+    expected = (
         f"zeta serve: a server is already listening on {socket_path}. "
         "Connect your client to that socket, or stop the running server before retrying."
-    ]
+    )
+    assert result.stderr.splitlines() == [expected]
 
 
 @pytest.mark.asyncio
