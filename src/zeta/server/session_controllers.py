@@ -82,20 +82,21 @@ class SessionUse:
     or the completion it was handed to settles. A close of the record waits
     until it holds no use."""
 
-    __slots__ = ("_owner", "_state", "acquisition", "generation", "record", "setup")
+    __slots__ = ("_owner", "_state", "acquisition", "generation", "is_view", "record", "setup")
 
     def __init__(
         self,
         owner: SessionControllers,
         record: SessionController,
         acquisition: SessionAcquisition | None = None,
-        *, setup: bool = False,
+        *, setup: bool = False, is_view: bool = False,
     ) -> None:
         self._owner = owner
         self._state: Literal["held", "transferred", "released"] = "held"
         self.record = record
         self.acquisition = acquisition
         self.setup = setup
+        self.is_view = is_view
         self.generation = record.generation
 
     @property
@@ -107,9 +108,13 @@ class SessionUse:
         return self.record.runtime
 
     def is_current_binding(self, connection: Any) -> bool:
-        """Whether a new owned read would still use this record."""
+        """Whether a new read through the same binding would still use this record."""
+        if self.record.closing:
+            return False
+        if self.is_view:
+            return connection.connections.replay.controller_for(connection) is self.record
         owner = self._owner
-        return not self.record.closing and owner._by_connection.get(connection, owner._attached) is self.record
+        return owner._by_connection.get(connection, owner._attached) is self.record
 
     def __enter__(self) -> Self:
         return self
@@ -413,6 +418,17 @@ class SessionControllers:
         if record.closing:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         return self._use(record)
+
+    def observer_view(self, connection: Any) -> SessionUse:
+        """A tracked use of the exact record selected by this observer's replay join."""
+        self._require_open()
+        record = connection.connections.replay.controller_for(connection)
+        if (
+            record is None or record.closing or record.runtime.opened is None
+            or self._records.get(record.control) is not record
+        ):
+            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+        return self._use(record, is_view=True)
 
     def selected(
         self,
@@ -748,9 +764,9 @@ class SessionControllers:
         self,
         record: SessionController,
         acquisition: SessionAcquisition | None = None,
-        *, setup: bool = False,
+        *, setup: bool = False, is_view: bool = False,
     ) -> SessionUse:
-        use = SessionUse(self, record, acquisition, setup=setup)
+        use = SessionUse(self, record, acquisition, setup=setup, is_view=is_view)
         record.uses.add(use)
         return use
 
@@ -771,13 +787,12 @@ class SessionControllers:
     ) -> None:
         """Fail unless the use's record is still resident, still at the use's
         generation, and still holds ``session_id``."""
-        del connection
         record = use.record
         runtime = record.runtime
         if self._frozen or record.closing or record not in self._records.values() or record.generation != use.generation or (
             session_id is not None
             and (runtime.opened is None or runtime.session_id != session_id)
-        ):
+        ) or (use.is_view and not use.is_current_binding(connection)):
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
 
     def is_attached(self, control: ServeControl) -> bool:

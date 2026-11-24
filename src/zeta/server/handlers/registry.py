@@ -73,11 +73,13 @@ class Resolve(Enum):
     # version and feature checks, so this resolve point keeps that error order
     OWNED_FIRST = auto()
     OWNED = auto()  # after version and feature checks
+    OBSERVER_VIEW = auto()  # owned, except for an observer in multi mode
     SELECTED = auto()  # once, at the handler's validated session_id
     NONE = auto()  # global or sessionless: the handler gets None
 
 
 _O, _S, _N, _F = Resolve.OWNED, Resolve.SELECTED, Resolve.NONE, Resolve.OWNED_FIRST
+_V = Resolve.OBSERVER_VIEW
 _M = MethodDescriptor
 RESOLVE: dict[MethodDescriptor | tuple[str, str], Resolve] = {
     _M.LIST_SESSIONS: _N,
@@ -88,7 +90,7 @@ RESOLVE: dict[MethodDescriptor | tuple[str, str], Resolve] = {
     _M.APPROVE: _F,
     _M.DENY: _F,
     _M.ABORT: _F,
-    _M.STATUS: _O,
+    _M.STATUS: _V,
     _M.RENAME_SESSION: _F,
     _M.DELETE_SESSION: _O,
     _M.REPAIR_TRANSCRIPT: _F,
@@ -97,11 +99,11 @@ RESOLVE: dict[MethodDescriptor | tuple[str, str], Resolve] = {
     _M.SESSION_HISTORY_AND_SUBSCRIBE: _S,
     _M.CHILD_RUN_HISTORY: _S,
     _M.CHILD_RUN_EVENTS: _S,
-    _M.CONTENT_READ: _O,
+    _M.CONTENT_READ: _V,
     _M.SWITCH_BRANCH: _F,
     _M.FORK_MESSAGE: _F,
-    _M.MODEL_CATALOG: _O,
-    _M.SESSION_SETTINGS: _O,
+    _M.MODEL_CATALOG: _V,
+    _M.SESSION_SETTINGS: _V,
     _M.SET_SETTINGS: _F,
     _M.SET_COMPACTION: _F,
     _M.SEND_IMAGES: _O,
@@ -124,8 +126,8 @@ RESOLVE: dict[MethodDescriptor | tuple[str, str], Resolve] = {
     _M.PROJECT_MEMORY_LOG: _N,
     _M.PROJECT_INBOX: _N,
     _M.CLEAR_STEERING: _F,
-    _M.DELIVERY_STATUS: _O,
-    _M.SESSION_GRANTS: _O,
+    _M.DELIVERY_STATUS: _V,
+    _M.SESSION_GRANTS: _V,
     _M.REVOKE_SESSION_GRANTS: _F,
     _M.RUN_WORK_LIST: _O,
     _M.BACKGROUND_TASK_CANCEL: _F,
@@ -168,17 +170,17 @@ RESOLVE: dict[MethodDescriptor | tuple[str, str], Resolve] = {
     ("home_settings_v1", "home_settings_get"): _N,
     ("home_settings_v1", "home_settings_update"): _O,
     # library_read_v1
-    ("library_read_v1", "skill_catalog"): _O,
-    ("library_read_v1", "skill_read"): _O,
-    ("library_read_v1", "agent_profile_catalog"): _O,
-    ("library_read_v1", "agent_profile_read"): _O,
+    ("library_read_v1", "skill_catalog"): _V,
+    ("library_read_v1", "skill_read"): _V,
+    ("library_read_v1", "agent_profile_catalog"): _V,
+    ("library_read_v1", "agent_profile_read"): _V,
     # library_write_v1
     ("library_write_v1", "skill_write"): _O,
     ("library_write_v1", "skill_delete"): _O,
     ("library_write_v1", "agent_profile_write"): _O,
     ("library_write_v1", "agent_profile_delete"): _O,
     # mcp_management_v1
-    ("mcp_management_v1", "mcp_server_list"): _O,
+    ("mcp_management_v1", "mcp_server_list"): _V,
     ("mcp_management_v1", "mcp_server_add"): _O,
     ("mcp_management_v1", "mcp_server_remove"): _O,
     ("mcp_management_v1", "mcp_server_set_enabled"): _O,
@@ -192,7 +194,7 @@ RESOLVE: dict[MethodDescriptor | tuple[str, str], Resolve] = {
     ("project_writes_v1", "project_memory_update"): _O,
     ("project_writes_v1", "project_inbox_send"): _O,
     # session_history_read_v1
-    ("session_history_read_v1", "session_history_read"): _O,
+    ("session_history_read_v1", "session_history_read"): _V,
 }
 
 
@@ -208,6 +210,8 @@ if RESOLVE.keys() != {_policy_key(item) for item in (*MethodDescriptor, *RESOURC
         item.access in {Access.DELIVERY, Access.CONTROLLER_WRITE}
         and RESOLVE[_policy_key(item)] is not Resolve.OWNED
     )
+    or (item.access is Access.READ and RESOLVE[_policy_key(item)] is Resolve.OWNED)
+    or (item.access is not Access.READ and RESOLVE[_policy_key(item)] is Resolve.OBSERVER_VIEW)
     for item in (*MethodDescriptor, *RESOURCE_METHODS)
 ):
     raise RuntimeError("serve method resolve policies are not exhaustive")
@@ -547,7 +551,7 @@ async def clear_steering(client, request_id, params, controller):
 
 
 async def delivery_status(client, request_id, params, controller):
-    return controller.control.deliveries.status(params, client.features)
+    return controller.control.deliveries.status(params, client.features, lookup=not controller.is_view)
 
 
 async def session_grants_read(client, request_id, params, controller):
@@ -743,7 +747,14 @@ async def dispatch(
     handler = descriptor.handler if isinstance(descriptor, ResourceDescriptor) else HANDLERS[descriptor]
     if policy is not Resolve.OWNED_FIRST:
         _require_negotiated(client, descriptor)
-    if policy not in {Resolve.OWNED_FIRST, Resolve.OWNED}:
+    if (
+        policy is Resolve.OBSERVER_VIEW
+        and client.role == "observer"
+        and client.server.controllers.controller_mode == "multi"
+    ):
+        with client.server.controllers.observer_view(client) as controller:
+            return await handler(client, request_id, params, controller)
+    if policy in {Resolve.NONE, Resolve.SELECTED}:
         return await handler(client, request_id, params, None)
     with client.server.controllers.owned(client) as controller:
         if policy is Resolve.OWNED_FIRST:

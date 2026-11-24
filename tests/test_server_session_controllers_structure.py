@@ -13,18 +13,18 @@ from zeta.server.session_controllers import SessionControllers
 
 ROOT = Path(__file__).parents[1] / "src" / "zeta" / "server"
 SCANNED = [*sorted(ROOT.rglob("*.py")), *sorted((ROOT.parent / "remote").rglob("*.py"))]
-# the only request entries that resolve a record, with their one resolver;
+# the only request entries that resolve a record, with their permitted resolvers;
 # everything below them takes the record as an argument
 RESOLVER_ENTRIES = {
-    "handlers/registry.py:dispatch": "owned",
-    "server.py:_Client._route_hello": "owned",
-    "session_replay/__init__.py:join_history_and_subscribe": "selected",
-    "handlers/registry.py:child_run_events": "selected",
-    "handlers/registry.py:path_complete": "selected",
-    "handlers/registry.py:child_run_list": "selected",
-    "connections.py:ConnectionRegistry.read_tree": "selected",
-    "connections.py:ConnectionRegistry.read_history": "selected",
-    "connections.py:ConnectionRegistry.read_child_run_history": "selected",
+    "handlers/registry.py:dispatch": ("owned", "observer_view"),
+    "server.py:_Client._route_hello": ("owned",),
+    "session_replay/__init__.py:join_history_and_subscribe": ("selected",),
+    "handlers/registry.py:child_run_events": ("selected",),
+    "handlers/registry.py:path_complete": ("selected",),
+    "handlers/registry.py:child_run_list": ("selected",),
+    "connections.py:ConnectionRegistry.read_tree": ("selected",),
+    "connections.py:ConnectionRegistry.read_history": ("selected",),
+    "connections.py:ConnectionRegistry.read_child_run_history": ("selected",),
 }
 # `.owned`/`.selected` attributes that are not the resolvers
 OTHER_ATTRIBUTES = {("accounts.py", "snapshot.selected")}
@@ -38,7 +38,7 @@ RETIRE_CALLERS = {
 }
 # close state that only `SessionControllers` holds
 CLOSE_STATE = {"closing", "close_task", "closing_session_id", "_closing", "_close_pair", "closing_tasks"}
-RESOLVERS = {"owned", "selected"}
+RESOLVERS = {"owned", "selected", "observer_view"}
 # the only places a request use is handed to an existing completion: the worker
 # read and the approval settlement; delivery and setup tasks use `SessionUse.run`
 TRANSFER_ENTRIES = {
@@ -96,7 +96,7 @@ def _resolver_violations() -> list[str]:
     """Every use of a resolver that is not one direct ``<x>.controllers.<kind>(...)``
     call in its entry, plus every entry whose count differs from one."""
     problems: list[str] = []
-    counts = dict.fromkeys(RESOLVER_ENTRIES, 0)
+    counts = {(name, kind): 0 for name, kinds in RESOLVER_ENTRIES.items() for kind in kinds}
     module_level: list[tuple[Path, ast.AST]] = [
         (file, ast.parse(file.read_text())) for file in SCANNED if file.name != "session_controllers.py"
     ]
@@ -133,14 +133,14 @@ def _resolver_violations() -> list[str]:
                 problems.append(f"{where}: not a direct controllers.{node.attr}(...) call")
             elif id(node) in in_lambda:
                 problems.append(f"{where}: resolver inside a lambda")
-            elif RESOLVER_ENTRIES.get(name) != node.attr:
+            elif (name, node.attr) not in counts:
                 problems.append(f"{where}: resolver outside its request entry")
             elif id(node) not in scoped:
                 problems.append(f"{where}: resolved use not held by a with block")
             else:
-                counts[name] += 1
+                counts[name, node.attr] += 1
     problems += [
-        f"{name}: {count} resolver calls, expected 1" for name, count in counts.items() if count != 1
+        f"{name}: {count} {kind} calls, expected 1" for (name, kind), count in counts.items() if count != 1
     ]
     return problems
 

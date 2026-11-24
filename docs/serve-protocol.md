@@ -163,6 +163,18 @@ subscriptions, including child streams for that session. A ninth join returns
 `-32001` without closing the connection. An observer without a subscription
 does not occupy a session bucket.
 
+In multi-controller mode, an observer's `session_history_and_subscribe` join
+selects the session used by `status`, `content_read`, `model_catalog`,
+`session_settings`, `delivery_status`, `session_grants`, `skill_catalog`,
+`skill_read`, `agent_profile_catalog`, `agent_profile_read`, `mcp_server_list`,
+and `session_history_read`. Without a live view, those methods return
+`-32003` (`session is not active`); they do not fall back to another session.
+`session_history_read` still pages another session in the selected session's
+project. `delivery_status` returns `unknown` for a valid delivery ID because
+observers cannot send deliveries. `mcp_server_list` uses the selected project's
+redacted disk configuration, not the controller's live MCP mount or headers.
+Legacy observer reads and the observer write restrictions are unchanged.
+
 The eight resident records include setup, parked, closing, and reconnect-grace
 records. A ninth record is refused with `-32004` and `reason: "resident_limit"`.
 Each connection can charge three parked or closing records. The existing
