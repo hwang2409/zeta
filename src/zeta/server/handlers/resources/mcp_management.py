@@ -151,7 +151,9 @@ def _write(action: str, *keys: str, optional: tuple[str, ...] = ()):
 def _target(params, *, scoped=True):
     from ...protocol import invalid_resource_params
 
-    require_params(params, "name", optional=("scope",) if scoped else ())
+    require_params(params, "name", optional=("scope", "revision") if scoped else ())
+    if "revision" in params:
+        require_revision(params["revision"])
     name = params["name"]
     scope = params.get("scope", "effective")
     if not _text(name) or len(name) > 256 or scope not in _SCOPES:
@@ -167,7 +169,9 @@ def _registry(runtime):
 async def mcp_server_test(client, request_id, params, controller):
     name, scope = _target(params)
     with owner_errors(**_error_rules()), private_management_io():
-        result = await _owner(client, controller.runtime).test(name, scope=scope, wire=True, registry=_registry(controller.runtime))
+        result = await _owner(client, controller.runtime).test(
+            name, scope=scope, wire=True, registry=_registry(controller.runtime), revision=params.get("revision"),
+        )
     return {"data": {"status": result["status"], "tool_count": result.get("tool_count", 0)}}
 
 
@@ -175,8 +179,13 @@ async def mcp_auth_start(client, request_id, params, controller):
     name, scope = _target(params)
     owner = _owner(client, controller.runtime)
     registry = _registry(controller.runtime)
+    target = None
+    if "revision" in params:
+        # Reject stale requests before creating or replacing an OAuth attempt.
+        with owner_errors(**_error_rules()), private_management_io():
+            target = await owner.action_target(name, scope=scope, revision=params["revision"])
     return {"data": await client.server._mcp_auth.start(name, lambda ready, commit: owner.login(
-        name, scope=scope, launch_ready=ready, before_commit=commit, registry=registry,
+        name, scope=scope, launch_ready=ready, before_commit=commit, registry=registry, target=target,
     ))}
 
 
@@ -193,9 +202,14 @@ async def mcp_auth_cancel(client, request_id, params, controller):
 async def mcp_auth_logout(client, request_id, params, controller):
     name, scope = _target(params)
     auth = client.server._mcp_auth
-    await auth.cancel(name)
+    revision = params.get("revision")
+    if revision is None:
+        await auth.cancel(name)
     with owner_errors(**_error_rules()), private_management_io():
-        work = asyncio.create_task(_owner(client, controller.runtime).logout(name, scope=scope))
+        work = asyncio.create_task(_owner(client, controller.runtime).logout(
+            name, scope=scope, revision=revision,
+            before_delete=(lambda: auth.cancel(name)) if revision is not None else None,
+        ))
         cancelled = False
         # Every cancellation waits for the credential delete before unwinding.
         while not work.done():

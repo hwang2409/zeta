@@ -777,14 +777,14 @@ async def test_manager_dispatches_enable_remove_test_trust_and_navigation(
     called = []
     storage_threads = []
     loop_thread = threading.get_ident()
-    original_read_text = Path.read_text
+    original_read_bytes = Path.read_bytes
 
-    def gated_read_text(path, *args, **kwargs):
+    def gated_read_bytes(path, *args, **kwargs):
         storage_threads.append(threading.get_ident())
         assert threading.get_ident() != loop_thread
-        return original_read_text(path, *args, **kwargs)
+        return original_read_bytes(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", gated_read_text)
+    monkeypatch.setattr(Path, "read_bytes", gated_read_bytes)
     view.render()
 
     async def fake_test(name, *, scope="effective"):

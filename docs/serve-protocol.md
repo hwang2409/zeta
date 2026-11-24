@@ -2100,9 +2100,9 @@ unnegotiated method returns `-32601`.
 | `mcp_auth_logout` | `1.0` | `mcp_management_v1` | `controller_write` |
 
 `mcp_server_list` accepts `{scope?}` and returns `{revision,data:{items}}`.
-Scope is `user`, `project`, or `effective` (default). The active session's
-project is used when attached, otherwise the serve working directory. In the
-effective view a project definition shadows a user definition with the same
+Scope is `user`, `project`, or `effective` (default). The requesting
+connection's record supplies the project context for lists, writes, and actions.
+In the effective view a project definition shadows a user definition with the same
 name. Items are sorted by name and contain `name`, `scope`, `enabled`,
 `trusted`, `status`, `auth`, `tool_count`, and a redacted `config`. This is a
 disk view, not a live connection or credential probe. Command/argument, URL,
@@ -2140,9 +2140,19 @@ and reason `observer_read_only`, plus the method, before parameter validation.
 Unnegotiated methods return `-32601`.
 
 `mcp_server_test`, `mcp_auth_start`, and `mcp_auth_logout` accept
-`{name,scope?}`, with the same scopes as list. `mcp_server_test` performs a
-bounded connection and lists tools without calling them or returning tool
-names, descriptions, or stdio stderr. It returns `{data:{status,tool_count}}`.
+`{name,scope?,revision?}`, with the same scopes as list. To detect support,
+request `mcp_action_revision_v1` alongside `mcp_management_v1` in `hello`
+and check for it in `capabilities.features`. `revision` is the opaque revision
+from `mcp_server_list` in the same project context. A mismatch returns
+`-32009` with `data.code` and
+`data.reason` both set to `stale_mcp_revision`; re-list and review the new
+definition before retrying. No connection, stdio process, OAuth attempt, or
+credential deletion occurs on a mismatch. On a match, the action uses the
+same definition and trust data that were checked. A malformed revision returns
+`-32602 invalid_params`. Omit the revision to act on the current definition.
+
+`mcp_server_test` performs a bounded connection and lists tools without calling
+them or returning tool names, descriptions, or stdio stderr. It returns `{data:{status,tool_count}}`.
 One MCP call deadline covers initialization and listing. On timeout, the probe
 closes the transport, reaps any stdio child, and returns
 `{data:{status:"failed",tool_count:0}}`.
@@ -3327,6 +3337,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `approval_reconnect` | keeps pending approvals for the configured grace after controller loss, replays them after a reclaiming controller's `hello`, and adds the bounded live status fields described above |
 | `session_history_backward` | enables newest-first `session_history` paging with `before`, `next_before`, and `history_validator` |
 | `session_host_commands` | allows controllers to bind validated session-scoped host commands on `new_session` and `resume` |
+| `mcp_action_revision_v1` | `mcp_server_test`, `mcp_auth_start`, and `mcp_auth_logout` accept the revision from `mcp_server_list` and reject stale revisions before acting |
 | `session_mcp_bindings` | allows controllers to bind transient headers for trusted global MCP servers on `new_session` and `resume` |
 | `session_history_fidelity` | preserves bounded tool arguments and structured results in live tool events and `session_history`; adds dropped-steer `delivery_status` events, terminal steer history rows, and tool-result image metadata stubs |
 | `tool_approval_origin` | adds `approval_origin: "automatic" | "user"` to live `tool_start` calls and replayed history `tool_use` calls |
