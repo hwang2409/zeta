@@ -42,6 +42,7 @@ async def controllers(home, transport, monkeypatch, count=2, *, multi=True):
         fake.model = model
         return fake, model
 
+    # test-contract: seam inject the fake backend on the active-session replacement path
     monkeypatch.setattr(ServerRuntime, "_build_backend", backend)
     server = replay_server(home, transport, _backend_factory)
     clients, sessions = [], []
@@ -158,12 +159,15 @@ async def test_account_intervals_do_not_overlap(tmp_path, monkeypatch, transport
                 asyncio.get_running_loop().call_soon(contender.set)
             return await original_dispatch(client, request_id, method, params)
 
+        # test-contract: seam gate the switch immediately before metadata and backend apply
         monkeypatch.setattr(SessionAccountContext, "_commit_and_apply", commit)
+        # test-contract: seam gate the final publication after the synthetic exchange
         monkeypatch.setattr(login_flow, "_publish_credentials", publish)
         monkeypatch.setattr(accounts, "switch", switch)
         monkeypatch.setattr(accounts, "logout", logout)
         monkeypatch.setattr(accounts, refresh_body, refresh)
         monkeypatch.setattr(AccountUsage, "refresh_stale", no_usage_network)
+        # test-contract: seam observe competing dispatch before releasing the worker
         monkeypatch.setattr(_Client, "_dispatch", dispatch)
         target = "anthropic:target" if first == "publication" else "codex:second"
         try:
@@ -217,14 +221,17 @@ async def test_unrelated_busy_record_does_not_block_account_operation(tmp_path, 
         if method == "account_logout":
             selected_target = await a.request(3, "account_switch", params)
             assert "result" in selected_target
+            # test-contract: seam hold the target record busy across the logout reply
             monkeypatch.setattr(affected, "_turn_task", asyncio.current_task())
             try:
                 response = await a.request(4, method, params)
                 assert response["error"]["code"] == -32004
             finally:
+                # test-contract: seam release the target record even if the request fails
                 monkeypatch.setattr(affected, "_turn_task", None)
             params["account"] = "anthropic:other"
         # The current task remains active across both wire replies.
+        # test-contract: seam hold the unrelated record busy across the wire replies
         monkeypatch.setattr(unrelated, "_turn_task", asyncio.current_task())
         try:
             if method == "account_logout":
@@ -235,6 +242,7 @@ async def test_unrelated_busy_record_does_not_block_account_operation(tmp_path, 
             assert "result" in response, "unrelated running record blocked account operation"
             assert unrelated.state_change_busy()
         finally:
+            # test-contract: seam release the unrelated record even if the request fails
             monkeypatch.setattr(unrelated, "_turn_task", None)
 
 
@@ -254,6 +262,7 @@ async def test_legacy_cancel_holds_owner_until_switch_worker_settles(tmp_path, m
                 responses.append(payload)
             return await original_write(client, payload)
 
+        # test-contract: seam capture encoded legacy bytes before transport framing
         monkeypatch.setattr(_Client, "_write_physical", capture)
         params = {"session_id": sid, "account": "codex:first"}
         assert "result" in await peer.request(3, "account_switch", params)
@@ -285,6 +294,7 @@ async def test_legacy_cancel_holds_owner_until_switch_worker_settles(tmp_path, m
 
         monkeypatch.setattr(accounts, refresh_body, refresh_accounts)
         monkeypatch.setattr(AccountUsage, "refresh_stale", no_usage_network)
+        # test-contract: seam hold the legacy worker after it observes cancellation
         monkeypatch.setattr(SessionAccountContext, "_locked_apply_worker", worker)
         await peer.send(5, "account_switch", {"session_id": sid, "account": "codex:second"})
         refresh = None
@@ -368,11 +378,15 @@ async def test_cancel_account_operation_at_commit_boundary(tmp_path, monkeypatch
                 loop.call_soon(dispatched.set)
             return await original_dispatch(client, request_id, method, params)
 
+        # test-contract: seam gate the switch before commit authorization
         monkeypatch.setattr(SessionAccountContext, "_prepare", prepare)
+        # test-contract: seam gate the switch immediately before metadata and backend apply
         monkeypatch.setattr(SessionAccountContext, "_commit_and_apply", commit)
+        # test-contract: seam count runtime applies across request cancellation
         monkeypatch.setattr(SessionAccountContext, "_apply", apply)
         monkeypatch.setattr(AccountStore, "logout", logout)
         monkeypatch.setattr(AccountUsage, "refresh_stale", refresh)
+        # test-contract: seam observe competing dispatch before releasing the worker
         monkeypatch.setattr(_Client, "_dispatch", dispatch)
         def client_for(session):
             return next(

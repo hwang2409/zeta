@@ -404,7 +404,7 @@ async def test_serve_login_publication_does_not_block_event_loop(
                 return
             callback_before_release.append(callback_ran.wait(timeout=1))
             if callback_before_release[-1]:
-                release_lock.wait()
+                release_lock.wait(timeout=10)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
@@ -552,7 +552,7 @@ async def test_cancelled_serve_login_never_publishes_and_releases_locks(
             provider.credential_store.account
         ):
             lock_ready.set()
-            release_lock.wait()
+            release_lock.wait(timeout=10)
 
     fd_before = len(os.listdir("/dev/fd"))
     holder = threading.Thread(target=hold_lifecycle_lock)
@@ -572,7 +572,7 @@ async def test_cancelled_serve_login_never_publishes_and_releases_locks(
         assert not first.done()
         release_lock.set()
         with pytest.raises(asyncio.CancelledError):
-            await first
+            await asyncio.wait_for(first, 10)
         assert await asyncio.to_thread(save_finished.wait, 5)
 
         second_url = asyncio.get_running_loop().create_future()
@@ -589,7 +589,7 @@ async def test_cancelled_serve_login_never_publishes_and_releases_locks(
 
     assert not holder.is_alive()
     assert published == [new]
-    assert await asyncio.to_thread(provider.credential_store.read) == new
+    assert await asyncio.wait_for(asyncio.to_thread(provider.credential_store.read), 10) == new
     with AccountStore(home).provider_login_lock("anthropic"):
         pass
     assert len(os.listdir("/dev/fd")) == fd_before
