@@ -9,14 +9,41 @@ import pytest
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
+# Keep the real session-finish arm request, but start its short timer in
+# the hanging frame, not while pytest is still running unrelated hooks.
+_ARM_ON_HANG = """
+import threading
+
+import pytest
+
+from tests.support import exit_watchdog
+
+
+_arm = exit_watchdog._arm
+_arm_requested = threading.Event()
+
+
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_sessionfinish():
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(exit_watchdog, "_arm", _arm_requested.set)
+        return (yield)
+
+
+def arm_on_hang():
+    assert _arm_requested.is_set(), "session finish did not arm the watchdog"
+    exit_watchdog._seconds = 1
+    _arm()
+"""
+
 # A hang after every test finished: at interpreter exit (after pytest's own
 # unconfigure), or in an xdist worker's session finish.
 _HANG_AT_EXIT = """
 import atexit
-import threading
 
 
 def hang_after_pytest_exit():
+    arm_on_hang()
     threading.Event().wait()
 
 
@@ -24,18 +51,14 @@ atexit.register(hang_after_pytest_exit)
 """
 
 _HANG_IN_WORKER_SESSION_FINISH = """
-import threading
-
-import pytest
-
-
-@pytest.hookimpl(trylast=True)
-def pytest_sessionfinish(session):
+@pytest.hookimpl(trylast=True, specname="pytest_sessionfinish")
+def pytest_hang_worker(session):
     if hasattr(session.config, "workerinput"):
         hang_in_worker_session_finish()
 
 
 def hang_in_worker_session_finish():
+    arm_on_hang()
     threading.Event().wait()
 """
 
@@ -61,8 +84,7 @@ def test_exit_watchdog_ends_a_hung_exit_with_a_traceback(
 ) -> None:
     # The child loads the real repository conftest, which installs the watchdog.
     monkeypatch.setenv("PYTHONPATH", str(_REPOSITORY_ROOT))
-    monkeypatch.setenv("ZETA_TEST_EXIT_WATCHDOG_SECONDS", "1")
-    pytester.makeconftest(conftest)
+    pytester.makeconftest(_ARM_ON_HANG + conftest)
     pytester.makepyfile("def test_passes():\n    pass\n")
 
     try:
@@ -74,7 +96,11 @@ def test_exit_watchdog_ends_a_hung_exit_with_a_traceback(
 
     output = "\n".join(result.outlines + result.errlines)
     assert "Timeout (0:00:01)!" in output, output
-    assert hanging_frame in output, output
+    assert f"in {hanging_frame}" in output, output
+    if extra_args:
+        assert "node down:" in output, output
+    else:
+        assert result.ret != pytest.ExitCode.OK, output
 
 
 # A test fails at its timeout guard while a task re-shields every cancellation,
