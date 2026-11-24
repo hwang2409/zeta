@@ -1206,7 +1206,7 @@ def _main(argv: list[str] | None = None) -> int:
 
         return _run_inbox(args)
     if args.command == "serve":
-        from ..server import ZetaServer, run_server
+        from ..server import ServerAlreadyListeningError, ZetaServer, run_server
 
         try:
             server = ZetaServer(
@@ -1240,6 +1240,13 @@ def _main(argv: list[str] | None = None) -> int:
                 approval_reconnect_grace=args.approval_reconnect_grace,
             )
             asyncio.run(run_server(server))
+        except ServerAlreadyListeningError as exc:
+            print(
+                f"zeta serve: {exc}. Connect your client to that socket, "
+                "or stop the running server before retrying.",
+                file=sys.stderr,
+            )
+            return 1
         except StorageFormatError:
             raise
         except (SessionError, ValueError) as exc:
