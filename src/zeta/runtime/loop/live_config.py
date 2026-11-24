@@ -1,4 +1,4 @@
-"""Live catalog refresh at model-request boundaries."""
+"""Live catalog refresh at agent turn and child request boundaries."""
 
 from __future__ import annotations
 
@@ -178,7 +178,7 @@ class LiveConfigMixin:
         )
 
     async def _flush_live_config_notices(self) -> None:
-        """Persist queued notices only before a new model request."""
+        """Persist queued notices at a turn or child request boundary."""
 
         if not self._live_config_notices:
             return

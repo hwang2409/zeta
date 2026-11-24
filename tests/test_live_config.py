@@ -138,7 +138,7 @@ def _definition(loop: AgentLoop):
     "explicit_schemas", [False, True], ids=["registry", "explicit"]
 )
 async def test_live_config_adds_profile_to_next_agent_schema_and_spawn(
-    tmp_path: Path, explicit_schemas: bool
+    tmp_path: Path, explicit_schemas: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     call = ToolCall(
         "specialist-1",
@@ -160,18 +160,34 @@ async def test_live_config_adds_profile_to_next_agent_schema_and_spawn(
         "committed specialist body",
     )
 
-    _ = [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
+    try:
+        ensure_mcp_servers = loop._ensure_mcp_servers
+        before_mcp: list[list[tuple[MessageRole, str]]] = []
 
-    assert "specialist" in _agent_enums(backend.calls[0][1])[0]
-    assert "specialist" in _agent_enums(backend.calls[0][1])[1]
-    assert len(backend.calls) >= 2, "live profile failed execution validation"
-    child_prompt = backend.calls[1][0][0]
-    assert any(
-        isinstance(block, TextContent) and "committed specialist body" in block.text
-        for block in child_prompt.content
-    )
-    loop.store.close()
-    await loop.close()
+        async def observe_mcp_setup() -> None:
+            before_mcp.append([
+                (msg.role, assistant_text(msg)) for msg in branch_messages(loop.store)
+            ])
+            await ensure_mcp_servers()
+
+        monkeypatch.setattr(loop, "_ensure_mcp_servers", observe_mcp_setup)
+        _ = [event async for event in loop.run_turn("start", origin=MessageOrigin.USER)]
+
+        assert before_mcp[0] == [
+            (MessageRole.USER, "start"),
+            (MessageRole.SYSTEM, "[zeta] skill refresh: agent profiles changed: added specialist"),
+        ]
+        assert "specialist" in _agent_enums(backend.calls[0][1])[0]
+        assert "specialist" in _agent_enums(backend.calls[0][1])[1]
+        assert len(backend.calls) >= 2, "live profile failed execution validation"
+        child_prompt = backend.calls[1][0][0]
+        assert any(
+            isinstance(block, TextContent) and "committed specialist body" in block.text
+            for block in child_prompt.content
+        )
+    finally:
+        await loop.close()
+        loop.store.close()
 
 
 @pytest.mark.asyncio
@@ -212,14 +228,11 @@ async def test_live_added_profile_remains_hidden_and_blocked_at_depth_cap(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("old_body", "new_body"), [
-    ("old profile body", "new worker profile body"),
-    ("", "new worker profile body"),
-    ("old profile body", ""),
-])
+@pytest.mark.parametrize("new_body", ["new worker profile body", ""], ids=["changed", "invalid"])
 async def test_running_child_refreshes_selected_profile_before_next_request(
-    tmp_path: Path, old_body: str, new_body: str,
+    tmp_path: Path, new_body: str,
 ) -> None:
+    old_body = "old profile body"
     spawn = ToolCall(
         "worker-1", "agent",
         {"prompt": "work", "description": "worker", "preset": "worker", "background": True},
@@ -270,23 +283,24 @@ async def test_running_child_refreshes_selected_profile_before_next_request(
         await wait_background_owner(loop)
 
         first, second, third = backend.children["work"].calls
-        old_contribution = f"\n\n{old_body}" if old_body else ""
-        new_contribution = f"\n\n{new_body}" if new_body else ""
+        old_contribution = f"\n\n{old_body}"
+        expected_contribution = f"\n\n{new_body or old_body}"
         base_prompt = assistant_text(backend.parent.calls[0][0][0])
         assert assistant_text(first[0][0]) == base_prompt + old_contribution
         assert any(
             message.role is MessageRole.USER and assistant_text(message) == "also check the tests"
             for message in second[0]
         ), "follow-up did not reach the next model request"
-        assert assistant_text(second[0][0]) == base_prompt + new_contribution, (
-            "next worker request did not replace the whole profile contribution"
+        assert assistant_text(second[0][0]) == base_prompt + expected_contribution, (
+            "next worker request did not use the last valid profile contribution"
         )
         assert "delegate" in _agent_enums(second[1])[0]
         assert backend.children["delegate"].calls, "running child rejected the new delegate profile"
         assert second[0][0] == third[0][0]
+        notice_text = "updated worker" if new_body else "has an empty prompt body"
         notices = [
             assistant_text(message) for message in third[0]
-            if message.role is MessageRole.SYSTEM and "updated worker" in assistant_text(message)
+            if message.role is MessageRole.SYSTEM and notice_text in assistant_text(message)
         ]
         assert len(notices) == 1
         assert any(assistant_text(message) == notices[0] for message in second[0])

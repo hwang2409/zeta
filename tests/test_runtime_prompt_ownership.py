@@ -82,17 +82,3 @@ def test_owned_prompt_operations_preserve_valid_nested_spans() -> None:
         "length": 2,
         "digest": _serialized("abcdefghij", 3, 2)["digest"],
     }
-
-
-def test_empty_span_at_component_end_is_a_sibling() -> None:
-    text = "abcdefghij"
-    prompt = _prompt({
-        "base": _serialized(text, 0, len(text)),
-        "suffix": _serialized(text, len(text), 0),
-    })
-    updated = replace_owned_fragment(prompt, "base", PromptFragment("base", {}))
-    assert owned_fragment(updated, "suffix").text == ""
-
-    updated = replace_owned_fragment(updated, "suffix", PromptFragment(" suffix", {}))
-    assert updated.system_prompt == "base suffix"
-    assert owned_fragment(updated, "base").text == "base"

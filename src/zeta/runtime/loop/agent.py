@@ -744,6 +744,9 @@ class AgentLoop(
     ) -> AsyncIterator[StreamEvent]:
         step_delivery = await self._ensure_step_delivery()
         self._advance_project_context_recovery()
+        reload_child_profile = CHILD_PROFILE_BODY in self._skill_prompt_base().prompt_components
+        if not reload_child_profile:
+            await self.refresh_live_config()
         if system_message is not None and system_message.role is not MessageRole.SYSTEM:
             raise ValueError("system_message must have the system role")
         await self._await_project_inbox_turn_start()
@@ -772,6 +775,8 @@ class AgentLoop(
             raise ValueError("cannot reuse a user message that is not persisted")
         if system_message is None and persist_user_message:
             await self._append_turn_message(user_message)
+        if not reload_child_profile:
+            await self._flush_live_config_notices()
         setup_error: ErrorInfo | None = None
         try:
             await self._ensure_mcp_servers()
@@ -846,10 +851,7 @@ class AgentLoop(
                 nudge_turn_pending = False
                 self._turn_stop_reason = None
                 self._turn_output_tokens = None
-                if (
-                    turn_number == 1
-                    or CHILD_PROFILE_BODY in self._skill_prompt_base().prompt_components
-                ):
+                if reload_child_profile:
                     await self.refresh_live_config()
                     await self._flush_live_config_notices()
                 self.tool_registry.start_batch()
@@ -1095,7 +1097,10 @@ class AgentLoop(
                 except ProviderAccountSwitched as exc:  # redispatch through the new account's backend
                     inference.error = exc
                     await completion.aclose()  # type: ignore[union-attr]
-                    redispatch = redispatch or "account"
+                    if reload_child_profile:
+                        redispatch = redispatch or "account"
+                    else:
+                        self._dispatch_progress.reset()
                     continue
                 except Exception as exc:
                     if completion is not None:

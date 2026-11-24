@@ -254,7 +254,7 @@ def _compose_child_project_context(
         for key, component in context.prompt_components.items()
         if key != CHILD_PROFILE_BODY and isinstance(prompt, str)
     }
-    if preset.path is not None:
+    if preset.path is not None and preset.prompt_suffix:
         text = prompt if isinstance(prompt, str) else assistant_text(prompt)
         length = len(child_profile_contribution(preset.prompt_suffix))
         finish_length = len(_EXPLICIT_FINISH_GUIDANCE) + 2 if explicit_finish else 0

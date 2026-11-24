@@ -72,8 +72,6 @@ def _validate_span(text: str, key: str, span: OwnedSpan) -> None:
 def _strictly_contains(outer: OwnedSpan, inner: OwnedSpan) -> bool:
     return (
         outer.offset <= inner.offset
-        # An empty span at the end belongs after the preceding component.
-        and inner.offset < outer.offset + outer.length
         and inner.offset + inner.length <= outer.offset + outer.length
         and (outer.offset, outer.length) != (inner.offset, inner.length)
     )
