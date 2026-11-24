@@ -589,7 +589,8 @@ async def test_cancelled_serve_login_never_publishes_and_releases_locks(
 
     assert not holder.is_alive()
     assert published == [new]
-    assert await asyncio.wait_for(asyncio.to_thread(provider.credential_store.read), 10) == new
+    # test-contract: durability read the published credential after both workers settled
+    assert await asyncio.to_thread(provider.credential_store.read) == new
     with AccountStore(home).provider_login_lock("anthropic"):
         pass
     assert len(os.listdir("/dev/fd")) == fd_before
