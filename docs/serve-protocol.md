@@ -222,7 +222,7 @@ feature. Observer connections receive only methods with `read` access.
 | `list_projects` | `1.1` | `projects` | `controller_read` |
 | `project_show` | `1.1` | `projects` | `controller_read` |
 | `project_memory_log` | `1.1` | `projects` | `controller_read` |
-| `project_inbox` | `1.1` | `projects` | `controller_write` |
+| `project_inbox` | `1.1` | `projects` | `controller_read` |
 | `clear_steering` | `1.0` | `abort_scope` | `session_mutation` |
 | `delivery_status` | `1.0` | `delivery_id` | `read` |
 | `session_grants` | `1.1` | `session_grants` | `read` |
@@ -386,6 +386,8 @@ request. If JSON escaping still approaches the frame limit, it shortens the
 diff and then the content and marks the applicable `*_truncated` field.
 
 ### `project_inbox` (`projects` feature)
+
+This controller-only read does not require an attached session.
 
 Params: required `project_id`; optional `status`, one of `new` (default),
 `claimed`, or `done`; and optional `offset` and `limit` with the same defaults
@@ -1093,6 +1095,11 @@ nanoseconds; missing times are null.
   and `summary`. Durable task clocks are monotonic, so Unix times are null.
 - Attention rows use the `Attention` shape in project state above, scoped
   to the selected session.
+
+The server captures live status for all resident sessions, including parked
+sessions, before it reads stored metadata. For example, a parked session
+waiting for approval reports `approval`, not the `running` value inferred from
+its on-disk execution lease.
 
 Session state uses the same state read errors as the catalog. A missing
 `state_session` target returns `-32602` with `data.code` `session_not_found`.
