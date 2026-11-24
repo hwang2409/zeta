@@ -172,16 +172,14 @@ def load_mcp_config_overlay(
     if project_path is None or project_path.resolve() == home_path.resolve():
         return home_config
     project_config = _load_single(project_path)
-    return _overlay(home_config, project_config)
+    return overlay_mcp_configs(home_config, project_config)
 
 
 def read_mcp_config_file(path: str | Path) -> dict[str, dict[str, object]]:
     """Read the raw servers mapping from one config file, or {} if absent."""
 
     target = Path(path).expanduser()
-    value = _read_mcp_document(target)
-    raw_servers = value.get("servers", {})
-    return dict(raw_servers)
+    return dict(_raw_mcp_servers(target, _read_mcp_document(target)))
 
 
 def _read_mcp_document(path: Path) -> dict[str, object]:
@@ -194,13 +192,17 @@ def _read_mcp_document(path: Path) -> dict[str, object]:
         raise MCPConfigError(f"could not read MCP config {path}: {exc}") from exc
     if type(value) is not dict:
         raise MCPConfigError(f"MCP config must be an object: {path}")
-    raw_servers = value.get("servers", {})
+    return value
+
+
+def _raw_mcp_servers(path: Path, document: dict[str, object]) -> dict:
+    raw_servers = document.get("servers", {})
     if type(raw_servers) is not dict:
         raise MCPConfigError(f"MCP config servers must be an object: {path}")
     for name in raw_servers:
         if type(name) is not str or not name:
             raise MCPConfigError(f"MCP server names must be nonempty strings: {path}")
-    return dict(value)
+    return raw_servers
 
 
 def _load_single(selected_path: Path) -> MCPConfig:
@@ -209,7 +211,15 @@ def _load_single(selected_path: Path) -> MCPConfig:
             "MCP config not found; continuing without MCP servers: %s", selected_path
         )
         return MCPConfig(selected_path)
-    raw_servers = read_mcp_config_file(selected_path)
+    return _parse_servers(selected_path, read_mcp_config_file(selected_path))
+
+
+def parse_mcp_config(selected_path: Path, document: dict[str, object]) -> MCPConfig:
+    """Build runtime config from a JSON object without reopening its file."""
+    return _parse_servers(selected_path, _raw_mcp_servers(selected_path, document))
+
+
+def _parse_servers(selected_path: Path, raw_servers: dict[str, object]) -> MCPConfig:
     servers: dict[str, MCPServerConfig] = {}
     skipped: dict[str, MCPServerConfig] = {}
     malformed: dict[str, MCPServerConfig] = {}
@@ -261,7 +271,7 @@ def _load_single(selected_path: Path) -> MCPConfig:
     return MCPConfig(selected_path, servers, skipped, malformed, sources)
 
 
-def _overlay(base: MCPConfig, top: MCPConfig) -> MCPConfig:
+def overlay_mcp_configs(base: MCPConfig, top: MCPConfig) -> MCPConfig:
     """Merge two configs so that top's entries win by name."""
 
     servers = dict(base.servers)
@@ -566,6 +576,8 @@ __all__ = [
     "load_mcp_config",
     "load_mcp_config_overlay",
     "mcp_log_path",
+    "overlay_mcp_configs",
+    "parse_mcp_config",
     "project_config_path",
     "read_mcp_config_file",
     "resolve_server_config",
