@@ -108,14 +108,13 @@ async def test_simultaneous_first_legacy_and_multi_have_one_serial_admission(
     events: list[str] = []
     original = server.controllers.admit_hello
 
-    def admit(connection, *, negotiated_multi, reconnect_session_id=None):
+    def admit(connection, *, negotiated_multi):
         mode = "multi" if negotiated_multi else "legacy"
         admissions.append((mode, str(id(connection))) )
         events.append("admit")
         return original(
             connection,
             negotiated_multi=negotiated_multi,
-            reconnect_session_id=reconnect_session_id,
         )
 
     monkeypatch.setattr(server.controllers, "admit_hello", admit)
@@ -228,7 +227,8 @@ async def test_multi_reconnect_requires_matching_session_id(
             "hello",
             {"protocol_version": "1.1", "features": ["multi_controller"], "session_id": "wrong"},
         )
-        assert refused["error"]["code"] == -32001
+        # a wrong id reclaims nothing; grace no longer refuses the hello for capacity
+        assert refused["error"]["code"] == -32003, refused
         admitted = await right.request(
             1,
             "hello",
@@ -1305,8 +1305,9 @@ async def test_multi_reconnect_grace_is_independent(
             expire_b.set()
             await await_or_fail(asyncio.shield(grace), what="settle B's grace")
             unrelated = await connect()
-            refused = await negotiate(unrelated, replay=False, extra=features)
-            assert refused.get("error", {}).get("code") == -32001, "B's expiry lost A's idle grace"
+            assert "result" in await negotiate(unrelated, replay=False, extra=features)
+            refused = await unrelated.request(2, "resume", {"session_id": a_id})
+            assert refused.get("error", {}).get("code") == -32014, "B's expiry lost A's idle grace"
         a, status = await reclaim(a_id)
         assert status["state"] == ("running" if a_has_turn else "idle")
         a_peer = server.connections.clients()[-1]
@@ -1322,7 +1323,7 @@ async def test_multi_reconnect_grace_is_independent(
             refused = await expired.request(1, "hello", {
                 "protocol_version": "1.1", "features": list(features), "session_id": b_id,
             })
-            assert refused.get("error", {}).get("code") == -32001, refused
+            assert refused.get("error", {}).get("code") == -32003, refused
     finally:
         expire_b.set()
         backend.open_all()
