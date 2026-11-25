@@ -225,9 +225,10 @@ session from disk.
 Reclaiming or settling one session does not end another session's grace. An
 unattached controller does not infer a target from someone else's grace. If
 no controllers are connected and only grace or cleanup keeps multi-controller
-mode active, a controller `hello` can succeed only by naming a session with
-live grace. Legacy controller `hello` is refused until the multi-controller
-mode clears, including while its grace or closing records remain.
+mode active, a multi-controller `hello` is admitted as usual, up to the
+controller limit; it takes a grace session only by naming its exact id.
+Legacy controller `hello` is refused until the multi-controller mode clears,
+including while its grace or closing records remain.
 
 An idle session still reserves capacity while detached. Its grace is bounded
 by `approval_reconnect_grace` (`--approval-reconnect-grace`, default 90 seconds)

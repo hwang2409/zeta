@@ -205,7 +205,6 @@ class SessionControllers:
         connection: Any,
         *,
         negotiated_multi: bool,
-        reconnect_session_id: str | None = None,
     ) -> HelloAdmission:
         """Reserve process controller mode before claiming the physical socket."""
         self._require_open()
@@ -221,15 +220,9 @@ class SessionControllers:
             self._snapshot_retention_eligibility()
             self.bind_retention_planner()
         elif not self._controller_members:
+            # Only grace or cleanup holds the mode. A fresh multi controller is
+            # admitted; graced sessions stay reachable only by their exact id.
             if self._controller_mode != requested:
-                raise ProtocolError(
-                    ErrorDescriptor.CONNECTION_CAPACITY,
-                    "another client is already connected",
-                )
-            if requested == "multi" and not any(
-                not record.closing and grace.session_id == reconnect_session_id
-                for record, grace in self._multi_graces.items()
-            ):
                 raise ProtocolError(
                     ErrorDescriptor.CONNECTION_CAPACITY,
                     "another client is already connected",

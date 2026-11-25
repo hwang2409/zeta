@@ -1177,7 +1177,7 @@ class _Client:
         admission = None
         acquisition = None
         try:
-            admission = self._admit_controller_hello(hello, params)
+            admission = self._admit_controller_hello(hello)
             multi = admission is not None and admission.mode == "multi" and self.max_role != "observer"
             # Multi must refuse a conflicting hello before claiming its output queue.
             role = "controller" if multi else self._claim_hello_role(hello)
@@ -1209,18 +1209,13 @@ class _Client:
             raise
         return True, result
 
-    def _admit_controller_hello(
-        self, hello: _HelloNegotiation, params: dict[str, Any]
-    ) -> HelloAdmission | None:
+    def _admit_controller_hello(self, hello: _HelloNegotiation) -> HelloAdmission | None:
         if hello.role != "controller":
             return None
         try:
             admission = self.server.controllers.admit_hello(
                 self,
                 negotiated_multi="multi_controller" in self.features,
-                reconnect_session_id=params.get("session_id")
-                if isinstance(params.get("session_id"), str)
-                else None,
             )
         except ProtocolError as exc:
             if exc.code == ErrorDescriptor.CONNECTION_CAPACITY.code:
