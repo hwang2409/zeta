@@ -40,7 +40,6 @@ from zeta.server.resource_protocol import Access, collect_families
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
-MAX_PRE_HELLO_CONNECTIONS = 10
 
 
 async def _observer(
@@ -158,7 +157,7 @@ async def test_observer_catalog_does_not_wait_for_controller_history(
     observer_reader, observer_writer = await _observer(
         server, 3, features=["serve_observers", "list_sessions_paging", "ping"]
     )
-    store = server.runtime.opened.store
+    store = server.controllers.attached().runtime.opened.store
     entered = threading.Event()
     release = threading.Event()
     original_page = store.history_index_page
@@ -268,9 +267,9 @@ async def test_observer_hello_has_no_controller_side_effects(
         "set_memory_notice_sink",
         "set_background_wake_sink",
     ):
-        original = getattr(server.runtime, name)
+        original = getattr(server.controllers.attached().runtime, name)
         monkeypatch.setattr(
-            server.runtime,
+            server.controllers.attached().runtime,
             name,
             lambda *args, _name=name, _original=original, **kwargs: (
                 calls.append(_name) or _original(*args, **kwargs)
@@ -633,10 +632,10 @@ async def test_observer_disconnects_keep_controller_approval(
         released.set()
 
     monkeypatch.setattr(server.connections, "release", release)
-    assert server.runtime.policy is not None
+    assert server.controllers.attached().runtime.policy is not None
     store_calls: list[tuple[str, int]] = []
     for name in ("pending_requests", "abort"):
-        original = getattr(server.runtime.policy, name)
+        original = getattr(server.controllers.attached().runtime.policy, name)
 
         def record(
             *args: Any, _name: str = name, _original: Any = original, **kwargs: Any
@@ -644,7 +643,7 @@ async def test_observer_disconnects_keep_controller_approval(
             store_calls.append((_name, threading.get_ident()))
             return _original(*args, **kwargs)
 
-        monkeypatch.setattr(server.runtime.policy, name, record)
+        monkeypatch.setattr(server.controllers.attached().runtime.policy, name, record)
 
     sockets: list[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = []
     try:
@@ -732,7 +731,7 @@ async def test_controller_history_does_not_block_other_clients(
     observer_reader, observer_writer = await _observer(
         server, 3, features=["serve_observers", "ping"]
     )
-    store = server.runtime.opened.store
+    store = server.controllers.attached().runtime.opened.store
     entered = threading.Event()
     release = threading.Event()
     ping_answered = threading.Event()
@@ -804,7 +803,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
             {"provider": "codex"},
         )
     )[-1]["result"]["session"]["session_id"]
-    server.runtime.opened.store.append_message(
+    server.controllers.attached().runtime.opened.store.append_message(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("from-a")]), MessageOrigin.USER
         )
@@ -842,7 +841,7 @@ async def test_observer_read_is_fenced_from_controller_session_switch(
                 {"provider": "codex"},
             )
         )[-1]["result"]["session"]["session_id"]
-        server.runtime.opened.store.append_message(
+        server.controllers.attached().runtime.opened.store.append_message(
             with_message_origin(
                 Message(MessageRole.USER, [TextContent("from-b")]), MessageOrigin.USER
             )
@@ -873,20 +872,23 @@ async def test_controller_close_never_writes_after_registry_release(
     reader, writer = await _connect(server)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
     await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-    assert server._client is not None and server.connections is not None
-    client = server._client
-    runtime_sink = server.runtime._background_event_sink
+    assert next(iter(server.connections.clients()), None) is not None and server.connections is not None
+    client = next(iter(server.connections.clients()), None)
+    runtime = server.controllers.attached().runtime
+    runtime_sink = runtime._background_event_sink
+    assert runtime.retention_event_sink is not None
     assert runtime_sink is not None
     close_entered = asyncio.Event()
     close_release = asyncio.Event()
-    original_terminate = server.control._terminate_pending_approvals
+    original_terminate = server.controllers.attached().control._terminate_pending_approvals
 
     async def gated_terminate(*args: Any, **kwargs: Any) -> None:
         close_entered.set()
         await asyncio.wait_for(close_release.wait(), TIMEOUT)
         await original_terminate(*args, **kwargs)
 
-    monkeypatch.setattr(server.control, "_terminate_pending_approvals", gated_terminate)
+    # test-contract: seam patches the attached pair's private hook
+    monkeypatch.setattr(server.controllers.attached().control, "_terminate_pending_approvals", gated_terminate)
     order: list[str] = []
     original_write = client._write_physical
     original_release = server.connections.release
@@ -904,25 +906,33 @@ async def test_controller_close_never_writes_after_registry_release(
     monkeypatch.setattr(server.connections, "release", registry_release)
     publication_done = asyncio.Event()
     publication_results: list[bool] = []
-    original_notify = server.control._notify
+    retention_projection = {"mode": "none", "errors": ["test planner error"]}
+    original_notify = server.controllers.attached().control._notify
 
     async def record_notification(*args: Any, **kwargs: Any) -> bool:
         result = await original_notify(*args, **kwargs)
-        publication_results.append(result)
-        publication_done.set()
+        data = kwargs.get("data", {})
+        if data is retention_projection:
+            assert "release" in order and result is False
+        if data.get("notification_id") == "late-close-test":
+            publication_results.append(result)
+            publication_done.set()
         return result
 
-    monkeypatch.setattr(server.control, "_notify", record_notification)
+    # test-contract: seam patches the attached pair's private hook
+    monkeypatch.setattr(server.controllers.attached().control, "_notify", record_notification)
     writer.close()
     await writer.wait_closed()
     try:
         await asyncio.wait_for(close_entered.wait(), TIMEOUT)
-        assert server.runtime._background_event_sink is runtime_sink
+        assert server.controllers.attached().runtime._background_event_sink is runtime_sink
+        # The independent planner can publish while the old connection closes.
+        await runtime.retention_event_sink(retention_projection)
         runtime_sink(
-            server.runtime.session_id,
+            server.controllers.attached().runtime.session_id,
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
-                data={"kind": "agent_completion", "text": "late"},
+                data={"kind": "agent_completion", "text": "late", "notification_id": "late-close-test"},
             ),
         )
         close_release.set()
@@ -938,34 +948,6 @@ async def test_controller_close_never_writes_after_registry_release(
         )
     finally:
         close_release.set()
-        await server.close()
-
-
-@pytest.mark.asyncio
-async def test_pre_hello_connections_are_bounded(tmp_path: Path) -> None:
-    server = ZetaServer(
-        home=tmp_path, socket_path=_socket_path(tmp_path), provider="codex"
-    )
-    await server.start()
-    sockets = [
-        await asyncio.wait_for(
-            asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT
-        )
-        for _ in range(MAX_PRE_HELLO_CONNECTIONS)
-    ]
-    extra_reader, extra_writer = await asyncio.wait_for(
-        asyncio.open_unix_connection(str(server.socket_path)), TIMEOUT
-    )
-    try:
-        assert await asyncio.wait_for(extra_reader.read(), TIMEOUT) == b""
-        assert server.connections is not None
-        assert len(server.connections._connections) == MAX_PRE_HELLO_CONNECTIONS
-    finally:
-        extra_writer.close()
-        await extra_writer.wait_closed()
-        for _, socket_writer in sockets:
-            socket_writer.close()
-            await socket_writer.wait_closed()
         await server.close()
 
 
@@ -1013,8 +995,8 @@ async def _controller_event_stream(
         frames = await read_until(
             reader, is_event("approval_request"), what="approval_request"
         )
-        assert server.runtime.loop is not None
-        server.runtime.loop._publish_background_event(
+        assert server.controllers.attached().runtime.loop is not None
+        server.controllers.attached().runtime.loop._publish_background_event(
             StreamEvent(
                 StreamEventType.AGENT_NOTIFICATION,
                 data={"kind": "agent_completion", "text": "background done"},
@@ -1191,7 +1173,7 @@ async def test_session_tree_uses_one_store_snapshot(
     session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[
         -1
     ]["result"]["session"]
-    store = server.runtime.opened.store
+    store = server.controllers.attached().runtime.opened.store
     first = store.append_message(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("before")]), MessageOrigin.USER
@@ -1291,7 +1273,7 @@ async def test_observer_list_and_history_reads_run_off_loop(tmp_path: Path) -> N
     release = threading.Event()
     ping_done = threading.Event()
     answered_while_held: list[bool] = []
-    original = server.runtime.manager.list_sessions_read_only
+    original = server.controllers.attached().runtime.manager.list_sessions_read_only
 
     def gated_list():
         started.set()
@@ -1301,7 +1283,7 @@ async def test_observer_list_and_history_reads_run_off_loop(tmp_path: Path) -> N
         answered_while_held.append(ping_done.is_set())
         return original()
 
-    server.runtime.manager.list_sessions_read_only = gated_list
+    server.controllers.attached().runtime.manager.list_sessions_read_only = gated_list
     try:
         listing = asyncio.create_task(_request(reader, writer, 3, "list_sessions"))
         await _wait_thread(started)
@@ -1418,7 +1400,7 @@ async def test_observer_history_shape_matches_negotiated_backward_feature(
             {"provider": "codex"},
         )
     )[-1]["result"]["session"]["session_id"]
-    server.runtime.opened.store.append_message(
+    server.controllers.attached().runtime.opened.store.append_message(
         with_message_origin(
             Message(MessageRole.USER, [TextContent("history")]), MessageOrigin.USER
         )

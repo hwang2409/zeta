@@ -292,7 +292,7 @@ async def test_written_skill_refreshes_live_catalog_once(tmp_path: Path) -> None
     try:
         await _hello(reader, writer)
         await _request(reader, writer, "start", "new_session", {"provider": "codex"})
-        loop = server.runtime.loop
+        loop = server.controllers.attached().runtime.loop
         assert loop is not None
         created = (await _request(reader, writer, "create", "skill_write", {
             "name": "fresh", "scope": "home", "mutation": {"document": _document("fresh")},
@@ -349,7 +349,7 @@ async def test_project_scope_uses_the_root_sessions_load_from_a_worktree(tmp_pat
         assert (repo / ".zeta" / "skills" / "alpha.md").read_text() == document
         catalog = (await _request(reader, writer, "catalog", "skill_catalog", {"scope": "project"}))[-1]
         assert [item["name"] for item in catalog["result"]["data"]["items"]] == ["alpha"]
-        loop = server.runtime.loop
+        loop = server.controllers.attached().runtime.loop
         assert loop is not None
         await await_or_fail(loop.refresh_live_config(), what="live refresh")
         assert "alpha" in {skill.name for skill in loop.tool_registry.skill_catalog.skills}

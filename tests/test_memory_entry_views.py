@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import io
 import json
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -90,12 +91,10 @@ class _SizedCodec(FrameCodec):
         ) <= self.maximum
 
 
-def _requests(home: Path, *, frame_size: int = 16 * 1024 * 1024) -> ProjectRequests:
-    runtime = SimpleNamespace(manager=SimpleNamespace(list_sessions_read_only=list))
+def _requests(home: Path) -> ProjectRequests:
     return ProjectRequests(
         home=home,
-        runtime=runtime,
-        codec=_SizedCodec(frame_size),
+        manager=SimpleNamespace(list_sessions_read_only=list),
         registry=ProjectRegistry(home / "projects"),
     )
 
@@ -103,7 +102,7 @@ def _requests(home: Path, *, frame_size: int = 16 * 1024 * 1024) -> ProjectReque
 def test_project_show_v2_returns_kind_views_and_entry_counts(tmp_path: Path) -> None:
     home, _, project_id, _, _ = _fixture(tmp_path)
     result = _requests(home).show(
-        1, {"project_id": project_id}, entry_response=True
+        partial(FrameCodec().response_fits, 1), {"project_id": project_id}, entry_response=True
     )
     memory = result["memory"]
     assert memory["schema_version"] == 3
@@ -384,16 +383,16 @@ def test_project_show_v2_truncates_rendered_kind_to_frame(tmp_path: Path) -> Non
         operations=(AddOperation("state", "x" * 3500, _source(3)),),
         reconciliation_key="c" * 64,
     )
-    result = _requests(home, frame_size=2500).show(
-        "frame", {"project_id": project_id}, entry_response=True
+    result = _requests(home).show(
+        partial(_SizedCodec(2500).response_fits, "frame"), {"project_id": project_id}, entry_response=True
     )
     assert any(item["rendered_truncated"] for item in result["memory"]["kinds"])
 
 
 def test_project_memory_log_v2_is_bounded_and_filters_entry(tmp_path: Path) -> None:
     home, _, project_id, state_id, decision_id = _fixture(tmp_path)
-    result = _requests(home, frame_size=3500).memory_log(
-        1,
+    result = _requests(home).memory_log(
+        partial(_SizedCodec(3500).response_fits, 1),
         {"project_id": project_id, "entry_id": state_id},
         entry_response=True,
     )
@@ -416,7 +415,7 @@ def test_format_one_command_mirror_and_serve_views_remain_golden(tmp_path: Path)
         home / "projects" / project.project_id / "memory" / "brief.md"
     ).read_text() == "# Brief\n"
     result = _requests(home).show(
-        1, {"project_id": project.project_id}, entry_response=False
+        partial(FrameCodec().response_fits, 1), {"project_id": project.project_id}, entry_response=False
     )
     assert result["memory"] == {
         "version_id": None,
@@ -438,10 +437,10 @@ def test_project_response_versions_are_explicitly_negotiated(tmp_path: Path) -> 
     requests = _requests(home)
     with pytest.raises(ProjectRegistryError, match="format 2"):
         requests.show(
-            1, {"project_id": project_id}, entry_response=False
+            partial(FrameCodec().response_fits, 1), {"project_id": project_id}, entry_response=False
         )
     result = requests.show(
-        2, {"project_id": project_id}, entry_response=True
+        partial(FrameCodec().response_fits, 2), {"project_id": project_id}, entry_response=True
     )
     assert "kinds" in result["memory"]
     assert "files" not in result["memory"]

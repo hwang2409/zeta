@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
+from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -13,6 +14,14 @@ import pytest
 
 from zeta.core import login_flow
 from zeta.providers import login as provider_login
+
+
+def isolated_logins(home: Path):
+    from zeta.server.accounts import AccountOperations
+    from zeta.server.login import Logins
+
+    owner = AccountOperations(tuple, lambda: False, lambda: iter(()), lambda _control: False)
+    return Logins(home, account_operations=owner)
 
 
 def reject_provider_token_exchange(

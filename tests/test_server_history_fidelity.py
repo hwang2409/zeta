@@ -116,7 +116,7 @@ async def test_session_history_fidelity_projects_bounded_tool_data_over_socket(
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path)
     try:
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         store.append_message(
             Message(
                 MessageRole.ASSISTANT,
@@ -215,7 +215,7 @@ async def test_serve_replay_maps_turn_limit_receipt(tmp_path: Path) -> None:
             {"turns_used": 2, "elapsed": 0.0, "tool_calls": 0},
             structured_content={"status": "completed"},
         )["content"][0]["text"]
-        server.runtime.opened.store.append_message(
+        server.controllers.attached().runtime.opened.store.append_message(
             with_message_origin(
                 Message(
                     MessageRole.USER,
@@ -244,13 +244,13 @@ async def test_serve_replay_maps_turn_limit_receipt(tmp_path: Path) -> None:
 async def test_serve_history_maps_child_turn_limit_notice_once(tmp_path: Path) -> None:
     server, reader, writer, session_id = await _open(tmp_path)
     try:
-        control = ChildTurnControl(10, str(server.runtime.opened.store.session_dir))
+        control = ChildTurnControl(10, str(server.controllers.attached().runtime.opened.store.session_dir))
         warning = None
         for _ in range(9):
             warning = control.begin_completion() or warning
             control.finish_completion()
         assert warning is not None
-        server.runtime.opened.store.append_message(warning)
+        server.controllers.attached().runtime.opened.store.append_message(warning)
 
         rows = await _history(reader, writer, session_id)
         text = "\n".join(
@@ -276,7 +276,7 @@ async def test_session_history_fidelity_projects_tool_image_stubs_over_socket(
             "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAHnOcQAAAAABJRU5ErkJggg==",
             "mimeType": "image/png",
         }
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         store.append_message(
             with_message_origin(
                 Message(
@@ -465,7 +465,7 @@ async def test_automatic_approval_origin_is_live_and_replayed_over_socket(
         features=["session_history_fidelity", "tool_approval_origin"],
     )
     try:
-        policy = server.runtime.loop.tool_registry.approval_policy
+        policy = server.controllers.attached().runtime.loop.tool_registry.approval_policy
         assert policy is not None
         policy.default = ApprovalDecision.ALLOW
         await request(reader, writer, 3, "send", {"text": "hello"})
@@ -474,7 +474,7 @@ async def test_automatic_approval_origin_is_live_and_replayed_over_socket(
         assert "approval_origin" not in started["data"]
         await event(reader, "agent_end")
 
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         old_call = ToolCall("old-call", "read", {"path": str(target)})
         store.append_message(Message(MessageRole.ASSISTANT, [ToolUseContent(old_call)]))
         store.append_message(
@@ -653,13 +653,13 @@ async def test_real_served_turn_finalizers_persist_closed_outcomes(
         tmp_path, backend, features=["served_turn_end"]
     )
     finalized = asyncio.Event()
-    original_finalize = server.control.deliveries.finalize_turn
+    original_finalize = server.controllers.attached().control.deliveries.finalize_turn
 
     async def track_finalize(*args, **kwargs) -> None:
         await original_finalize(*args, **kwargs)
         finalized.set()
 
-    server.control.deliveries.finalize_turn = track_finalize
+    server.controllers.attached().control.deliveries.finalize_turn = track_finalize
     try:
         writer.close()
         await writer.wait_closed()
@@ -721,13 +721,13 @@ async def test_background_finalizers_persist_served_turn_end(
         tmp_path, backend, features=["served_turn_end"]
     )
     finalized = asyncio.Event()
-    original_finalize = server.control.deliveries.finalize_turn
+    original_finalize = server.controllers.attached().control.deliveries.finalize_turn
 
     async def track_finalize(*args, **kwargs) -> None:
         await original_finalize(*args, **kwargs)
         finalized.set()
 
-    server.control.deliveries.finalize_turn = track_finalize
+    server.controllers.attached().control.deliveries.finalize_turn = track_finalize
     try:
         writer.close()
         await writer.wait_closed()
@@ -740,7 +740,7 @@ async def test_background_finalizers_persist_served_turn_end(
             {"protocol_version": "1.2", "features": ["served_turn_end"]},
         )
         assert "served_turn_end" in hello[-1]["result"]["capabilities"]["features"]
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         if finalizer == "notification":
             store.append_agent_notification(
                 "child",
@@ -749,7 +749,7 @@ async def test_background_finalizers_persist_served_turn_end(
                 status="completed",
                 text="done",
             )
-            server.control._schedule_background_wake(session_id)
+            server.controllers.attached().control._schedule_background_wake(session_id)
         else:
             target = tmp_path / "resumed-tool.txt"
             target.write_text("ready")
@@ -791,7 +791,7 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
     server, reader, writer, session_id = await _open(
         tmp_path, backend, features=["served_turn_end"]
     )
-    store = server.runtime.opened.store
+    store = server.controllers.attached().runtime.opened.store
     original_durable_write = type(store)._run_committed_mutation
     committed = threading.Event()
     release = threading.Event()
@@ -846,7 +846,7 @@ async def test_turn_end_commit_precedes_cleanup_and_agent_end(
             and isinstance(row.data.get("turn_id"), str)
             for row in durable_rows
         )
-        assert server.runtime.state.status == "running"
+        assert server.controllers.attached().runtime.state.status == "running"
         assert not announcement.done()
 
         release.set()
@@ -872,7 +872,7 @@ async def test_history_projects_all_closed_served_turn_end_reasons(
         tmp_path, features=["served_turn_end"]
     )
     try:
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         for index, reason in enumerate(
             ("completed", "user_stop", "error", "disconnect")
         ):
@@ -899,7 +899,7 @@ async def test_history_without_fidelity_keeps_legacy_empty_arguments(
 ) -> None:
     server, reader, writer, session_id = await _open(tmp_path)
     try:
-        server.runtime.opened.store.append_message(
+        server.controllers.attached().runtime.opened.store.append_message(
             Message(
                 MessageRole.ASSISTANT,
                 [ToolUseContent(ToolCall("call-1", "read", {"path": "/secret"}))],

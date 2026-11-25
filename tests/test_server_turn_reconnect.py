@@ -170,7 +170,7 @@ async def test_nobody_returns_within_grace_cancels_turn_with_disconnect(
     async def injected_deadline() -> None:
         await await_or_fail(deadline.wait(), what="injected grace deadline")
 
-    server.control._grace_deadline = injected_deadline
+    server.controllers.attached().control._grace_deadline = injected_deadline
     reader, writer = await _connect(server)
     writer2 = None
     try:
@@ -184,8 +184,8 @@ async def test_nobody_returns_within_grace_cancels_turn_with_disconnect(
         assert steer[-1]["result"] == {"accepted": True}
 
         await _drop(writer, server)
-        assert server.runtime.state.status == "running"
-        grace = server.control._grace_task
+        assert server.controllers.attached().runtime.state.status == "running"
+        grace = server.controllers.attached().control._grace_task
         assert grace is not None and not grace.done()
         deadline.set()
         await await_or_fail(asyncio.shield(grace), what="grace expiry")
@@ -194,7 +194,7 @@ async def test_nobody_returns_within_grace_cancels_turn_with_disconnect(
         status = (await _request(reader2, writer2, 6, "status", {}))[-1]["result"]
         assert status["state"] == "idle"
         assert status["last_turn_outcome"]["reason"] == "disconnect"
-        dropped = server.runtime.opened.store.client_delivery("steer-1")
+        dropped = server.controllers.attached().runtime.opened.store.client_delivery("steer-1")
         assert dropped.status == "dropped" and dropped.reason == "disconnect"
         assert backend.calls == 1
     finally:
@@ -209,15 +209,15 @@ async def _late_steer_at_turn_end(server: ZetaServer, reader, writer, backend):
 
     Returns the event that lets the end-of-turn decision run.
     """
-    store = server.runtime.opened.store
+    store = server.controllers.attached().runtime.opened.store
     committed = asyncio.Event()
     finalizing = asyncio.Event()
     publish = asyncio.Event()
     decide = asyncio.Event()
     at_decision = asyncio.Event()
     append = store.append_client_delivery_async
-    finalize = server.control.deliveries.finalize_turn
-    continue_after_turn = server.control.deliveries.continue_after_turn
+    finalize = server.controllers.attached().control.deliveries.finalize_turn
+    continue_after_turn = server.controllers.attached().control.deliveries.continue_after_turn
 
     async def pause_after_commit(*args: Any, **kwargs: Any) -> None:
         await append(*args, **kwargs)
@@ -235,8 +235,8 @@ async def _late_steer_at_turn_end(server: ZetaServer, reader, writer, backend):
         await continue_after_turn(*args, **kwargs)
 
     store.append_client_delivery_async = pause_after_commit
-    server.control.deliveries.finalize_turn = track_finalize
-    server.control.deliveries.continue_after_turn = hold_decision
+    server.controllers.attached().control.deliveries.finalize_turn = track_finalize
+    server.controllers.attached().control.deliveries.continue_after_turn = hold_decision
     steer = asyncio.create_task(_request(reader, writer, 10, "steer", {
         "text": "late steer", "delivery_id": "late-steer"
     }))
@@ -275,18 +275,18 @@ async def test_disconnect_before_end_of_turn_decision_follows_grace_rule(
 
         await _drop(writer, server)
         decide.set()
-        handoff = server.control._turn_handoff_task
+        handoff = server.controllers.attached().control._turn_handoff_task
         await await_or_fail(asyncio.shield(handoff), what="end-of-turn step")
-        delivery = server.runtime.opened.store.client_delivery("late-steer")
+        delivery = server.controllers.attached().runtime.opened.store.client_delivery("late-steer")
         if not kept:
             assert delivery.status == "dropped" and delivery.reason == "disconnect"
             assert backend.calls == 1
             return
         await await_or_fail(backend.streaming[1].wait(), what="steered turn")
-        steered = server.control._turn_task
+        steered = server.controllers.attached().control._turn_task
         assert steered is not None
         await await_or_fail(asyncio.shield(steered), what="steered turn end")
-        assert server.runtime.opened.store.last_turn_end().data["reason"] == "completed"
+        assert server.controllers.attached().runtime.opened.store.last_turn_end().data["reason"] == "completed"
     finally:
         if decide is not None:
             decide.set()
@@ -311,10 +311,10 @@ async def test_close_finishes_end_of_turn_step_before_runtime_closes(
         await await_or_fail(backend.streaming[0].wait(), what="first request")
         decide = await _late_steer_at_turn_end(server, reader, writer, backend)
 
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         drop = store.drop_client_steering_async
-        runtime_close = server.runtime.close
-        finish_handoff = getattr(server.control, "_finish_turn_handoff", None)
+        runtime_close = server.controllers.attached().runtime.close
+        finish_handoff = getattr(server.controllers.attached().control, "_finish_turn_handoff", None)
 
         async def record_drop(*args: Any, **kwargs: Any):
             order.append("drop steering")
@@ -331,9 +331,9 @@ async def test_close_finishes_end_of_turn_step_before_runtime_closes(
             await finish_handoff()
 
         store.drop_client_steering_async = record_drop
-        server.runtime.close = record_runtime_close
+        server.controllers.attached().runtime.close = record_runtime_close
         if finish_handoff is not None:
-            server.control._finish_turn_handoff = release_on_wait
+            server.controllers.attached().control._finish_turn_handoff = release_on_wait
         await await_or_fail(server.close(), what="server close")
         assert order == ["drop steering", "runtime close"], order
     finally:
@@ -420,24 +420,24 @@ async def test_turn_ending_inside_grace_ends_it_so_later_wake_survives_deadline(
     async def injected_deadline() -> None:
         await await_or_fail(deadline.wait(), what="injected grace deadline")
 
-    server.control._grace_deadline = injected_deadline
+    server.controllers.attached().control._grace_deadline = injected_deadline
     reader, writer = await _connect(server)
     try:
         await _hello(reader, writer, 1, RECONNECT)
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "first"})
         await await_or_fail(backend.streaming[0].wait(), what="first request")
-        first = server.control._turn_task
+        first = server.controllers.attached().control._turn_task
         assert first is not None
 
         await _drop(writer, server)
-        grace = server.control._grace_task
+        grace = server.controllers.attached().control._grace_task
         assert grace is not None
         backend.release[0].set()
         await await_or_fail(asyncio.shield(first), what="first turn end")
 
         # a background completion wakes the session after the client's turn ended.
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         store.append_agent_notification(
             "child",
             child_session_path="/tmp/child",
@@ -445,11 +445,11 @@ async def test_turn_ending_inside_grace_ends_it_so_later_wake_survives_deadline(
             status="completed",
             text="child done",
         )
-        sink = server.runtime._background_wake_sink
+        sink = server.controllers.attached().runtime._background_wake_sink
         assert sink is not None
-        sink(server.runtime.session_id)
+        sink(server.controllers.attached().runtime.session_id)
         await await_or_fail(backend.streaming[1].wait(), what="wake turn")
-        wake = server.control._turn_task
+        wake = server.controllers.attached().control._turn_task
         assert wake is not None
 
         # the old grace deadline passes while the wake turn runs.

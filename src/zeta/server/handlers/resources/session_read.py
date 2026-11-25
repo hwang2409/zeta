@@ -154,10 +154,10 @@ def _read(home, manager, session_id, project_id, request_id, features, start, ba
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE) from None
 
 
-def _read_scope(client, session_id):
+def _read_scope(client, session_id, controller):
     from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
 
-    runtime = client.server.runtime
+    runtime = controller.runtime
     opened = runtime.opened
     generation = runtime.attachment_generation
     if opened is None:
@@ -173,7 +173,7 @@ def _read_scope(client, session_id):
     def validate():
         # A session can attach and detach during the read.
         if (
-            client.server.runtime is not runtime or runtime.opened is not opened
+            not controller.is_current_binding(client) or runtime.opened is not opened
             or runtime.attachment_generation != generation
             or (opened is not None and opened.metadata.project_id != project_id)
         ):
@@ -187,7 +187,7 @@ def _retrieve(future: asyncio.Future) -> None:
         future.exception()  # a timed-out caller no longer awaits this result
 
 
-async def _handle(client, request_id, params):
+async def _handle(client, request_id, params, controller):
     from ...protocol import (
         MAX_FRAME_BYTES,
         ErrorDescriptor,
@@ -214,7 +214,7 @@ async def _handle(client, request_id, params):
         start = resume(params.get("cursor"), (_METHOD, session_id, direction), (0,), _ORDER)
     except (SessionError, InvalidParams):
         raise invalid_resource_params() from None
-    reader, validate_scope = _read_scope(client, session_id)
+    reader, validate_scope = _read_scope(client, session_id, controller)
     loop = asyncio.get_running_loop()
     if loop in _in_flight:
         error = resource_error(ErrorDescriptor.OPERATION_BUSY)
@@ -223,7 +223,7 @@ async def _handle(client, request_id, params):
     features = history_features(client.features)
 
     read_page = partial(reader, request_id, features, start, direction == "backward", limit, max_bytes)
-    read = asyncio.ensure_future(client.connections.run_blocking(read_page))
+    read = asyncio.ensure_future(client.connections.run_read(client, read_page, controller, fence=False))
     _in_flight[loop] = read
     # The slot frees only when the worker thread is done, even after a timeout or cancel.
     read.add_done_callback(lambda done: (_retrieve(done), _in_flight.pop(loop, None)))

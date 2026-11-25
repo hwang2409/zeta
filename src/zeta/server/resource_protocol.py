@@ -47,9 +47,9 @@ class ResourceDescriptor:
 
 
 def _close_handler_errors(handler: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
-    async def handle(client: Any, request_id: Any, params: Any) -> Any:
+    async def handle(client: Any, request_id: Any, params: Any, controller: Any) -> Any:
         with owner_errors():
-            return await handler(client, request_id, params)
+            return await handler(client, request_id, params, controller)
 
     return handle
 

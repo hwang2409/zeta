@@ -4,8 +4,22 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterable, AsyncIterator
+from contextlib import aclosing
+from dataclasses import dataclass
 
 from ..protocol.types import StreamEvent
+
+
+@dataclass(frozen=True, slots=True)
+class SessionEventSource:
+    generation: int
+    session_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ServeEvent:
+    source: SessionEventSource
+    event: StreamEvent
 
 
 class ForegroundEventSubscription:
@@ -100,3 +114,10 @@ class ForegroundEventPublisher:
             close = getattr(iterator, "aclose", None)
             if close is not None:
                 await close()
+
+    async def serve_events(
+        self, source: SessionEventSource, stream: AsyncIterable[StreamEvent]
+    ) -> AsyncIterator[ServeEvent]:
+        async with aclosing(self.events(stream)) as events:
+            async for event in events:
+                yield ServeEvent(source, event)

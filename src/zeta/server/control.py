@@ -32,7 +32,11 @@ from ..protocol.types import (
     StreamEventType,
     TextContent,
 )
-from ..runtime.foreground_events import ForegroundEventPublisher
+from ..runtime.foreground_events import (
+    ForegroundEventPublisher,
+    ServeEvent,
+    SessionEventSource,
+)
 from . import abort_scope, event_contract, model_selection
 from .approval_lifecycle import (
     ApprovalKey,
@@ -65,6 +69,7 @@ if TYPE_CHECKING:
     from ..mcp import MCPServerConfig
     from .runtime import ServerRuntime
     from .server import ZetaServer
+    from .session_controllers import SessionUse
 
 USER_MESSAGE_MAX_BYTES = 262_144
 CONTROLLER_HANDOFF_DEADLINE_SECONDS = 10.0
@@ -149,6 +154,8 @@ class ServeControl:
         self._no_state_change = asyncio.Event()
         self._no_state_change.set()
         self._session_swap_active = False
+        self._binding_transitions = 0
+        self._binding_clear_task: asyncio.Task[None] | None = None
         self._session_swap_id: str | None = None
         self._turn_cancel_outcome: TurnOutcome | None = None
         self._grace_task: asyncio.Task[None] | None = None
@@ -164,7 +171,6 @@ class ServeControl:
         # Serve reads requests serially per connection and has one controller,
         # so this lock never contends today; status projects its holder.
         self.slash_lock = SlashLock(offload=self._run_blocking)
-        self.closing = False
         self._active_host_commands: SessionHostCommands | None = None
         self._active_mcp_bindings: dict[str, dict[str, str]] = {}
         self._mcp_binding_servers: frozenset[str] = frozenset()
@@ -181,7 +187,7 @@ class ServeControl:
             if self.runtime.opened is not None
             else None,
             offload=lambda job: self._run_blocking(job),
-            is_closing=lambda: self.closing,
+            is_closing=lambda: self.server.controllers.is_closing(self),
             grant_published=self._publish_session_grant,
         )
 
@@ -228,7 +234,7 @@ class ServeControl:
     @property
     def attached(self) -> bool:
         """This pair is the client's session; a parked pair sends no frame."""
-        return self.server.control is self
+        return self.server.controllers.is_attached(self)
 
     def pair_state(self) -> str:
         state = self.runtime.state
@@ -327,6 +333,22 @@ class ServeControl:
                 and not self._turn_end_published
             )
         )
+
+    def account_snapshot_transition(self) -> bool:
+        context = getattr(self.runtime.loop, "account_context", None)
+        return bool(
+            self._session_swap_active or self._binding_transitions
+            or (context is not None and context.transition_active())
+            or (self._binding_clear_task is not None and not self._binding_clear_task.done())
+        )
+
+    @contextmanager
+    def hold_binding_transition(self) -> Iterator[None]:
+        self._binding_transitions += 1
+        try:
+            yield
+        finally:
+            self._binding_transitions -= 1
 
     def state_change_busy(self) -> bool:
         """Report a turn a state-changing request must wait for."""
@@ -435,10 +457,19 @@ class ServeControl:
         else:
             await self._approvals.wait_for_approval_settlement(timeout)
 
+    @property
+    def reconnect_grace_task(self) -> asyncio.Task[None] | None:
+        """The current grace work, for admission to observe its settlement."""
+        return self._grace_task
+
     def begin_controller_release(
-        self, *, reconnect: bool = False, keep_turn: bool = False
+        self, *, reconnect: bool = False, keep_turn: bool = False, preserve_grace: bool = False
     ) -> asyncio.Task[None]:
         previous = self._controller_release_task
+        # A parked turn may already be released with a live work deadline.
+        if (preserve_grace and reconnect and not self._controller_attached
+                and self._grace_task is not None and previous is not None):
+            return previous
         # Establish approval grace before the physical controller slot is released.
         operation = (
             None
@@ -499,10 +530,11 @@ class ServeControl:
         """Re-bind the active session's released MCP headers for a returning client."""
         loop = self.runtime.loop
         assert loop is not None
-        await loop.rebind_mcp(headers, configs)
-        self._end_grace_deadline()
-        await loop._ensure_mcp_servers()
-        self._active_mcp_bindings = headers
+        with self.hold_binding_transition():
+            await loop.rebind_mcp(headers, configs)
+            self._end_grace_deadline()
+            await loop._ensure_mcp_servers()
+            self._active_mcp_bindings = headers
 
     async def controller_ready(self, *, reconnect: bool = False) -> None:
         if reconnect:
@@ -539,6 +571,8 @@ class ServeControl:
             if loop is not None:
                 await loop.clear_mcp_bindings(hold=hold)
         clear_task = asyncio.create_task(clear_mcp()) if had_mcp_bindings else None
+        if clear_task is not None:
+            self._binding_clear_task = clear_task
         if grace_running:
 
             async def wait_for_grace() -> None:
@@ -637,7 +671,6 @@ class ServeControl:
         self._approvals.prune_ended()
 
     async def close(self) -> None:
-        self.closing = True
         task = self._grace_task
         if task is not None:
             task.cancel()
@@ -702,9 +735,9 @@ class ServeControl:
             connections.release_deferred_replay(session_id, close=True)
 
     async def _run_blocking(self, job: Callable[[], object]) -> object:
-        if self.closing:
-            return await asyncio.to_thread(job)
         registry = self.server.connections
+        if self.server.controllers.is_closing(self) or (registry is not None and registry.frozen):
+            return await asyncio.to_thread(job)
         if registry is None:
             raise RuntimeError("serve control worker is unavailable")
         return await registry.run_blocking(job)
@@ -718,14 +751,15 @@ class ServeControl:
         return self._approvals.cleanup_delegated(child_instance_id)
 
     async def resolve_approval(
-        self, method: ApprovalDecision, request_id: str, scope: str = "once"
+        self, use: SessionUse, method: ApprovalDecision, request_id: str, scope: str = "once"
     ) -> dict[str, object]:
         loop = self.runtime.loop
         policy = self.runtime.policy
         if loop is None or policy is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "no active session")
+        # the decision's settlement owns the request's use from its start
         result, core_key = await self._approvals.transition(
-            Decide(ApprovalDecision(method), request_id, scope)
+            Decide(ApprovalDecision(method), request_id, scope, use.transfer_to)
         )
         assert isinstance(result, dict)
         # The Decide just wrote on this thread, so the memoized `*_now` seam has
@@ -759,13 +793,8 @@ class ServeControl:
             )
 
     async def publish_session_grant_change(self, change: SessionGrantChange) -> None:
-        connections = self.server.connections
         session_id = self.runtime.session_id
-        if connections is None or session_id is None or not self.attached:
-            return
-        await connections.publish_feature_event(
-            FEATURE, EVENT, session_id, data=event_data(change, session_id)
-        )
+        await self._notify(EventDescriptor.SESSION_GRANTS_CHANGED, session_id, data=event_data(change, session_id))
 
     async def publish_session_grant_reset(self) -> None:
         policy = self.runtime.policy
@@ -853,15 +882,17 @@ class ServeControl:
         if loop is None or state is None:
             return
         session_id = state.session_id
+        source = self.event_source(session_id)
         state.turn_started()
         outcome = TurnOutcome.COMPLETED
-        terminal_events: list[StreamEvent] = []
-        pending_turn_end: StreamEvent | None = None
+        terminal_events: list[ServeEvent] = []
+        pending_turn_end: ServeEvent | None = None
         terminal_error: dict[str, object] | None = None
-        agent_end: StreamEvent | None = None
+        agent_end: ServeEvent | None = None
         try:
             async with aclosing(
-                self.foreground_event_publisher.events(
+                self.foreground_event_publisher.serve_events(
+                    source,
                     loop.run_turn(
                         text,
                         origin=origin,
@@ -877,26 +908,23 @@ class ServeControl:
                     )
                 )
             ) as event_stream:
-                async for event in event_stream:
+                async for envelope in event_stream:
+                    event = envelope.event
                     if pending_turn_end is not None:
                         if event.type is StreamEventType.AGENT_END:
                             terminal_events.append(pending_turn_end)
                         else:
-                            await self._event(
-                                pending_turn_end,
-                                session_id=session_id,
-                                turn_id=turn_id,
-                            )
+                            await self.server.route_serve_event(pending_turn_end, turn_id=turn_id)
                         pending_turn_end = None
                     if event.type is StreamEventType.TURN_END:
-                        pending_turn_end = event
+                        pending_turn_end = envelope
                     elif event.type is StreamEventType.ERROR:
                         outcome = TurnOutcome.FAILED
-                        terminal_events.append(event)
+                        terminal_events.append(envelope)
                     elif event.type is StreamEventType.AGENT_END:
-                        agent_end = event
+                        agent_end = envelope
                     else:
-                        await self._event(event, session_id=session_id, turn_id=turn_id)
+                        await self.server.route_serve_event(envelope, turn_id=turn_id)
         except asyncio.CancelledError:
             outcome = self._turn_cancel_outcome or TurnOutcome.SESSION_CANCELED
             raise
@@ -920,17 +948,17 @@ class ServeControl:
                 error=terminal_error,
                 data={},
             )
-        for event in terminal_events:
-            await self._event(event, session_id=session_id, turn_id=turn_id)
+        for envelope in terminal_events:
+            await self.server.route_serve_event(envelope, turn_id=turn_id)
         if agent_end is not None:
-            await self._event(agent_end, session_id=session_id, turn_id=turn_id)
+            await self.server.route_serve_event(agent_end, turn_id=turn_id)
         if outcome is TurnOutcome.COMPLETED:
             await self.deliveries.continue_after_turn(
                 session_id, state, allow_assistant_reset=allow_assistant_reset
             )
 
     def _schedule_background_wake(self, session_id: str) -> None:
-        if self.closing or self._session_swap_id == session_id:
+        if self.server.controllers.is_closing(self) or self._session_swap_id == session_id:
             return
         loop = self.runtime.loop
         state = self.runtime.state
@@ -1137,7 +1165,6 @@ class ServeControl:
         if foreground:
             state.usage_tracker.record(kind, state.model)
         wire_event = event_contract.STREAM_EVENT_WIRE_EVENTS[kind]
-        connections = getattr(self.server, "connections", None)
         # updated in the loop step that publishes, so a join's snapshot is exact
         in_flight = self.in_flight if foreground else None
         if in_flight is not None:
@@ -1192,57 +1219,41 @@ class ServeControl:
                     **event_contract.assistant_message(event),
                 )
             return
-        controller = (
-            connections.controller_metadata() if connections is not None else None
-        )
-        fidelity = (
-            controller is not None and "session_history_fidelity" in controller.features
-        )
         if kind is StreamEventType.TURN_START:
             data = dict(event.data)
-            if (
-                controller is not None
-                and "served_turn_end" in controller.features
-                and turn_id is not None
-            ):
-                data["turn_id"] = turn_id
-            await self._notify(wire_event, session_id, data=data)
+            overrides = {"served_turn_end": {"data": {**data, "turn_id": turn_id}}} if turn_id is not None else None
+            await self._notify(wire_event, session_id, data=data, feature_fields=overrides)
             return
         if kind is StreamEventType.TOOL_EXECUTION_UPDATE:
-            fields = event_contract.tool_output(event, fidelity=fidelity)
+            fields = event_contract.tool_output(event)
             if in_flight is not None:
                 in_flight.tool_output(session_id, fields)
-            await self._notify(wire_event, session_id, **fields)
+            await self._notify(
+                wire_event, session_id, **fields,
+                feature_fields={"session_history_fidelity": event_contract.tool_output(event, fidelity=True)},
+            )
             return
         if kind is StreamEventType.TOOL_EXECUTION_START:
             if foreground:
                 state.tool_started()
             await self._notify(
-                wire_event,
-                session_id,
-                **event_contract.tool_start(
-                    event,
-                    fidelity=fidelity,
-                    approval_origin=(
-                        controller is not None
-                        and "tool_approval_origin" in controller.features
-                    ),
-                ),
+                wire_event, session_id, **event_contract.tool_start(event, approval_origin=True),
+                feature_fields={"session_history_fidelity": event_contract.tool_start(event, fidelity=True, approval_origin=True)},
             )
             return
         if kind is StreamEventType.TOOL_EXECUTION_END:
             if foreground:
                 state.tool_finished()
-            fields = event_contract.tool_end(event, fidelity=fidelity)
+            fields = event_contract.tool_end(event)
             if in_flight is not None:
                 in_flight.end_tool(fields)
             if not foreground and self._approvals.release_or_hold_terminal(
                 _approval_key(event), session_id, fields
             ):
-                await self._notify(wire_event, session_id, admitted=True, **fields)
                 return
             await self._notify(
-                wire_event, session_id, replay_row=RowFacts(seq=event.row_seq), **fields
+                wire_event, session_id, replay_row=RowFacts(seq=event.row_seq), **fields,
+                feature_fields={"session_history_fidelity": event_contract.tool_end(event, fidelity=True)},
             )
             return
         if kind is StreamEventType.TOOL_APPROVAL_END:
@@ -1305,17 +1316,19 @@ class ServeControl:
     ) -> None:
         await self._approvals.transition(Start(event, session_id, wire_event))
 
+    def event_source(self, session_id: str | None) -> SessionEventSource:
+        return SessionEventSource(self.server.controllers.record_for(self).generation, session_id)
+
     def _protocol_version(self) -> str:
-        connections = self.server.connections
-        controller = (
-            connections.controller_metadata() if connections is not None else None
-        )
-        return controller.protocol_version if controller is not None else "1.0"
+        owner = self.server.controllers.event_owner(self.event_source(
+            self.runtime.session_id if self.runtime.opened is not None else None
+        ))
+        return owner.protocol_version if owner is not None else "1.0"
 
     def _publish_background_event(self, session_id: str, event: StreamEvent) -> None:
         """Schedule child events from the loop's synchronous sink."""
         self._maybe_idle()
-        if not self.closing:
+        if not self.server.controllers.is_closing(self):
             asyncio.create_task(
                 self._event(event, session_id=session_id, background=True)
             )
@@ -1324,18 +1337,11 @@ class ServeControl:
         connections = self.server.connections
         if connections is None:
             return
-        def publish() -> None:
+        def publish(event: EventDescriptor = event) -> None:
             # the sink may run on a worker thread; check idleness on the loop
             self._maybe_idle()
-            controller = connections.controller_metadata()
-            if not self.closing and controller is not None and "run_work" in controller.features:
-                if event is EventDescriptor.BACKGROUND_TASK_UPDATED:
-                    awaitable = self._notify(EventDescriptor.BACKGROUND_TASK_UPDATED, session_id, **fields)
-                elif event is EventDescriptor.TODO_UPDATED:
-                    awaitable = self._notify(EventDescriptor.TODO_UPDATED, session_id, **fields)
-                else:
-                    raise ValueError(f"unsupported run-work event: {event.value}")
-                asyncio.create_task(awaitable)
+            if not self.server.controllers.is_closing(self):
+                self.server.publish_session_event(self.event_source(session_id), event, **fields)
         try:
             connections.loop.call_soon_threadsafe(publish)
         except RuntimeError:
@@ -1344,7 +1350,7 @@ class ServeControl:
 
     def _publish_memory_notice(self, session_id: str, message: str) -> None:
         """Publish updates only when the client negotiated the optional feature."""
-        if not self.closing and self.server.connections is not None:
+        if not self.server.controllers.is_closing(self) and self.server.connections is not None:
             asyncio.create_task(
                 self._notify(
                     event_contract.AUXILIARY_WIRE_EVENTS[
@@ -1358,14 +1364,13 @@ class ServeControl:
     def _admit_controller(
         self, event: EventDescriptor, session_id: str | None = None, **fields: object
     ) -> object:
-        connections = getattr(self.server, "connections", None)
-        if connections is None or not self.attached:
-            if connections is not None:
-                self._maybe_idle()  # a dropped frame of a parked pair may change its row
-            from .connections import Admission
-
-            return Admission("no_controller")
-        return connections.try_admit_controller(event, session_id, **fields)
+        if not self.attached:
+            self._maybe_idle()  # a parked approval can change the summary without a live frame
+        return self.server.publish_session_event(
+            self.event_source(session_id), event, finalizer=event in {
+                EventDescriptor.APPROVAL_END, EventDescriptor.TOOL_END,
+            }, **fields,
+        )
 
     async def _notify(
         self, event: EventDescriptor, session_id: str | None = None, *, admitted: bool = False,
@@ -1375,16 +1380,11 @@ class ServeControl:
             return True
         if session_id is None and self.runtime.opened is not None:
             session_id = self.runtime.session_id
-        connections = self.server.connections
-        if connections is None or not self.attached:
-            if connections is not None:
-                self._maybe_idle()  # a dropped frame of a parked pair may change its row
-            return False
-        if feature_fields is not None:
-            return await connections.publish_controller(
-                event, session_id, feature_fields=feature_fields, **fields
-            )
-        return await connections.publish_controller(event, session_id, **fields)
+        if not self.attached:
+            self._maybe_idle()
+        return await self.server.publish_session_event(
+            self.event_source(session_id), event, wait_for_write=True, feature_fields=feature_fields, **fields,
+        ).delivered()
 
     async def _end_approval(
         self,
@@ -1424,9 +1424,6 @@ def _approval_key(event: StreamEvent) -> ApprovalKey:
 FEATURE = "session_grants"
 READ = "session_grants"
 REVOKE = "revoke_session_grants"
-EVENT = event_contract.AUXILIARY_WIRE_EVENTS[
-    event_contract.AuxiliaryEvent.SESSION_GRANTS_CHANGED
-]
 
 
 def require_feature(features: frozenset[str]) -> None:

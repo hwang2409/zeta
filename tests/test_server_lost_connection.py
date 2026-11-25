@@ -83,7 +83,7 @@ def _gate_handler(
     event is set, modelling a cancel-resistant handler.
     """
 
-    async def handler(client: object, request_id: object, params: object) -> object:
+    async def handler(client: object, request_id: object, params: object, controller: object) -> object:
         started.set()
         try:
             await asyncio.wait_for(gate.wait(), 10)
@@ -109,7 +109,7 @@ def _spy_handler(
     *,
     ran: asyncio.Event,
 ) -> None:
-    async def handler(client: object, request_id: object, params: object) -> object:
+    async def handler(client: object, request_id: object, params: object, controller: object) -> object:
         ran.set()
         return {"ok": True}
 
@@ -128,16 +128,16 @@ async def _make_server(tmp_path: Path, transport: Transport) -> ZetaServer:
 
 
 def _is_lost(server: ZetaServer) -> bool:
-    controller = server.connections._controller
+    controller = server.connections.legacy_controller_holder
     return controller is not None and getattr(controller, "lost", False)
 
 
 def _released(server: ZetaServer) -> bool:
-    return server.connections._controller is None
+    return server.connections.legacy_controller_holder is None
 
 
 def _contended(server: ZetaServer) -> bool:
-    controller = server.connections._controller
+    controller = server.connections.legacy_controller_holder
     event = getattr(controller, "contended", None) if controller is not None else None
     return event is not None and event.is_set()
 
@@ -343,14 +343,14 @@ async def test_one_shared_handoff_deadline(tmp_path: Path, transport: Transport)
     server.lost_request_contended_drain = 0.0
     deadline = control_module.CONTROLLER_HANDOFF_DEADLINE_SECONDS
     captured: list[float] = []
-    original = server.control.controller_claimed
+    original = server.controllers.attached().control.controller_claimed
 
     async def spy(*args: object, **kwargs: object) -> bool:
         captured.append(float(kwargs["deadline"]))
         return await original(*args, **kwargs)
 
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(server.control, "controller_claimed", spy)
+    monkeypatch.setattr(server.controllers.attached().control, "controller_claimed", spy)
     started = asyncio.Event()
     gate = asyncio.Event()
     _gate_handler(MethodDescriptor.STATUS, monkeypatch, started=started, gate=gate)
@@ -450,7 +450,7 @@ async def test_turn_reconnect_through_loss_path(tmp_path: Path, transport: Trans
         await _settle_until(lambda: _is_lost(server))
         gate.set()
         await _spin(lambda: _released(server), what="A released via loss path")
-        assert server.runtime.state.status == "running", "the turn was lost on release"
+        assert server.controllers.attached().runtime.state.status == "running", "the turn was lost on release"
 
         await negotiate(b, extra=tuple(RECONNECT), protocol_version="1.2")
         status = (await b.request(5, "status", {}))["result"]
@@ -499,7 +499,7 @@ async def test_parked_output_drain_on_lost_holder_releases_slot(tmp_path: Path) 
         a.writer.get_extra_info("socket").setsockopt(
             socket.SOL_SOCKET, socket.SO_RCVBUF, 8192
         )
-        state = server.connections._controller
+        state = server.connections.legacy_controller_holder
         conn, output = state.connection, state.output
         # publish big live events the holder never reads; the writer parks in
         # drain() with its caller still counted, so callers_settled stays clear.

@@ -47,7 +47,7 @@ async def _serve(home: Path, step: str, monkeypatch: pytest.MonkeyPatch) -> None
         port=0,
         backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
     )
-    runtime = server.runtime
+    runtime = server.controllers.attached().runtime
     release = threading.Event()
     composing = threading.Event()
     original_compose = runtime._compose

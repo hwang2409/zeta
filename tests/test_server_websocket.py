@@ -291,10 +291,10 @@ async def test_websocket_drop_during_approval_finishes_cleanly(
         writer.close()
         await writer.wait_closed()
         for _ in range(100):
-            opened = server.runtime.opened
+            opened = server.controllers.attached().runtime.opened
             if (
                 opened is not None
-                and server._client is None
+                and next(iter(server.connections.clients()), None) is None
                 and any(
                     entry.type == "approval_resolution"
                     and entry.data.get("decision") == "abort"
@@ -892,8 +892,8 @@ async def test_websocket_child_history_requires_negotiation(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_websocket_child_history_reads_child(tmp_path: Path) -> None:
     server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
-    metadata = await server.runtime.create_session(provider="codex", model="offline", cwd=tmp_path)
-    root = server.runtime.opened.store
+    metadata = await server.controllers.attached().runtime.create_session(provider="codex", model="offline", cwd=tmp_path)
+    root = server.controllers.attached().runtime.opened.store
     from zeta.core.store import ConversationStore
     from zeta.protocol.types import Message, MessageRole
     child = ConversationStore(root.session_dir / "agents", session_id="1", _storage_lease=root._storage_lease)
@@ -921,8 +921,8 @@ async def test_websocket_child_history_ignores_production_partial_append(
     from zeta.protocol.types import Message, MessageRole
 
     server = ZetaServer(home=tmp_path, port=0, ws_port=0, provider="codex")
-    metadata = await server.runtime.create_session(provider="codex", model="offline", cwd=tmp_path)
-    root = server.runtime.opened.store
+    metadata = await server.controllers.attached().runtime.create_session(provider="codex", model="offline", cwd=tmp_path)
+    root = server.controllers.attached().runtime.opened.store
     child = ConversationStore(
         root.session_dir / "agents",
         session_id="1",

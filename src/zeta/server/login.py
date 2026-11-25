@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -33,6 +35,9 @@ from .protocol import (
     closed_error,
     invalid_resource_params,
 )
+
+if TYPE_CHECKING:
+    from .accounts import AccountOperations
 
 LOGIN_PUBLICATION_TIMEOUT_SECONDS = 60.0
 
@@ -71,9 +76,14 @@ class Logins:
     all tasks. Tasks own their result; no completion callbacks mutate the map.
     """
 
-    def __init__(self, home: Path, *, timeout: float = 300) -> None:
+    def __init__(
+        self, home: Path, *, timeout: float = 300,
+        account_operations: AccountOperations,
+    ) -> None:
         self.home = home
         self.timeout = timeout
+        self._closed = False
+        self._publication_owner = partial(account_operations.run, "login_publication", None)
         self.tasks: dict[str, asyncio.Task[dict]] = {}
         self.operations: dict[str, _LoginOperation] = {}
 
@@ -110,6 +120,8 @@ class Logins:
         account = "default"
         if named_accounts and "account" in params:
             account = await asyncio.to_thread(self._resolve_account, provider, params["account"])
+        if self._closed:
+            raise ProtocolError(ErrorDescriptor.OPERATION_BUSY, "server is closing")
         url = asyncio.get_running_loop().create_future()
         operation = _LoginOperation()
         task = asyncio.create_task(self._run(
@@ -192,6 +204,7 @@ class Logins:
                     on_authorization_url=url.set_result,
                     publication_timeout_seconds=LOGIN_PUBLICATION_TIMEOUT_SECONDS,
                     on_publication_commit=operation.commit,
+                    publication_owner=self._publication_owner,
                 )
             return {"state": "succeeded"}
         except TimeoutError:
@@ -271,6 +284,7 @@ class Logins:
         return result
 
     async def close(self) -> None:
+        self._closed = True
         for provider, task in self.tasks.items():
             if not task.done():
                 self.operations[provider].cancel(task)

@@ -18,9 +18,9 @@ from ..session_mutation import rename_session
 from . import validation
 
 
-async def repair_transcript(self, params: dict[str, Any]) -> dict[str, object]:
-    runtime = self.server.runtime
-    await self.server.control.require_idle()
+async def repair_transcript(params: dict[str, Any], controller) -> dict[str, object]:
+    runtime = controller.runtime
+    await controller.control.require_idle()
     if params.get("confirm") is not True:
         raise ProtocolError(
             ErrorDescriptor.INVALID_PARAMS,

@@ -54,8 +54,8 @@ class Harness:
         self.other_project = registry.create_project("beta", "repo").project_id
 
     def session(self, project_id: str | None, turns: int = 0, *, keep_open: bool = False):
-        opened = self.server.runtime.manager.create(
-            provider="codex", model="offline", cwd=self.server.runtime.cwd, project_id=project_id, auto_project=False,
+        opened = self.server.controllers.attached().runtime.manager.create(
+            provider="codex", model="offline", cwd=self.server.controllers.attached().runtime.cwd, project_id=project_id, auto_project=False,
         )
         for turn in range(turns):
             append_turn(opened.store, f"turn {turn}")
@@ -89,7 +89,7 @@ async def start(tmp_path: Path, attach: bool = True, *, projectless: bool = Fals
     attached = None
     if attach:
         attached = await asyncio.to_thread(harness.session, None if projectless else harness.project)
-        await harness.server.runtime.resume_session(attached)
+        await harness.server.controllers.attached().runtime.resume_session(attached)
     await harness.server.start()
     return harness, attached
 
@@ -168,8 +168,8 @@ async def test_observer_reads_same_project_session_as_its_session_history(tmp_pa
             rows = [row for group in (reversed(pages) if direction == "backward" else pages) for row in group]
             assert rows == forward["messages"], direction
 
-        assert harness.server.runtime.session_id == attached
-        with session_root(harness.server.runtime.manager.sessions_dir) as root, child_directory(root, target) as fd:
+        assert harness.server.controllers.attached().runtime.session_id == attached
+        with session_root(harness.server.controllers.attached().runtime.manager.sessions_dir) as root, child_directory(root, target) as fd:
             assert execution_owner_state(fd) is None, "the read must not take execution ownership"
     finally:
         await close_serve(harness.server, *harness.writers)
@@ -287,7 +287,7 @@ async def test_idle_history_reads_only_the_launch_project(tmp_path: Path) -> Non
         reply = await read(observer, "same", session_id=target)
         assert "result" in reply, reply
         assert texts(reply["result"]) == ["turn 0 question", "turn 0 answer"]
-        assert harness.server.runtime.opened is None
+        assert harness.server.controllers.attached().runtime.opened is None
         absent = (await read(observer, "absent", session_id="0" * 32))["error"]
         assert (absent["code"], absent["data"]["code"]) == (-32602, "session_not_found")
         assert (await read(observer, "foreign", session_id=foreign))["error"] == absent
@@ -296,7 +296,7 @@ async def test_idle_history_reads_only_the_launch_project(tmp_path: Path) -> Non
         controller = await harness.client(role="controller")
         created = await controller.request("new", "new_session", {})
         assert "result" in created, created
-        assert harness.server.runtime.metadata.project_id == harness.project
+        assert harness.server.controllers.attached().runtime.metadata.project_id == harness.project
     finally:
         await close_serve(harness.server, *harness.writers)
 
@@ -311,7 +311,7 @@ async def test_idle_history_keeps_launch_scope_after_registry_change(tmp_path: P
         if not projectless:
             await asyncio.to_thread((projects / harness.project).rename, tmp_path / "old-project")
         replacement = await asyncio.to_thread(
-            ProjectRegistry(projects).create_project, "replacement", "repo", str(harness.server.runtime.cwd),
+            ProjectRegistry(projects).create_project, "replacement", "repo", str(harness.server.controllers.attached().runtime.cwd),
         )
         foreign = await asyncio.to_thread(harness.session, replacement.project_id, 1)
         observer = await harness.client()
@@ -351,7 +351,7 @@ async def test_idle_history_read_rejects_failed_launch_git_discovery(
 ) -> None:
     harness = await asyncio.to_thread(Harness, tmp_path, launch_project=True)
     try:
-        cwd = harness.server.runtime.cwd
+        cwd = harness.server.controllers.attached().runtime.cwd
         await asyncio.to_thread(subprocess.run, ["git", "init", str(cwd)], check=True, capture_output=True)
         projectless = await asyncio.to_thread(harness.session, None, 1)
         real_run = project_context.subprocess.run
@@ -382,7 +382,7 @@ async def test_idle_history_read_discards_rows_after_target_reassociation(
 ) -> None:
     harness, _ = await start(tmp_path, attach=False, projectless=True)
     owner = await asyncio.to_thread(harness.session, None, 1, keep_open=True)
-    manager = harness.server.runtime.manager
+    manager = harness.server.controllers.attached().runtime.manager
     real_page = session_read._page
 
     def reassociate_before_page_returns(*args):
@@ -424,8 +424,8 @@ async def test_history_read_discards_rows_when_the_attachment_changes(
             assert "result" in attached, attached
         if transition != "attach":
             # Serve has no detach RPC; exercise the real runtime teardown without closing the socket.
-            await harness.server.runtime.close()
-            assert harness.server.runtime.opened is None
+            await harness.server.controllers.attached().runtime.close()
+            assert harness.server.controllers.attached().runtime.opened is None
         gate.release.set()
         reply = await await_or_fail(pending, what="history reply after attachment change")
         assert "error" in reply, reply

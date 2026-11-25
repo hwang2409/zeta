@@ -53,7 +53,7 @@ def test_feature_tables_only_name_negotiable_features() -> None:
     would gate an event behind a feature no client can ever hold."""
     valid = set(FEATURES)
     for event, required in connection_module.EVENT_FEATURES.items():
-        unknown = sorted(required - valid)
+        unknown = sorted(required.features - valid)
         assert not unknown, f"{event.value} requires unknown features {unknown}"
     for (event, field), required in connection_module.OPTIONAL_FIELD_FEATURES.items():
         assert isinstance(event, EventDescriptor), f"{event!r}.{field} is not an event"
@@ -111,11 +111,11 @@ def _backend_factory(provider: str, model: str | None, home: Path) -> tuple[Fake
     return FakeBackend([]), model or "offline"
 
 
-async def _started(tmp_path: Path, transport: Transport) -> tuple[ZetaServer, ReplayClient, str]:
+async def _started(tmp_path: Path, transport: Transport, *, extra: tuple[str, ...] = ()) -> tuple[ZetaServer, ReplayClient, str]:
     server = replay_server(tmp_path, transport, _backend_factory)
     await server.start()
     client = await connect_replay(server, transport)
-    hello = await negotiate(client)
+    hello = await negotiate(client, extra=extra)
     assert "session_history_and_subscribe" in hello["result"]["capabilities"]["requests"]
     created = await client.request(2, "new_session", {"provider": "codex"})
     return server, client, created["result"]["session"]["session_id"]
@@ -134,7 +134,7 @@ async def _join(client: ReplayClient, session_id: str, request_id: int = 3) -> d
 async def _publish(server: ZetaServer, session_id: str, count: int = 1) -> None:
     for index in range(count):
         await await_or_fail(
-            server.control._notify(
+            server.controllers.attached().control._notify(
                 EventDescriptor.TURN_START,
                 session_id,
                 data={"turn_id": f"turn-{index}"},
@@ -177,7 +177,7 @@ def _wire(frames: list[dict[str, Any]]) -> list[tuple[object, ...]]:
 def _watch_release(server: ZetaServer, monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
     """Set the returned event when the server releases the current controller connection."""
     assert server.connections is not None
-    connection, released = server._client, asyncio.Event()
+    connection, released = next(iter(server.connections.clients()), None), asyncio.Event()
     original = server.connections.release
 
     def release(target: Any) -> None:
@@ -204,8 +204,8 @@ async def _capacity_returns(server: ZetaServer, client: ReplayClient, session_id
     stream_id = joined["result"]["replay"]["stream_id"]
     for sequence in range(1, 301):
         await _publish(server, session_id)
-        assert server.connections is not None and server._client is not None
-        assert server.connections.replay.stream_id(server._client) is not None
+        assert server.connections is not None and next(iter(server.connections.clients()), None) is not None
+        assert server.connections.replay.stream_id(next(iter(server.connections.clients()), None)) is not None
         event = await client.event("turn_start")
         assert event["stream_id"] == stream_id
         assert event["seq"] == sequence
@@ -232,17 +232,17 @@ async def _history_read_race(tmp_path: Path, transport: Transport, monkeypatch: 
     entered, release = asyncio.Event(), asyncio.Event()
     original = server.connections.run_read
 
-    async def gated(connection: Any, callable: Callable[[], Any], *, session_id: str | None = None) -> Any:
+    async def gated(connection: Any, callable: Callable[[], Any], controller: Any = None, **kwargs: Any) -> Any:
         entered.set()
         await await_or_fail(release.wait(), what="release history read")
-        return await original(connection, callable, session_id=session_id)
+        return await original(connection, callable, controller, **kwargs)
 
     monkeypatch.setattr(server.connections, "run_read", gated)
     try:
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
         await await_or_fail(entered.wait(), what="history read entered")
-        assert server.runtime.state is not None
-        server.runtime.state.turn_started()
+        assert server.controllers.attached().runtime.state is not None
+        server.controllers.attached().runtime.state.turn_started()
         await _publish(server, session_id)
         release.set()
         response = await client.response(3)
@@ -260,8 +260,8 @@ async def _history_read_race(tmp_path: Path, transport: Transport, monkeypatch: 
         assert event["seq"] == 1
     finally:
         release.set()
-        if server.runtime.state is not None:
-            server.runtime.state.turn_finished()
+        if server.controllers.attached().runtime.state is not None:
+            server.controllers.attached().runtime.state.turn_finished()
         await client.close()
         await server.close()
 
@@ -287,14 +287,14 @@ async def test_pending_approval_limit_waits_for_a_free_slot(tmp_path: Path) -> N
         await client.send(3, "send", {"text": "read all files"})
         admitted = [await client.event("approval_request") for _ in range(64)]
         admitted_ids = {request["request_id"] for request in admitted}
-        assert {item["request_id"] for item in server.control.pending_approvals_now()} == admitted_ids
+        assert {item["request_id"] for item in server.controllers.attached().control.pending_approvals_now()} == admitted_ids
 
         first_id = admitted[0]["request_id"]
         denied = await client.request(4, "deny", {"request_id": first_id})
         assert denied["result"]["accepted"] is True
         next_request = await client.event("approval_request")
         assert next_request["request_id"] not in admitted_ids
-        assert len(server.control.pending_approvals_now()) == 64
+        assert len(server.controllers.attached().control.pending_approvals_now()) == 64
 
         joined = await client.request(
             5, "session_history_and_subscribe", {"session_id": session_id}
@@ -322,9 +322,9 @@ async def _physical_response_gate(tmp_path: Path, transport: Transport, monkeypa
     try:
         await client.send(3, "session_history_and_subscribe", {"session_id": session_id})
         await await_or_fail(entered.wait(), what="physical join response entered")
-        assert server.connections is not None and server._client is not None
-        assert server._client in server.connections.replay._subscriptions
-        assert server._client not in server.connections.replay._pending
+        assert server.connections is not None and next(iter(server.connections.clients()), None) is not None
+        assert next(iter(server.connections.clients()), None) in server.connections.replay._subscriptions
+        assert next(iter(server.connections.clients()), None) not in server.connections.replay._pending
         await _publish(server, session_id, 3)
         release.set()
         response = await client.response(3)
@@ -367,7 +367,7 @@ async def _response_admission_failure(
             },
         }
         assert not activated, "pending tail was released before response admission"
-        assert server.connections.replay.stream_id(server._client) is None
+        assert server.connections.replay.stream_id(next(iter(server.connections.clients()), None)) is None
     finally:
         await client.close()
         await server.close()
@@ -377,7 +377,7 @@ async def _response_write_failure(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, client, session_id = await _started(tmp_path, transport)
-    owner = server._client
+    owner = next(iter(server.connections.clients()), None)
     released = _watch_release(server, monkeypatch)
     failed = asyncio.Event()
     original = _Client._write_physical
@@ -418,7 +418,7 @@ async def _active_write_failure(
 ) -> None:
     server, client, session_id = await _started(tmp_path, transport)
     await _join(client, session_id)
-    owner = server._client
+    owner = next(iter(server.connections.clients()), None)
     failed = asyncio.Event()
     original = _Client._write_physical
 
@@ -473,7 +473,7 @@ async def _same_connection_rejoin(
         await await_or_fail(entered.wait(), what="old rejoin frame entered")
         await _publish(server, session_id)
         await client.send(4, "session_history_and_subscribe", {"session_id": session_id})
-        assert server._client is not None
+        assert next(iter(server.connections.clients()), None) is not None
         await await_or_fail(activated.wait(), what="replacement stream activated")
         release.set()
         second = await client.response(4)
@@ -504,8 +504,8 @@ async def _connection_close(
 ) -> None:
     server, client, session_id = await _started(tmp_path, transport)
     await _join(client, session_id)
-    assert server.connections is not None and server._client is not None
-    closed_connection = server._client
+    assert server.connections is not None and next(iter(server.connections.clients()), None) is not None
+    closed_connection = next(iter(server.connections.clients()), None)
     released = asyncio.Event()
     release_errors: list[AttributeError] = []
     original_release = server.connections.release
@@ -559,7 +559,7 @@ async def _scope_cap(
         await _publish(server, session_id)
         await await_or_fail(entered.wait(), what="first scope-cap frame")
         await _publish(server, session_id, 2)
-        assert server.connections.replay.scope_for(server._client) is None
+        assert server.connections.replay.scope_for(next(iter(server.connections.clients()), None)) is None
         assert unrelated in server.connections.replay.scopes()
         release.set()
         old_stream = joined["result"]["replay"]["stream_id"]
@@ -604,7 +604,7 @@ async def _global_cap(
             for _ in range(4):
                 assert replay.reserve(scope, 1) is None
     await _publish(server, session_id)
-    assert replay.scope_for(server._client) is not None, "requesting scope was evicted"
+    assert replay.scope_for(next(iter(server.connections.clients()), None)) is not None, "requesting scope was evicted"
     event = await client.event("turn_start")
     assert event["stream_id"] == joined["result"]["replay"]["stream_id"]
     assert event["seq"] == 1
@@ -692,10 +692,10 @@ async def _replacement(
     entered, release = asyncio.Event(), asyncio.Event()
     original_read = server.connections.run_read
 
-    async def gated(connection: Any, callable: Callable[[], Any], *, session_id: str | None = None) -> Any:
+    async def gated(connection: Any, callable: Callable[[], Any], controller: Any = None, **kwargs: Any) -> Any:
         entered.set()
         await await_or_fail(release.wait(), what="release replacement history read")
-        return await original_read(connection, callable, session_id=session_id)
+        return await original_read(connection, callable, controller, **kwargs)
 
     monkeypatch.setattr(server.connections, "run_read", gated)
     try:
@@ -807,7 +807,7 @@ async def _publication_routes(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     del monkeypatch
-    server, client, session_id = await _started(tmp_path, transport)
+    server, client, session_id = await _started(tmp_path, transport, extra=("session_grants",))
     joined = await _join(client, session_id)
     stream_id = joined["result"]["replay"]["stream_id"]
     ordinary = (
@@ -826,27 +826,29 @@ async def _publication_routes(
     observed: list[dict[str, Any]] = []
     for index, descriptor in enumerate(ordinary, 1):
         await await_or_fail(
-            server.control._notify(descriptor, session_id, data={"route": index}),
+            server.controllers.attached().control._notify(descriptor, session_id, data={"route": index}),
             what=f"publish {descriptor.value}",
         )
         observed.append(await client.event(descriptor.value))
     assert server.connections is not None
-    admitted = server.connections.try_admit_controller(
+    admitted = server.controllers.attached().control._admit_controller(
         EventDescriptor.APPROVAL_END, session_id, data={"route": "settlement"}
     )
     assert admitted.kind == "admitted"
     observed.append(await client.event(EventDescriptor.APPROVAL_END.value))
-    assert await server.connections.publish_controller(
+    assert await server.controllers.attached().control._notify(
         EventDescriptor.DELIVERY_STATUS, session_id, data={"route": "direct"}
     )
     observed.append(await client.event(EventDescriptor.DELIVERY_STATUS.value))
-    await server.connections.publish_feature_event(
-        "session_replay_seq",
+    await server.controllers.attached().control._notify(
         EventDescriptor.SESSION_GRANTS_CHANGED,
         session_id,
         data={"route": "grants"},
     )
-    observed.append(await client.event(EventDescriptor.SESSION_GRANTS_CHANGED.value))
+    grant = await client.event(EventDescriptor.SESSION_GRANTS_CHANGED.value)
+    while grant.get("data") != {"route": "grants"}:
+        grant = await client.event(EventDescriptor.SESSION_GRANTS_CHANGED.value)
+    observed.append(grant)
     assert [event.get("stream_id") for event in observed] == [stream_id] * len(observed)
     assert [event["seq"] for event in observed] == list(range(1, len(observed) + 1))
     await client.close()
@@ -914,7 +916,7 @@ async def _observer_without_join(
         stream_id = (await _join(controller, session_id))["result"]["replay"]["stream_id"]
         await _publish(server, session_id)
         assert server.connections is not None
-        assert await server.connections.publish_controller(
+        assert await server.controllers.attached().control._notify(
             EventDescriptor.APPROVAL_REQUEST,
             session_id,
             data={"arguments": {"command": "secret"}},
@@ -935,8 +937,8 @@ async def _join_failure(tmp_path: Path, transport: Transport, monkeypatch: pytes
     assert server.connections is not None
     original = server.connections.run_read
 
-    async def fail(connection: Any, callable: Callable[[], Any], *, session_id: str | None = None) -> Any:
-        del connection, callable, session_id
+    async def fail(connection: Any, callable: Callable[[], Any], controller: Any = None, **kwargs: Any) -> Any:
+        del connection, callable, controller
         raise RuntimeError("history read failed")
 
     # test-contract: seam make the off-loop history read fail with a non-protocol error
@@ -963,9 +965,9 @@ async def _global_pressure_two_victims(
     server, client, session_id = await _started(tmp_path, transport)
     try:
         stream_id = (await _join(client, session_id))["result"]["replay"]["stream_id"]
-        assert server.connections is not None and server._client is not None
+        assert server.connections is not None and next(iter(server.connections.clients()), None) is not None
         replay = server.connections.replay
-        frame = server._client.codec.notification(
+        frame = next(iter(server.connections.clients()), None).codec.notification(
             EventDescriptor.TURN_START, session_id, stream_id=stream_id, seq=1, data={"turn_id": "turn-0"}
         )
         assert frame is not None
@@ -978,7 +980,7 @@ async def _global_pressure_two_victims(
         for scope, size in zip(incumbents, (large, large, large, small), strict=True):
             assert replay.reserve(scope, size) is None
         await _publish(server, session_id)
-        assert replay.scope_for(server._client) is not None, "requesting scope was evicted"
+        assert replay.scope_for(next(iter(server.connections.clients()), None)) is not None, "requesting scope was evicted"
         assert [scope in replay.scopes() for scope in incumbents] == [False, False, True, True]
         await _assert_events(client, stream_id, 1)
         await _publish(server, session_id)
@@ -997,7 +999,7 @@ async def _join_during_swap(
     assert server.connections is not None
     swapped, resume = asyncio.Event(), asyncio.Event()
     read_entered, read_release = asyncio.Event(), asyncio.Event()
-    original_create = server.runtime.create_session
+    original_create = server.controllers.attached().runtime.create_session
     original_read = server.connections.run_read
 
     async def gated_create(**kwargs: Any) -> Any:
@@ -1006,17 +1008,17 @@ async def _join_during_swap(
         await await_or_fail(resume.wait(), what="resume session swap")
         return result
 
-    async def gated_read(connection: Any, callable: Callable[[], Any], *, session_id: str | None = None) -> Any:
+    async def gated_read(connection: Any, callable: Callable[[], Any], controller: Any = None, **kwargs: Any) -> Any:
         read_entered.set()
         await await_or_fail(read_release.wait(), what="release swap join read")
-        return await original_read(connection, callable, session_id=session_id)
+        return await original_read(connection, callable, controller, **kwargs)
 
     # test-contract: seam hold the swap after the runtime switched, before it finishes
-    monkeypatch.setattr(server.runtime, "create_session", gated_create)
+    monkeypatch.setattr(server.controllers.attached().runtime, "create_session", gated_create)
     try:
         await controller.send(6, "new_session", {"provider": "codex"})
         await await_or_fail(swapped.wait(), what="runtime switched session")
-        new_session = server.runtime.session_id
+        new_session = server.controllers.attached().runtime.session_id
         assert new_session != old_session
         monkeypatch.setattr(server.connections, "run_read", gated_read)
         await observer.send(3, "session_history_and_subscribe", {"session_id": new_session})
@@ -1062,8 +1064,8 @@ async def _observer_write_failure(
         await _publish(server, session_id)
         await await_or_fail(failing.wait(), what="observer replay write entered")
         await await_or_fail(writes[0], what="observer replay write failure")
-        assert server.connections is not None and server._client is not None
-        assert server.connections.replay.stream_id(server._client) == stream_id, "observer failure ended the controller stream"
+        assert server.connections is not None and next(iter(server.connections.clients()), None) is not None
+        assert server.connections.replay.stream_id(next(iter(server.connections.clients()), None)) == stream_id, "observer failure ended the controller stream"
         await _publish(server, session_id)
         await _assert_events(controller, stream_id, 2)
     finally:
@@ -1104,12 +1106,12 @@ async def _old_generation_failure(
         await await_or_fail(entered.wait(), what="old-generation frame entered")
         await client.send(4, "session_history_and_subscribe", {"session_id": session_id})
         await await_or_fail(activated.wait(), what="new generation activated")
-        assert server._client is not None
-        second_stream = server.connections.replay.stream_id(server._client)
+        assert next(iter(server.connections.clients()), None) is not None
+        second_stream = server.connections.replay.stream_id(next(iter(server.connections.clients()), None))
         assert second_stream is not None and second_stream != first_stream
         release.set()
         await await_or_fail(writes[0], what="old-generation write failure")
-        assert server.connections.replay.stream_id(server._client) == second_stream, "old-generation failure ended the new stream"
+        assert server.connections.replay.stream_id(next(iter(server.connections.clients()), None)) == second_stream, "old-generation failure ended the new stream"
         second = await client.response(4)
         assert second["result"]["replay"]["stream_id"] == second_stream
         await _publish(server, session_id)
@@ -1130,7 +1132,7 @@ async def _observer_settlement(
         await negotiate(observer, observer=True)
         stream_id = (await _join(observer, session_id))["result"]["replay"]["stream_id"]
         assert server.connections is not None
-        admitted = server.connections.try_admit_controller(
+        admitted = server.controllers.attached().control._admit_controller(
             EventDescriptor.APPROVAL_END, session_id, data={"route": "settlement"}
         )
         assert admitted.kind == "admitted"
@@ -1183,7 +1185,7 @@ async def _replay_only_backward_page(
     server, client, session_id = await _started(tmp_path, transport)
     try:
         for number in range(60):
-            server.runtime.opened.store.append_message(
+            server.controllers.attached().runtime.opened.store.append_message(
                 with_message_origin(
                     Message(MessageRole.USER, [TextContent(f"message-{number}" + "x" * 100)]),
                     MessageOrigin.USER,
@@ -1271,8 +1273,8 @@ async def _approval_reconnect_rejoin(
     session_id = created["result"]["session"]["session_id"]
     observer, observer_stream = await _observer_with_stream(server, transport, session_id)
     controller_stream = (await _join(controller, session_id))["result"]["replay"]["stream_id"]
-    assert server.connections is not None and server._client is not None
-    old_controller = server._client
+    assert server.connections is not None and next(iter(server.connections.clients()), None) is not None
+    old_controller = next(iter(server.connections.clients()), None)
     entered, released, hold = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_write = _Client._write_physical
     original_release = server.connections.release

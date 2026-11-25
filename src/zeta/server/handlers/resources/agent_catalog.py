@@ -34,7 +34,7 @@ def _public_page(page, start, fits):
         raise catalog.CatalogReadError("result_too_large") from None
 
 
-async def agent_run_catalog(client, request_id, params):
+async def agent_run_catalog(client, request_id, params, controller):
     from ...protocol import ErrorDescriptor, invalid_resource_params
 
     require_params(params, optional=("cursor", "limit", "state", "root_session_id"))

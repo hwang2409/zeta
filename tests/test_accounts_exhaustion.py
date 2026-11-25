@@ -1005,9 +1005,6 @@ async def test_account_switch_never_replays_transcript(
     assert task is not None
     await asyncio.wait_for(task, 10)
 
-    async def idle() -> None:
-        return None
-
     response = await asyncio.wait_for(
         server_accounts.switch(
             SimpleNamespace(
@@ -1017,8 +1014,7 @@ async def test_account_switch_never_replays_transcript(
                     SimpleNamespace(model="offline"), "codex"
                 ),
             ),
-            idle,
-            {"account": str(first)},
+            first,
         ),
         10,
     )

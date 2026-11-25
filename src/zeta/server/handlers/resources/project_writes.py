@@ -22,7 +22,6 @@ from ....project_inbox import (
     InboxConflictError,
     InboxDeliveryPendingError,
     InboxInvalidError,
-    ProjectInbox,
     is_message_id,
 )
 from ....project_memory_history import PROJECT_MEMORY_FILES
@@ -61,13 +60,13 @@ def _entry_id(value: object) -> str:
     return value
 
 
-def _registry(client):
+def _projects(client):
     from ...protocol import ErrorDescriptor, resource_error
 
-    registry = client.server.runtime.manager.project_registry
-    if registry is None:
+    projects = client.server.projects
+    if projects is None:
         raise resource_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
-    return registry
+    return projects
 
 
 def _project_id(params: dict[str, Any]) -> str:
@@ -199,20 +198,19 @@ def _memory_write(registry, project_id: str, revision: str, mutation: object) ->
     return write
 
 
-async def project_memory_update(client, request_id, params):
+async def project_memory_update(client, request_id, params, controller):
     require_params(params, "project_id", "revision", "mutation")
     require_revision(params["revision"])
-    registry = _registry(client)
+    registry = _projects(client).registry
     project_id = _project_id(params)
     write = _memory_write(registry, project_id, params["revision"], params["mutation"])
     return await client.connections.run_blocking(lambda: _owner_call(registry, project_id, write))
 
 
-def _sender(client) -> tuple[str, str, Any]:
-    """The attached session and its project are the sender, exactly as `/inbox send` uses them."""
+def _sender(runtime) -> tuple[str, str, Any]:
+    """The owned session and its project are the sender, exactly as `/inbox send` uses them."""
     from ...protocol import ErrorDescriptor, resource_error
 
-    runtime = client.server.runtime
     if runtime.opened is None or runtime.loop is None:
         raise resource_error(ErrorDescriptor.NO_ACTIVE_SESSION)
     project_id = runtime.opened.metadata.project_id
@@ -221,7 +219,7 @@ def _sender(client) -> tuple[str, str, Any]:
     return project_id, runtime.session_id, runtime.loop
 
 
-async def project_inbox_send(client, request_id, params):
+async def project_inbox_send(client, request_id, params, controller):
     from ...protocol import invalid_resource_params
 
     require_params(params, "project_id", "mutation")
@@ -238,18 +236,17 @@ async def project_inbox_send(client, request_id, params):
     ):
         raise invalid_resource_params()
     title, body = _text(mutation["title"]), _text(mutation["body"], empty=True)
-    registry = _registry(client)
-    from_project, from_session, loop = _sender(client)
+    projects = _projects(client)
+    from_project, from_session, loop = _sender(controller.runtime)
     # One delivery id per sender session and recipient: a retry maps to the same message id,
     # so the owner's immutable-record check gives idempotency and rejects a changed payload.
     message_id = hashlib.sha256(
         f"serve-inbox\0{from_session}\0{to_project}\0{delivery_id}".encode()
     ).hexdigest()[:32]
-    inbox = ProjectInbox(registry, sessions_root=registry.root.parent / "sessions")
 
     def send() -> dict:
         try:
-            sent, _outcome = inbox.send_user_with_outcome(
+            sent, _outcome = projects.inbox.send_user_with_outcome(
                 from_project=from_project,
                 from_session=from_session,
                 to_project=to_project,
@@ -260,12 +257,12 @@ async def project_inbox_send(client, request_id, params):
                 to_session=to_session,
             )
         except InboxDeliveryPendingError:
-            # Saved as a durable intent: the attached session re-publishes it, so the client must not resend.
+            # Saved as a durable intent: the sender republishes it, so the client must not resend.
             return {"data": {"message_id": message_id, "pending": True}}
-        loop.notify_project_inbox_publication()  # wake the attached poller; others poll as usual
+        loop.notify_project_inbox_publication()  # wake the sender poller; others poll as usual
         return {"data": {"message_id": sent, "pending": False}}
 
-    return await client.connections.run_blocking(lambda: _owner_call(registry, to_project, send))
+    return await client.connections.run_blocking(lambda: _owner_call(projects.registry, to_project, send))
 
 
 METHODS = (

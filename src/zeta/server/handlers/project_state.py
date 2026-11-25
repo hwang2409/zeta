@@ -5,15 +5,15 @@ from pathlib import Path
 from time import time_ns
 from typing import Any
 
-from .. import attention_records, storage_format
-from ..memory.transaction import STATE_MEMORY_KINDS
-from ..project_inbox import ProjectInbox
-from ..project_inbox import is_message_id as _valid_message_id
-from ..project_registry import ProjectRegistry
-from ..project_schema import PROJECT_ID_PATTERN
-from ..read_page import InvalidParams, Key, Resume, descending_page, resume
-from ..state_snapshot import stamps, timestamp_ns
-from .protocol import ErrorDescriptor, ProtocolError
+from ... import attention_records, storage_format
+from ...memory.transaction import STATE_MEMORY_KINDS
+from ...project_inbox import ProjectInbox
+from ...project_inbox import is_message_id as _valid_message_id
+from ...project_registry import ProjectRegistry
+from ...project_schema import PROJECT_ID_PATTERN
+from ...read_page import InvalidParams, Key, Resume, descending_page, resume
+from ...state_snapshot import stamps, timestamp_ns
+from ..protocol import ErrorDescriptor, ProtocolError
 
 _ORDER = {
     "projects": ("updated_ns", "project_id"),

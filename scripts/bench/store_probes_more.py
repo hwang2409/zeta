@@ -529,7 +529,7 @@ def probe_serve(args: argparse.Namespace) -> dict[str, Any]:
             with OPS.measure() as ops:
                 await client.request("resume", {"session_id": sid})
             result["resume_ops"] = ops
-            store = server.runtime.opened.store
+            store = server.controllers.attached().runtime.opened.store
             for name, params in (
                 ("history_forward_first_cold", {"session_id": sid, "offset": 0}),
                 ("history_forward_first_cached", {"session_id": sid, "offset": 0}),

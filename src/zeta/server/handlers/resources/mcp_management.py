@@ -20,8 +20,7 @@ FEATURE = "mcp_management_v1"
 _SCOPES = ("user", "project", "effective")
 
 
-def _owner(client) -> MCPManagementService:
-    runtime = client.server.runtime
+def _owner(client, runtime) -> MCPManagementService:
     project = runtime.loop._mcp_project_dir_value if runtime.loop is not None else runtime.cwd
     return MCPManagementService(home=client.server.home, project_dir=project)
 
@@ -48,14 +47,14 @@ def _data(entries: tuple[ManagedServer, ...], scope: str) -> dict:
     return {"items": [rows[name] for name in sorted(rows)]}
 
 
-async def mcp_server_list(client, request_id, params):
+async def mcp_server_list(client, request_id, params, controller):
     from ...protocol import invalid_resource_params
 
     require_params(params, optional=("scope",))
     scope = params.get("scope", "effective")
     if scope not in _SCOPES:
         raise invalid_resource_params()
-    owner = _owner(client)
+    owner = _owner(client, controller.runtime)
     def read():
         with private_management_io():
             return owner.read_disk(require_project=scope == "project")
@@ -118,7 +117,7 @@ def _add_params(mutation: dict) -> None:
 
 
 def _write(action: str, *keys: str, optional: tuple[str, ...] = ()):
-    async def handle(client, request_id, params):
+    async def handle(client, request_id, params, controller):
         from ...protocol import invalid_resource_params
 
         require_params(params, "revision", "mutation")
@@ -134,7 +133,7 @@ def _write(action: str, *keys: str, optional: tuple[str, ...] = ()):
         elif any(key in mutation and not _boolean(mutation[key]) for key in ("enabled", "trusted")):
             raise invalid_resource_params()
 
-        owner = _owner(client)
+        owner = _owner(client, controller.runtime)
         with owner_errors(**_error_rules()), private_management_io():
             try:
                 view = await getattr(owner, action)(**mutation, revision=params["revision"])
@@ -162,54 +161,55 @@ def _target(params, *, scoped=True):
     return name, scope
 
 
-def _registry(client):
-    loop = client.server.runtime.loop
+def _registry(runtime):
+    loop = runtime.loop
     return loop.tool_registry if loop is not None else None
 
 
-async def mcp_server_test(client, request_id, params):
+async def mcp_server_test(client, request_id, params, controller):
     name, scope = _target(params)
     with owner_errors(**_error_rules()), private_management_io():
-        result = await _owner(client).test(
-            name, scope=scope, wire=True, registry=_registry(client), revision=params.get("revision"),
+        result = await _owner(client, controller.runtime).test(
+            name, scope=scope, wire=True, registry=_registry(controller.runtime), revision=params.get("revision"),
         )
     return {"data": {"status": result["status"], "tool_count": result.get("tool_count", 0)}}
 
 
-async def mcp_auth_start(client, request_id, params):
+async def mcp_auth_start(client, request_id, params, controller):
     name, scope = _target(params)
-    owner = _owner(client)
-    registry = _registry(client)
+    owner = _owner(client, controller.runtime)
+    registry = _registry(controller.runtime)
     target = None
     if "revision" in params:
         # Reject stale requests before creating or replacing an OAuth attempt.
         with owner_errors(**_error_rules()), private_management_io():
             target = await owner.action_target(name, scope=scope, revision=params["revision"])
-    return {"data": await client.server._mcp_auth.start(name, lambda ready, commit: owner.login(
+    return {"data": await client.server._mcp_auth.start(client.mcp_auth_owner, name, lambda ready, commit: owner.login(
         name, scope=scope, launch_ready=ready, before_commit=commit, registry=registry, target=target,
     ))}
 
 
-async def mcp_auth_status(client, request_id, params):
+async def mcp_auth_status(client, request_id, params, controller):
     name, _ = _target(params, scoped=False)
-    return {"data": client.server._mcp_auth.status(name)}
+    return {"data": client.server._mcp_auth.status(client.mcp_auth_owner, name)}
 
 
-async def mcp_auth_cancel(client, request_id, params):
+async def mcp_auth_cancel(client, request_id, params, controller):
     name, _ = _target(params, scoped=False)
-    return {"data": await client.server._mcp_auth.cancel(name)}
+    return {"data": await client.server._mcp_auth.cancel(client.mcp_auth_owner, name)}
 
 
-async def mcp_auth_logout(client, request_id, params):
+async def mcp_auth_logout(client, request_id, params, controller):
     name, scope = _target(params)
     auth = client.server._mcp_auth
+    owner = client.mcp_auth_owner
     revision = params.get("revision")
     if revision is None:
-        await auth.cancel(name)
+        await auth.cancel(owner, name)
     with owner_errors(**_error_rules()), private_management_io():
-        work = asyncio.create_task(_owner(client).logout(
+        work = asyncio.create_task(_owner(client, controller.runtime).logout(
             name, scope=scope, revision=revision,
-            before_delete=(lambda: auth.cancel(name)) if revision is not None else None,
+            before_delete=(lambda: auth.cancel(owner, name)) if revision is not None else None,
         ))
         cancelled = False
         # Every cancellation waits for the credential delete before unwinding.
@@ -223,7 +223,7 @@ async def mcp_auth_logout(client, request_id, params):
                 work.exception()  # Mark it retrieved; a cancelled request never relays it.
             raise asyncio.CancelledError
         work.result()
-    auth.forget(name)
+    auth.forget(owner, name)
     return {"data": {"state": "unauthorized"}}
 
 

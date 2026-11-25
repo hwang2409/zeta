@@ -136,7 +136,7 @@ async def test_code_mode_is_off_by_default(tmp_path):
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_cwd"]})
         await _request(reader, writer, 2, "new_session", {"provider": "codex", "cwd": str(tmp_path)})
-        registry = server.runtime.loop.tool_registry
+        registry = server.controllers.attached().runtime.loop.tool_registry
         tools = build_responses_payload([], registry.schemas, model="gpt")["tools"]
         assert "code" not in {tool["name"] for tool in tools}
     finally:
@@ -881,7 +881,7 @@ const selected = await tools.read({path: 'selected'});'''
             'session_history_fidelity', 'session_history_backward', 'session_cwd',
         ]})
         session = (await _request(reader, writer, 2, 'new_session', {'provider': 'codex', 'cwd': str(tmp_path)}))[-1]['result']['session']
-        loop = server.runtime.loop
+        loop = server.controllers.attached().runtime.loop
         store = loop.store
         policy = loop.tool_registry.approval_policy
 

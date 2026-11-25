@@ -1899,6 +1899,40 @@ def test_generic_tool_card_surfaces_structured_only_result() -> None:
     assert '"answer":"structured result"' in terminal_plain(rendered)
 
 
+def test_session_controlled_serve_error_uses_generic_tui_error_render_path() -> None:
+    from zeta.server.protocol import ErrorDescriptor, FrameCodec
+
+    frame = json.loads(
+        FrameCodec().error_response(
+            7,
+            ErrorDescriptor.SESSION_CONTROLLED,
+            "session is controlled by another client",
+            {"session_id": "s1"},
+        )
+    )
+    assert frame["error"] == {
+        "code": -32014,
+        "message": "session is controlled by another client",
+        "data": {"code": "session_controlled", "session_id": "s1"},
+    }
+
+    rendered = render_event(
+        StreamEvent(
+            StreamEventType.ERROR,
+            error=ErrorInfo(
+                frame["error"]["data"]["code"],
+                frame["error"]["message"],
+                status_code=frame["error"]["code"],
+            ),
+            data=frame["error"]["data"],
+        )
+    )
+    assert rendered is not None
+    plain = terminal_plain(rendered)
+    assert "session is controlled by another client" in plain
+    assert "session_controlled" in plain
+
+
 def test_every_stream_event_has_one_tui_owner() -> None:
     owners = (
         STREAM_EVENTS_RENDERED,
@@ -11721,6 +11755,9 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(
             ScriptedTurn(content=[TextContent("finished")]),
         ]
     )
+    from zeta.runtime.foreground_events import ForegroundEventPublisher
+
+    publisher = ForegroundEventPublisher()
     output = StringIO()
     app = TUIApp(
         AgentLoop(
@@ -11732,13 +11769,23 @@ async def test_visual_snapshot_fake_turn_has_cards_receipt_and_thought(
             },
             skill_catalog=SkillCatalog.empty(),
         ),
+        foreground_event_publisher=publisher,
         provider="codex",
         model="offline",
         console=Console(file=output, force_terminal=False, width=72),
     )
 
     app._print_user("inspect the session")
-    await app._consume_turn("inspect the session")
+    subscription = publisher.subscribe()
+    try:
+        await app._consume_turn("inspect the session")
+        async with asyncio.timeout(10):
+            async for event in subscription:
+                assert isinstance(event, StreamEvent)
+                if event.type is StreamEventType.AGENT_END:
+                    break
+    finally:
+        publisher.unsubscribe(subscription)
     snapshot = "\n".join(
         line.rstrip() for line in output.getvalue().splitlines()
     ).strip()

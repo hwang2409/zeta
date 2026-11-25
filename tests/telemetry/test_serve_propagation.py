@@ -432,14 +432,14 @@ async def test_auth_error_names_failed_account_for_negotiated_clients(
         backend_factory=lambda _provider, model, _home: (RejectedBackend(), model), telemetry=telemetry,
     )
     rendered = []
-    publish = server.control._event
+    publish = server.controllers.attached().control._event
 
     async def capture(event, **kwargs):
         if event.type.value == "error":
             rendered.append(renderable_plain(render_event(event)))
         await publish(event, **kwargs)
 
-    server.control._event = capture
+    server.controllers.attached().control._event = capture
     controller = Wire(server, "unix")
     observers = []
     caplog.set_level(logging.DEBUG)

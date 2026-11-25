@@ -12,7 +12,7 @@ from ..core.slash import home_slash_registry
 from ..read_page import InvalidParams, Key, page_result, page_room, resume
 from ..skills.agent_catalog import discover_session_agents
 from ..skills.catalog import discover_session_skills
-from . import project_state
+from .handlers import project_state
 from .protocol import ErrorDescriptor, ProtocolError
 
 _ORDER = (Key("name", str), Key("source", str))

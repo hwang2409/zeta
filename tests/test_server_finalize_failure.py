@@ -66,8 +66,8 @@ async def test_finalize_error_ends_turn_and_fails_late_steer(
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        session_id = server.runtime.session_id
-        store = server.runtime.opened.store
+        session_id = server.controllers.attached().runtime.session_id
+        store = server.controllers.attached().runtime.opened.store
         finalizing = asyncio.Event()
         fail = asyncio.Event()
         original_append = store.append_turn_end_async
@@ -84,14 +84,14 @@ async def test_finalize_error_ends_turn_and_fails_late_steer(
 
         store.append_turn_end_async = failing_append
         outcomes: list[TurnOutcome] = []
-        original_finalize_or_fail = server.control.deliveries.finalize_or_fail
+        original_finalize_or_fail = server.controllers.attached().control.deliveries.finalize_or_fail
 
         async def recording_finalize_or_fail(*args: Any, **kwargs: Any) -> TurnOutcome:
             result = await original_finalize_or_fail(*args, **kwargs)
             outcomes.append(result)
             return result
 
-        server.control.deliveries.finalize_or_fail = recording_finalize_or_fail
+        server.controllers.attached().control.deliveries.finalize_or_fail = recording_finalize_or_fail
         caplog.set_level(logging.ERROR, logger="zeta.server")
         await _request(reader, writer, 3, "send", {"text": "first"})
         await await_or_fail(finalizing.wait(), what="turn finalization start")
@@ -118,8 +118,8 @@ async def test_finalize_error_ends_turn_and_fails_late_steer(
         # the fallback ends the turn as FAILED and releases it, so the next
         # send starts a fresh turn instead of the server wedging on a held turn.
         assert outcomes == [TurnOutcome.FAILED], outcomes
-        assert server.control._turn_task is None
-        assert server.runtime.state.status == "idle"
+        assert server.controllers.attached().control._turn_task is None
+        assert server.controllers.attached().runtime.state.status == "idle"
 
         status = await _request(
             reader, writer, 6, "delivery_status", {"delivery_id": "late"}
@@ -166,7 +166,7 @@ async def test_finalize_and_drop_error_still_release_turn(
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         finalizing = asyncio.Event()
         fail = asyncio.Event()
         original_append = store.append_turn_end_async
@@ -207,8 +207,8 @@ async def test_finalize_and_drop_error_still_release_turn(
         )
         assert "turn_end" in _events(frames), _events(frames)
         assert dropped == [True]
-        assert server.control._turn_task is None
-        assert server.runtime.state.status == "idle"
+        assert server.controllers.attached().control._turn_task is None
+        assert server.controllers.attached().runtime.state.status == "idle"
 
         await _request(reader, writer, 5, "send", {"text": "next"})
         frames = await await_or_fail(

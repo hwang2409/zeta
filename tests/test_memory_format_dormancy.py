@@ -165,19 +165,17 @@ def test_format_two_views_are_available_after_per_project_activation(
         registry, project_id, "retry", reconciler
     )
 
-    runtime = SimpleNamespace(
-        manager=SimpleNamespace(list_sessions_read_only=list)
-    )
+    manager = SimpleNamespace(list_sessions_read_only=list)
     requests = ProjectRequests(
-        home=home, runtime=runtime, codec=FrameCodec(), registry=registry
+        home=home, manager=manager, registry=registry
     )
     for operation, expected_key in (
         (requests.show, "memory"),
         (requests.memory_log, "versions"),
     ):
         with pytest.raises(UnsupportedMemoryFormatError, match=UNSUPPORTED_FORMAT_2):
-            operation(1, {"project_id": project_id}, entry_response=False)
-        result = operation(2, {"project_id": project_id}, entry_response=True)
+            operation(lambda result: FrameCodec().response_fits(1, result), {"project_id": project_id}, entry_response=False)
+        result = operation(lambda result: FrameCodec().response_fits(2, result), {"project_id": project_id}, entry_response=True)
         assert expected_key in result
     descriptor, message, data = project_request_error(
         UnsupportedMemoryFormatError(UNSUPPORTED_FORMAT_2)

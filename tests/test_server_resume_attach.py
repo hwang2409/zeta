@@ -100,7 +100,7 @@ async def test_resume_attach_keeps_approval_and_rebinds_mcp_for_next_turn(
             "session_id": session_id, "mcp_bindings": [new]
         })
         assert _error_code(changed) == BUSY
-        assert server.control._active_mcp_bindings == {
+        assert server.controllers.attached().control._active_mcp_bindings == {
             "page": {"Authorization": "Bearer old-secret"}
         }
 
@@ -188,8 +188,8 @@ async def test_resume_attach_resupplies_host_commands_for_next_turn(
         async def probe(arguments: dict[str, object], abort_signal: object) -> str:
             return "ok"
 
-        assert server.runtime.loop is not None
-        server.runtime.loop.tool_registry.register("probe", probe)
+        assert server.controllers.attached().runtime.loop is not None
+        server.controllers.attached().runtime.loop.tool_registry.register("probe", probe)
         await _request(reader, writer, 3, "send", {"text": "probe"})
         approval = await _event(reader, "approval_request")
         await _close(writer)
@@ -247,8 +247,8 @@ async def test_resume_attach_rejects_mcp_bindings_for_unbound_session(
         async def probe(arguments: dict[str, object], abort_signal: object) -> str:
             return "ok"
 
-        assert server.runtime.loop is not None
-        server.runtime.loop.tool_registry.register("probe", probe)
+        assert server.controllers.attached().runtime.loop is not None
+        server.controllers.attached().runtime.loop.tool_registry.register("probe", probe)
         await _request(reader, writer, 3, "send", {"text": "probe"})
         approval = await _event(reader, "approval_request")
         rejected = await _request(reader, writer, 4, "resume", {
@@ -256,7 +256,7 @@ async def test_resume_attach_rejects_mcp_bindings_for_unbound_session(
             "mcp_bindings": [{"server": "page", "headers": {"X-Key": "k"}}],
         })
         assert _error_code(rejected) == INVALID_PARAMS, rejected[-1]
-        assert server.control._active_mcp_bindings == {}
+        assert server.controllers.attached().control._active_mcp_bindings == {}
         allowed = await _request(reader, writer, 5, "approve", {
             "request_id": approval["request_id"]
         })
@@ -290,8 +290,8 @@ async def test_resume_without_attach_feature_stays_busy(tmp_path: Path) -> None:
         async def probe(arguments: dict[str, object], abort_signal: object) -> str:
             return "ok"
 
-        assert server.runtime.loop is not None
-        server.runtime.loop.tool_registry.register("probe", probe)
+        assert server.controllers.attached().runtime.loop is not None
+        server.controllers.attached().runtime.loop.tool_registry.register("probe", probe)
         await _request(reader, writer, 3, "send", {"text": "probe"})
         approval = await _event(reader, "approval_request")
         resumed = await _request(reader, writer, 4, "resume", {
@@ -366,7 +366,7 @@ async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
             await _request(reader, writer, 4, "send", {"text": "warm"})
             await _event(reader, "agent_end")
 
-        loop = server.runtime.loop
+        loop = server.controllers.attached().runtime.loop
         in_setup = asyncio.Event()
         original_ensure = loop._ensure_mcp_servers
 
@@ -379,11 +379,11 @@ async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
 
         # test-contract: seam MCP startup is the slow step a wake runs before turn_start
         monkeypatch.setattr(loop, "_ensure_mcp_servers", held_ensure)
-        server.runtime.opened.store.append_agent_notification(
+        server.controllers.attached().runtime.opened.store.append_agent_notification(
             "child", child_session_path="/tmp/child", description="child",
             status="completed", text="child done",
         )
-        server.runtime._background_wake_sink(session_id)
+        server.controllers.attached().runtime._background_wake_sink(session_id)
         await await_or_fail(in_setup.wait(), what="wake in setup")
 
         # a page reload during the wake's setup: reconnect and resume the open session.
@@ -398,7 +398,7 @@ async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
             mounting = asyncio.Event()
             rebinding = asyncio.Event()
             original_mount = loop._mount_mcp_servers
-            original_reattach = server.control.reattach_mcp_bindings
+            original_reattach = server.controllers.attached().control.reattach_mcp_bindings
 
             async def held_mount() -> None:
                 mounting.set()
@@ -412,7 +412,7 @@ async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
             # test-contract: seam the first mount is the wake's slow MCP step
             monkeypatch.setattr(loop, "_mount_mcp_servers", held_mount)
             # test-contract: seam signal when the attach starts its MCP rebind
-            monkeypatch.setattr(server.control, "reattach_mcp_bindings", observed_reattach)
+            monkeypatch.setattr(server.controllers.attached().control, "reattach_mcp_bindings", observed_reattach)
             release_setup.set()
             await await_or_fail(mounting.wait(), what="wake mount running")
             attaching = asyncio.create_task(_request(reader2, writer2, 7, "resume", resume))
@@ -434,7 +434,7 @@ async def test_reload_resume_attaches_to_wake_in_setup_before_turn_start(
         backend.release[-1].set()
         end = await _event(reader2, "agent_end")
         assert end["session_id"] == session_id
-        assert server.runtime.session_id == session_id
+        assert server.controllers.attached().runtime.session_id == session_id
     finally:
         release_setup.set()
         release_mount.set()
@@ -476,12 +476,12 @@ async def test_resume_attach_reports_idle_when_turn_ends_during_rebind(
         }))[-1]["result"]["session"]["session_id"]
         await _request(reader, writer, 3, "send", {"text": "hold"})
         await await_or_fail(backend.streaming[0].wait(), what="turn streaming")
-        turn = server.control._turn_task
+        turn = server.controllers.attached().control._turn_task
         assert turn is not None
         await _drop(writer, server)
         reader2, writer2 = await _reconnect(server, 4, features)
 
-        loop = server.runtime.loop
+        loop = server.controllers.attached().runtime.loop
         original_rebind = loop.rebind_mcp
 
         async def rebind_after_turn_end(*args) -> None:
@@ -497,7 +497,7 @@ async def test_resume_attach_reports_idle_when_turn_ends_during_rebind(
         result = attached[-1].get("result", {})
         assert "attached" not in result, attached[-1]
         assert result["session"]["session_id"] == session_id
-        assert server.control._active_mcp_bindings == {"page": {"Authorization": "Bearer page"}}
+        assert server.controllers.attached().control._active_mcp_bindings == {"page": {"Authorization": "Bearer page"}}
     finally:
         for event in backend.release:
             event.set()

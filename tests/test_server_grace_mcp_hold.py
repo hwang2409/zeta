@@ -66,7 +66,7 @@ class Grace:
             self.deadlines_started += 1
             await await_or_fail(self.deadline.wait(), what="injected grace deadline")
 
-        self.server.control._grace_deadline = injected_deadline
+        self.server.controllers.attached().control._grace_deadline = injected_deadline
         return self.server, self.backend
 
     async def open_session(self, approval_mode: str = "allow"):
@@ -84,8 +84,8 @@ class Grace:
         return reader, writer, session_id
 
     def _track_page_calls(self) -> None:
-        assert self.server is not None and self.server.runtime.loop is not None
-        mount = self.server.runtime.loop._mcp_mount
+        assert self.server is not None and self.server.controllers.attached().runtime.loop is not None
+        mount = self.server.controllers.attached().runtime.loop._mcp_mount
         assert mount is not None
         actor = mount._actors["page"]
         handle = actor._handle_call
@@ -217,12 +217,12 @@ async def test_abort_during_wait_releases_call_and_it_never_runs(
         reader2, writer2 = await grace.reconnect(5)
         backend.release[1].set()
         await grace.call_waits()
-        turn = server.control._turn_task
+        turn = server.controllers.attached().control._turn_task
         assert turn is not None
         aborted = await _request(reader2, writer2, 6, "abort", {})
         assert aborted[-1]["result"] == {"aborted": True}
         await await_or_fail(asyncio.wait({turn}), what="aborted turn end")
-        actor = server.runtime.loop._mcp_mount._actors["page"]
+        actor = server.controllers.attached().runtime.loop._mcp_mount._actors["page"]
         assert actor._held_calls() == []
 
         # a binding that returns after the abort must not run the dropped call.
@@ -255,7 +255,7 @@ async def test_approval_grace_deadline_also_bounds_the_approved_bound_call(
 
         await _drop(writer, server)
         reader2, writer2 = await grace.reconnect(5)
-        assert server.control._grace_task is None
+        assert server.controllers.attached().control._grace_task is None
         approved = await _request(reader2, writer2, 6, "approve", {
             "request_id": approval["request_id"]
         })
@@ -312,7 +312,7 @@ async def test_call_in_flight_at_disconnect_returns_its_real_result_after_reatta
         reader, writer, session_id = await grace.open_session()
         await _request(reader, writer, 4, "send", {"text": "use page"})
         await await_or_fail(grace.mcp.tool_called.wait(), what="call in flight")
-        turn = server.control._turn_task
+        turn = server.controllers.attached().control._turn_task
         assert turn is not None
 
         await _drop(writer, server)
@@ -321,7 +321,7 @@ async def test_call_in_flight_at_disconnect_returns_its_real_result_after_reatta
             "session_id": session_id, "mcp_bindings": [NEW]
         })
         # the old client sends nothing new with the departed page's header.
-        actor = server.runtime.loop._mcp_mount._actors["page"]
+        actor = server.controllers.attached().runtime.loop._mcp_mount._actors["page"]
         (old_client,) = actor._draining
         listener = old_client._notification_task
         assert listener is not None
@@ -355,7 +355,7 @@ async def test_call_in_flight_without_reattach_ends_at_deadline(
         reader, writer, session_id = await grace.open_session()
         await _request(reader, writer, 4, "send", {"text": "use page"})
         await await_or_fail(grace.mcp.tool_called.wait(), what="call in flight")
-        turn = server.control._turn_task
+        turn = server.controllers.attached().control._turn_task
         assert turn is not None
 
         await _drop(writer, server)
@@ -367,7 +367,7 @@ async def test_call_in_flight_without_reattach_ends_at_deadline(
         assert len(results) == 1 and results[0]["is_error"] is True, results
         status = (await _request(reader2, writer2, 7, "status", {}))[-1]["result"]
         assert status["last_turn_outcome"]["reason"] == "disconnect", status
-        actor = server.runtime.loop._mcp_mount._actors["page"]
+        actor = server.controllers.attached().runtime.loop._mcp_mount._actors["page"]
         assert actor._draining == set(), "the old client was never closed"
         assert grace.page_calls() == ["Bearer old-page"]
     finally:
@@ -389,7 +389,7 @@ async def test_in_flight_call_answered_404_sends_nothing_with_old_header(
         reader, writer, session_id = await grace.open_session()
         await _request(reader, writer, 4, "send", {"text": "use page"})
         await await_or_fail(grace.mcp.tool_called.wait(), what="call in flight")
-        turn = server.control._turn_task
+        turn = server.controllers.attached().control._turn_task
         assert turn is not None
         sent_before = len(grace.mcp.headers)
 
@@ -498,7 +498,7 @@ async def test_server_close_during_wait_does_not_hang(
         await _drop(writer, server)
         backend.release[1].set()
         await grace.call_waits()
-        turn = server.control._turn_task
+        turn = server.controllers.attached().control._turn_task
         assert turn is not None
         # the deadline never fires: only close may end the wait.
         await await_or_fail(server.close(), what="server close")

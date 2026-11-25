@@ -213,6 +213,9 @@ class SessionAccountContext:
                 result["account"] = account
         return result
 
+    def transition_active(self) -> bool:
+        return self._switch_lock.locked()
+
     def snapshot(self) -> dict[str, AccountId]:
         return dict(self._pins)
 
@@ -261,6 +264,7 @@ class SessionAccountContext:
         boundary: int,
         provider: str,
         build_backend: Callable[[AccountId], Any],
+        authorize_commit: Callable[[], bool] | None = None,
     ) -> None:
         def prepare(metadata: SessionMetadata) -> SessionMetadata:
             if self.switching_unavailable is not None:
@@ -292,6 +296,7 @@ class SessionAccountContext:
             prepare=prepare,
             build_backend=backend_for_metadata,
             active_provider=active_provider,
+            authorize_commit=authorize_commit,
         )
 
     async def switch_model(
@@ -315,6 +320,7 @@ class SessionAccountContext:
         prepare: Callable[[SessionMetadata], SessionMetadata],
         build_backend: Callable[[SessionMetadata], Any],
         active_provider: str | None,
+        authorize_commit: Callable[[], bool] | None = None,
     ) -> SessionMetadata:
         async with self._switch_lock:
             if self._account_state_unknown:
@@ -328,6 +334,11 @@ class SessionAccountContext:
                 build_backend,
                 active_provider,
             )
+            if authorize_commit is not None and not authorize_commit():
+                backend = getattr(new.backend_state, "backend", new.backend_state)
+                if backend is not loop.backend and is_owned_completion_backend(backend):
+                    await loop.close_backend(backend, stage="replacement_failure")
+                raise asyncio.CancelledError
             return await self._commit_and_apply(loop, new, build_backend)
 
     async def _commit_and_apply(

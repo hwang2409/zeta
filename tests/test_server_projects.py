@@ -60,7 +60,7 @@ def _mtimes(root: Path) -> dict[str, int]:
 
 async def _await_setup_reapers(server) -> None:
     """Wait (bounded) for the runtime-owned cleanup of canceled session setups."""
-    reapers = list(server.runtime._setup_reapers)
+    reapers = list(server.controllers.attached().runtime._setup_reapers)
     assert reapers, "a canceled setup must be handed to a reaper"
     await asyncio.wait_for(asyncio.gather(*reapers), 2)
 
@@ -136,12 +136,12 @@ async def test_new_session_promotes_healthy_cwd_project_after_malformed_finding(
     )
     try:
         await server.start()
-        assert server.runtime.manager.project_registry_unavailable is None
+        assert server.controllers.attached().runtime.manager.project_registry_unavailable is None
 
-        metadata = await server.runtime.create_session()
+        metadata = await server.controllers.attached().runtime.create_session()
 
         assert metadata.project_id == healthy.project_id
-        assert server.runtime.loop.root_project_id == healthy.project_id
+        assert server.controllers.attached().runtime.loop.root_project_id == healthy.project_id
         assert server.port is not None
         reader, writer = await asyncio.open_connection("127.0.0.1", server.port)
         try:
@@ -168,14 +168,14 @@ async def test_session_project_preparation_does_not_block_ping(
     tmp_path: Path, method: str
 ) -> None:
     server = _server(tmp_path)
-    root = server.runtime.cwd
+    root = server.controllers.attached().runtime.cwd
     await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=root, check=True)
     registry = ProjectRegistry(server.home / "projects")
     await asyncio.to_thread(registry.create_project, "launch", "git", root)
     try:
         if method == "resume":
-            first = await server.runtime.create_session()
-            await server.runtime.create_session()
+            first = await server.controllers.attached().runtime.create_session()
+            await server.controllers.attached().runtime.create_session()
             request = {"session_id": first.session_id}
         else:
             request = {}
@@ -183,9 +183,9 @@ async def test_session_project_preparation_does_not_block_ping(
             server.home / "projects" / ".lock"
         )
         operation = asyncio.create_task(
-            server.runtime.create_session()
+            server.controllers.attached().runtime.create_session()
             if method == "new_session"
-            else server.runtime.resume_session(request["session_id"])
+            else server.controllers.attached().runtime.resume_session(request["session_id"])
         )
         progress = asyncio.create_task(asyncio.sleep(0))
         await asyncio.wait_for(progress, 10)
@@ -205,19 +205,19 @@ async def test_serve_resume_cancel_closes_store_after_preparation_finishes(
     tmp_path: Path,
 ) -> None:
     server = _server(tmp_path)
-    first = await server.runtime.create_session()
-    await server.runtime.create_session()
+    first = await server.controllers.attached().runtime.create_session()
+    await server.controllers.attached().runtime.create_session()
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     opened: list[object] = []
     preparation_started = threading.Event()
     preparation_release = threading.Event()
     preparation_done = threading.Event()
     preparation_active: set[int] = set()
-    original_open = server.runtime.manager.open
-    original_prepare = server.runtime._prepare_resumed_session
+    original_open = server.controllers.attached().runtime.manager.open
+    original_prepare = server.controllers.attached().runtime._prepare_resumed_session
 
     def tracked_open(session_id: str):
         result = original_open(session_id)
@@ -235,8 +235,8 @@ async def test_serve_resume_cancel_closes_store_after_preparation_finishes(
             preparation_active.discard(ident)
             preparation_done.set()
 
-    server.runtime.manager.open = tracked_open
-    server.runtime._prepare_resumed_session = tracked_prepare
+    server.controllers.attached().runtime.manager.open = tracked_open
+    server.controllers.attached().runtime._prepare_resumed_session = tracked_prepare
     operation = asyncio.create_task(
         client._dispatch(2, "resume", {"session_id": first.session_id})
     )
@@ -260,18 +260,18 @@ async def test_serve_resume_cancel_reaper_waits_for_composition_before_closing_s
     tmp_path: Path,
 ) -> None:
     server = _server(tmp_path)
-    first = await server.runtime.create_session()
-    await server.runtime.create_session()
+    first = await server.controllers.attached().runtime.create_session()
+    await server.controllers.attached().runtime.create_session()
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     opened: list[object] = []
     compose_started = threading.Event()
     compose_done = threading.Event()
     worker_saw_closed: list[bool] = []
-    original_open = server.runtime.manager.open
-    original_compose = server.runtime._compose
+    original_open = server.controllers.attached().runtime.manager.open
+    original_compose = server.controllers.attached().runtime._compose
 
     def tracked_open(session_id: str):
         result = original_open(session_id)
@@ -287,8 +287,8 @@ async def test_serve_resume_cancel_reaper_waits_for_composition_before_closing_s
         finally:
             compose_done.set()
 
-    server.runtime.manager.open = tracked_open
-    server.runtime._compose = tracked_compose
+    server.controllers.attached().runtime.manager.open = tracked_open
+    server.controllers.attached().runtime._compose = tracked_compose
     close_count = 0
     original_close = None
     operation = asyncio.create_task(
@@ -323,7 +323,7 @@ async def test_serve_create_cancel_reaps_after_compose_finishes(
     server = _server(tmp_path)
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     compose_started = threading.Event()
     compose_release = threading.Event()
@@ -331,7 +331,7 @@ async def test_serve_create_cancel_reaps_after_compose_finishes(
     worker_saw_closed: list[bool] = []
     compositions: list[object] = []
     close_count = 0
-    original_compose = server.runtime._compose
+    original_compose = server.controllers.attached().runtime._compose
 
     def tracked_compose(**kwargs):
         nonlocal close_count
@@ -351,7 +351,7 @@ async def test_serve_create_cancel_reaps_after_compose_finishes(
         compose_done.set()
         return composition
 
-    server.runtime._compose = tracked_compose
+    server.controllers.attached().runtime._compose = tracked_compose
     operation = asyncio.create_task(client._dispatch(2, "new_session", {}))
     try:
         assert await asyncio.to_thread(compose_started.wait, 2)
@@ -366,7 +366,7 @@ async def test_serve_create_cancel_reaps_after_compose_finishes(
         assert store._closed
         assert close_count == 1
         assert worker_saw_closed == [False]
-        assert server.runtime.state is None
+        assert server.controllers.attached().runtime.state is None
     finally:
         compose_release.set()
         await close_serve(server, writer)
@@ -377,20 +377,20 @@ async def test_serve_resume_cancel_reaper_closes_store_after_compose(
     tmp_path: Path,
 ) -> None:
     server = _server(tmp_path)
-    first = await server.runtime.create_session()
-    await server.runtime.create_session()
-    previous = server.runtime.session_id
+    first = await server.controllers.attached().runtime.create_session()
+    await server.controllers.attached().runtime.create_session()
+    previous = server.controllers.attached().runtime.session_id
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     compose_started = threading.Event()
     compose_release = threading.Event()
     worker_saw_closed: list[bool] = []
     opened: list[object] = []
     close_count = 0
-    original_open = server.runtime.manager.open
-    original_compose = server.runtime._compose
+    original_open = server.controllers.attached().runtime.manager.open
+    original_compose = server.controllers.attached().runtime._compose
 
     def tracked_open(session_id: str):
         result = original_open(session_id)
@@ -412,8 +412,8 @@ async def test_serve_resume_cancel_reaper_closes_store_after_compose(
         worker_saw_closed.append(composition.opened.store._closed)
         return composition
 
-    server.runtime.manager.open = tracked_open
-    server.runtime._compose = tracked_compose
+    server.controllers.attached().runtime.manager.open = tracked_open
+    server.controllers.attached().runtime._compose = tracked_compose
     operation = asyncio.create_task(
         client._dispatch(2, "resume", {"session_id": first.session_id})
     )
@@ -423,14 +423,14 @@ async def test_serve_resume_cancel_reaper_closes_store_after_compose(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(operation, 2)
         assert not compose_release.is_set()
-        assert len(server.runtime._setup_reapers) == 1
-        reaper = next(iter(server.runtime._setup_reapers))
+        assert len(server.controllers.attached().runtime._setup_reapers) == 1
+        reaper = next(iter(server.controllers.attached().runtime._setup_reapers))
         compose_release.set()
         await asyncio.wait_for(reaper, 2)
         assert opened and opened[0]._closed
         assert close_count == 1
         assert worker_saw_closed == [False]
-        assert server.runtime.session_id == previous
+        assert server.controllers.attached().runtime.session_id == previous
     finally:
         compose_release.set()
         await close_serve(server, writer)
@@ -443,14 +443,14 @@ async def test_serve_create_cancel_reaper_closes_store_after_compose(
     server = _server(tmp_path)
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     compose_started = threading.Event()
     compose_release = threading.Event()
     worker_saw_closed: list[bool] = []
     compositions: list[object] = []
     close_count = 0
-    original_compose = server.runtime._compose
+    original_compose = server.controllers.attached().runtime._compose
 
     def tracked_compose(**kwargs):
         nonlocal close_count
@@ -469,7 +469,7 @@ async def test_serve_create_cancel_reaper_closes_store_after_compose(
         worker_saw_closed.append(composition.opened.store._closed)
         return composition
 
-    server.runtime._compose = tracked_compose
+    server.controllers.attached().runtime._compose = tracked_compose
     operation = asyncio.create_task(client._dispatch(2, "new_session", {}))
     try:
         assert await asyncio.to_thread(compose_started.wait, 2)
@@ -477,14 +477,14 @@ async def test_serve_create_cancel_reaper_closes_store_after_compose(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(operation, 2)
         assert not compose_release.is_set()
-        assert len(server.runtime._setup_reapers) == 1
-        reaper = next(iter(server.runtime._setup_reapers))
+        assert len(server.controllers.attached().runtime._setup_reapers) == 1
+        reaper = next(iter(server.controllers.attached().runtime._setup_reapers))
         compose_release.set()
         await asyncio.wait_for(reaper, 2)
         assert compositions and compositions[0].opened.store._closed
         assert close_count == 1
         assert worker_saw_closed == [False]
-        assert server.runtime.state is None
+        assert server.controllers.attached().runtime.state is None
     finally:
         compose_release.set()
         await close_serve(server, writer)
@@ -498,17 +498,17 @@ async def test_serve_repeated_cancel_still_hands_setup_to_reaper(
     server = _server(tmp_path)
     params: dict[str, object] = {}
     if method == "resume":
-        created = await server.runtime.create_session()
-        await server.runtime.create_session()
+        created = await server.controllers.attached().runtime.create_session()
+        await server.controllers.attached().runtime.create_session()
         params = {"session_id": created.session_id}
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     compose_started = threading.Event()
     compose_release = threading.Event()
     compositions: list[object] = []
-    original_compose = server.runtime._compose
+    original_compose = server.controllers.attached().runtime._compose
 
     def tracked_compose(**kwargs):
         compose_started.set()
@@ -517,7 +517,7 @@ async def test_serve_repeated_cancel_still_hands_setup_to_reaper(
         compositions.append(composition)
         return composition
 
-    server.runtime._compose = tracked_compose
+    server.controllers.attached().runtime._compose = tracked_compose
     operation = asyncio.create_task(client._dispatch(2, method, params))
     try:
         assert await asyncio.to_thread(compose_started.wait, 2)
@@ -528,8 +528,8 @@ async def test_serve_repeated_cancel_still_hands_setup_to_reaper(
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(operation, 2)
         assert not compose_release.is_set()
-        assert len(server.runtime._setup_reapers) == 1
-        reaper = next(iter(server.runtime._setup_reapers))
+        assert len(server.controllers.attached().runtime._setup_reapers) == 1
+        reaper = next(iter(server.controllers.attached().runtime._setup_reapers))
         compose_release.set()
         await asyncio.wait_for(reaper, 2)
         assert len(compositions) == 1
@@ -544,17 +544,17 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     server = _server(tmp_path)
-    first = await server.runtime.create_session()
-    await server.runtime.create_session()
+    first = await server.controllers.attached().runtime.create_session()
+    await server.controllers.attached().runtime.create_session()
     reader, writer = await _connect(server)
     await _hello(reader, writer)
-    client = server._client
+    client = next(iter(server.connections.clients()), None)
     assert client is not None
     compose_started = threading.Event()
     compose_release = threading.Event()
     compositions: list[object] = []
     close_count = 0
-    original_compose = server.runtime._compose
+    original_compose = server.controllers.attached().runtime._compose
 
     def tracked_compose(**kwargs):
         nonlocal close_count
@@ -572,7 +572,7 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
         compositions.append(composition)
         return composition
 
-    server.runtime._compose = tracked_compose
+    server.controllers.attached().runtime._compose = tracked_compose
     operation = asyncio.create_task(
         client._dispatch(2, "resume", {"session_id": first.session_id})
     )
@@ -589,11 +589,11 @@ async def test_serve_shutdown_reports_blocked_setup_reaper(
             for record in caplog.records
         )
         compose_release.set()
-        reaper = next(iter(server.runtime._setup_reapers))
+        reaper = next(iter(server.controllers.attached().runtime._setup_reapers))
         await asyncio.wait_for(reaper, 2)
         assert compositions and compositions[0].opened.store._closed
         assert close_count == 1
-        assert server.runtime.state is None
+        assert server.controllers.attached().runtime.state is None
     finally:
         compose_release.set()
         await close_serve(server, writer)
@@ -604,17 +604,17 @@ async def test_serve_project_instructions_does_not_block_loop_tick(
     tmp_path: Path,
 ) -> None:
     server = _server(tmp_path)
-    root = server.runtime.cwd
+    root = server.controllers.attached().runtime.cwd
     await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=root, check=True)
     registry = ProjectRegistry(server.home / "projects")
     await asyncio.to_thread(registry.create_project, "launch", "git", root)
-    await server.runtime.create_session()
+    await server.controllers.attached().runtime.create_session()
     try:
         _acquired, release, holder = _hold_registry_lock(
             server.home / "projects" / ".lock"
         )
         operation = asyncio.create_task(
-            run_command(server.runtime, "/project-instructions")
+            run_command(server.controllers.attached().runtime, "/project-instructions")
         )
         progress = asyncio.create_task(asyncio.sleep(0))
         await asyncio.wait_for(progress, 10)
@@ -636,13 +636,13 @@ async def test_serve_blocking_git_does_not_block_ping(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, method: str
 ) -> None:
     server = _server(tmp_path)
-    root = server.runtime.cwd
+    root = server.controllers.attached().runtime.cwd
     await asyncio.to_thread(subprocess.run, ["git", "init", "-q"], cwd=root, check=True)
     registry = ProjectRegistry(server.home / "projects")
     await asyncio.to_thread(registry.create_project, "launch", "git", root)
-    first = await server.runtime.create_session()
+    first = await server.controllers.attached().runtime.create_session()
     if method == "resume":
-        await server.runtime.create_session()
+        await server.controllers.attached().runtime.create_session()
     real_git = shutil.which("git")
     assert real_git is not None
     fake_bin = tmp_path / "bin"
@@ -676,7 +676,7 @@ async def test_serve_blocking_git_does_not_block_ping(
             monkeypatch.setattr(
                 slash_commands, "build_registry", blocking_build_registry
             )
-        client = server._client
+        client = next(iter(server.connections.clients()), None)
         assert client is not None
         _acquired, release, holder = _hold_registry_lock(
             server.home / "projects" / ".lock"
@@ -1170,7 +1170,7 @@ async def test_project_requests_show_memory_history_and_inbox_read_only(
 
         await _request(reader, writer, 7, "new_session", {})
         # test-contract: seam wait for expected background MCP startup before the read-only probe
-        state = server.runtime._state
+        state = server.controllers.attached().runtime._state
         assert state is not None
         mount_task = state.loop._mcp_mount_task
         assert mount_task is not None
@@ -1193,17 +1193,17 @@ async def test_list_sessions_filters_project_and_keeps_lineage(tmp_path: Path) -
     registry = ProjectRegistry(server.home / "projects")
     project = await asyncio.to_thread(registry.create_project, "alpha", "repo")
     other = await asyncio.to_thread(registry.create_project, "beta", "repo")
-    parent = await asyncio.to_thread(lambda: server.runtime.manager.create(
-        provider="codex", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
+    parent = await asyncio.to_thread(lambda: server.controllers.attached().runtime.manager.create(
+        provider="codex", model="offline", cwd=server.controllers.attached().runtime.cwd, project_id=project.project_id,
         project_role="orchestrator", name="parent", auto_project=False,
     ))
-    child = await asyncio.to_thread(lambda: server.runtime.manager.create(
-        provider="codex", model="offline", cwd=server.runtime.cwd, project_id=project.project_id,
+    child = await asyncio.to_thread(lambda: server.controllers.attached().runtime.manager.create(
+        provider="codex", model="offline", cwd=server.controllers.attached().runtime.cwd, project_id=project.project_id,
         project_role="worker", parent_session_id=parent.metadata.session_id,
         name="child", auto_project=False,
     ))
-    other_opened = await asyncio.to_thread(lambda: server.runtime.manager.create(
-        provider="codex", model="offline", cwd=server.runtime.cwd, project_id=other.project_id,
+    other_opened = await asyncio.to_thread(lambda: server.controllers.attached().runtime.manager.create(
+        provider="codex", model="offline", cwd=server.controllers.attached().runtime.cwd, project_id=other.project_id,
         project_role="session", auto_project=False,
     ))
     parent.store.close()
@@ -1452,11 +1452,10 @@ def test_project_inbox_omits_too_deep_unknown_field(tmp_path: Path) -> None:
 
     requests = ProjectRequests(
         home=server.home,
-        runtime=server.runtime,
-        codec=FrameCodec(),
+        manager=server.manager,
         registry=registry,
     )
-    projected = requests._bounded_message("request", record)
+    projected = requests._bounded_message(lambda result: FrameCodec().response_fits("request", result), record)
 
     assert "future_metadata" not in projected
     assert projected["truncated_fields"] == ["future_metadata"]

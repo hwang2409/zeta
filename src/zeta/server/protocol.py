@@ -35,6 +35,11 @@ class ErrorDescriptor(Enum):
         None,
         "requested controller or observer connection role is at capacity",
     )
+    SESSION_CONTROLLED = (
+        -32014,
+        "session_controlled",
+        "the requested session is controlled by another client; the connection stays open",
+    )
     PROTOCOL_MISMATCH = (
         -32002,
         None,
@@ -318,7 +323,6 @@ _LEGACY_FEATURES = (
     "state_read_v1",
 )
 
-
 class MethodDescriptor(Enum):
     """Frozen legacy capabilities; new requests belong to resource families."""
 
@@ -383,7 +387,7 @@ class MethodDescriptor(Enum):
         "projects",
         Access.CONTROLLER_READ,
     )
-    PROJECT_INBOX = ("project_inbox", "1.1", "projects", Access.CONTROLLER_WRITE)
+    PROJECT_INBOX = ("project_inbox", "1.1", "projects", Access.CONTROLLER_READ)
     CLEAR_STEERING = ("clear_steering", None, "abort_scope", Access.SESSION_MUTATION)
     DELIVERY_STATUS = ("delivery_status", None, "delivery_id", Access.READ)
     SESSION_GRANTS = ("session_grants", "1.1", "session_grants", Access.READ)
@@ -470,13 +474,13 @@ def served_methods() -> tuple[MethodDescriptor | ResourceDescriptor, ...]:
     return _SERVED_METHODS
 
 
-_RESOURCE_METHODS = collect_families()
-_SERVED_METHODS = (*MethodDescriptor, *(item for item in _RESOURCE_METHODS if not item.extends_legacy))
+RESOURCE_METHODS = collect_families()
+_SERVED_METHODS = (*MethodDescriptor, *(item for item in RESOURCE_METHODS if not item.extends_legacy))
 _METHODS_BY_WIRE = {item.wire: item for item in served_methods()}
 _METHOD_EXTENSIONS: dict[str, ResourceDescriptor] = {}
 if len(_METHODS_BY_WIRE) != len(served_methods()):
     raise RuntimeError("serve resource methods must have unique names and may not replace legacy methods")
-for _extension in _RESOURCE_METHODS:
+for _extension in RESOURCE_METHODS:
     if not _extension.extends_legacy:
         continue
     _legacy = _METHODS_BY_WIRE.get(_extension.wire)
@@ -488,7 +492,11 @@ for _extension in _RESOURCE_METHODS:
     ):
         raise RuntimeError("serve method extensions must preserve the legacy version and access")
     _METHOD_EXTENSIONS[_extension.wire] = _extension
-FEATURES = tuple(dict.fromkeys((*_LEGACY_FEATURES, *(item.feature for item in _RESOURCE_METHODS))))
+FEATURES = tuple(dict.fromkeys((
+    *_LEGACY_FEATURES,
+    *(item.feature for item in RESOURCE_METHODS),
+    "multi_controller",
+)))
 
 
 EVENT_ACCESS = {
@@ -939,7 +947,7 @@ class FrameCodec:
             logger.error("refusing unregistered event descriptor: %r", event)
             return None
         params: dict[str, object] = {"event": event.value}
-        if session_id is not None:
+        if session_id is not None or event is EventDescriptor.ZETA_UPDATED:
             params["session_id"] = session_id
         params.update(fields)
         value = {"jsonrpc": "2.0", "method": "event", "params": params}

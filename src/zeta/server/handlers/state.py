@@ -11,7 +11,7 @@ from ..read_home_state import (
 from ..read_sessions import read_session_page
 
 
-async def state_catalog(client, request_id, params):
+async def state_catalog(client, request_id, params, controller):
     try:
         return await client.connections.state_reader.catalog(
             client.server.home, params, lambda result: client.codec.response_fits(request_id, result),
@@ -23,7 +23,7 @@ async def state_catalog(client, request_id, params):
 
 
 def _project_state_handler(collection):
-    async def read(client, request_id, params):
+    async def read(client, request_id, params, controller):
         try:
             return await client.connections.state_reader.project_state(
                 client.server.home, collection, params, lambda result: client.codec.response_fits(request_id, result),
@@ -46,18 +46,10 @@ state_attention = _project_state_handler("attention")
 
 async def _session_read(client, request_id, params, method, *, collection=None, detail=False):
     server = client.server
-    active = server.runtime.state
-    statuses = {}
-    if active is not None:
-        status = active.status
-        if server.control.has_pending_approvals():
-            status = "approval"
-        elif server.control.turn_busy() or status == "tool":
-            status = "running"
-        statuses[active.metadata.session_id] = status
+    snapshot = server.session_statuses()
     try:
         return await client.connections.run_blocking(lambda: read_session_page(
-            server.home, method, params, lambda result: client.codec.response_fits(request_id, result), statuses,
+            server.home, method, params, lambda result: client.codec.response_fits(request_id, result), snapshot,
             collection=collection, detail=detail,
         ))
     except InvalidParams:
@@ -66,24 +58,24 @@ async def _session_read(client, request_id, params, method, *, collection=None, 
         raise ProtocolError(ErrorDescriptor.RESULT_TOO_LARGE, "result exceeds frame limit") from None
 
 
-async def state_sessions(client, request_id, params):
+async def state_sessions(client, request_id, params, controller):
     return await _session_read(client, request_id, params, MethodDescriptor.STATE_SESSIONS)
 
 
-async def state_session(client, request_id, params):
+async def state_session(client, request_id, params, controller):
     return await _session_read(client, request_id, params, MethodDescriptor.STATE_SESSION, detail=True)
 
 
-async def state_agents(client, request_id, params):
+async def state_agents(client, request_id, params, controller):
     return await _session_read(client, request_id, params, MethodDescriptor.STATE_AGENTS, collection="agents")
 
 
-async def state_background_tasks(client, request_id, params):
+async def state_background_tasks(client, request_id, params, controller):
     return await _session_read(client, request_id, params, MethodDescriptor.STATE_BACKGROUND_TASKS, collection="background_tasks")
 
 
 def _home_state_handler(owner_read):
-    async def read(client, request_id, params):
+    async def read(client, request_id, params, controller):
         try:
             return await client.connections.run_blocking(lambda: owner_read(
                 client.server.home, params, lambda result: client.codec.response_fits(request_id, result),

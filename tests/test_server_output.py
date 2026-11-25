@@ -19,7 +19,6 @@ from tests.test_server import TIMEOUT
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent, ToolCall
 from zeta.server import ZetaServer
-from zeta.server import accounts as accounts_module
 from zeta.server import connections as connections_module
 from zeta.server import control as control_module
 from zeta.server import server as server_module
@@ -201,6 +200,8 @@ async def _ready_connection(
         {"jsonrpc": "2.0", "id": 1, "method": "hello", "params": params},
     )
     assert (await _read_json(reader, transport))["id"] == 1
+    # A hello frame can be read while the server still drains its hello queue.
+    assert (await _rpc(reader, writer, transport, 99, "ping", {}))["id"] == 99
     state = next(
         state
         for state in server.connections._connections.values()
@@ -228,7 +229,8 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
     old_publish: asyncio.Task[bool] | None = None
     fenced = False
     raw_after_fence: list[tuple[object, dict[str, Any]]] = []
-    original_cancel = accounts_module.cancel_owned_switch
+    logins = old_state.connection.logins
+    original_close = logins.close
     original_claim = server.connections._claim
     original_write = _Client._write_physical
 
@@ -244,11 +246,10 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
             raw_after_fence.append((client, frame))
         return await original_write(client, payload)
 
-    async def gated_cancel(owner: object) -> None:
-        if owner is old_state.connection:
-            cleanup_entered.set()
-            await asyncio.wait_for(cleanup_release.wait(), 10)
-        await original_cancel(owner)
+    async def gated_close() -> None:
+        cleanup_entered.set()
+        await asyncio.wait_for(cleanup_release.wait(), 10)
+        await original_close()
 
     def tracked_claim(
         connection: object,
@@ -261,7 +262,7 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
         original_claim(connection, role, protocol_version, features)
 
     # test-contract: seam hold real disconnect cleanup after physical release
-    monkeypatch.setattr(accounts_module, "cancel_owned_switch", gated_cancel)
+    monkeypatch.setattr(logins, "close", gated_close)
     # test-contract: seam observe raw transport writes around the replacement fence
     monkeypatch.setattr(_Client, "_write_physical", gated_write)
     # test-contract: seam observe the replacement claim without timing assumptions
@@ -269,11 +270,12 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
     hello: asyncio.Task[dict[str, Any]] | None = None
     try:
         old_publish = asyncio.create_task(
-            server.connections.publish_controller(
+            server.connections.publish_session(server.connections.legacy_controller_holder.connection,
                 EventDescriptor.ASSISTANT_DELTA,
                 "session",
                 delta="old-controller",
-            )
+                wait_for_write=True,
+            ).delivered()
         )
         await asyncio.wait_for(old_output_entered.wait(), 10)
         old_writer.close()
@@ -302,14 +304,15 @@ async def test_controller_reconnect_claims_slot_before_old_cleanup_finishes(
         old_output_release.set()
         assert old_publish is not None
         assert not await asyncio.wait_for(old_publish, 10)
-        assert await server.connections.publish_controller(
-            EventDescriptor.ASSISTANT_DELTA, "session", delta="new-controller"
-        )
+        assert await server.connections.publish_session(server.connections.legacy_controller_holder.connection,
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="new-controller",
+            wait_for_write=True,
+        ).delivered()
         event = await _read_json(new_reader, transport)
         assert event["params"]["delta"] == "new-controller"
         assert [
             (client, frame["params"]["delta"]) for client, frame in raw_after_fence
-        ] == [(server._client, "new-controller")]
+        ] == [(next(iter(server.connections.clients()), None), "new-controller")]
     finally:
         cleanup_release.set()
         old_output_release.set()
@@ -355,7 +358,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
     old_output_gate = asyncio.Event()
     rejected_released = asyncio.Event()
     old_frames_after_fence: list[dict[str, Any]] = []
-    original_release = server.control._controller_release
+    original_release = server.controllers.attached().control._controller_release
     original_registry_release = server.connections.release
     original_write = _Client._write_physical
     old_state: Any = None
@@ -394,7 +397,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
             rejected_released.set()
 
     # test-contract: seam hold the real semantic handoff past its production bound
-    monkeypatch.setattr(server.control, "_controller_release", gated_release)
+    monkeypatch.setattr(server.controllers.attached().control, "_controller_release", gated_release)
     # test-contract: seam observe the rejected controller slot release without polling
     monkeypatch.setattr(server.connections, "release", tracked_release)
     # test-contract: seam observe raw old-controller writes after the output fence
@@ -434,17 +437,18 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
         assert approval["request_id"] == call.id
 
         old_publish = asyncio.create_task(
-            server.connections.publish_controller(
+            server.connections.publish_session(server.connections.legacy_controller_holder.connection,
                 EventDescriptor.ASSISTANT_DELTA,
-                server.runtime.session_id,
+                server.controllers.attached().runtime.session_id,
                 delta="old-controller",
-            )
+                wait_for_write=True,
+            ).delivered()
         )
         await asyncio.wait_for(old_output_entered.wait(), 10)
         old_writer.close()
         await old_writer.wait_closed()
         await asyncio.wait_for(release_entered.wait(), 10)
-        assert server.connections.controller_metadata() is None
+        assert server.connections.legacy_controller_holder is None
         fenced = True
 
         rejected_reader, rejected_writer = await _connect(
@@ -476,7 +480,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
             "message": "another client is already connected",
         }
         await asyncio.wait_for(rejected_released.wait(), 10)
-        assert server.connections.controller_metadata() is None
+        assert server.connections.legacy_controller_holder is None
 
         old_output_gate.set()
         assert old_publish is not None
@@ -485,7 +489,7 @@ async def test_controller_handoff_deadline_refuses_then_replays_approval(
         assert old_frames_after_fence == []
 
         release_gate.set()
-        release = server.control._controller_release_task
+        release = server.controllers.attached().control._controller_release_task
         assert release is not None
         await asyncio.wait_for(asyncio.shield(release), 10)
 
@@ -541,16 +545,17 @@ async def test_unregistered_descriptors_do_not_break_live_connection(
     try:
         invalid_event = await asyncio.wait_for(
             asyncio.gather(
-                server.connections.publish_controller("unregistered", "session"),
+                server.connections.publish_session(server.connections.legacy_controller_holder.connection, "unregistered", "session", wait_for_write=True).delivered(),
                 return_exceptions=True,
             ),
             10,
         )
         assert invalid_event == [False]
 
-        assert await server.connections.publish_controller(
-            EventDescriptor.ASSISTANT_DELTA, "session", delta="still-open"
-        )
+        assert await server.connections.publish_session(server.connections.legacy_controller_holder.connection,
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="still-open",
+            wait_for_write=True,
+        ).delivered()
         event = await _read_json(reader, transport)
         assert event["params"]["delta"] == "still-open"
 
@@ -612,12 +617,13 @@ def _retained(output: Any) -> tuple[int, int]:
     return frame_count, byte_count
 
 
-def _offer(server: ZetaServer, state: Any, role: Role, label: str) -> Awaitable[bool]:
+async def _offer(server: ZetaServer, state: Any, role: Role, label: str) -> Awaitable[bool]:
     if role == "controller":
-        return server.connections.publish_controller(
-            EventDescriptor.ASSISTANT_DELTA, "session", delta=label
-        )
-    return server.connections.send(
+        return await server.connections.publish_session(state.connection,
+            EventDescriptor.ASSISTANT_DELTA, "session", delta=label,
+            wait_for_write=True,
+        ).delivered()
+    return await server.connections.send(
         state.connection,
         state.connection.codec.notification(
             EventDescriptor.ASSISTANT_DELTA, "session", delta=label
@@ -756,7 +762,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
     original_write = _Client._write_physical
     original_release = server.connections.release
     original_enqueue = server.connections._enqueue
-    original_finalize = server.control.deliveries.finalize_turn
+    original_finalize = server.controllers.attached().control.deliveries.finalize_turn
 
     async def gated_write(client: _Client, payload: bytes) -> bool:
         frame = json.loads(payload)
@@ -792,7 +798,7 @@ async def test_controller_overflow_does_not_cancel_active_turn(
     monkeypatch.setattr(server.connections, "release", release)
     # test-contract: seam identifies when the active turn publication is queued
     monkeypatch.setattr(server.connections, "_enqueue", observe_enqueue)
-    monkeypatch.setattr(server.control.deliveries, "finalize_turn", record_finalize)
+    monkeypatch.setattr(server.controllers.attached().control.deliveries, "finalize_turn", record_finalize)
     try:
         await _send_json(
             writer,
@@ -823,20 +829,22 @@ async def test_controller_overflow_does_not_cancel_active_turn(
         session_id = created["result"]["session"]["session_id"]
 
         head = asyncio.create_task(
-            server.connections.publish_controller(
-                EventDescriptor.ASSISTANT_DELTA, session_id, delta="head"
-            )
+            server.connections.publish_session(server.connections.legacy_controller_holder.connection,
+                EventDescriptor.ASSISTANT_DELTA, session_id, delta="head",
+                wait_for_write=True,
+            ).delivered()
         )
         await asyncio.wait_for(head_started.wait(), TIMEOUT)
-        server.control.start_turn("finish despite output overload")
+        server.controllers.attached().control.start_turn("finish despite output overload")
         await asyncio.wait_for(turn_event_queued.wait(), TIMEOUT)
         trigger_started = asyncio.Event()
 
         async def trigger_overflow() -> bool:
             trigger_started.set()
-            return await server.connections.publish_controller(
-                EventDescriptor.ASSISTANT_DELTA, session_id, delta="trigger"
-            )
+            return await server.connections.publish_session(server.connections.legacy_controller_holder.connection,
+                EventDescriptor.ASSISTANT_DELTA, session_id, delta="trigger",
+                wait_for_write=True,
+            ).delivered()
 
         trigger = asyncio.create_task(trigger_overflow())
         await asyncio.wait_for(trigger_started.wait(), 10)
@@ -987,14 +995,16 @@ async def test_active_flush_overflow_sends_control_then_closes(
         output = state.output
         assert output is not None
         results = [
-            await server.connections.publish_controller(
-                EventDescriptor.ASSISTANT_DELTA, "session", delta=f"tail-{index}"
-            )
+            await server.connections.publish_session(state.connection,
+                EventDescriptor.ASSISTANT_DELTA, "session", delta=f"tail-{index}",
+                wait_for_write=True,
+            ).delivered()
             for index in range(257)
         ]
-        later = await server.connections.publish_controller(
-            EventDescriptor.ASSISTANT_DELTA, "session", delta="later"
-        )
+        later = await server.connections.publish_session(state.connection,
+            EventDescriptor.ASSISTANT_DELTA, "session", delta="later",
+            wait_for_write=True,
+        ).delivered()
 
         await _send_json(
             writer,
@@ -1381,8 +1391,8 @@ async def test_status_projects_foreign_turn_end_after_resident_append(
             {"provider": "codex"},
         )
         session_id = created["result"]["session"]["session_id"]
-        assert server.runtime.opened is not None
-        resident = server.runtime.opened.store
+        assert server.controllers.attached().runtime.opened is not None
+        resident = server.controllers.attached().runtime.opened.store
         foreign = await asyncio.to_thread(
             ConversationStore, resident.root_dir, session_id=session_id
         )

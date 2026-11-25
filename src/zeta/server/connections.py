@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -33,6 +33,7 @@ from .protocol import (
     _Frame,
 )
 from .read_catalog import ReadCatalog
+from .session_controllers import SessionController, SessionUse
 from .session_replay import (
     DeferredFrame,
     ReplayScopeId,
@@ -40,7 +41,6 @@ from .session_replay import (
     history_features,
 )
 from .session_replay.children import ChildRunProjection
-from .session_replay.in_flight import InFlightReply
 from .session_replay.output import ReplayOutput, _OutputFrame
 from .session_replay.rows import RowFacts
 
@@ -63,7 +63,8 @@ OBSERVER_REQUESTS = frozenset(
         "session_grants",
     }
 )
-MAX_CONNECTIONS = 10  # controller, eight observers, and one handshake
+MAX_CONNECTIONS = 32
+MAX_OBSERVERS = 8
 OUTPUT_MAX_BYTES = 4 * 1024 * 1024
 OUTPUT_MAX_FRAMES = 256
 OUTPUT_OVERFLOW_CLOSE_DEADLINE = 1.0
@@ -73,7 +74,14 @@ OUTPUT_OVERFLOW_CLOSE_DEADLINE = 1.0
 REFUSAL_LOG_INTERVAL_SECONDS = 30.0
 
 # one owner for feature gates and optional wire fields on every output path
-NO_FEATURE = frozenset()
+@dataclass(frozen=True, slots=True)
+class _EventRoute:
+    features: frozenset[str] = frozenset()
+    legacy_observers: bool = False
+    destination: Literal["session", "connection", "global"] = "session"
+
+
+NO_FEATURE = _EventRoute()
 EVENT_FEATURES = {
     EventDescriptor.AGENT_START: NO_FEATURE,
     EventDescriptor.TURN_START: NO_FEATURE,
@@ -96,9 +104,9 @@ EVENT_FEATURES = {
     EventDescriptor.PROJECT_INBOX_NOTIFICATION: NO_FEATURE,
     EventDescriptor.PROJECT_INBOX_HEALTH: NO_FEATURE,
     EventDescriptor.CHILD_QUESTION: NO_FEATURE,
-    EventDescriptor.CHILD_STARTED: frozenset({"child_run_events"}),
-    EventDescriptor.CHILD_PROGRESS: frozenset({"child_run_events"}),
-    EventDescriptor.CHILD_ENDED: frozenset({"child_run_events"}),
+    EventDescriptor.CHILD_STARTED: _EventRoute(frozenset({"child_run_events"})),
+    EventDescriptor.CHILD_PROGRESS: _EventRoute(frozenset({"child_run_events"})),
+    EventDescriptor.CHILD_ENDED: _EventRoute(frozenset({"child_run_events"})),
     EventDescriptor.CHILD_QUESTION_WITHDRAWN: NO_FEATURE,
     EventDescriptor.CHILD_MESSAGE_DELIVERED: NO_FEATURE,
     EventDescriptor.ACCOUNT_LIMIT: NO_FEATURE,
@@ -107,19 +115,19 @@ EVENT_FEATURES = {
     EventDescriptor.SERVED_TURN_END: NO_FEATURE,
     EventDescriptor.AGENT_END: NO_FEATURE,
     EventDescriptor.ERROR: NO_FEATURE,
-    EventDescriptor.DELIVERY_STATUS: frozenset({"session_history_fidelity"}),
-    EventDescriptor.MEMORY_UPDATED: frozenset({"memory_updated"}),
+    EventDescriptor.DELIVERY_STATUS: _EventRoute(frozenset({"session_history_fidelity"})),
+    EventDescriptor.MEMORY_UPDATED: _EventRoute(frozenset({"memory_updated"})),
     EventDescriptor.TURN_ABORTED: NO_FEATURE,
     EventDescriptor.USAGE: NO_FEATURE,
-    EventDescriptor.USER_MESSAGE: frozenset({"user_message_event"}),
-    EventDescriptor.SESSION_GRANTS_CHANGED: frozenset({"session_grants"}),
-    EventDescriptor.REPLAY_STREAM_ENDED: NO_FEATURE,
-    EventDescriptor.CONFIG_CHANGED: frozenset({"live_config_changed"}),
-    EventDescriptor.BACKGROUND_TASK_UPDATED: frozenset({"run_work"}),
-    EventDescriptor.SESSION_RETENTION: frozenset({"session_retention"}),
-    EventDescriptor.TODO_UPDATED: frozenset({"run_work"}),
-    EventDescriptor.ZETA_UPDATED: frozenset({"zeta_updated"}),
-    EventDescriptor.PARKED_SESSION_CHANGED: frozenset({"session_park"}),
+    EventDescriptor.USER_MESSAGE: _EventRoute(frozenset({"user_message_event"})),
+    EventDescriptor.SESSION_GRANTS_CHANGED: _EventRoute(frozenset({"session_grants"}), legacy_observers=True),
+    EventDescriptor.REPLAY_STREAM_ENDED: _EventRoute(destination="connection"),
+    EventDescriptor.CONFIG_CHANGED: _EventRoute(frozenset({"live_config_changed"})),
+    EventDescriptor.BACKGROUND_TASK_UPDATED: _EventRoute(frozenset({"run_work"})),
+    EventDescriptor.SESSION_RETENTION: _EventRoute(frozenset({"session_retention"}), legacy_observers=True),
+    EventDescriptor.TODO_UPDATED: _EventRoute(frozenset({"run_work"})),
+    EventDescriptor.ZETA_UPDATED: _EventRoute(frozenset({"zeta_updated"}), destination="global"),
+    EventDescriptor.PARKED_SESSION_CHANGED: _EventRoute(frozenset({"session_park"}), destination="connection"),
 }
 OPTIONAL_FIELD_FEATURES = {
     (EventDescriptor.USER_MESSAGE, "delivery_id"): frozenset(
@@ -144,12 +152,10 @@ class Admission:
     ]
     connection: Any | None = None
 
+    write: Awaitable[bool] | None = None
 
-@dataclass(frozen=True)
-class ControllerMetadata:
-    connection: Any
-    protocol_version: str
-    features: frozenset[str]
+    async def delivered(self) -> bool:
+        return await self.write if self.write is not None else self.kind == "admitted"
 
 
 @dataclass
@@ -182,6 +188,7 @@ class _Connection:
     protocol_version: str = "1.0"
     features: frozenset[str] = frozenset()
     output: _OutputState | None = None
+    paused: bool = False
     # set when the run loop sees the peer gone while a request still runs
     lost: bool = False
     # set when a controller hello starts waiting for this lost holder to release
@@ -196,12 +203,12 @@ class ConnectionRegistry(ReplayOutput):
     def __init__(
         self,
         loop: asyncio.AbstractEventLoop,
-        in_flight: Callable[[], InFlightReply],
+        publish_child_lifecycle: Callable[[EventDescriptor, ReplayScopeId, str, dict[str, object], int | None], None],
     ) -> None:
         self.loop = loop
         self._connections: dict[Any, _Connection] = {}
-        self._controller: _Connection | None = None
-        self._controller_output_paused = False
+        # Writers of unregistered clients, held until they finish so shutdown can join them.
+        self._retired_writers: set[asyncio.Task[None]] = set()
         # Rate-limit state for the contended-slot refusal log: the holder a
         # refusal was last logged against, that log's time, and how many later
         # refusals against the same holder were suppressed. The clock is an
@@ -213,14 +220,25 @@ class ConnectionRegistry(ReplayOutput):
         self._observers: list[_Connection] = []
         self._closed = False
         self.replay = SessionReplay()
-        # the attached control's unfinished reply, read by a join and the live skip
-        self.in_flight = in_flight
-        self.child_runs = ChildRunProjection(loop, self)
+        self.child_runs = ChildRunProjection(loop, publish_child_lifecycle)
         self._unregister_child_run_sink = register_child_run_sink(self.child_runs.sink)
         self._child_reader: tuple[tuple[str, str], ConversationStore] | None = None
         self._child_reader_lock = threading.Lock()
         self._reads = ThreadCallWorkers(loop, workers=2, name="zeta-read")
         self.state_reader = ReadCatalog(self.run_blocking)
+
+    @property
+    def frozen(self) -> bool:
+        return self._closed
+
+    @property
+    def legacy_controller_holder(self) -> _Connection | None:
+        return next((state for state in self._connections.values()
+                     if state.role == "controller" and "multi_controller" not in state.features), None)
+
+    def clients(self) -> tuple[Any, ...]:
+        """The physical clients currently owned by this registry."""
+        return tuple(state.connection for state in self._connections.values())
 
     def register(self, connection: Any) -> None:
         if self._closed:
@@ -244,6 +262,7 @@ class ConnectionRegistry(ReplayOutput):
         features: frozenset[str],
         *,
         max_role: str = "controller",
+        multi_mode: bool = False,
     ) -> str:
         if requested_role not in {"controller", "observer"}:
             raise ProtocolError(
@@ -263,6 +282,8 @@ class ConnectionRegistry(ReplayOutput):
                 "observer requires protocol 1.1 and serve_observers",
             )
         try:
+            if role == "observer" and not multi_mode and len(self._observers) >= MAX_OBSERVERS:
+                raise RuntimeError("observer limit reached")
             self._claim(connection, role, protocol_version, features)
         except RuntimeError as exc:
             if role == "observer":
@@ -277,6 +298,18 @@ class ConnectionRegistry(ReplayOutput):
         connection.role = role
         return role
 
+    def require_observer_room(self, session_id: str) -> None:
+        if sum(
+            record.runtime.opened is not None and record.runtime.session_id == session_id
+            for state in self._observers
+            if (record := self.replay.controller_for(state.connection)) is not None
+        ) >= MAX_OBSERVERS:
+            raise ProtocolError(ErrorDescriptor.CONNECTION_CAPACITY, "observer limit reached")
+
+    def log_controller_refusal(self, refused: Any) -> None:
+        """Record the physical diagnostic for a semantic controller refusal."""
+        self._log_controller_refusal(refused)
+
     def _log_controller_refusal(self, refused: Any) -> None:
         """Name the holder and the refused connection on a -32001 slot refusal.
 
@@ -285,7 +318,7 @@ class ConnectionRegistry(ReplayOutput):
         count. The holder's stuck request and await chain are added only when
         its connection is already closed while a request still runs.
         """
-        holder = self._controller
+        holder = self.legacy_controller_holder
         if holder is None:
             return
         client = holder.connection
@@ -312,15 +345,11 @@ class ConnectionRegistry(ReplayOutput):
         state = self._connections[connection]
         if state.role is not None:
             raise ValueError("connection already claimed")
-        if role == "controller":
-            if self._controller is not None:
-                raise RuntimeError("controller occupied")
-            self._controller = state
-        else:
-            if len(self._observers) >= 8:
-                raise RuntimeError("observer limit reached")
+        if role == "observer":
             self._observers.append(state)
         state.role = role
+        # Legacy hello buffers its own pre-commit events. Multi claims activate independently.
+        state.paused = role == "controller" and "multi_controller" in features
         assert state.output is not None
         state.output.overflow_frame = self._overflow_frame(role)
         state.protocol_version = protocol_version
@@ -328,7 +357,7 @@ class ConnectionRegistry(ReplayOutput):
 
     def is_controller(self, connection: Any) -> bool:
         state = self._connections.get(connection)
-        return state is not None and state is self._controller
+        return state is not None and state.role == "controller"
 
     def output_state(self, connection: Any) -> _OutputState | None:
         state = self._connections.get(connection)
@@ -349,7 +378,7 @@ class ConnectionRegistry(ReplayOutput):
     async def wait_for_lost_controller(self, deadline: float) -> None:
         """If the controller slot is held by a lost holder, signal contention
         and wait up to ``deadline`` seconds for the slot to be released."""
-        state = self._controller
+        state = self.legacy_controller_holder
         if state is None or not state.lost:
             return
         state.contended.set()
@@ -357,18 +386,11 @@ class ConnectionRegistry(ReplayOutput):
             await asyncio.wait_for(state.released.wait(), deadline)
 
     def activate_controller(self, connection: Any) -> None:
-        if self.is_controller(connection):
-            self._controller_output_paused = False
+        state = self._connections.get(connection)
+        if state is not None and state.role == "controller":
+            state.paused = False
 
-    def controller_metadata(self) -> ControllerMetadata | None:
-        state = self._controller
-        if state is None:
-            return None
-        return ControllerMetadata(
-            state.connection, state.protocol_version, state.features
-        )
-
-    def _controller_preflight(
+    def _event_preflight(
         self,
         state: _Connection | None,
         event: EventDescriptor,
@@ -380,7 +402,7 @@ class ConnectionRegistry(ReplayOutput):
     ) -> tuple[Admission, _Frame | None, _OutputState | None]:
         if state is None:
             return Admission("no_controller"), None, None
-        if state is self._controller and self._controller_output_paused:
+        if state.paused or state.role is None:
             return Admission("not_writable"), None, None
         if self._feature_rejected(state, event, required_feature, fields):
             return Admission("feature_rejected"), None, None
@@ -407,7 +429,7 @@ class ConnectionRegistry(ReplayOutput):
         if event not in EVENT_FEATURES:
             # fail closed: an event the table does not name is never admitted.
             return True
-        required = EVENT_FEATURES[event]
+        required = EVENT_FEATURES[event].features
         if required_feature is not None:
             required |= frozenset({required_feature})
         if not required <= history_features(state.features):
@@ -433,165 +455,134 @@ class ConnectionRegistry(ReplayOutput):
                 state.features
             ):
                 shaped.pop(name)
+        return ConnectionRegistry._shape_event_fields(event, shaped, state.features)
+
+    @staticmethod
+    def _shape_event_fields(
+        event: EventDescriptor, fields: dict[str, object], features: frozenset[str],
+    ) -> dict[str, object]:
+        if event is EventDescriptor.TOOL_START and "tool_approval_origin" not in features:
+            tool_call = fields.get("tool_call")
+            if isinstance(tool_call, dict) and "approval_origin" in tool_call:
+                fields["tool_call"] = {key: value for key, value in tool_call.items() if key != "approval_origin"}
         if event is EventDescriptor.APPROVAL_END:
-            shaped = event_contract.approval_end_for_features(
-                shaped,
-                include_restart_reason="approval_restart_reason" in state.features,
+            return event_contract.approval_end_for_features(
+                fields, include_restart_reason="approval_restart_reason" in features,
             )
-        return shaped
+        return fields
 
-    def try_admit_controller(
+    def publish_session(
         self,
-        event: EventDescriptor,
-        session_id: str | None,
-        *,
-        required_feature: str | None = None,
-        replay_row: RowFacts | None = None,
-        **fields: object,
-    ) -> Admission:
-        """Admit one controller event without waiting for physical output."""
-        covers = self._replay_covers(
-            event, session_id, fields, replay_row, required_feature
-        )
-        if not isinstance(covers, DeferredFrame):
-            self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers, replay_row
-            )
-        outcome, frame, output = self._controller_preflight(
-            self._controller,
-            event,
-            session_id,
-            required_feature=required_feature,
-            fields=fields,
-        )
-        if outcome.kind != "admitted" or frame is None or output is None:
-            return outcome
-        assert self._controller is not None
-        if self._replay_holds_copy(self._controller, covers):
-            return outcome
-        if not isinstance(covers, DeferredFrame) and self._publish_replay(
-            self._controller,
-            event,
-            session_id,
-            self._fields_for_connection(self._controller, event, fields),
-            covers,
-            replay_row=replay_row,
-        ):
-            return outcome
-        if not self._admit(self._controller, frame):
-            return Admission("capacity_rejected")
-        self._enqueue(
-            output,
-            _OutputFrame(frame),
-            wake=self._phase_allows_writes(output),
-        )
-        return outcome
-
-    def _replay_holds_copy(self, state: _Connection, covers: object) -> bool:
-        """True when a deferred record will send the controller's copy on its stream.
-
-        A controller with no stream or join in the scope gets the frame plainly now.
-        """
-        return isinstance(covers, DeferredFrame) and self.replay.scope_for(
-            state.connection
-        ) == ReplayScopeId.top(covers.session_id)
-
-    async def publish_controller(
-        self,
+        owner: Any | None,
         event: EventDescriptor,
         session_id: str | None,
         *,
         required_feature: str | None = None,
         replay_row: RowFacts | None = None,
         feature_fields: event_contract.FeatureFields | None = None,
+        replay_scope: ReplayScopeId | None = None,
+        covers: int | None = None,
+        legacy_observers: bool = False,
+        wait_for_write: bool = False,
+        finalizer: bool = False,
         **fields: object,
-    ) -> bool:
-        covers = self._replay_covers(
-            event, session_id, fields, replay_row, required_feature
-        )
-        if not isinstance(covers, DeferredFrame):
-            self._publish_observer_replay(
-                event, session_id, required_feature, fields, covers, replay_row,
-                feature_fields=feature_fields,
+    ) -> Admission:
+        """Admit once per target. Only the owner may receive a plain frame."""
+        if self._closed and not finalizer:
+            return Admission("not_writable")
+        route = EVENT_FEATURES.get(event)
+        if route is None or route.destination != "session":
+            return Admission("feature_rejected")
+        coverage = (self._replay_covers(event, session_id, fields, replay_row, required_feature)
+                    if replay_scope is None else covers)
+        state = self._connections.get(owner)
+        if not isinstance(coverage, DeferredFrame):
+            self._publish_replay_subscribers(
+                event, session_id, required_feature, fields, coverage, replay_row,
+                exclude=owner, scope=replay_scope, feature_fields=feature_fields,
+                legacy_observers=legacy_observers and route.legacy_observers,
             )
-        outcome, frame, output = self._controller_preflight(
-            self._controller,
-            event,
-            session_id,
-            required_feature=required_feature,
-            fields=fields,
-            feature_fields=feature_fields,
+        outcome, frame, output = self._event_preflight(
+            state, event, session_id, required_feature=required_feature,
+            fields=fields, feature_fields=feature_fields,
         )
-        if outcome.kind != "admitted" or frame is None or output is None:
-            return False
-        state = self._controller
-        assert state is not None
-        if self._replay_holds_copy(state, covers):
-            return True
-        if not isinstance(covers, DeferredFrame) and self._publish_replay(
-            state,
-            event,
-            session_id,
+        if state is None or frame is None or output is None:
+            return outcome
+        if isinstance(coverage, DeferredFrame):
+            if self.replay.scope_for(owner) == ReplayScopeId.top(coverage.session_id):
+                return outcome
+        elif self._publish_replay(
+            state, event, session_id,
             self._fields_for_connection(state, event, fields, feature_fields=feature_fields),
-            covers,
-            replay_row=replay_row,
+            coverage, scope=replay_scope, replay_row=replay_row,
         ):
-            return True
+            return outcome
+        return self._publish_local(state, output, frame, wait_for_write=wait_for_write)
+
+    def _publish_local(
+        self, state: _Connection, output: _OutputState, frame: _Frame, *, wait_for_write: bool
+    ) -> Admission:
+        if wait_for_write and output.phase == "ready":
+            return Admission("admitted", state.connection, self._write_event(state, output, frame))
         if not self._admit(state, frame):
+            return Admission("capacity_rejected")
+        self._enqueue(output, _OutputFrame(frame), wake=self._phase_allows_writes(output))
+        return Admission("admitted", state.connection)
+
+    async def _write_event(self, state: _Connection, output: _OutputState, frame: _Frame) -> bool:
+        if output.phase != "ready" or state.paused or not self._admit(state, frame):
             return False
-        if output.phase in {"claimed_buffering", "flushing"}:
-            self._enqueue(
-                output,
-                _OutputFrame(frame),
-                wake=self._phase_allows_writes(output),
-            )
-            return True
         return await self._send_frame(output, frame)
 
-    async def publish_feature_event(
-        self,
-        feature: str,
-        event: EventDescriptor,
-        session_id: str,
-        *,
-        data: dict[str, object],
-    ) -> None:
-        """Queue one live event for every connection that negotiated a feature."""
-        states = tuple(
-            state
-            for state in (self._controller, *self._observers)
-            if state is not None
-            and feature in state.features
-            and (state is not self._controller or not self._controller_output_paused)
+    def publish_connection(
+        self, connection: Any, event: EventDescriptor, session_id: str | None,
+        *, wait_for_write: bool = False, **fields: object,
+    ) -> Admission:
+        if self._closed:
+            return Admission("not_writable")
+        state = self._connections.get(connection)
+        outcome, frame, output = self._event_preflight(
+            state, event, session_id, required_feature=None, fields=fields,
         )
-        covers = self._replay_covers(event, session_id, {"data": data}, None)
-        # feature events have no publish-first route
-        assert not isinstance(covers, DeferredFrame)
-        for state in states:
-            frame = state.connection.codec.notification(event, session_id, data=data)
-            if frame is None:
-                continue
-            if self._publish_replay(state, event, session_id, {"data": data}, covers):
-                continue
-            if state is self._controller:
-                await self.send(state.connection, frame)
-            else:
-                self._publish_observer(state, frame)
+        if state is None or frame is None or output is None:
+            return outcome
+        return self._publish_local(state, output, frame, wait_for_write=wait_for_write)
+
+    async def publish_global(
+        self, event: EventDescriptor, *, required_feature: str, data: dict[str, object]
+    ) -> None:
+        for state in tuple(self._connections.values()):
+            if required_feature in state.features:
+                await self.publish_connection(
+                    state.connection, event, None, wait_for_write=state.role == "controller", data=data,
+                ).delivered()
 
     def release(self, connection: Any) -> None:
+        """Release physical role/output state, retaining the client until close."""
         self.invalidate_replay_connection(connection)
-        state = self._connections.pop(connection, None)
-        if state is None:
+        state = self._connections.get(connection)
+        if state is None or state.role is None:
             return
         state.released.set()
-        if state is self._controller:
-            self._controller = None
-            self._controller_output_paused = True
+        state.paused = True
         if state in self._observers:
             self._observers.remove(state)
         output = state.output
         if output is not None:
             self._release_output(output, state.role)
+        state.role = None
+
+    def unregister(self, connection: Any) -> None:
+        """Remove a physically closed client and settle its output writer."""
+        state = self._connections.pop(connection, None)
+        output = None if state is None else state.output
+        if output is None:
+            return
+        self._settle_output(output)
+        writer = output.writer_task
+        if writer is not None and not writer.done():
+            self._retired_writers.add(writer)
+            writer.add_done_callback(self._retired_writers.discard)
 
     async def send(self, connection: Any, frame: _Frame) -> bool:
         state = self._connections.get(connection)
@@ -781,7 +772,7 @@ class ConnectionRegistry(ReplayOutput):
     async def _complete_output_phase(
         self, state: _Connection, output: _OutputState
     ) -> bool:
-        if output.released:
+        if output.released or output.phase == "closed":
             return True
         if output.phase == "flushing":
             output.phase = "ready"
@@ -794,7 +785,7 @@ class ConnectionRegistry(ReplayOutput):
         if output.phase != "overflowing":
             return False
         self._cancel_overflow_deadline(output)
-        await state.connection.close()
+        await self._close_overflow_connection(state)
         self._finish_future(output.ready, False)
         return True
 
@@ -809,17 +800,6 @@ class ConnectionRegistry(ReplayOutput):
         self._finish_future(output.ready, result, error=error)
         output.ready = self.loop.create_future()
         output.phase = "claimed_buffering"
-
-    def _publish_observer(self, state: _Connection, frame: _Frame) -> None:
-        output = state.output
-        if (
-            state.connection not in self._connections
-            or output is None
-            or output.phase != "ready"
-            or not self._admit(state, frame)
-        ):
-            return
-        self._enqueue(output, _OutputFrame(frame))
 
     def _fits(self, output: _OutputState, size: int, frames: int = 1) -> bool:
         control = output.overflow_frame
@@ -876,8 +856,16 @@ class ConnectionRegistry(ReplayOutput):
         if writer is not None:
             writer.cancel()
             await asyncio.gather(writer, return_exceptions=True)
-        await state.connection.close()
+        await self._close_overflow_connection(state)
         self._finish_future(output.ready, False)
+
+    async def _close_overflow_connection(self, state: _Connection) -> None:
+        if state.role == "controller" and "multi_controller" in state.features:
+            # The connection runner settles its active request before releasing
+            # a semantic slot, even when overflow originates in this writer.
+            state.connection.stop_transport()
+        else:
+            await state.connection.close()
 
     @staticmethod
     def _overflow_frame(role: str) -> _Frame:
@@ -987,11 +975,12 @@ class ConnectionRegistry(ReplayOutput):
         writer_task.cancel()
 
     def _settle_output(self, output: _OutputState) -> None:
-        while output.queue:
-            item = output.queue.popleft()
-            self._finish_frame_accounting(output, item)
-            self._finish_future(item.future, False)
-        if output.writer_task is not None:
+        # A physical write can consume cancellation while reporting its outcome.
+        # Close admission before joining the writer, and don't let it wait again.
+        output.phase = "closed"
+        self._clear_output(output, result=False)
+        # an overflow close runs inside the writer; it returns on the closed phase
+        if output.writer_task is not None and output.writer_task is not asyncio.current_task():
             output.writer_task.cancel()
         self._cancel_overflow_deadline(output)
         self._finish_future(output.ready, False)
@@ -1016,60 +1005,77 @@ class ConnectionRegistry(ReplayOutput):
 
     async def run_blocking(self, callable: Callable[[], Any]) -> Any:
         """Run one store or observer read away from the event loop."""
+        if self._closed:
+            raise RuntimeError("reads are closed")
         return await self._reads.run(callable)
 
     async def run_read(
         self,
         connection: Any,
         callable: Callable[[], Any],
+        use: SessionUse | None = None,
         *,
-        session_id: str | None = None,
+        fence: bool = True,
     ) -> Any:
-        if connection not in self._connections:
+        """Run one read off-loop. ``use`` passes to the worker's completion, so
+        its record cannot close under a read whose waiter was cancelled; with
+        ``fence``, fail if that record no longer holds the session it held
+        before the read. A replay view also has to remain selected."""
+        if self._closed or connection not in self._connections:
             raise RuntimeError("connection is not connected")
-        result = await self.run_blocking(callable)
-        if (
-            session_id is not None
-            and connection.server.runtime.session_id != session_id
-        ):
-            raise ProtocolError(
-                ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active"
-            )
+        if use is None:
+            return await self.run_blocking(callable)
+        runtime = use.runtime
+        session_id = None if runtime.opened is None else runtime.session_id
+        handle = self._reads.submit(callable)
+        use.transfer_to(handle.completed)
+        result = await handle.result
+        if fence or use.is_view:
+            connection.server.controllers.require_current(connection, use, session_id)
         return result
 
-    async def read_tree(self, connection: Any, params: dict[str, Any]) -> object:
-        runtime = connection.server.runtime
-        store = validation.active(runtime, params)
+    async def read_tree(
+        self, connection: Any, params: dict[str, Any], controller: SessionUse | None = None
+    ) -> object:
+        """``controller`` is the request's owned use after a mutation; else select."""
+        if controller is None:
+            with connection.server.controllers.selected(
+                connection, validation.required_string(params, "session_id")
+            ) as selected:
+                return await self.read_tree(connection, params, selected)
+        store = validation.active(controller.runtime, params)
         return await self.run_read(
-            connection,
-            lambda: session.tree(_observer_runtime(store)),
-            session_id=runtime.session_id,
+            connection, lambda: session.tree(_observer_runtime(store)), controller
         )
 
     async def read_history(self, connection: Any, params: dict[str, Any]) -> object:
-        runtime = connection.server.runtime
-        store = validation.active(runtime, params)
-        features = history_features(self._connections[connection].features)
-        result = await self.run_read(
-            connection,
-            lambda: history.history(
-                _observer_runtime(store),
-                params,
-                include_delivery_id={"delivery_id", "user_message_event", "user_message_delivery_id"} <= features,
-                backward_enabled="session_history_backward" in features,
-                fidelity="session_history_fidelity" in features,
-                content_read="content_read" in features,
-                served_turn_end="served_turn_end" in features,
-                approval_origin="tool_approval_origin" in features,
-            ),
-            session_id=runtime.session_id,
-        )
+        with connection.server.controllers.selected(
+            connection, validation.required_string(params, "session_id")
+        ) as selected:
+            store = validation.active(selected.runtime, params)
+            features = history_features(self._connections[connection].features)
+            result = await self.run_read(
+                connection,
+                lambda: history.history(
+                    _observer_runtime(store),
+                    params,
+                    include_delivery_id={"delivery_id", "user_message_event", "user_message_delivery_id"} <= features,
+                    backward_enabled="session_history_backward" in features,
+                    fidelity="session_history_fidelity" in features,
+                    content_read="content_read" in features,
+                    served_turn_end="served_turn_end" in features,
+                    approval_origin="tool_approval_origin" in features,
+                ),
+                selected,
+            )
         return self._strip_restart_reason(connection, result)
 
-    async def read_content(self, connection: Any, params: dict[str, Any]) -> object:
+    async def read_content(
+        self, connection: Any, params: dict[str, Any], controller: SessionUse
+    ) -> object:
         if set(params) - {"handle", "offset", "limit"}:
             raise ProtocolError(ErrorDescriptor.INVALID_CONTENT_READ, "invalid content read")
-        runtime = connection.server.runtime
+        runtime = controller.runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         return await self.run_read(
@@ -1080,19 +1086,22 @@ class ConnectionRegistry(ReplayOutput):
                 offset=params.get("offset", 0),
                 limit=params.get("limit", content.MAX_CONTENT_READ),
             ),
-            session_id=runtime.session_id,
+            controller,
         )
 
-    async def read_catalog(self, connection: Any) -> object:
-        return await self.run_read(connection, lambda: settings.catalog(connection.server.runtime))
+    async def read_catalog(self, connection: Any, controller: SessionUse) -> object:
+        runtime = controller.runtime
+        return await self.run_read(
+            connection, lambda: settings.catalog(runtime), controller, fence=False
+        )
 
-    async def read_settings(self, connection: Any, params: dict[str, Any]) -> object:
-        runtime = connection.server.runtime
+    async def read_settings(self, connection: Any, controller: SessionUse) -> object:
+        runtime = controller.runtime
         if runtime.opened is None:
             raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "server has no active session")
         telemetry = settings.telemetry(connection)
         return await self.run_read(
-            connection, lambda: settings.settings(runtime, telemetry=telemetry)
+            connection, lambda: settings.settings(runtime, telemetry=telemetry), controller, fence=False
         )
 
     async def read_child_run_history(
@@ -1107,27 +1116,30 @@ class ConnectionRegistry(ReplayOutput):
                 ErrorDescriptor.INVALID_PARAMS,
                 "session_id and run_id are required child history parameters",
             )
-        runtime = connection.server.runtime
-        if runtime.opened is None or params["session_id"] != runtime.session_id:
-            raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
-        features = self._connections[connection].features
-        target = (runtime.session_id, runtime.opened.store)
-        result = await self.run_read(
-            connection,
-            lambda: perform_child_history_read(
-                target,
-                params,
-                registry=self,
-                fidelity="session_history_fidelity" in features,
-                approval_origin="tool_approval_origin" in features,
-            ),
-            session_id=runtime.session_id,
-        )
+        with connection.server.controllers.selected(connection, params["session_id"]) as selected:
+            runtime = selected.runtime
+            if runtime.opened is None or params["session_id"] != runtime.session_id:
+                raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
+            features = self._connections[connection].features
+            target = (runtime.session_id, runtime.opened.store)
+            result = await self.run_read(
+                connection,
+                lambda: perform_child_history_read(
+                    target,
+                    params,
+                    registry=self,
+                    fidelity="session_history_fidelity" in features,
+                    approval_origin="tool_approval_origin" in features,
+                ),
+                selected,
+            )
         return self._strip_restart_reason(connection, result)
 
-    async def read_child_run_events(self, connection: Any, params: dict[str, Any]):
+    async def read_child_run_events(
+        self, connection: Any, params: dict[str, Any], controller: SessionUse
+    ):
         # params are validated by the child_run_events handler before begin_replay_join
-        runtime = connection.server.runtime
+        runtime = controller.runtime
         if runtime.opened is None or params["session_id"] != runtime.session_id:
             raise ProtocolError(ErrorDescriptor.NO_ACTIVE_SESSION, "session is not active")
         features = self._connections[connection].features
@@ -1154,7 +1166,7 @@ class ConnectionRegistry(ReplayOutput):
             if row is None:
                 raise ProtocolError(ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found")
             return result, row
-        result = await self.run_read(connection, read, session_id=runtime.session_id)
+        result = await self.run_read(connection, read, controller)
         return result[0], 0, result[1]
 
     def _child_reader_for(
@@ -1215,31 +1227,83 @@ class ConnectionRegistry(ReplayOutput):
 
     # merge-resolution: src/zeta/server/connections.py pr-lines ConnectionRegistry.read_status@9bb4d2bb8ef9 -> keep the shared status method after adding child history reads
     async def read_status(
-        self, connection: Any, status: dict[str, Any], session_id: str | None
+        self, connection: Any, status: dict[str, Any], controller: SessionUse
     ) -> object:
         features = self._connections[connection].features
         return await self.run_read(
             connection,
             lambda: project_status(status, served_turn_end="served_turn_end" in features),
-            session_id=session_id,
+            controller,
         )
 
-    async def aclose(self) -> None:
+    def stop_admission(self) -> None:
+        """Freeze new peers, requests and ordinary publications, not finalizers."""
         self._closed = True
+
+    async def stop_producers(self) -> None:
         self._unregister_child_run_sink()
-        states = tuple(self._connections.values())
-        await asyncio.to_thread(self.close_child_reader)
-        self.state_reader.close()
-        self._reads.close()
-        for state in states:
-            if state.output is not None:
+
+    async def stop_reads(self) -> None:
+        """Abandon read results; transferred uses still track worker completion."""
+        try:
+            self.state_reader.close()
+        finally:
+            self._reads.close()
+
+    async def drain_record_events(self, record: SessionController) -> None:
+        """Settle replay output while its record is still readable."""
+        async def drain(client: Any) -> None:
+            try:
+                await self.flush(client)
+            finally:
+                self.invalidate_replay_connection(client)
+
+        clients = tuple(client for client in self.clients() if self.replay.controller_for(client) is record)
+        results = await asyncio.gather(*(drain(client) for client in clients), return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    async def stop_workers(self, clients: tuple[Any, ...]) -> None:
+        """Drain the frozen peers without owning their physical lifetime."""
+        first: BaseException | None = None
+
+        async def attempt(operation: Awaitable[object]) -> None:
+            nonlocal first
+            try:
+                await operation
+            except BaseException as exc:  # noqa: BLE001
+                if first is None:
+                    first = exc
+
+        async def settle_output(client: Any) -> None:
+            if (state := self._connections.get(client)) is not None and state.output is not None:
                 self._settle_output(state.output)
-        await asyncio.gather(
-            *(state.connection.close() for state in states), return_exceptions=True
-        )
-        self._connections.clear()
-        self._observers.clear()
-        self._controller = None
+
+        await attempt(asyncio.to_thread(self.close_child_reader))
+        writers = (*self._retired_writers, *(
+            output.writer_task for client in clients
+            if (output := self.output_state(client)) is not None and output.writer_task is not None
+        ))
+        for client in clients:
+            await attempt(settle_output(client))
+        await asyncio.gather(*writers, return_exceptions=True)
+        for writer in writers:
+            if not writer.cancelled():
+                await attempt(writer)
+        self.clear_replay_scopes()
+        if first is not None:
+            raise first
+
+    async def aclose(self) -> None:
+        self.stop_admission()
+        try:
+            await self.stop_producers()
+        finally:
+            try:
+                await self.stop_reads()
+            finally:
+                await self.stop_workers(self.clients())
 
 
 def perform_child_history_read(

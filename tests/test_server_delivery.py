@@ -45,6 +45,7 @@ from zeta.server.delivery import (
     ResolvedModelInput,
     _deliver_after_commit,
 )
+from zeta.server.session_controllers import SessionControllers
 
 pytest_plugins = ("tests.support.socket_fixtures",)
 
@@ -109,6 +110,21 @@ class SteerTurnEndBackend:
             message=Message(MessageRole.ASSISTANT, [TextContent("done")]),
         )
 
+
+
+async def _deliver(
+    requests: DeliveryRequests, method: str, params: dict[str, Any], features: frozenset[str]
+) -> dict[str, object]:
+    """A delivery as the serve request runs it: through a session use. Return or
+    raise only once the delivery's completion released that use, so its effects
+    are final even when the request was cancelled first."""
+    use = SessionControllers(requests._control).owned(None)  # type: ignore[arg-type]
+    try:
+        return await getattr(requests, method)(use, params, features)
+    finally:
+        async with asyncio.timeout(10):
+            while use.record.uses:
+                await asyncio.sleep(0)
 
 @pytest.mark.asyncio
 async def test_max_turns_emits_terminal_error(tmp_path: Path) -> None:
@@ -198,7 +214,7 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
     requests = DeliveryRequests(control)
     features = frozenset({"delivery_id"})
     request_task = asyncio.create_task(
-        getattr(requests, method)({"text": "hello", "delivery_id": "cancel-1"}, features)
+        _deliver(requests, method, {"text": "hello", "delivery_id": "cancel-1"}, features)
     )
     await await_or_fail(append_started.wait(), what="append start")
     release_append.set()
@@ -208,9 +224,7 @@ async def test_delivery_id_cancel_after_append_finishes_effects(
     assert store.client_delivery("cancel-1") is not None
     # canceled at commit: no echo, the work still runs once
     assert effects == (["start"] if method == "send" else ["steer"])
-    duplicate = await getattr(
-        requests, method
-    )({"text": "hello", "delivery_id": "cancel-1"}, features)
+    duplicate = await _deliver(requests, method, {"text": "hello", "delivery_id": "cancel-1"}, features)
     assert duplicate["duplicate"] is True
     assert effects == (["start"] if method == "send" else ["steer"])
     if method == "steer":
@@ -260,7 +274,7 @@ async def test_delivery_id_cancel_before_append_commits_does_nothing(
     control.start_turn = lambda *args, **kwargs: effects.append("start")
     requests = DeliveryRequests(control)
     task = asyncio.create_task(
-        getattr(requests, method)({"text": "hello", "delivery_id": "cancel-2"}, frozenset({"delivery_id"}))
+        _deliver(requests, method, {"text": "hello", "delivery_id": "cancel-2"}, frozenset({"delivery_id"}))
     )
     await await_or_fail(append_started.wait(), what="append start")
     task.cancel()
@@ -296,17 +310,17 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
             },
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        original_append = server.runtime.opened.store.append_client_delivery_async
+        original_append = server.controllers.attached().runtime.opened.store.append_client_delivery_async
 
         async def fail_append(*args, **kwargs):
             raise OSError("injected durable-write failure")
 
-        server.runtime.opened.store.append_client_delivery_async = fail_append
+        server.controllers.attached().runtime.opened.store.append_client_delivery_async = fail_append
         failed_send = await _request(
             reader, writer, 3, "send", {"text": "ghost", "delivery_id": "ghost-1"}
         )
         assert failed_send[-1]["error"]["code"] == -32000
-        assert server.runtime.opened.store.client_delivery("ghost-1") is None
+        assert server.controllers.attached().runtime.opened.store.client_delivery("ghost-1") is None
 
         await _request(reader, writer, 4, "send", {"text": "active"})
         await asyncio.wait_for(backend.started.wait(), TIMEOUT)
@@ -318,11 +332,11 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
             {"text": "ghost steer", "delivery_id": "ghost-steer"},
         )
         assert failed_steer[-1]["error"]["code"] == -32000
-        assert server.runtime.opened.store.client_delivery("ghost-steer") is None
+        assert server.controllers.attached().runtime.opened.store.client_delivery("ghost-steer") is None
         backend.release.set()
         await _event(reader, "agent_end")
 
-        server.runtime.opened.store.append_client_delivery_async = original_append
+        server.controllers.attached().runtime.opened.store.append_client_delivery_async = original_append
         await _request(
             reader, writer, 6, "send", {"text": "real", "delivery_id": "real-1"}
         )
@@ -336,14 +350,14 @@ async def test_delivery_id_echo_waits_for_durable_append(tmp_path: Path) -> None
         assert echoes == [
             {
                 "event": "user_message",
-                "session_id": server.runtime.session_id,
+                "session_id": server.controllers.attached().runtime.session_id,
                 "text": "real",
                 "mode": "send",
                 "attachments": [],
                 "delivery_id": "real-1",
             }
         ]
-        assert server.runtime.opened.store.client_delivery("real-1") is not None
+        assert server.controllers.attached().runtime.opened.store.client_delivery("real-1") is not None
         backend.release.set()
     finally:
         await close_serve(server, writer)
@@ -389,7 +403,7 @@ async def test_duplicate_send_starts_one_turn(tmp_path: Path) -> None:
             "duplicate": True,
         }
         assert backend.calls == 1
-        assert len(branch_messages(server.runtime.opened.store)) == 1
+        assert len(branch_messages(server.controllers.attached().runtime.opened.store)) == 1
         backend.release.set()
         await _event(reader, "agent_end")
     finally:
@@ -449,7 +463,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
         assert accepted[-1]["result"] == {"accepted": True}
         assert duplicate[-1]["result"] == {"accepted": True, "duplicate": True}
         assert queued[-1]["result"]["status"] == "queued"
-        assert server.runtime.loop.has_pending_steering
+        assert server.controllers.attached().runtime.loop.has_pending_steering
 
         await _request(reader, writer, 7, "deny", {"request_id": "read-1"})
         await _event(reader, "agent_end")
@@ -463,7 +477,7 @@ async def test_duplicate_steer_is_queued_once_and_status_becomes_delivered(
         assert delivered[-1]["result"]["status"] == "delivered"
         texts = [
             block.text
-            for message in branch_messages(server.runtime.opened.store)
+            for message in branch_messages(server.controllers.attached().runtime.opened.store)
             if message.role is MessageRole.USER
             for block in message.content
             if isinstance(block, TextContent)
@@ -499,12 +513,12 @@ async def test_steer_committed_at_turn_finalization_starts_next_turn(
         await _request(reader, writer, 3, "send", {"text": "first"})
         await await_or_fail(backend.first_started.wait(), what="first provider request")
 
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         committed = asyncio.Event()
         finalize_started = asyncio.Event()
         finalize_finished = asyncio.Event()
         original_append = store.append_client_delivery_async
-        original_finalize = server.control.deliveries.finalize_turn
+        original_finalize = server.controllers.attached().control.deliveries.finalize_turn
 
         async def pause_after_commit(*args: Any, **kwargs: Any) -> None:
             await original_append(*args, **kwargs)
@@ -520,7 +534,7 @@ async def test_steer_committed_at_turn_finalization_starts_next_turn(
                 finalize_finished.set()
 
         store.append_client_delivery_async = pause_after_commit
-        server.control.deliveries.finalize_turn = track_finalize
+        server.controllers.attached().control.deliveries.finalize_turn = track_finalize
         steer = asyncio.create_task(
             _request(
                 reader,
@@ -565,7 +579,7 @@ async def test_steer_committed_at_turn_finalization_starts_next_turn(
         )
         assert status[-1]["result"]["status"] == "delivered"
         assert len(backend.calls) == 2
-        assert not server.runtime.loop.has_pending_steering
+        assert not server.controllers.attached().runtime.loop.has_pending_steering
     finally:
         resume_publish.set()
         backend.release_first.set()
@@ -865,7 +879,7 @@ async def test_evicted_delivery_status_and_send_reuse_are_distinct(
             {"protocol_version": "1.1", "features": ["delivery_id"]},
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
-        _evict_delivery(server.runtime.opened.store, "old-send")
+        _evict_delivery(server.controllers.attached().runtime.opened.store, "old-send")
 
         status = await _request(
             reader, writer, 3, "delivery_status", {"delivery_id": "old-send"}
@@ -916,7 +930,7 @@ async def test_evicted_dropped_steer_status_and_reuse_are_distinct(
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         _evict_delivery(
-            server.runtime.opened.store,
+            server.controllers.attached().runtime.opened.store,
             "old-steer",
             method="steer",
             status="dropped",
@@ -943,7 +957,7 @@ async def test_evicted_dropped_steer_status_and_reuse_are_distinct(
             "message": "delivery id already used",
             "data": {"outcome": "dropped"},
         }
-        assert not server.runtime.loop.has_pending_steering
+        assert not server.controllers.attached().runtime.loop.has_pending_steering
     finally:
         await close_serve(server, writer)
 
@@ -962,7 +976,7 @@ async def test_restart_rebuilds_evicted_delivery_outcome(tmp_path: Path) -> None
     try:
         created = await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         session_id = created[-1]["result"]["session"]["session_id"]
-        _evict_delivery(first.runtime.opened.store, "restart-old")
+        _evict_delivery(first.controllers.attached().runtime.opened.store, "restart-old")
     finally:
         await close_serve(first, writer)
 
@@ -1047,7 +1061,7 @@ async def test_session_abort_marks_accepted_steering_dropped(tmp_path: Path) -> 
             reader, writer, 6, "delivery_status", {"delivery_id": "drop-me"}
         )
         assert status[-1]["result"]["status"] == "dropped"
-        assert server.runtime.opened.store.client_delivery("drop-me").reason == "abort"
+        assert server.controllers.attached().runtime.opened.store.client_delivery("drop-me").reason == "abort"
     finally:
         await close_serve(server, writer)
 
@@ -1072,7 +1086,7 @@ async def test_clear_steering_marks_delivery_dropped_and_duplicate_rejected(
             "duplicate": True,
             "status": "dropped",
         }
-        assert server.runtime.opened.store.client_delivery("drop-me").reason == "clear"
+        assert server.controllers.attached().runtime.opened.store.client_delivery("drop-me").reason == "clear"
         backend.release.set()
         await _event(reader, "agent_end")
     finally:
@@ -1085,10 +1099,10 @@ async def test_disconnect_marks_accepted_steering_dropped(tmp_path: Path) -> Non
     writer.close()
     await writer.wait_closed()
     for _ in range(100):
-        if not server._client_active:
+        if not (server.connections is not None and next(iter(server.connections.clients()), None) is not None):
             break
         await asyncio.sleep(0.01)
-    assert not server._client_active
+    assert not (server.connections is not None and next(iter(server.connections.clients()), None) is not None)
 
     reader, writer = await asyncio.open_unix_connection(str(server.socket_path))
     try:
@@ -1103,7 +1117,7 @@ async def test_disconnect_marks_accepted_steering_dropped(tmp_path: Path) -> Non
             reader, writer, 8, "delivery_status", {"delivery_id": "drop-me"}
         )
         assert status[-1]["result"]["status"] == "dropped"
-        assert server.runtime.opened.store.client_delivery("drop-me").reason == "disconnect"
+        assert server.controllers.attached().runtime.opened.store.client_delivery("drop-me").reason == "disconnect"
     finally:
         await close_serve(server, writer)
 
@@ -1167,7 +1181,7 @@ async def test_restart_marks_orphaned_steering_dropped(tmp_path: Path) -> None:
             {"delivery_id": "restart-steer"},
         )
         assert status[-1]["result"]["status"] == "dropped"
-        delivery = resumed.runtime.opened.store.client_delivery("restart-steer")
+        delivery = resumed.controllers.attached().runtime.opened.store.client_delivery("restart-steer")
         assert delivery.reason == "restart"
         history = await _request(
             reader,
@@ -1278,7 +1292,7 @@ async def test_all_history_fidelity_rows_open_and_replay_with_origin_main_reader
             reader, writer, 2, "new_session", {"provider": "codex"}
         )
         session_id = created[-1]["result"]["session"]["session_id"]
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         store.append_message(
             Message(
                 MessageRole.ASSISTANT,
@@ -1469,10 +1483,10 @@ async def test_failed_turn_drops_queued_steering_before_next_turn(tmp_path: Path
         )
         backend.release.set()
         await _event(reader, "agent_end")
-        delivery = server.runtime.opened.store.client_delivery("failed-steer")
+        delivery = server.controllers.attached().runtime.opened.store.client_delivery("failed-steer")
         assert delivery.status == "dropped"
         assert delivery.reason == "failed"
-        assert not server.runtime.loop.has_pending_steering
+        assert not server.controllers.attached().runtime.loop.has_pending_steering
 
         await _request(reader, writer, 5, "send", {"text": "next"})
         await _event(reader, "agent_end")
@@ -1517,7 +1531,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
             reader, writer, 2, "new_session", {"provider": "codex"}
         )
         session_id = created[-1]["result"]["session"]["session_id"]
-        original = server.runtime.loop.context_assembler.assemble
+        original = server.controllers.attached().runtime.loop.context_assembler.assemble
         entered = asyncio.Event()
         calls = 0
 
@@ -1529,7 +1543,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
                 await asyncio.wait_for(release.wait(), 10)
             return await original(*args, **kwargs)
 
-        server.runtime.loop.context_assembler.assemble = blocked_assemble
+        server.controllers.attached().runtime.loop.context_assembler.assemble = blocked_assemble
         await _request(reader, writer, 3, "send", {"text": "read"})
         await _event(reader, "approval_request")
         await _request(
@@ -1539,7 +1553,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
         await _request(reader, writer, 5, "deny", {"request_id": "read-1"})
         await asyncio.wait_for(entered.wait(), TIMEOUT)
 
-        delivery = server.runtime.opened.store.client_delivery("dispatch-steer")
+        delivery = server.controllers.attached().runtime.opened.store.client_delivery("dispatch-steer")
         assert delivery.status == "queued"
         assert len(backend.calls) == 1
         shutil.copytree(tmp_path, crash_home)
@@ -1547,7 +1561,7 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
         release.set()
         async with asyncio.timeout(TIMEOUT):
             while True:
-                delivery = server.runtime.opened.store.client_delivery("dispatch-steer")
+                delivery = server.controllers.attached().runtime.opened.store.client_delivery("dispatch-steer")
                 if len(backend.calls) == 2 and delivery.status == "delivered":
                     break
                 await asyncio.sleep(0.01)
@@ -1572,14 +1586,14 @@ async def test_steering_is_queued_until_dispatch_and_dropped_after_restart(
             {"delivery_id": "dispatch-steer"},
         )
         assert status[-1]["result"]["status"] == "dropped"
-        delivery = resumed.runtime.opened.store.client_delivery("dispatch-steer")
+        delivery = resumed.controllers.attached().runtime.opened.store.client_delivery("dispatch-steer")
         assert delivery.reason == "restart"
         assert all(
             not any(
                 isinstance(block, TextContent) and block.text == "later"
                 for block in message.content
             )
-            for message in branch_messages(resumed.runtime.opened.store)
+            for message in branch_messages(resumed.controllers.attached().runtime.opened.store)
         )
     finally:
         await close_serve(resumed, writer)
@@ -1662,10 +1676,10 @@ async def test_committed_delivery_runs_work_when_echo_fails(method: str) -> None
     params = {"text": "hello", "delivery_id": f"{method}-error"}
 
     with pytest.raises(ConnectionError):
-        await getattr(requests, method)(params, frozenset({"delivery_id"}))
+        await _deliver(requests, method, params, frozenset({"delivery_id"}))
 
     assert control.start_calls + control.steer_calls == 1
-    retry = await getattr(requests, method)(params, frozenset({"delivery_id"}))
+    retry = await _deliver(requests, method, params, frozenset({"delivery_id"}))
     assert retry["duplicate"] is True
     assert control.start_calls + control.steer_calls == 1
 
@@ -1714,12 +1728,12 @@ async def test_cancel_cleans_up_echo_and_runs_committed_work(method: str) -> Non
     control.echo_stalls = True
     requests = DeliveryRequests(control)
     request = asyncio.create_task(
-        getattr(requests, method)(
+        _deliver(requests, method,
             {"text": "hello", "delivery_id": f"{method}-cancel"},
             frozenset({"delivery_id", "user_message_event"}),
         )
     )
-    await control.echo_started.wait()
+    await await_or_fail(control.echo_started.wait(), what="echo starts")
     request.cancel()
 
     with pytest.raises(asyncio.CancelledError):
@@ -1744,7 +1758,7 @@ async def test_cancel_during_commit_runs_work_without_waiting_for_echo(method: s
 
     control.store.append_client_delivery_async = append_then_cancel
     request = asyncio.create_task(
-        getattr(requests, method)(
+        _deliver(requests, method,
             {"text": "hello", "delivery_id": f"{method}-commit-cancel"},
             frozenset({"delivery_id", "user_message_event"}),
         )
@@ -1957,7 +1971,7 @@ async def test_steer_during_final_response_is_answered_by_next_turn(
             if isinstance(block, TextContent)
         ]
         assert steered.count("also this") == 1, steered
-        assert not server.runtime.loop.has_pending_steering
+        assert not server.controllers.attached().runtime.loop.has_pending_steering
     finally:
         backend.release.set()
         await close_serve(server, writer)
@@ -2017,7 +2031,7 @@ async def test_send_after_turn_end_and_queued_steer_start_one_turn(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)
-    control = server.control
+    control = server.controllers.attached().control
     original_event = control._event
     original_start = control.start_turn
     at_agent_end = asyncio.Event()
@@ -2071,7 +2085,7 @@ async def test_send_after_turn_end_and_queued_steer_start_one_turn(
             reader, writer, 6, "delivery_status", {"delivery_id": "s1"}
         )
         assert status[-1]["result"]["status"] == "delivered"
-        assert not server.runtime.loop.has_pending_steering
+        assert not server.controllers.attached().runtime.loop.has_pending_steering
     finally:
         publish_agent_end.set()
         backend.release.set()
@@ -2090,7 +2104,7 @@ async def test_late_steer_is_dropped_when_mcp_bindings_left(tmp_path: Path) -> N
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)
-    deliveries = server.control.deliveries
+    deliveries = server.controllers.attached().control.deliveries
     original_continue = deliveries.continue_after_turn
     decided = asyncio.Event()
 
@@ -2122,8 +2136,8 @@ async def test_late_steer_is_dropped_when_mcp_bindings_left(tmp_path: Path) -> N
         )
         assert steer[-1].get("result") == {"accepted": True}, steer[-1]
         # test-contract: seam serve has no public way to lose MCP bindings mid-turn
-        server.control._mcp_binding_required = True
-        server.control._active_mcp_bindings = {}
+        server.controllers.attached().control._mcp_binding_required = True
+        server.controllers.attached().control._active_mcp_bindings = {}
 
         backend.release.set()
         await await_or_fail(decided.wait(), what="end-of-turn decision")
@@ -2131,10 +2145,10 @@ async def test_late_steer_is_dropped_when_mcp_bindings_left(tmp_path: Path) -> N
             reader, writer, 5, "delivery_status", {"delivery_id": "unbound-steer"}
         )
         assert status[-1]["result"]["status"] == "dropped", status[-1]
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         assert store.client_delivery("unbound-steer").reason == "disconnect"
         assert backend.calls == 1
-        assert not server.runtime.loop.has_pending_steering
+        assert not server.controllers.attached().runtime.loop.has_pending_steering
     finally:
         backend.release.set()
         await close_serve(server, writer)
@@ -2154,7 +2168,7 @@ async def test_send_holding_its_echo_orders_against_end_of_turn_steering(
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)
-    control = server.control
+    control = server.controllers.attached().control
     deliveries = control.deliveries
     original_event = control._event
     original_echo = control.user_message

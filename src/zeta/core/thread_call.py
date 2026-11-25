@@ -12,13 +12,13 @@ thread-safe when they register it.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import functools
 import logging
 import threading
 import weakref
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..storage_format import release_later
@@ -231,6 +231,15 @@ async def run_owned_thread_call[T](
     return await call.wait()
 
 
+@dataclass(frozen=True, slots=True)
+class ThreadCallHandle[T]:
+    """One submitted call. Cancelling ``result`` gives up only the answer;
+    ``completed`` settles on the loop once the call can no longer run."""
+
+    result: asyncio.Future[T]
+    completed: asyncio.Future[None]
+
+
 class ThreadCallWorkers:
     """A fixed pool of named worker threads running owned calls in order."""
 
@@ -241,7 +250,8 @@ class ThreadCallWorkers:
         self._condition = threading.Condition()
         self._queue: deque[_OwnedCall[Any]] = deque()
         self._stopping = False
-        self._calls: set[_OwnedCall[Any]] = set()  # loop thread only
+        # loop thread only; a call stays here until its ``completed`` settles
+        self._calls: dict[_OwnedCall[Any], asyncio.Future[None]] = {}
         self.threads = [
             threading.Thread(target=self._work, daemon=True, name=f"{name}-{i}")
             for i in range(workers)
@@ -249,31 +259,51 @@ class ThreadCallWorkers:
         for thread in self.threads:
             thread.start()
 
-    async def run(self, callable: Callable[[], Any]) -> Any:
+    def submit[T](self, callable: Callable[[], T]) -> ThreadCallHandle[T]:
+        """Queue ``callable``; call on the loop thread. Never awaits."""
         call = _OwnedCall(self._loop, callable, None)
         with self._condition:
             if self._stopping:
                 raise RuntimeError("reads are closed")
             self._queue.append(call)
             self._condition.notify()
-        self._calls.add(call)
-        try:
-            return await call.wait()
-        finally:
-            self._calls.discard(call)
-            with self._condition, contextlib.suppress(ValueError):
-                self._queue.remove(call)  # cancelled before a worker took it
+        completed = self._loop.create_future()
+        self._calls[call] = completed
+        call._future.add_done_callback(functools.partial(self._result_done, call))
+        return ThreadCallHandle(call._future, completed)
+
+    async def run[T](self, callable: Callable[[], T]) -> T:
+        """``submit`` for sessionless work that tracks no completion."""
+        return await self.submit(callable).result
 
     def close(self) -> None:
-        """Abandon every queued and running call; call on the loop thread."""
+        """Abandon every queued and running call; call on the loop thread. A
+        running call completes only when its worker returns."""
         with self._condition:
             self._stopping = True
+            queued = tuple(self._queue)
             self._queue.clear()
             self._condition.notify_all()
-        calls = tuple(self._calls)
-        self._calls.clear()
-        for call in calls:
+        for call in tuple(self._calls):
             call.abandon()
+        for call in queued:
+            self._complete(call)
+
+    def _result_done(self, call: _OwnedCall[Any], result: asyncio.Future[Any]) -> None:
+        if not result.cancelled():
+            return
+        call.abandon()
+        with self._condition:
+            try:
+                self._queue.remove(call)
+            except ValueError:
+                return  # a worker took it; the worker completes it
+        self._complete(call)
+
+    def _complete(self, call: _OwnedCall[Any]) -> None:
+        completed = self._calls.pop(call, None)
+        if completed is not None and not completed.done():
+            completed.set_result(None)
 
     def _work(self) -> None:
         while True:
@@ -284,3 +314,11 @@ class ThreadCallWorkers:
                     return
                 call = self._queue.popleft()
             call.run()
+            # a closed loop drops this: nothing is left to wait for it
+            _Handoff.schedule(
+                self._loop, functools.partial(self._complete, call), _nothing
+            )
+
+
+def _nothing() -> None:
+    pass

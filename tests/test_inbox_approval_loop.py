@@ -336,7 +336,10 @@ async def test_registry_error_in_label_lookup_keeps_the_approval_usable(
             request_id = admitted[-1]["request_id"] if admitted else event.tool_call.id
             try:
                 decision, _key = await asyncio.wait_for(
-                    lifecycle.transition(Decide(ApprovalDecision.APPROVE, request_id)), 10
+                    lifecycle.transition(
+                        Decide(ApprovalDecision.APPROVE, request_id, "once", lambda _settlement: None)
+                    ),
+                    10,
                 )
                 outcomes["decide"] = decision
             except BaseException as exc:  # noqa: BLE001 - APPROVAL_UNAVAILABLE on the base

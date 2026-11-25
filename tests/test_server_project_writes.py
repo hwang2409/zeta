@@ -5,11 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from threading import Event
 from unittest import mock
 
 import pytest
 
 from tests.support.owned import await_or_fail
+from tests.support.replay_transport import (
+    Transport,
+    connect_replay,
+    negotiate,
+    replay_server,
+)
 from tests.support.serve_close import close_serve
 from tests.support.serve_contract import ServeClient, ServeContract
 from tests.test_server import _connect, _request
@@ -197,53 +204,94 @@ async def test_memory_set_with_a_secret_is_refused_and_writes_nothing(tmp_path: 
         await contract.close()
 
 
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
 @pytest.mark.asyncio
-async def test_inbox_send_is_the_user_send_and_idempotent(tmp_path: Path) -> None:
+async def test_inbox_send_is_the_user_send_and_idempotent(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     alpha, beta = await _off_loop(_projects, tmp_path)
-    contract = await ServeContract.start(tmp_path, "websocket")
+    monkeypatch.setenv("ZETA_TEST_SCRIPTED_PROVIDER", "1")
+    server = replay_server(tmp_path / "home", transport, None)
+    clients = []
+    committed = asyncio.Event()
+    unblock = Event()
+    event_loop = asyncio.get_running_loop()
+    sent_ids = []
+    send = ProjectInbox.send_user_with_outcome
+
+    def stop_after_commit(inbox, **kwargs):
+        result = send(inbox, **kwargs)
+        sent_ids.append(result[0])
+        event_loop.call_soon_threadsafe(committed.set)
+        assert unblock.wait(10), "timed out waiting for sender disconnect"
+        return result
+
+    async def connect():
+        client = await await_or_fail(connect_replay(server, transport), what="inbox connection")
+        clients.append(client)
+        hello = await negotiate(client, replay=False, extra=(*FEATURES, "session_cwd"), protocol_version="1.2")
+        assert "result" in hello, hello
+        return client
+
     try:
-        controller = await _client(contract, [*FEATURES, "session_cwd"])
+        controller = await connect()
         message = {"kind": "question", "title": "From the web", "body": "hello", "delivery_id": "web-1"}
-        detached = await controller.request("detached", "project_inbox_send", {"project_id": alpha, "mutation": message})
+        detached = await controller.request(2, "project_inbox_send", {"project_id": alpha, "mutation": message})
         assert detached["error"]["code"] == -32003
-        session_id = (await controller.request("new", "new_session", {
+        session_id = (await controller.request(3, "new_session", {
             "provider": "codex", "cwd": str((tmp_path / "alpha").resolve()),
         }))["result"]["session"]["session_id"]
 
         for forged in ({"mutation": {**message, "origin": "agent"}}, {"mutation": message, "from_session": "x"}):
-            refused = await controller.request("forged", "project_inbox_send", {"project_id": beta, **forged})
+            refused = await controller.request(4, "project_inbox_send", {"project_id": beta, **forged})
             assert refused["error"]["data"] == {"code": "invalid_params"}
 
-        sent = await controller.request("send", "project_inbox_send", {"project_id": alpha, "mutation": message})
-        assert "result" in sent, sent
-        sent = sent["result"]
+        params = {"project_id": alpha, "mutation": message}
+        sent = (await controller.request(5, "project_inbox_send", params))["result"]
         message_id = sent["data"]["message_id"]
-        notice = await await_or_fail(controller.event("project_inbox_notification"), what="inbox notification")
+        notice = await controller.event("project_inbox_notification")
         assert notice["data"]["message_ids"] == [message_id]
-
-        retry = (await controller.request("retry", "project_inbox_send", {"project_id": alpha, "mutation": message}))["result"]
-        assert retry == sent
-        changed = await controller.request("changed", "project_inbox_send", {
+        assert (await controller.request(6, "project_inbox_send", params))["result"] == sent
+        changed = await controller.request(7, "project_inbox_send", {
             "project_id": alpha, "mutation": {**message, "body": "different"},
         })
         assert changed["error"]["data"] == {"code": "invalid_params", "reason": "delivery_id_reused"}
 
-        second = (await controller.request("second", "project_inbox_send", {
+        second = (await controller.request(8, "project_inbox_send", {
             "project_id": alpha, "mutation": {**message, "delivery_id": "web-2"},
         }))["result"]["data"]["message_id"]
-        notice = await await_or_fail(controller.event("project_inbox_notification"), what="second inbox notification")
+        notice = await controller.event("project_inbox_notification")
         # The poller names every unclaimed message; the retry added no second copy of the first.
         assert sorted(notice["data"]["message_ids"]) == sorted([message_id, second])
 
-        inbox = (await controller.request("inbox", "project_inbox", {"project_id": alpha}))["result"]
+        inbox = (await controller.request(9, "project_inbox", {"project_id": alpha}))["result"]
         rows = {row["id"]: row for row in inbox["messages"]}
         assert set(rows) == {message_id, second}
         assert rows[message_id]["from"] == {"project": alpha, "session": session_id}
         assert rows[message_id]["origin"] == "user" and rows[message_id]["body"] == "hello"
         # Same trust as `/inbox send` from the TUI: a user-origin message is an assignment.
         assert rows[message_id]["authority"] == "trusted_assignment"
+
+        params = {"project_id": beta, "mutation": {**message, "delivery_id": "lost-response"}}
+        with monkeypatch.context() as patch:
+            # test-contract: seam pause a committed inbox send before its response
+            patch.setattr(ProjectInbox, "send_user_with_outcome", stop_after_commit)
+            await controller.send(10, "project_inbox_send", params)
+            await await_or_fail(committed.wait(), what="durable inbox commit")
+            await await_or_fail(controller.close(), what="drop inbox sender")
+            unblock.set()
+        committed_id, = sent_ids
+
+        controller = await connect()
+        retry = (await controller.request(11, "project_inbox_send", params))["result"]
+        assert retry["data"] == {"message_id": committed_id, "pending": False}
+        inbox = (await controller.request(12, "project_inbox", {"project_id": beta}))["result"]
+        assert [row["id"] for row in inbox["messages"]] == [committed_id]
     finally:
-        await contract.close()
+        unblock.set()
+        for client in clients:
+            await await_or_fail(client.close(), what="close inbox client")
+        await await_or_fail(server.close(), what="close inbox serve")
 
 
 async def _in_process(server, features: list[str]):

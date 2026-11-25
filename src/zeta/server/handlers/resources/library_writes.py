@@ -15,7 +15,7 @@ FEATURE = "library_write_v1"
 
 
 def _handler(*, profiles, delete):
-    async def handle(client, request_id, params):
+    async def handle(client, request_id, params, controller):
         from ....skills import resource_store
         from ...protocol import (
             ErrorDescriptor,
@@ -47,7 +47,7 @@ def _handler(*, profiles, delete):
         if scope == "home":
             base = client.server.home
         else:
-            project = project_root(client)
+            project = project_root(controller.runtime)
             if project is None:
                 raise closed_error(ErrorDescriptor.STATE_READ_UNAVAILABLE)
             base = project / ".zeta"

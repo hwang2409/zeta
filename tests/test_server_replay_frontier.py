@@ -81,7 +81,7 @@ class Serve:
 
     @property
     def store(self) -> Any:
-        return self.server.runtime.opened.store
+        return self.server.controllers.attached().runtime.opened.store
 
     async def client(self) -> ReplayClient:
         client = await connect_replay(self.server, self.transport)
@@ -142,17 +142,13 @@ async def _serve(tmp_path: Path, transport: Transport, backend: Any) -> Serve:
             serve.published.append((event, dict(fields), replay_row or rows.RowFacts(), covers))
         return covers
 
-    publish_child_lifecycle = server.connections.publish_child_lifecycle
+    publish_session = server.connections.publish_session
 
-    def recorded_child_lifecycle(
-        event: EventDescriptor,
-        scope: Any,
-        session_id: str,
-        fields: dict[str, Any],
-        covers: int | None,
-    ) -> None:
-        serve.published.append((event, dict(fields), rows.RowFacts(), covers))
-        publish_child_lifecycle(event, scope, session_id, fields, covers)
+    def recorded_session(owner: Any, event: EventDescriptor, session_id: str | None, **fields: Any):
+        if fields.get("replay_scope") is not None:
+            payload = {key: value for key, value in fields.items() if key not in {"replay_scope", "covers"}}
+            serve.published.append((event, payload, rows.RowFacts(), fields.get("covers")))
+        return publish_session(owner, event, session_id, **fields)
 
     admit_deferred = server.connections._admit_deferred
 
@@ -163,7 +159,7 @@ async def _serve(tmp_path: Path, transport: Transport, backend: Any) -> Serve:
     # test-contract: seam observe each publication's internal covers before the wire strips it
     server.connections._replay_covers = recorded  # type: ignore[method-assign]
     # test-contract: seam observe child lifecycle publication at its scope router
-    server.connections.publish_child_lifecycle = recorded_child_lifecycle  # type: ignore[method-assign]
+    server.connections.publish_session = recorded_session  # type: ignore[method-assign]
     # test-contract: seam observe each deferred copy's covers when its row is found
     server.connections._admit_deferred = recorded_deferred  # type: ignore[method-assign]
     return serve
@@ -246,7 +242,7 @@ async def _wait_event(
 
 
 def _background_diagnostic(serve: Serve, backend: PerActorFakeBackend, parent_started: bool) -> str:
-    active = tuple(serve.server.control._approvals.active_keys())
+    active = tuple(serve.server.controllers.attached().control._approvals.active_keys())
     published = [event.value for event, _fields, _facts, _covers in serve.published]
     buffered = [frame.get("params", {}).get("event") for frame in serve.observer.buffered]
     milestones = {
@@ -312,7 +308,7 @@ async def _send_images(serve: Serve) -> None:
 
 
 async def _send_skill(serve: Serve) -> None:
-    input_id = serve.server.control._model_inputs.register(
+    input_id = serve.server.controllers.attached().control._model_inputs.register(
         serve.session_id,
         ModelInputEnvelope("skill-marker expanded body", "skill-marker", MessageOrigin.SKILL_EXPANSION),
     )
@@ -344,7 +340,7 @@ async def _delivery_after_newer_row(serve: Serve) -> None:
     """The echo is admitted after a newer row installed, so its row is not the newest."""
     release = asyncio.Event()
     entered = asyncio.Event()
-    original = serve.server.control.user_message
+    original = serve.server.controllers.attached().control.user_message
 
     async def held(*args: Any, **kwargs: Any) -> None:
         entered.set()
@@ -352,7 +348,7 @@ async def _delivery_after_newer_row(serve: Serve) -> None:
         await original(*args, **kwargs)
 
     # test-contract: seam hold the echo after its delivery row installed
-    serve.server.control.user_message = held  # type: ignore[method-assign]
+    serve.server.controllers.attached().control.user_message = held  # type: ignore[method-assign]
     send = asyncio.create_task(
         serve.controller.request(serve.request_id(), "send", {"text": "delivery-marker", "delivery_id": "d-1"})
     )
@@ -363,7 +359,7 @@ async def _delivery_after_newer_row(serve: Serve) -> None:
         await await_or_fail(send, what="send response")
     finally:
         release.set()
-        serve.server.control.user_message = original  # type: ignore[method-assign]
+        serve.server.controllers.attached().control.user_message = original  # type: ignore[method-assign]
     await _wait_event(serve.observer, "user_message", text="delivery-marker")
     await _wait_event(serve.observer, "agent_end")
 
@@ -491,7 +487,7 @@ async def _synthetic_abort(serve: Serve) -> None:
         Message(MessageRole.ASSISTANT, [ToolUseContent(call) for call in calls]),
         [(call.id, call) for call in calls],
     )
-    control = serve.server.control
+    control = serve.server.controllers.attached().control
     for call in calls:
         await control._event(StreamEvent(StreamEventType.TOOL_APPROVAL_START, tool_call=call))
 
@@ -698,7 +694,7 @@ def test_every_serve_event_kind_has_a_route_or_is_never_published() -> None:
 
 
 async def _turn_start(serve: Serve) -> None:
-    await serve.server.control._notify(EventDescriptor.TURN_START, serve.session_id, data={})
+    await serve.server.controllers.attached().control._notify(EventDescriptor.TURN_START, serve.session_id, data={})
 
 
 @pytest.mark.asyncio
@@ -722,7 +718,7 @@ async def test_unrouted_event_ends_the_stream_and_is_logged(
 
 
 async def _publish_tool_end(serve: Serve, call_id: str) -> None:
-    await serve.server.control._notify(
+    await serve.server.controllers.attached().control._notify(
         EventDescriptor.TOOL_END,
         serve.session_id,
         tool_call={"id": call_id, "name": "read", "arguments": {}},

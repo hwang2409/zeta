@@ -13,7 +13,10 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 
-from tests.support.login import block_loop_until_publication_decision_expires
+from tests.support.login import (
+    block_loop_until_publication_decision_expires,
+    isolated_logins,
+)
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.support.storage_homes import initialize_storage_home
@@ -27,7 +30,6 @@ from zeta.providers import login as providers
 from zeta.providers.factory import credential_store
 from zeta.server import ZetaServer
 from zeta.server import login as server_login
-from zeta.server.login import Logins
 from zeta.server.protocol import MethodDescriptor
 
 LOGIN_REQUESTS = tuple(
@@ -89,7 +91,7 @@ async def test_login_is_hidden_and_rejected_for_legacy_protocol(tmp_path, server
         for method in LOGIN_REQUESTS:
             result = await rpc(reader, writer, method, provider="claude")
             assert result["error"]["code"] == -32601
-        assert not server._client.logins.tasks
+        assert not next(iter(server.connections.clients()), None).logins.tasks
     finally:
         await close_serve(server, writer)
 
@@ -188,7 +190,7 @@ async def test_rpc_login_persists_synthetic_exchange_and_reports_presence(tmp_pa
         assert (await rpc(reader, writer, "login_start", provider=other))["result"]["state"] == "pending"
         assert (await rpc(reader, writer, "login_cancel", provider=other))["result"]["state"] == "cancelled"
         assert await callback(captured["redirect"], {"code": "synthetic-code", "state": captured["state"]}) == 200
-        await asyncio.wait_for(server._client.logins.tasks[provider], 3)
+        await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks[provider], 10)
         assert (await rpc(reader, writer, "login_status", provider=provider))["result"] == {"state": "succeeded"}
         saved = await asyncio.to_thread(
             credential_store, provider, home=server.home,
@@ -290,7 +292,7 @@ async def test_login_refused_by_unloaded_registry_reports_the_cause(tmp_path, mo
         if orphan_appears == "during_browser":
             assert result["state"] == "pending"
             assert await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]}) == 200
-            await asyncio.wait_for(server._client.logins.tasks["claude"], 10)
+            await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks["claude"], 10)
             result = (await rpc(reader, writer, "login_status", provider="claude"))["result"]
         assert result == expected
         if orphan_appears == "before_start":
@@ -321,7 +323,7 @@ async def test_login_failures_release_listener_and_allow_retry(tmp_path, monkeyp
     monkeypatch.setattr(providers, "build_anthropic_authorization_url", build)
     monkeypatch.setattr(providers, "exchange_anthropic_authorization_code", exchange)
     server, reader, writer, _ = await connect(tmp_path)
-    manager = server._client.logins
+    manager = next(iter(server.connections.clients()), None).logins
     if outcome in {"timeout", "exchange_timeout"}:
         manager.timeout = 0.3
     try:
@@ -402,12 +404,12 @@ async def test_serve_login_publication_does_not_block_event_loop(
                 return
             callback_before_release.append(callback_ran.wait(timeout=1))
             if callback_before_release[-1]:
-                release_lock.wait()
+                release_lock.wait(timeout=10)
 
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
     assert lock_ready.wait(timeout=5)
-    manager = Logins(tmp_path / "zeta")
+    manager = isolated_logins(tmp_path / "zeta")
     url = asyncio.get_running_loop().create_future()
     task = asyncio.create_task(manager._run("claude", url))
     try:
@@ -472,7 +474,7 @@ async def test_serve_login_decision_expiry_reports_failure_and_releases_locks(
             captured["redirect"],
             {"code": "synthetic", "state": captured["state"]},
         )
-        result = await asyncio.wait_for(server._client.logins.tasks["claude"], 3)
+        result = await asyncio.wait_for(next(iter(server.connections.clients()), None).logins.tasks["claude"], 10)
 
         assert result == {
             "state": "failed",
@@ -550,13 +552,13 @@ async def test_cancelled_serve_login_never_publishes_and_releases_locks(
             provider.credential_store.account
         ):
             lock_ready.set()
-            release_lock.wait()
+            release_lock.wait(timeout=10)
 
     fd_before = len(os.listdir("/dev/fd"))
     holder = threading.Thread(target=hold_lifecycle_lock)
     holder.start()
     assert lock_ready.wait(timeout=5)
-    manager = Logins(home)
+    manager = isolated_logins(home)
     first_url = asyncio.get_running_loop().create_future()
     first = asyncio.create_task(manager._run("claude", first_url))
     try:
@@ -570,7 +572,7 @@ async def test_cancelled_serve_login_never_publishes_and_releases_locks(
         assert not first.done()
         release_lock.set()
         with pytest.raises(asyncio.CancelledError):
-            await first
+            await asyncio.wait_for(first, 10)
         assert await asyncio.to_thread(save_finished.wait, 5)
 
         second_url = asyncio.get_running_loop().create_future()
@@ -587,6 +589,7 @@ async def test_cancelled_serve_login_never_publishes_and_releases_locks(
 
     assert not holder.is_alive()
     assert published == [new]
+    # test-contract: durability read the published credential after both workers settled
     assert await asyncio.to_thread(provider.credential_store.read) == new
     with AccountStore(home).provider_login_lock("anthropic"):
         pass
@@ -598,7 +601,7 @@ async def test_login_port_conflict_has_specific_failure(tmp_path, monkeypatch):
         raise LoginPortInUseError("codex", 1455)
 
     monkeypatch.setattr(server_login, "run_login", raise_port_conflict)
-    manager = Logins(tmp_path / "zeta")
+    manager = isolated_logins(tmp_path / "zeta")
 
     result = await manager._run("codex", asyncio.get_running_loop().create_future())
 
@@ -643,16 +646,16 @@ async def test_login_action_uses_failed_provider_before_model_revert(tmp_path, v
         await rpc(reader, writer, "hello", protocol_version=version)
         created = await rpc(reader, writer, "new_session")
         assert "result" in created, created
-        await model_selection.apply(server.runtime, "gpt-5.4", "ask")
-        await server.control._event(
+        await model_selection.apply(server.controllers.attached().runtime, "gpt-5.4", "ask")
+        await server.controllers.attached().control._event(
             StreamEvent(StreamEventType.ERROR, error=ErrorInfo(
                 "http_error" if status else "auth_error", "Not a string classification hint", status, provider_error)),
-            session_id=server.runtime.session_id, background=background,
+            session_id=server.controllers.attached().runtime.session_id, background=background,
         )
         event = await _event(reader, "error")
         assert event["data"].get("login_provider") == expected
         if expected:
-            assert server.runtime.metadata.provider == (
+            assert server.controllers.attached().runtime.metadata.provider == (
                 "codex" if status is None else "claude"
             )
     finally:
@@ -694,7 +697,7 @@ async def test_cancel_during_provider_lock_release_reports_success(
         await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]})
         assert await asyncio.to_thread(release_entered.wait, 3)
 
-        task = server._client.logins.tasks["claude"]
+        task = next(iter(server.connections.clients()), None).logins.tasks["claude"]
         task.cancel()
         task.cancel()
         release_exit.set()
@@ -750,7 +753,7 @@ async def test_cancel_during_success_cleanup_reports_published_login(tmp_path, m
         await rpc(reader, writer, "login_start", provider="claude")
         await callback(captured["redirect"], {"code": "synthetic", "state": captured["state"]})
         await asyncio.wait_for(entered.wait(), 10)
-        task = server._client.logins.tasks["claude"]
+        task = next(iter(server.connections.clients()), None).logins.tasks["claude"]
         # publication already committed, so cancellation cannot report that
         # credentials were left unchanged.
         task.cancel()

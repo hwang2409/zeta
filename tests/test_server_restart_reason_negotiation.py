@@ -36,7 +36,7 @@ async def _open(tmp_path: Path, features: list[str]):
 
 
 def _seed_restart_end(server: ZetaServer) -> None:
-    store = server.runtime.opened.store
+    store = server.controllers.attached().runtime.opened.store
     store.append_approval_request("call-r", ToolCall("call-r", "bash", {"command": "true"}))
     store.resolve_approval("call-r", "abort", reason="server_restarted")
 

@@ -97,7 +97,7 @@ async def test_stuck_lost_holder_is_logged_with_dump(
     gate = asyncio.Event()
     entered = asyncio.Event()
 
-    async def gated_status(client, request_id, params):
+    async def gated_status(client, request_id, params, controller):
         entered.set()
         # Resist cancellation so the lost holder keeps the slot held: this is the
         # stuck-holder shape under slice 1 (a handler that swallows its cancel).
@@ -126,8 +126,8 @@ async def test_stuck_lost_holder_is_logged_with_dump(
             await await_or_fail(entered.wait(), what="holder enters its request")
             await holder.close()
             await _poll(
-                lambda: registry_connections._controller is not None
-                and registry_connections._controller.connection.peer_closed(),
+                lambda: registry_connections.legacy_controller_holder is not None
+                and registry_connections.legacy_controller_holder.connection.peer_closed(),
                 what="serve sees the holder connection close",
             )
 
@@ -159,7 +159,7 @@ async def test_stuck_lost_holder_is_logged_with_dump(
             if server.connections is not None:
                 await _poll(
                     lambda: server.connections is None
-                    or server.connections._controller is None,
+                    or server.connections.legacy_controller_holder is None,
                     what="holder released after the gate opens",
                 )
 

@@ -168,7 +168,7 @@ async def test_history_cache_is_keyed_by_row_shaping_features(
         session = (await _request(
             controller_reader, controller_writer, 2, "new_session", {"provider": "codex"}
         ))[-1]["result"]["session"]
-        server.runtime.opened.store.append_message(
+        server.controllers.attached().runtime.opened.store.append_message(
             with_message_origin(
                 Message(
                     MessageRole.USER,
@@ -238,7 +238,7 @@ async def test_handle_survives_disconnect_and_reattach(tmp_path: Path) -> None:
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_history_fidelity", "content_read"]})
         session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
-        store = server.runtime.opened.store
+        store = server.controllers.attached().runtime.opened.store
         store.append_message(with_message_origin(Message(MessageRole.USER, [ImageContent(base64.b64encode(raw).decode(), "image/png")]), MessageOrigin.USER))
         _, attachments, _ = await _history_with_image(reader, writer, request_id=4, session_id=session["session_id"])
         handle = attachments[0]["handle"]
@@ -259,7 +259,7 @@ async def test_handle_survives_server_restart(tmp_path: Path) -> None:
     reader, writer = await _connect(server)
     await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_history_fidelity", "content_read"]})
     session = (await _request(reader, writer, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
-    store = server.runtime.opened.store
+    store = server.controllers.attached().runtime.opened.store
     try:
         store.append_message(with_message_origin(Message(MessageRole.USER, [ImageContent(base64.b64encode(raw).decode(), "image/png")]), MessageOrigin.USER))
         _, attachments, _ = await _history_with_image(reader, writer, request_id=4, session_id=session["session_id"])
@@ -270,7 +270,7 @@ async def test_handle_survives_server_restart(tmp_path: Path) -> None:
     reader, writer = await _connect(restarted)
     try:
         await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["session_history_fidelity", "content_read"]})
-        await restarted.runtime.resume_session(session["session_id"])
+        await restarted.controllers.attached().runtime.resume_session(session["session_id"])
         await _request(reader, writer, 2, "session_history", {"session_id": session["session_id"]})
         reply = (await _request(reader, writer, 3, "content_read", {"handle": handle}))[-1]
         assert base64.b64decode(reply["result"]["data"]) == raw
@@ -351,7 +351,7 @@ async def test_handle_is_scoped_to_session_for_controller_and_observer(tmp_path:
     raw = _PNG
     await _request(reader_a, writer_a, 1, "hello", {"protocol_version": "1.2", "features": ["session_history_fidelity", "content_read"]})
     session = (await _request(reader_a, writer_a, 2, "new_session", {"provider": "codex"}))[-1]["result"]["session"]
-    store = first.runtime.opened.store
+    store = first.controllers.attached().runtime.opened.store
     store.append_message(with_message_origin(Message(MessageRole.USER, [ImageContent(base64.b64encode(raw).decode(), "image/png")]), MessageOrigin.USER))
     _, attachments, _ = await _history_with_image(reader_a, writer_a, request_id=4, session_id=session["session_id"])
     handle = attachments[0]["handle"]
