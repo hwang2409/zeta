@@ -1391,7 +1391,7 @@ async def _run_child(
         if abort_task in done:
             raise asyncio.CancelledError()
     except asyncio.CancelledError:
-        await run_owner.cancel_and_join()
+        await _complete_despite_cancellation(asyncio.create_task(run_owner.cancel_and_join()))
         raise
     finally:
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
