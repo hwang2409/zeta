@@ -51,13 +51,16 @@ async def _stop_publication_watcher(watcher: asyncio.Task[None]) -> None:
         await asyncio.wait_for(watcher, 10)
 
 
-async def _await_inbox_notice(store, *, what: str) -> list:
-    """Wait for the supervisor to deliver at least one durable inbox notice."""
+async def _await_inbox_notice(store, *, what: str, message_id: str | None = None) -> list:
+    """Wait for the supervisor to deliver a matching durable inbox notice."""
     async with asyncio.timeout(10):
-        while not store.agent_notifications():
+        while not (notices := [
+            notice for notice in store.agent_notifications()
+            if message_id is None or message_id in notice.data.get("message_ids", ())
+        ]):
             # test-contract: latency poll the delivered durable inbox notice
             await asyncio.sleep(0.02)
-    return store.agent_notifications()
+    return notices
 
 
 def _seed_inbox(registry, tmp_path: Path, project_id: str, session_id: str) -> str:
@@ -391,7 +394,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
         # the dismiss publishes in-process, waking the owner's supervisor to
         # deliver the pending inbox message as one durable notification.
         notices = await _await_inbox_notice(
-            opened.store, what="serve owner inbox delivery"
+            opened.store, what="serve owner inbox delivery", message_id=seeded
         )
         assert any(seeded in notice.data["message_ids"] for notice in notices)
     finally:
