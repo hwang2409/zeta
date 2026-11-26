@@ -6370,6 +6370,68 @@ async def test_child_registry_agent_schema_uses_its_catalog_snapshot(
         store.close()
 
 
+@pytest.mark.parametrize(
+    ("requires_cwd", "explicit", "refused"),
+    [
+        pytest.param(True, False, True, id="required-omitted"),
+        pytest.param(True, True, False, id="required-explicit"),
+        pytest.param(False, False, False, id="unset-inherits"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_agent_profile_requires_cwd(
+    tmp_path: Path, requires_cwd: bool, explicit: bool, refused: bool,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    home = tmp_path / "home"
+    profiles = home / "agents"
+    profiles.mkdir(parents=True)
+    flag = "requires_cwd: true\n" if requires_cwd else ""
+    (profiles / "implementer.md").write_text(
+        f"---\nname: implementer\ndescription: implementation\n{flag}---\nImplement.\n"
+    )
+    call = _agent_call(agent_type="implementer")
+    if explicit:
+        call.arguments["cwd"] = str(worktree)
+    backend = FakeBackend(
+        [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("complete")])]
+    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    registry = ToolRegistry(
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty(),
+        agent_catalog=discover_session_agents(home=home),
+    )
+    loop = AgentLoop(
+        backend, store, registry=registry, max_turns=1, skill_catalog=SkillCatalog.empty(),
+    )
+    try:
+        events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        completed = next(
+            event for event in events
+            if event.tool_result is not None and event.tool_result.tool_call_id == call.id
+        )
+        result = completed.tool_result
+        agents = store.session_dir / "agents"
+        if refused:
+            assert result.is_error, "agent accepted a profile that requires cwd"
+            assert "preset 'implementer' requires cwd" in result.content
+            assert "pass the intended worktree path" in result.content
+            assert not agents.exists()
+            assert len(backend.calls) == 1
+            output = StringIO()
+            Console(file=output, width=120).print(agent_card_module.render_agent_receipt(completed))
+            assert "pass the intended worktree path" in output.getvalue()
+        else:
+            assert not result.is_error, result.content
+            state = json.loads((agents / "1" / "session_state.json").read_text())
+            assert state["bash_cwd"] == str(worktree if explicit else tmp_path)
+    finally:
+        await loop.close()
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_general_agent_markers_keep_legacy_state_bytes(tmp_path: Path) -> None:
     omitted = ConversationStore(tmp_path / "omitted", cwd=tmp_path)

@@ -96,6 +96,8 @@ class AgentCatalog:
                     "max_turns": agent.max_turns,
                 }
             )
+            if agent.requires_cwd:
+                snapshot["requires_cwd"] = True
             snapshots.append(snapshot)
         return snapshots
 
@@ -116,6 +118,7 @@ class AgentCatalog:
             accepts_follow_ups = item.get("accepts_follow_ups", False)
             explicit_finish = item.get("explicit_finish", False)
             max_turns = item.get("max_turns")
+            requires_cwd = item.get("requires_cwd", False)
             source = item.get("source", "")
             path = item.get("path")
             agents_root = item.get("agents_root")
@@ -136,6 +139,7 @@ class AgentCatalog:
                 or type(allow_delegation) is not bool
                 or type(accepts_follow_ups) is not bool
                 or type(explicit_finish) is not bool
+                or type(requires_cwd) is not bool
                 or (max_turns is not None and not valid_max_turns(max_turns))
                 or type(source) is not str
                 or (path is not None and type(path) is not str)
@@ -157,6 +161,7 @@ class AgentCatalog:
                     accepts_follow_ups=accepts_follow_ups,
                     explicit_finish=explicit_finish,
                     max_turns=max_turns,
+                    requires_cwd=requires_cwd,
                 )
             )
         return cls(tuple(agents))
@@ -219,6 +224,12 @@ def build_agent(
         raise ValueError(
             f"agent {document.path} frontmatter explicit_finish must be a boolean"
         )
+    # Opt in to requiring an explicit spawn directory instead of inheriting the parent's.
+    requires_cwd = metadata.get("requires_cwd", False)
+    if type(requires_cwd) is not bool:
+        raise ValueError(
+            f"agent {document.path} frontmatter requires_cwd must be a boolean"
+        )
     max_turns = metadata.get("max_turns")
     if max_turns is not None and not valid_max_turns(max_turns):
         raise ValueError(
@@ -250,6 +261,7 @@ def build_agent(
         explicit_finish=explicit_finish,
         max_child_depth=max_child_depth,
         max_turns=max_turns,
+        requires_cwd=requires_cwd,
     )
 
 

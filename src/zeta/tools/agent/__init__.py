@@ -1033,6 +1033,7 @@ def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
 
     agent_names = catalog.names()
     agent_description = catalog.description()
+    cwd_required = ", ".join(preset.name for preset in catalog.agents if preset.requires_cwd)
     description = (
         "Delegate multi-step exploration or research that would pollute the "
         "main context. The child has its own bounded context and may spawn "
@@ -1075,7 +1076,8 @@ def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
                     "existing directory (a symlinked directory is rejected). "
                     "Pass this when delegating work in another directory or "
                     "git worktree so the child does not run in your checkout. "
-                    "Omit to inherit your starting directory."
+                    "Omit to inherit your starting directory unless the preset requires cwd."
+                    + (f" Required for these presets: {cwd_required}." if cwd_required else "")
                 ),
             },
             "background": {
