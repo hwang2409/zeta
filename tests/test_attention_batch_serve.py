@@ -28,6 +28,7 @@ from zeta.attention_records import AttentionStore
 from zeta.attention_replies import AttentionReplies
 from zeta.project_inbox import ProjectInbox
 from zeta.project_registry import ProjectRegistry
+from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
@@ -199,6 +200,11 @@ async def test_serve_decisions_lists_broken_record_without_body(tmp_path: Path) 
 async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    async def defer_inbox_activation(_loop):
+        pass
+
+    # test-contract: seam start the real supervisor only at the dismiss below, not for the earlier batch.
+    monkeypatch.setattr(AgentLoop, "_activate_project_inbox", defer_inbox_activation)
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
     registry = ProjectRegistry(tmp_path / "home" / "projects")
