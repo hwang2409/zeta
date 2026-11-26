@@ -42,6 +42,15 @@ class ProjectAttentionItem:
     record: AttentionRecord | Broken
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectAttentionPage:
+    items: tuple[ProjectAttentionItem, ...]
+    total: int
+    action_required_total: int
+    info_total: int
+    next_offset: int
+
+
 def _top_level_sessions(home: Path, project_id: str) -> tuple[tuple[str, Path], ...]:
     sessions = home / "sessions"
     try:
@@ -70,7 +79,7 @@ def _top_level_sessions(home: Path, project_id: str) -> tuple[tuple[str, Path], 
 
 def open_project_attention(
     home: Path, project_id: str, *, offset: int = 0, limit: int = 100
-) -> tuple[tuple[ProjectAttentionItem, ...], int, int]:
+) -> ProjectAttentionPage:
     """Read open attention from every top-level session in one project."""
     if type(offset) is not int or offset < 0:
         raise ValueError("offset must be a non-negative integer")
@@ -97,7 +106,17 @@ def open_project_attention(
         )
     )
     total = len(rows)
-    return tuple(rows[offset : offset + limit]), total, (offset + limit if offset + limit < total else 0)
+    actions = info = 0
+    for item in rows:
+        if isinstance(item.record, AttentionRecord):
+            if item.record.requires_action:
+                actions += 1
+            else:
+                info += 1
+    return ProjectAttentionPage(
+        tuple(rows[offset : offset + limit]), total, actions, info,
+        offset + limit if offset + limit < total else 0,
+    )
 
 
 def compact_age(created_at: str, *, now: datetime | None = None) -> str:
