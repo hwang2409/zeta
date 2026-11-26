@@ -1299,10 +1299,12 @@ reply streams, is not dropped when that turn completes. After the turn's
 `turn_end` and `agent_end`, the server starts the next turn with no new user
 message, and that turn's first provider request carries the steer, so its
 `delivery_status` becomes `delivered`. This turn emits the usual `agent_start`
-through `agent_end` events. The next turn does not start, and the steer is
-`dropped` with reason `disconnect`, if the server is closing, a `send` would be
-refused because the session is not attached, or the controller is gone with no
-`turn_reconnect` grace running. A `send` that arrives right after
+through `agent_end` events. If the server is closing or the session has no
+controller and no reconnect grace, the steer is `dropped` with reason
+`disconnect`. If the session still has a controller or reconnect grace but the
+finished turn cannot start a successor (for example, required bindings are
+missing or the runtime state was replaced), the reason is `turn_end`.
+A `send` that arrives right after
 `turn_end` either starts the turn that carries the steer, or gets `-32004`
 because that turn has already started; the client should then retry the text as
 a `steer`.
