@@ -201,6 +201,7 @@ class ResolvedConfig:
     otel_endpoint: str | None = None
     voice_engine: str = DEFAULT_VOICE_ENGINE
     voice_model: str = DEFAULT_VOICE_MODEL
+    configured_model: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,6 +419,7 @@ def resolve(
         otel_endpoint=settings.otel_endpoint,
         voice_engine=settings.voice_engine,
         voice_model=settings.voice_model,
+        configured_model=settings.model,
     )
 
 

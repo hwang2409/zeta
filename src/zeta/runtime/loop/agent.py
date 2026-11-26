@@ -88,7 +88,12 @@ from ...skills.agent_catalog import AgentCatalog
 from ...telemetry import Telemetry
 from ...tools import ToolHandler, ToolRegistry, ToolStreamPublisher
 from ...tools._shared.process import TaskExitInput
-from ...tools.registry import ToolExecutionContext, _validate_unique_tool_call_ids
+from ...tools.agent import agent_model_parameter
+from ...tools.registry import (
+    ToolExecutionContext,
+    ToolOrigin,
+    _validate_unique_tool_call_ids,
+)
 from ..backend_state import effective_backend_budget
 from ..prompt import CHILD_PROFILE_BODY, RuntimePrompt
 from ._completion import (
@@ -175,6 +180,7 @@ class AgentLoop(
         live_config_home: Path | None = None,
         live_config_project_dir: Path | None = None,
         freeze_live_config: bool = False,
+        configured_model: str | None = None,
         child_turn_control: ChildTurnControl | None = None,
         telemetry: Telemetry | None = None,
         pre_dispatch_clock: DeadlineClock | None = None,
@@ -190,6 +196,7 @@ class AgentLoop(
                 f"agent depth must be between 0 and {HARD_MAX_AGENT_DEPTH}"
             )
         self.backend = backend
+        self.configured_model = configured_model
         self._pre_dispatch_clock = pre_dispatch_clock or MonotonicDeadlineClock()
         self._set_pre_dispatch_step: Callable[[str], None] = lambda _step: None
         self._report_pre_dispatch_stall: Callable[[str, str], None] = lambda _step, _error: None
@@ -347,6 +354,11 @@ class AgentLoop(
             if record.running
         )
         return self._background_owner.active_descriptions + process_work
+    def allowed_child_models(self) -> tuple[str, ...] | None:
+        return self.tool_registry.agent_catalog.allowed_model_names(
+            self.configured_model, getattr(self.backend, "model", None),
+        )
+
     def _active_tool_schemas(self) -> list[ToolSchema]:
         schemas = (
             self.tool_registry.schemas
@@ -359,6 +371,20 @@ class AgentLoop(
             )
         if not agent_tool_available(self.agent_depth, self.max_agent_depth):
             schemas = [schema for schema in schemas if schema.get("name") != "agent"]
+        # The registered schema is context-free; the active backend can change mid-session.
+        definition = self.tool_registry.definition_reference("agent")
+        if definition is not None and definition.origin is ToolOrigin.PACKAGED_BUILTIN:
+            for schema in schemas:
+                if schema["name"] != "agent":
+                    continue
+                properties = schema.get("parameters", {}).get("properties", {})
+                if "model" in properties:
+                    allowed = self.allowed_child_models()
+                    model = agent_model_parameter(allowed)
+                    if allowed:
+                        model["enum"] = list(allowed)
+                    properties["model"] = model
+                break
         return canonical_tool_schemas(schemas)
     def _account_safe_context(self, messages: list[Message]) -> list[Message]:
         account_context = getattr(self, "account_context", None)

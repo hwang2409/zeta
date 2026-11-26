@@ -4,19 +4,43 @@ import asyncio
 import json
 import multiprocessing
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
+from zeta.agent.receipt import receipt_tool_result
 from zeta.attention_forks import create_discussion_fork
 from zeta.attention_records import AttentionStore
 from zeta.attention_replies import AttentionReplies
 from zeta.core.session import SessionManager
 from zeta.project_inbox import ProjectInbox
-from zeta.protocol.types import Message, MessageRole, TextContent
+from zeta.protocol.types import (
+    Message,
+    MessageRole,
+    StreamEvent,
+    StreamEventType,
+    StructuredToolResult,
+    TextContent,
+    ToolCall,
+)
+from zeta.server.event_contract import tool_end
 from zeta.skills import SkillCatalog
 from zeta.tools.registry import ToolRegistry
 from zeta.tools.resolve_attention import register_fork
+from zeta.tui.render import render_event
+
+
+def _render_receipt(call: ToolCall, result: StructuredToolResult):
+    event = StreamEvent(
+        StreamEventType.TOOL_EXECUTION_END,
+        tool_call=call,
+        tool_result=receipt_tool_result(call.id, result),
+    )
+    console = Console(record=True, width=120, file=StringIO())
+    console.print(render_event(event))
+    return console.export_text(), tool_end(event, fidelity=True)["tool_result"]
 
 
 def _project_session(home: Path, project_id: str, *, parent_session_id: str | None = None):
@@ -189,23 +213,39 @@ def test_orchestrator_can_resolve_own_attention_without_inbox(tmp_path: Path) ->
         project_registry=manager.project_registry,
     )
     definition = registry.definitions_by_name["resolve_attention"]
+    call = ToolCall(
+        "changed-reply", "resolve_attention",
+        {"attention_id": record.id, "decision": "Use Postgres."},
+    )
+    attention = AttentionStore(original.store.session_dir, writer_epoch=5)
+    try:
+        result = asyncio.run(
+            definition.handler({"attention_id": record.id, "decision": "Use SQLite."})
+        )
+        repeated = asyncio.run(
+            definition.handler({"attention_id": record.id, "decision": "Use SQLite."})
+        )
+        resolved = attention.get(record.id)
+        conflict = asyncio.run(registry.execute(call))
+    finally:
+        asyncio.run(registry.close())
+        original.store.close()
     assert "answered the decision in chat" in definition.description
-    result = asyncio.run(
-        definition.handler({"attention_id": record.id, "decision": "Use SQLite."})
-    )
-    repeated = asyncio.run(
-        definition.handler({"attention_id": record.id, "decision": "Use SQLite."})
-    )
-    resolved = AttentionStore(original.store.session_dir, writer_epoch=5).get(record.id)
     assert result["structuredContent"]["already_resolved"] is False
     assert repeated["structuredContent"]["already_resolved"] is True
     assert resolved.status == "resolved"
     assert resolved.decision == "Use SQLite."
+    rendered, wire = _render_receipt(call, conflict)
+    assert "Use SQLite." in rendered
+    assert "request_attention" in rendered
+    assert wire["is_error"] is True
+    assert wire["structured_content"]["stored_decision"] == "Use SQLite."
+    assert wire["structured_content"]["attention_id"] == record.id
+    assert "request_attention" in wire["structured_content"]["error"]["hint"]
+    assert attention.get(record.id) == resolved
     assert ProjectInbox(
         manager.project_registry, sessions_root=tmp_path / "sessions"
     ).new_ids(project.project_id, session_id=original.store.session_id) == ()
-    asyncio.run(registry.close())
-    original.store.close()
 
 
 def test_orchestrator_resolve_attention_rejects_unknown_and_foreign_items(
@@ -307,6 +347,7 @@ def test_list_attention_pages_and_keeps_broken_timestamps_visible(tmp_path: Path
             entry_seq=None,
             title=f"Choice {index:03d}",
             why="The predecessor stopped.",
+            kind={4: "answer", 6: "deferred", 100: "decided"}.get(index, "decision"),
         )
         for index in range(101)
     ]
@@ -324,10 +365,14 @@ def test_list_attention_pages_and_keeps_broken_timestamps_visible(tmp_path: Path
         project_registry=manager.project_registry,
     )
 
-    first = asyncio.run(registry.definitions_by_name["list_attention"].handler({}))
-    second = asyncio.run(
-        registry.definitions_by_name["list_attention"].handler({"offset": 100})
-    )
+    try:
+        first = asyncio.run(registry.definitions_by_name["list_attention"].handler({}))
+        second = asyncio.run(
+            registry.definitions_by_name["list_attention"].handler({"offset": 100})
+        )
+    finally:
+        asyncio.run(registry.close())
+        current.store.close()
     first_items = first["structuredContent"]["items"]
     second_items = second["structuredContent"]["items"]
     # mutation: omit Broken rows from _list_attention_sync(); the visibility assertion fails.
@@ -340,8 +385,14 @@ def test_list_attention_pages_and_keeps_broken_timestamps_visible(tmp_path: Path
         record.id for record in records[:3]
     )
     assert "next_offset" not in second["structuredContent"]
-    asyncio.run(registry.close())
-    current.store.close()
+    rendered, wire = _render_receipt(ToolCall("list-page", "list_attention", {}), first)
+    assert "96 require action · 2 FYI · 3 broken" in rendered
+    for page in (wire["structured_content"], second["structuredContent"]):
+        assert page["action_required_total"] == 96
+        assert page["info_total"] == 2
+        for item in page["items"]:
+            assert item["requires_action"] is (item["kind"] in {"decision", "deferred"})
+    assert "[FYI, answer," in rendered
 
 
 def test_list_attention_omits_nonopen_and_out_of_scope_owners(tmp_path: Path) -> None:
