@@ -335,8 +335,10 @@ class BackgroundAgentOwner:
             parent_store=parent_store, parent_instance_id=parent_instance_id,
             active_store=store, description=description,
         )
-        self._setup_tasks.discard(setup_task)
         return owner
+
+    def finish_child_setup(self, task: asyncio.Task[Any]) -> None:
+        self._setup_tasks.discard(task)
 
     def attach_run_watcher(self, instance_id: str, watcher: asyncio.Task[Any]) -> None:
         self._watchers[instance_id] = watcher

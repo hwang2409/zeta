@@ -134,6 +134,8 @@ class ChildRunTransitionOwner:
         if request is None or request.cleanup.done():
             request = self.request_cancel()
         await asyncio.shield(request.cleanup)
+        # A foreground cancellation must not return a receipt on write failure.
+        await asyncio.shield(request.confirmation)
 
     def owned_work_refusal(self) -> str | None:
         if not (work := self._owned_work()):

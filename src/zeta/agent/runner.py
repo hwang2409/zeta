@@ -1246,6 +1246,8 @@ async def _run_child(
         await child_store.drop_client_steering_async("abort")
 
     run_owner.attach_runtime(child_task, abort_runtime, cleanup_canceled_child)
+    if not external:
+        loop._background_owner.finish_child_setup(setup_task)
 
     if background:
         # Lifecycle final_result and the notification reuse the bounded
@@ -1387,7 +1389,6 @@ async def _run_child(
         if child_task in done:
             return child_task.result()
         if abort_task in done:
-            await run_owner.cancel_and_join()
             raise asyncio.CancelledError()
     except asyncio.CancelledError:
         await run_owner.cancel_and_join()
