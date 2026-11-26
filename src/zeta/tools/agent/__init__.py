@@ -1030,6 +1030,24 @@ async def _agent(
     )
 
 
+def agent_model_parameter(
+    allowed_models: tuple[str, ...] | None,
+) -> dict[str, object]:
+    choices = (
+        "Known model names include: " + ", ".join(known_model_names()) + ". "
+        if allowed_models is None
+        else "Allowed models: " + (", ".join(allowed_models) or "none") + ". "
+    )
+    return {
+        "type": "string",
+        "description": choices + (
+            "Override the profile's model (or the inherited parent model if the profile "
+            "does not set one). The provider follows from the model. Implies background "
+            "unless background is passed explicitly; --print runs children synchronously."
+        ),
+    }
+
+
 def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
     """Build the catalog-dependent agent tool schema without registry state."""
 
@@ -1068,17 +1086,7 @@ def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
                     "Alias for agent_type. Select a preset from the session catalog."
                 ),
             },
-            "model": {
-                "type": "string",
-                "description": (
-                    "Known model names include: " + ", ".join(known_model_names()) + ". " +
-                    "Run the child on this model instead of inheriting the "
-                    "parent's. The provider follows from the model, so this "
-                    "is how one provider delegates to another. Implies "
-                    "background unless background is passed explicitly; "
-                    "--print runs children synchronously."
-                ),
-            },
+            "model": agent_model_parameter(catalog.allowed_model_names(None, None)),
             "cwd": {
                 "type": "string",
                 "description": (
