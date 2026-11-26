@@ -27,6 +27,7 @@ from tests.test_server import (
 from zeta.attention_records import AttentionStore
 from zeta.attention_replies import AttentionReplies
 from zeta.project_inbox import ProjectInbox
+from zeta.project_registry import ProjectRegistry
 from zeta.server import ZetaServer
 from zeta.server.slash_commands import ServerSlashSession
 from zeta.skills import SkillCatalog
@@ -197,6 +198,11 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
 ) -> None:
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    registry = ProjectRegistry(tmp_path / "home" / "projects")
+    try:
+        await asyncio.to_thread(registry.create_project, "serve attention", "test", project)
+    finally:
+        registry._storage_lease.close()
     reader, writer, session_id = await _ready_extensions(server)
     watcher = None
     try:
@@ -204,9 +210,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
         assert opened is not None
         registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
-        project_id = (
-            await asyncio.to_thread(registry.create_project, "serve attention", "test")
-        ).project_id
+        project_id = opened.metadata.project_id
         store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         records = await await_or_fail(
             asyncio.gather(
@@ -531,6 +535,11 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
 ) -> None:
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    registry = ProjectRegistry(tmp_path / "home" / "projects")
+    try:
+        await asyncio.to_thread(registry.create_project, "operation error", "test", project)
+    finally:
+        registry._storage_lease.close()
     reader, writer, session_id = await _ready_extensions(server)
     watcher = None
     try:
@@ -538,9 +547,7 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
         assert opened is not None
         registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
-        project_id = (
-            await asyncio.to_thread(registry.create_project, "operation error", "test")
-        ).project_id
+        project_id = opened.metadata.project_id
         store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         sealed = await _seed_attention_record(store, session_id, project_id, "sealed")
         target = await _seed_attention_record(store, session_id, project_id, "target")
