@@ -711,6 +711,19 @@ async def _run_child(
         )
     raw_cwd = arguments.get("cwd")
     child_cwd = str(loop.store.cwd)
+    if raw_cwd is None and (
+        not preset.tool_names.isdisjoint({"edit", "write", "bash"})
+        if preset.tool_names is not None
+        else preset.source != "packaged"  # Keep inheritance for built-in general/run.
+    ):
+        parent_cwd = Path(child_cwd)
+        if await asyncio.to_thread(
+            lambda: (parent_cwd / ".git").is_dir() and (parent_cwd / ".worktrees").is_dir()
+        ):
+            return failure(
+                f"agent error: pass cwd explicitly for preset {preset.name!r} "
+                "when starting from the primary checkout; use the intended worktree"
+            )
     cwd_override: str | None = None
     if raw_cwd is not None:
         if type(raw_cwd) is not str or not raw_cwd.strip():

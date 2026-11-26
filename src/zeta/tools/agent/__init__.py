@@ -1067,7 +1067,9 @@ def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
                     "existing directory (a symlinked directory is rejected). "
                     "Pass this when delegating work in another directory or "
                     "git worktree so the child does not run in your checkout. "
-                    "Omit to inherit your starting directory."
+                    "Required from a primary checkout with a .worktrees/ directory "
+                    "for presets that allow edit, write, or bash, or custom profiles "
+                    "with no tool list. Otherwise omit to inherit your starting directory."
                 ),
             },
             "background": {
