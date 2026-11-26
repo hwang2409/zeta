@@ -23,6 +23,7 @@ from ..protocol.types import (
 )
 from . import conversation_channel
 from .background_owner import BackgroundAgentOwner
+from .child_run_owner import ChildRunTransitionOwner
 from .conversation_channel import recover_orphaned_questions
 from .finish_gate import FinishGateState
 from .pending_delivery import NotificationInput
@@ -37,7 +38,6 @@ from .receipt import (
     receipt_tool_result,
 )
 from .recovery_lease import AgentLoopForRecovery, acquire_recovery_subtree
-from .terminal_fence import TerminalTransitionFence
 from .turn_limit import (
     background_turn_limit_state,
     project_payload,
@@ -204,37 +204,14 @@ def _recovered_completion_input(
         "child_completion", data, dedupe_key=child_instance_id
     )
 
-def _settle_recovered_child(
-    child_store: ConversationStore, tool_call_id: str, status: str, text: str
-) -> None:
-    """Write a recovered child's terminal state from its decided outcome.
-
-    ``status`` is the parent receipt's outcome (``completed``, ``error``, or
-    ``canceled``). A lifecycle that is still running takes that outcome with the
-    existing lifecycle values; a terminal lifecycle stays as it is.
-    """
-
-    lifecycle = child_store.agent_lifecycle()
-    running = lifecycle is not None and lifecycle.get("finished_at") is None
-    if status == "canceled" and (lifecycle is None or running):
-        child_store.mark_agent_canceled(tool_call_id)
-        return
-    if running:
-        child_store.finish_agent_lifecycle(
-            "failed" if status == "error" else "completed",
-            final_result=text or "child completed",
-        )
-    child_store.finish_agent_parent()
-
 def _settle_recovered_child_from_receipt(
-    child_store: ConversationStore, result: ToolResult
+    owner: ChildRunTransitionOwner, result: ToolResult
 ) -> None:
-    """Write a recovered child's terminal state from its parent's tool result."""
-
     status = (
         "canceled" if result.is_canceled else "error" if result.is_error else "completed"
     )
-    _settle_recovered_child(child_store, result.tool_call_id, status, result.content)
+    owner.repair_terminal(status, result.content)
+
 
 def _recover_nested_children(
     store: ConversationStore,
@@ -278,11 +255,15 @@ def _recover_nested_children(
                     history_store, child_store, child_instance_id, home_epoch
                 )
             existing_result = store.tool_result(tool_call.id)
+            run_owner = (
+                ChildRunTransitionOwner(child_store, tool_call.id)
+                if child_store is not None else None
+            )
             if marker.get("background"):
                 terminal = child_store.agent_lifecycle() if child_store else None
                 accepted_report = (
-                    TerminalTransitionFence(child_store).accepted_report_snapshot()
-                    if child_store
+                    run_owner.recovered_report()
+                    if run_owner is not None
                     else None
                 )
                 reason = (
@@ -318,10 +299,8 @@ def _recover_nested_children(
                             "background child canceled when the parent session exited"
                         ),
                     )
-                    if child_store is not None:
-                        _settle_recovered_child(
-                            child_store, tool_call.id, terminal.status, terminal.text
-                        )
+                    if run_owner is not None:
+                        run_owner.repair_terminal(terminal.status, terminal.text)
                     _recover_completion_notification(
                         store,
                         notification_store,
@@ -339,16 +318,14 @@ def _recover_nested_children(
                             child_store.agent_lifecycle() if child_store is not None else None
                         ),
                     )
-                elif child_store is not None:
-                    _settle_recovered_child(
-                        child_store,
-                        tool_call.id,
+                elif run_owner is not None:
+                    run_owner.repair_terminal(
                         existing.data["status"],
                         str(existing.data["text"]),
                     )
             elif existing_result is not None:
-                if child_store is not None:
-                    _settle_recovered_child_from_receipt(child_store, existing_result)
+                if run_owner is not None:
+                    _settle_recovered_child_from_receipt(run_owner, existing_result)
             else:
                 recovered = (
                     lifecycle_tool_result(tool_call, child_store, child_path)
@@ -356,8 +333,8 @@ def _recover_nested_children(
                     else None
                 )
                 result = recovered or _nested_canceled_result(marker)
-                if child_store is not None:
-                    _settle_recovered_child_from_receipt(child_store, result)
+                if run_owner is not None:
+                    _settle_recovered_child_from_receipt(run_owner, result)
                 receipt = store.append_message(
                     Message(
                         MessageRole.TOOL_RESULT,
@@ -443,11 +420,15 @@ def _recover_agent_children(
                 repair_delegated_child(
                     loop.store, child_store, child_instance_id, home_epoch
                 )
+            run_owner = (
+                ChildRunTransitionOwner(child_store, tool_call.id)
+                if child_store is not None else None
+            )
             if marker.get("background"):
                 terminal = child_store.agent_lifecycle() if child_store else None
                 accepted_report = (
-                    TerminalTransitionFence(child_store).accepted_report_snapshot()
-                    if child_store
+                    run_owner.recovered_report()
+                    if run_owner is not None
                     else None
                 )
                 reason = (
@@ -483,10 +464,8 @@ def _recover_agent_children(
                             "background child canceled when the parent session exited"
                         ),
                     )
-                    if child_store is not None:
-                        _settle_recovered_child(
-                            child_store, tool_call.id, terminal.status, terminal.text
-                        )
+                    if run_owner is not None:
+                        run_owner.repair_terminal(terminal.status, terminal.text)
                     _recover_completion_notification(
                         loop.store,
                         notification_store,
@@ -507,10 +486,8 @@ def _recover_agent_children(
                             child_store.agent_lifecycle() if child_store is not None else None
                         ),
                     )
-                elif child_store is not None:
-                    _settle_recovered_child(
-                        child_store,
-                        tool_call.id,
+                elif run_owner is not None:
+                    run_owner.repair_terminal(
                         notification.data["status"],
                         str(notification.data["text"]),
                     )
@@ -518,8 +495,8 @@ def _recover_agent_children(
                 continue
             existing_result = loop._existing_tool_result(tool_call.id)
             if existing_result is not None:
-                if child_store is not None:
-                    _settle_recovered_child_from_receipt(child_store, existing_result)
+                if run_owner is not None:
+                    _settle_recovered_child_from_receipt(run_owner, existing_result)
                 loop.store.finish_agent_child(marker_key)
                 continue
             recovered = (
@@ -534,8 +511,8 @@ def _recover_agent_children(
                 agent_type=marker.get("agent_type"),
                 child_instance_id=child_instance_id,
             )
-            if child_store is not None:
-                _settle_recovered_child_from_receipt(child_store, result)
+            if run_owner is not None:
+                _settle_recovered_child_from_receipt(run_owner, result)
             receipt = loop.store.append_message(
                 Message(
                     MessageRole.TOOL_RESULT,
@@ -575,7 +552,7 @@ async def finish_background_child(
     marker_key: str | None = None,
     agent_instance_id: str | None = None,
     max_receipt_bytes: int | None = None,
-    explicit_finish: bool = False,
+    run_owner: ChildRunTransitionOwner,
     child_loop: Any | None = None,
     finish_gate_state: FinishGateState | None = None,
 ) -> None:
@@ -583,19 +560,18 @@ async def finish_background_child(
     status = "completed"
     notification_text = ""
     result: object = None
-    explicit_finish_report = (
-        await TerminalTransitionFence(child_store).recover()
-        if explicit_finish
-        else None
-    )
     explicit_finish_content: dict[str, object] | None = None
     close_cause, _ = child_cleanup_details("background", False)
     try:
+        execution_error: BaseException | None = None
         try:
             result = await child_task
-            report = result.get("explicitFinishReport")
-            if isinstance(report, dict):
-                explicit_finish_report = report
+        except asyncio.CancelledError as exc:
+            execution_error = exc
+        except Exception as exc:  # noqa: BLE001 - child failures become receipts
+            execution_error = exc
+        canceled, explicit_finish_report = await run_owner.background_outcome()
+        if isinstance(result, dict):
             structured = result.get("structuredContent")
             if isinstance(structured, dict):
                 explicit_finish_content = structured
@@ -609,34 +585,16 @@ async def finish_background_child(
                 notification_text = content[0]["text"]
             else:
                 notification_text = "background child returned no text"
-            if explicit_finish_report is not None:
-                status = (
-                    "error"
-                    if explicit_finish_report["status"] == "failed"
-                    else "completed"
-                )
-            elif result.get("isError") is True:
-                status = "error"
-        except asyncio.CancelledError:
-            if explicit_finish_report is None:
-                status = "canceled"
-                notification_text = "background child canceled"
-            else:
-                status = (
-                    "error"
-                    if explicit_finish_report["status"] == "failed"
-                    else "completed"
-                )
-        except Exception as exc:  # noqa: BLE001 - child failures become receipts
-            if explicit_finish_report is None:
-                status = "error"
-                notification_text = f"agent error: {error_message(exc)}"
-            else:
-                status = (
-                    "error"
-                    if explicit_finish_report["status"] == "failed"
-                    else "completed"
-                )
+        if explicit_finish_report is not None:
+            status = "error" if explicit_finish_report["status"] == "failed" else "completed"
+        elif canceled or isinstance(execution_error, asyncio.CancelledError):
+            status = "canceled"
+            notification_text = "background child canceled"
+        elif execution_error is not None:
+            status = "error"
+            notification_text = f"agent error: {error_message(execution_error)}"
+        elif isinstance(result, dict) and result.get("isError") is True:
+            status = "error"
         turn_limited, turns_used, turn_limit_handoff = background_turn_limit_state(
             result=result,
             child_turns=child_turns,
@@ -795,7 +753,7 @@ async def finish_background_child(
                 child_lifecycle=child_store.agent_lifecycle(),
             )
 
-        transition = asyncio.create_task(commit_adopt_publish())
+        transition = asyncio.create_task(run_owner.publish_background(commit_adopt_publish))
         deferred_cancel = False
         while not transition.done():
             try:

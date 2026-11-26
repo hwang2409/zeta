@@ -87,6 +87,7 @@ from zeta.accounts import (
     SessionAccountContext,
 )
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
+from zeta.agent.child_run_owner import ChildRunTransitionOwner
 from zeta.attention_decisions import DecisionItem
 from zeta.attention_records import AttentionRecord
 from zeta.core.approval import ApprovalPolicy
@@ -1816,6 +1817,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
         agent_instance_id="root:2",
         _explicit_finish_report=None,
     )
+    child_loop._child_run_owner = ChildRunTransitionOwner(stores[3], "test-call", explicit_finish=True)
     register_finish(explicit_child, child_loop=child_loop)
     register_handoff(child_loop)
     attention_fork = ToolRegistry(

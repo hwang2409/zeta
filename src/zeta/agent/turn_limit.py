@@ -318,31 +318,6 @@ async def finalize_exhausted_child(
     return project_payload(result, child_session_path)
 
 
-def finish_foreground_turn_limit(
-    *,
-    store: ConversationStore,
-    child_session_path: str,
-    readable_text: str,
-    turns_used: int,
-    stats: dict[str, object],
-    build_result: Callable[..., dict[str, object]],
-) -> dict[str, object]:
-    payload = build_result(
-        readable_text,
-        state="completed",
-        stats=stats,
-        persist_receipt=False,
-    )
-    receipt = payload["content"][0]["text"]
-    store.finish_agent_lifecycle(
-        "completed",
-        final_result=build_turn_limit_result(receipt, child_session_path),
-        turns_used=turns_used,
-        canonical_receipt=True,
-    )
-    return payload
-
-
 def make_publish_child_lifecycle(
     *,
     account_context: Any,
@@ -400,28 +375,6 @@ def make_child_progress_callbacks(
         child_store.update_agent_lifecycle(tool_calls=1)
 
     return update_turns, record_tool_call
-
-
-def make_finish_limited_child_turn(
-    *,
-    store: ConversationStore,
-    child_session_path: str,
-    turns_used: Callable[[], int],
-    stats: Callable[[int], dict[str, object]],
-    build_result: Callable[..., dict[str, object]],
-) -> Callable[[str], dict[str, object]]:
-    def finish(readable_text: str) -> dict[str, object]:
-        used = turns_used()
-        return finish_foreground_turn_limit(
-            store=store,
-            child_session_path=child_session_path,
-            readable_text=readable_text,
-            turns_used=used,
-            stats=stats(used),
-            build_result=build_result,
-        )
-
-    return finish
 
 
 def fallback_handoff(

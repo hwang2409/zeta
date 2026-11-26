@@ -320,7 +320,7 @@ async def consume_run(
                     ended_with_text
                     and not isinstance(recoverable_error, dict)
                     and await idle_lifecycle.reserve_immediate_reminder(
-                        child_loop._terminal_transition_fence
+                        child_loop._child_run_owner
                     )
                 ):
                     _transition_running(child_loop, child_store)
@@ -348,7 +348,7 @@ async def consume_run(
                     lambda: child_loop._background_owner.conversation_channel.wait(
                         child_loop.agent_instance_id
                     ),
-                    child_loop._terminal_transition_fence,
+                    child_loop._child_run_owner,
                 )
                 if action == "external_input":
                     continue
@@ -410,5 +410,3 @@ async def consume_run(
                 if receipt_components is not None
                 else _without_agent_receipt_suffix(text),
             )
-            if receipt_components is not None:
-                child_store.update_agent_lifecycle_result(text, canonical_receipt=True)

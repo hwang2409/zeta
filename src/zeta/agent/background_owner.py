@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..core.store import ConversationStore
+from .child_run_owner import ChildRunTransitionOwner
 from .conversation_channel import ConversationChannel
 from .finish_gate import CausalEpisodeRegistry
 
@@ -121,11 +122,6 @@ class BackgroundAgentOwner:
         task.add_done_callback(self._setup_tasks.discard)
         return task
 
-    def finish_child_setup(self) -> None:
-        task = asyncio.current_task()
-        if task is not None:
-            self._setup_tasks.discard(task)
-
     def create_cancellation_task[TaskResult](
         self, awaitable: Awaitable[TaskResult]
     ) -> asyncio.Task[TaskResult]:
@@ -226,9 +222,11 @@ class BackgroundAgentOwner:
         return _CancellationConfirmation(instance_id, confirmation)
 
     def cancel_subtree(
-        self, instance_id: str
+        self, instance_id: str, *, include_self: bool = True,
     ) -> tuple[_CancellationConfirmation, ...]:
         selected = self._subtree_ids(instance_id)
+        if not include_self:
+            selected.discard(instance_id)
         return tuple(
             confirmation
             for child in tuple(self._cancellers)
@@ -313,6 +311,35 @@ class BackgroundAgentOwner:
             )
             self._store_close_tasks.add(close_task)
             self._store_close_stores[close_task] = store
+
+    def begin_run(
+        self,
+        instance_id: str,
+        store: ConversationStore,
+        tool_call_id: str,
+        setup_task: asyncio.Task[Any],
+        prepare_cancel: Callable[[], Awaitable[None]],
+        *,
+        parent_store: ConversationStore,
+        parent_instance_id: str | None,
+        description: str | None,
+        explicit_finish: bool,
+        background: bool,
+    ) -> ChildRunTransitionOwner:
+        owner = ChildRunTransitionOwner(
+            store, tool_call_id, explicit_finish=explicit_finish, background=background,
+        )
+        owner.attach_setup(self, setup_task, prepare_cancel)
+        self.register(
+            instance_id, owner.request_cancel, setup_task,
+            parent_store=parent_store, parent_instance_id=parent_instance_id,
+            active_store=store, description=description,
+        )
+        self._setup_tasks.discard(setup_task)
+        return owner
+
+    def attach_run_watcher(self, instance_id: str, watcher: asyncio.Task[Any]) -> None:
+        self._watchers[instance_id] = watcher
 
     def register(
         self,

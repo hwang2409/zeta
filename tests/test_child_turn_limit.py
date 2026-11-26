@@ -20,6 +20,7 @@ from zeta.agent.background_lifecycle import (
     finish_background_child,
     recover_agent_children,
 )
+from zeta.agent.child_run_owner import ChildRunTransitionOwner
 from zeta.agent.receipt import build_agent_receipt, has_agent_receipt_suffix
 from zeta.agent.turn_limit import (
     ChildTurnControl,
@@ -870,6 +871,7 @@ async def test_turn_limit_finalization_defers_cancel_at_each_await(
 
     watcher = asyncio.create_task(
         finish_background_child(
+            run_owner=ChildRunTransitionOwner(child_store, call.id),
             child_task=asyncio.create_task(
                 asyncio.sleep(
                     0,
