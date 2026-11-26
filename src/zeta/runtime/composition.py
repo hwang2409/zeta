@@ -241,6 +241,7 @@ def compose_runtime(
                 memory_account = account_context.resolve(memory_provider)
         loop_kwargs: dict[str, Any] = {
             "approval_policy": policy,
+            "configured_model": config.configured_model,
             "hooks": (
                 load_hooks_for_provider(home, provider)
                 if config.allow_hooks or not hooks_restricted
