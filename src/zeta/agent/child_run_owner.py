@@ -205,9 +205,6 @@ class ChildRunTransitionOwner:
 
     async def background_outcome(self) -> tuple[bool, dict[str, object] | None]:
         """Read the winning outcome after execution settles, before publication."""
-        request = self._cancellation
-        if request is not None:
-            await asyncio.shield(request.cleanup)
         async with self._lock:
             report = None
             if self._explicit_finish:
@@ -219,7 +216,12 @@ class ChildRunTransitionOwner:
                     self._winner = "cancel"
             if self._winner is None:
                 self._winner = "finish" if report is not None else "complete"
-            return self._winner == "cancel", report
+            canceled = self._winner == "cancel"
+            request = self._cancellation
+        # Only the winning cancel request can have runtime cleanup to join.
+        if canceled and request is not None:
+            await asyncio.shield(request.cleanup)
+        return canceled, report
 
     async def publish_background[Result](self, publish: Callable[[], Awaitable[Result]]) -> Result:
         async with self._lock:
@@ -258,4 +260,3 @@ class ChildRunTransitionOwner:
         return await self._store.idle_nudge_eligible(
             self._persisted_notification_ids()
         )
-

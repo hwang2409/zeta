@@ -12,7 +12,7 @@ from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail, close_owned_app
 from tests.support.replay_transport import connect_replay, negotiate, replay_server
 from zeta.agent import runner
-from zeta.agent.terminal_fence import TerminalTransitionFence
+from zeta.agent.child_run_owner import ChildRunTransitionOwner
 from zeta.protocol.types import StreamEventType, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
 from zeta.tui.app import TUIApp
@@ -146,16 +146,16 @@ async def test_serve_spawn_lifecycle_and_cancel_race(tmp_path, monkeypatch, winn
             assert "running" in output.getvalue()
             unit, = tui._presenter._tool_region_units.values()
             assert any("thinking" in snapshot for snapshot in progress)
-            # test-contract: seam force finish to complete while cancellation is at the fence
-            original_cancel = TerminalTransitionFence.cancel
+            # test-contract: seam force finish to complete while cancellation is at the run owner
+            original_cancel = ChildRunTransitionOwner.cancel
 
-            async def finish_before_cancel(fence):
+            async def finish_before_cancel(owner):
                 backend.release.set()
                 await await_or_fail(loop._background_owner.wait(), what="finish wins")
-                return await original_cancel(fence)
+                return await original_cancel(owner)
 
             if winner == "completed":
-                monkeypatch.setattr(TerminalTransitionFence, "cancel", finish_before_cancel)
+                monkeypatch.setattr(ChildRunTransitionOwner, "cancel", finish_before_cancel)
             params = {"session_id": session_id, "run_id": run_id, "reason": "user_cancelled"}
             cancelled = await controller.request(5, "child_run_cancel", params)
             assert cancelled["result"]["data"]["state"] == (

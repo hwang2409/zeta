@@ -425,7 +425,7 @@ async def test_agent_cancel_racing_child_finish_reports_already_finished(
     # Forced order: the cancel request reaches the child's store only after its
     # accepted finish has unregistered the child and closed that store.
     from zeta.agent import background_owner
-    from zeta.agent.terminal_fence import TerminalTransitionFence
+    from zeta.agent.child_run_owner import ChildRunTransitionOwner
 
     child_backend = _GrandchildBackend(1, rich_report=False)
     monkeypatch.setattr(
@@ -444,17 +444,17 @@ async def test_agent_cancel_racing_child_finish_reports_already_finished(
         max_turns=2,
     )
     loop.explicit_finish = True
-    original_cancel = TerminalTransitionFence.cancel
+    original_cancel = ChildRunTransitionOwner.cancel
 
-    async def cancel_after_finish_cleanup(fence: TerminalTransitionFence) -> bool:
+    async def cancel_after_finish_cleanup(owner: ChildRunTransitionOwner) -> bool:
         child_backend.release.set()
         await await_or_fail(
             loop._background_owner.wait(), what="child finish cleanup"
         )
-        return await original_cancel(fence)
+        return await original_cancel(owner)
 
     # test-contract: seam park the cancel write until the finish path closed the store
-    monkeypatch.setattr(TerminalTransitionFence, "cancel", cancel_after_finish_cleanup)
+    monkeypatch.setattr(ChildRunTransitionOwner, "cancel", cancel_after_finish_cleanup)
     try:
         await await_or_fail(
             _collect(loop.run_turn("start", origin=MessageOrigin.USER)),

@@ -1192,6 +1192,20 @@ async def _run_child(
     )
     spawn_ready = asyncio.Event() if external else None
 
+    async def commit_foreground_terminal(result: dict[str, object]) -> None:
+        if background or terminal_state is None:
+            return
+        text = canonical_text
+        if text is None and follow_up_loop:
+            content = result.get("content")
+            if isinstance(content, list) and content and isinstance(content[0], dict):
+                candidate = content[0].get("text")
+                if isinstance(candidate, str):
+                    text = candidate
+        await run_owner.complete_foreground(
+            terminal_state, text or terminal_text, child_turns(), canonical=text is not None,
+        )
+
     async def run_child() -> dict[str, object]:
         if spawn_ready is not None:
             await spawn_ready.wait()
@@ -1214,17 +1228,7 @@ async def _run_child(
             child_result=child_result,
             error_message=error_message,
         )
-        if not background and terminal_state is not None:
-            text = canonical_text
-            if text is None and follow_up_loop:
-                content = result.get("content")
-                if isinstance(content, list) and content and isinstance(content[0], dict):
-                    candidate = content[0].get("text")
-                    if isinstance(candidate, str):
-                        text = candidate
-            await run_owner.complete_foreground(
-                terminal_state, text or terminal_text, child_turns(), canonical=text is not None,
-            )
+        await commit_foreground_terminal(result)
         return result
 
     child_task = loop._create_task(run_child())
