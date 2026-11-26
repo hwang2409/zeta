@@ -183,9 +183,10 @@ The limits are fixed, not settings:
 - Sixteen multi controllers may hold sessions. A multi controller that has not
   attached to a session does not count toward this limit. The seventeenth
   session-holding controller `hello` gets `-32001` and closes.
-- Twenty resident records, including the sessionless record plus attached,
-  setup, parked, closing, and reconnect-grace records: an operation that would
-  allocate a twenty-first gets `-32004` with `data.reason: "resident_limit"`.
+- Twenty resident records bound total loaded records for the serve: 16 session
+  holders, one sessionless record, and three records of room for parked, grace,
+  or closing records across all connections; a fifth tab that parks 3 chats hits
+  `-32004` with `data.reason: "resident_limit"`.
 - Eight pending or active observer subscriptions per session, including child
   streams for that session: the ninth join gets `-32001` and the connection
   stays open. An observer with no subscription does not count toward a session.

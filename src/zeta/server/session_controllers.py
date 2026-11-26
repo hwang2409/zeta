@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 MAX_MULTI_CONTROLLERS = 16
 MAX_PARKED_RECORDS = 3
-# resident records: multi controllers, one sessionless record, and parked records.
+# resident cap bounds total loaded records: 16 session holders, one sessionless record,
+# and three records of room for parked, grace, or closing records across all connections.
 MAX_RESIDENT_RECORDS = MAX_MULTI_CONTROLLERS + 1 + MAX_PARKED_RECORDS
 
 
