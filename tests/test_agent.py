@@ -22208,9 +22208,10 @@ async def test_pending_task_or_child_notification_rejects_finish(
 
 @pytest.mark.asyncio
 async def test_child_run_owner_serializes_finish_idle_nudge_cancel_and_recovery(
-    tmp_path: Path,
+    tmp_path: Path, request: pytest.FixtureRequest,
 ) -> None:
     prompt_store = ConversationStore(tmp_path, session_id="prompt")
+    request.addfinalizer(prompt_store.close)
     prompt_fence = ChildRunTransitionOwner(prompt_store, "test-call", explicit_finish=True)
     prompt_ready = asyncio.Event()
 
@@ -22224,6 +22225,7 @@ async def test_child_run_owner_serializes_finish_idle_nudge_cancel_and_recovery(
     assert await await_or_fail(nudge, what="join terminal transition") is False
 
     finish_store = ConversationStore(tmp_path, session_id="finish")
+    request.addfinalizer(finish_store.close)
     finish_fence = ChildRunTransitionOwner(finish_store, "test-call", explicit_finish=True)
     finish_ready = asyncio.Event()
 
@@ -22241,6 +22243,7 @@ async def test_child_run_owner_serializes_finish_idle_nudge_cancel_and_recovery(
     assert (await finish_fence.background_outcome())[1] == {"status": "done", "summary": "done"}
 
     cancel_store = ConversationStore(tmp_path, session_id="cancel")
+    request.addfinalizer(cancel_store.close)
     cancel_fence = ChildRunTransitionOwner(cancel_store, "test-call", explicit_finish=True)
     cancel_ready = asyncio.Event()
 

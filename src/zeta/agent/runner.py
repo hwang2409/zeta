@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ..core.abort import AbortSignal as ToolAbortSignal
-from ..core.agent_state import LoadedAgentLifecycle, MissingAgentLifecycle
+from ..core.agent_state import LoadedAgentLifecycle, MissingAgentLifecycle, _lifecycle_elapsed
 from ..core.checkpoints.mutation import AppendConversationRows, ConversationRow
 from ..core.child_runs import TERMINAL_AGENT_STATES, read_child_lifecycle
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
@@ -848,6 +848,13 @@ async def _run_child(
         loop._background_owner.finish_store(child_instance_id, child_store)
         await loop._background_owner.wait_for_store_closes()
 
+    def foreground_terminal_stats(state: str, turns_used: int) -> dict[str, object]:
+        lifecycle = child_store.agent_lifecycle() or {}
+        stats = agent_stats(lifecycle, status=state, turns_used=turns_used)
+        stats["turns_used"] = turns_used
+        stats["elapsed"] = _lifecycle_elapsed(lifecycle)
+        return stats
+
     async def prepare_setup_cancel() -> None:
         if child_store.agent_lifecycle() is None:
             await await_joined_offload(start_lifecycle, {})
@@ -961,9 +968,7 @@ async def _run_child(
             raise
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         failure_text = f"agent error: {error_message(exc)}"
-        terminal_stats = agent_stats(
-            child_store.agent_lifecycle(), status="failed", turns_used=0
-        )
+        terminal_stats = foreground_terminal_stats("failed", 0)
         failure_payload = loop._child_result_payload(
             tool_call.id,
             failure_text,
@@ -1052,9 +1057,9 @@ async def _run_child(
         turns_used = child_turns()
         if background:
             child_store.update_agent_lifecycle(turns_used=turns_used)
-        else:
-            terminal_state, terminal_text = state, text
-        return agent_stats(child_store.agent_lifecycle(), status=state, turns_used=turns_used)
+            return agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
+        terminal_state, terminal_text = state, text
+        return foreground_terminal_stats(state, turns_used)
 
     def child_result(
         text: str,
