@@ -132,6 +132,8 @@ The server echoes it in `result.capabilities.features`. Use multi-controller
 mode only after that echo. Controllers that do not negotiate it use the
 exclusive legacy slot. Legacy and multi-controller modes cannot mix; a
 controller `hello` for the other mode returns `-32001` and closes the connection.
+A fresh multi-controller `hello` is admitted during reconnect grace; exact
+session reclaim still requires the matching session id (see issue #1586).
 
 Each controller can attach to at most one session, and each session has at most
 one controller. There is no automatic or forced handoff. Another connection
@@ -178,9 +180,12 @@ and a pending approval of a child is terminated.
 
 The limits are fixed, not settings:
 
-- Four multi controllers: the fifth controller `hello` gets `-32001` and closes.
-- Eight resident records, including unattached, setup, parked, closing, and
-  reconnect-grace records: an operation that would allocate a ninth gets
+- Sixteen multi controllers may hold sessions. A multi controller that has not
+  attached to a session does not count toward this limit. The seventeenth
+  session-holding controller `hello` gets `-32001` and closes.
+- Twenty resident records bound total loaded records for the serve: 16 session
+  holders, one sessionless record, and three records of room for parked, grace,
+  or closing records across all connections; a fifth tab that parks 3 chats hits
   `-32004` with `data.reason: "resident_limit"`.
 - Eight pending or active observer subscriptions per session, including child
   streams for that session: the ninth join gets `-32001` and the connection
@@ -195,8 +200,11 @@ The limits are fixed, not settings:
   legacy role limits and refusal behavior are unchanged. The 33rd connection
   closes without a JSON-RPC response.
 
-In multi-controller mode, an observer's `session_history_and_subscribe` join
-selects the session used by `status`, `content_read`, `model_catalog`,
+In multi-controller mode, a controller may join another controller's session with
+`session_history_and_subscribe`. This gives the joining controller read history
+and live events for that session, but does not attach it or allow it to `send`
+or `steer`; those operations still require the controller's own attached session.
+An observer's `session_history_and_subscribe` join selects the session used by `status`, `content_read`, `model_catalog`,
 `session_settings`, `delivery_status`, `session_grants`, `skill_catalog`,
 `skill_read`, `agent_profile_catalog`, `agent_profile_read`, `mcp_server_list`,
 and `session_history_read`. Without a live view, those methods return
@@ -3495,7 +3503,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 | `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
 | `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
-| `multi_controller` | enables up to four controllers with exclusive ownership of attached and parked sessions, connection-local parking, and exact-id reclaim of independent per-session reconnect grace; see [`multi_controller`](#multi_controller) for limits and refusals |
+| `multi_controller` | enables up to sixteen session-holding controllers with exclusive ownership of attached and parked sessions, sessionless controllers that do not count toward that cap, connection-local parking, and exact-id reclaim of independent per-session reconnect grace; see [`multi_controller`](#multi_controller) for limits and refusals |
 | `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 per connection are parked or closing (`-32004` with `data.reason: "parked_limit"`), `status` adds `parked_sessions`, and the controller gets `parked_session_changed` events (see "parking a busy session") |
 | `in_flight_replay` | requires `session_replay_seq`; a `session_history_and_subscribe` join during a reply starts its stream with the reply text, thinking, and running-tool output streamed so far, as ordinary `assistant_delta` and `tool_output` events (see "joining during a reply") |
 

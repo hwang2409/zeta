@@ -54,6 +54,56 @@ async def test_ordinary_server_negotiates_multi_controller(
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
 @pytest.mark.asyncio
+async def test_five_sessionless_multi_controllers_do_not_use_session_cap(
+    tmp_path: Path, transport: Transport
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    clients = [await connect_replay(server, transport) for _ in range(5)]
+    try:
+        for client in clients:
+            hello = await negotiate(client, replay=False, extra=("multi_controller",))
+            assert "result" in hello, hello
+    finally:
+        await _close_server(server, clients)
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_multi_controller_can_read_another_controllers_session(
+    tmp_path: Path, transport: Transport
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await server.start()
+    owner = await connect_replay(server, transport)
+    reader = await connect_replay(server, transport)
+    try:
+        assert "result" in await negotiate(owner, replay=False, extra=("multi_controller",))
+        assert "result" in await negotiate(
+            reader, replay=False, extra=("multi_controller", "session_replay_seq")
+        )
+        created = await owner.request(2, "new_session", {})
+        assert "result" in created, created
+        session_id = created["result"]["session"]["session_id"]
+
+        joined = await reader.request(3, "session_history_and_subscribe", {"session_id": session_id})
+        assert "result" in joined, joined
+        assert joined["result"]["messages"] is not None
+
+        sent = await owner.request(4, "send", {"text": "visible to second controller"})
+        assert sent.get("result", {}).get("accepted") is True, sent
+        await owner.event("agent_end")
+        assert (await reader.event("agent_end"))["session_id"] == session_id
+
+        for request_id, method in ((5, "send"), (6, "steer")):
+            refused = await reader.request(request_id, method, {"text": "not attached"})
+            assert refused["error"]["code"] == -32003, refused
+    finally:
+        await _close_server(server, (owner, reader))
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
 async def test_unattached_multi_close_releases_mode_for_legacy(
     tmp_path: Path, transport: Transport
 ) -> None:
@@ -607,12 +657,12 @@ async def test_cancelled_old_cleanup_does_not_remove_concurrent_newer_multi_toke
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
 @pytest.mark.asyncio
-async def test_four_multi_controllers_keep_distinct_session_ownership(
+async def test_sixteen_multi_controllers_keep_distinct_session_ownership(
     tmp_path: Path, transport: Transport
 ) -> None:
     server = replay_server(tmp_path, transport, _backend_factory)
     await server.start()
-    clients = [await connect_replay(server, transport) for _ in range(4)]
+    clients = [await connect_replay(server, transport) for _ in range(16)]
     try:
         for client in clients:
             hello = await negotiate(client, replay=False, extra=("multi_controller",))
@@ -621,13 +671,13 @@ async def test_four_multi_controllers_keep_distinct_session_ownership(
         for request_id, client in enumerate(clients, 2):
             created = await client.request(request_id, "new_session", {})
             session_ids.append(created["result"]["session"]["session_id"])
-        assert len(set(session_ids)) == 4
-        fifth = await await_or_fail(connect_replay(server, transport), what="fifth socket")
-        clients.append(fifth)
-        refused = await negotiate(fifth, replay=False, extra=("multi_controller",))
+        assert len(set(session_ids)) == 16
+        seventeenth = await await_or_fail(connect_replay(server, transport), what="seventeenth socket")
+        clients.append(seventeenth)
+        refused = await negotiate(seventeenth, replay=False, extra=("multi_controller",))
         assert refused.get("error") == {"code": -32001, "message": "another client is already connected"}
-        assert await fifth.closed(42) == []
-        for request_id, (client, session_id) in enumerate(zip(clients[:4], session_ids, strict=True), 10):
+        assert await seventeenth.closed(42) == []
+        for request_id, (client, session_id) in enumerate(zip(clients[:16], session_ids, strict=True), 10):
             status = await client.request(request_id, "status", {})
             assert status["result"]["session"]["session_id"] == session_id
     finally:
@@ -1029,6 +1079,7 @@ async def test_public_multi_controller_owner_state_table(
 async def test_multi_resident_limit_includes_setup_and_closing(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr("zeta.server.session_controllers.MAX_RESIDENT_RECORDS", 8)
     text = TextContent("held")
     backend = GatedBackend([([text, HOLD], [text])] * 3)
     server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
@@ -1214,7 +1265,7 @@ async def test_multi_overflow_settles_only_its_connection(
         await await_or_fail(settling.wait(), what="overflow request finalizer")
         extra = await await_or_fail(connect_replay(server, transport), what="overflow contender")
         clients.append(extra)
-        assert (await negotiate(extra, replay=False, extra=("multi_controller",)))["error"]["code"] == -32001
+        assert "result" in await negotiate(extra, replay=False, extra=("multi_controller",))
         assert (await b.request(3, "status", {}))["result"]["session"]["session_id"] == b_id
         settle.set()
         await await_or_fail(released.wait(), what="release settled overflow controller")
