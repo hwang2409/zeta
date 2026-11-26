@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import TypedDict
 
@@ -13,7 +14,7 @@ from ...attention_records import (
     AttentionStore,
     observed_epoch_for_session,
 )
-from ...attention_replies import AttentionReplies, ReplyOutcome
+from ...attention_replies import AttentionReplies, ReplyOutcome, TerminalReplyConflict
 from ...core.session_execution import (
     OwnerHint,
     SessionExecutionLease,
@@ -23,7 +24,7 @@ from ...core.session_files import child_directory, session_root
 from ...project_inbox import AGENT_ORIGIN
 from ...protocol.types import StructuredToolResult
 from ...runtime.project_registry_state import ProjectRegistryState
-from .._results import _success_result, text_block
+from .._results import _error_result, _success_result, text_block
 from ..registry import ToolRegistry
 
 
@@ -134,6 +135,22 @@ def _close_attention_sync(
             lease.close()
 
 
+def _terminal_conflict(conflict: TerminalReplyConflict) -> StructuredToolResult:
+    record = conflict.record
+    hint = (
+        "From the active top-level session, use request_attention to file a replacement "
+        f"that cites {record.id} as superseded, then resolve the replacement with the new decision."
+    )
+    stored = (
+        "none (dismissed)" if record.decision is None
+        else json.dumps(record.decision, ensure_ascii=False)
+    )
+    result = _error_result(f"{conflict}. {hint}\nStored decision: {stored}", hint=hint)
+    assert result["structuredContent"] is not None
+    result["structuredContent"].update(attention_id=record.id, stored_decision=record.decision)
+    return result
+
+
 async def _resolve_attention(
     registry: ToolRegistry, arguments: ResolveAttentionArguments
 ) -> StructuredToolResult:
@@ -152,17 +169,20 @@ async def _resolve_attention(
         directory_fd=store.directory_fd,
         registry_state=state,
     )
-    outcome = await asyncio.to_thread(
-        AttentionReplies(
-            home,
-            validated.record.session_id,
-            registry_state=state,
-            origin=AGENT_ORIGIN,
-        ).reply,
-        validated.record.id,
-        arguments["decision"],
-        store.session_id,
-    )
+    try:
+        outcome = await asyncio.to_thread(
+            AttentionReplies(
+                home,
+                validated.record.session_id,
+                registry_state=state,
+                origin=AGENT_ORIGIN,
+            ).reply,
+            validated.record.id,
+            arguments["decision"],
+            store.session_id,
+        )
+    except TerminalReplyConflict as conflict:
+        return _terminal_conflict(conflict)
     record = await asyncio.to_thread(
         AttentionStore(
             home / "sessions" / validated.record.session_id,
@@ -194,12 +214,15 @@ async def _resolve_attention(
 async def _close_attention(
     registry: ToolRegistry, arguments: CloseAttentionArguments
 ) -> StructuredToolResult:
-    outcome, record = await asyncio.to_thread(
-        _close_attention_sync,
-        registry,
-        arguments["attention_id"],
-        arguments["decision"],
-    )
+    try:
+        outcome, record = await asyncio.to_thread(
+            _close_attention_sync,
+            registry,
+            arguments["attention_id"],
+            arguments["decision"],
+        )
+    except TerminalReplyConflict as conflict:
+        return _terminal_conflict(conflict)
     if outcome.already_resolved:
         return _success_result(
             text_block(f"Decision was already resolved ({record.id})."),
@@ -225,8 +248,9 @@ def register(registry: ToolRegistry) -> None:
         _close_attention,
         binding="shared",
         description=(
-            "Close your own pending attention item when the user answered the decision "
-            "in chat. This does not send an inbox message."
+            "Close an item from list_attention in this session or a dead predecessor session, "
+            "for example when the user answered the decision in chat. Cannot close broken or "
+            "ambiguous records or items owned by another live session. This does not send an inbox message."
         ),
         parameters={
             "type": "object",
