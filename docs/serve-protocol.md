@@ -1132,7 +1132,7 @@ requested method. Without feature negotiation the methods return `-32601`.
 | `state_memory_detail` | `project_id`, `memory_id` | `{memory, body, truncated}` | — |
 | `state_inbox` | `project_id`, `status?`, `limit?`, `cursor?` | Page of Inbox | `created_ns`, `message_id` |
 | `state_inbox_detail` | `project_id`, `message_id` | `{message, body, truncated}` | — |
-| `state_attention` | `project_id?`, `status?`, `limit?`, `cursor?` | Page of Attention | `created_ns`, `attention_id` |
+| `state_attention` | `project_id?`, `status?`, `list?`, `limit?`, `cursor?` | Page of Attention | `created_ns`, `attention_id` |
 
 Ids are strings. Use `null` or omit a filter to include all values. Memory
 `kind` is `brief`, `decision`, `state`, `backlog`, `changelog`, or `legacy`; inbox
@@ -1146,7 +1146,7 @@ snapshot and returns the largest prefix that fits the frame.
 Project   {project_id, name, path, session_count, memory_count, inbox: {new, claimed, done}, updated_ns}
 Memory    {memory_id, project_id, kind, automatic, accepted, summary, created_ns, updated_ns, source_session_id, has_body}
 Inbox     {message_id, project_id, kind, status, sender, summary, created_ns, updated_ns, trusted_assignment, has_body}
-Attention {attention_id, project_id, session_id, kind, status, title, created_ns, updated_ns}
+Attention {attention_id, project_id, session_id, kind, requires_action, status, title, created_ns, updated_ns}
 ```
 
 Project `path` is the canonical integration root, or `null` when there is none.
@@ -3393,7 +3393,16 @@ The shared slash registry has this order and surface availability:
 | `restart` | no | restart this session from the local checkout (reinstall after `pyproject` changes) |
 | `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
 
-The `/decisions` list includes broken attention records instead of hiding them. A
+`state_attention` accepts `list: "action"` for decisions and deferred items,
+or `list: "fyi"` for answers and decided notes. Without `list`, it still
+returns both. The derived `requires_action` field classifies each row; use
+`status: "open"` to exclude resolved records.
+
+`/decisions action` and `/decisions fyi` select the corresponding open list
+for the attached session. Bare `/decisions` still lists both over serve. Reading
+does not acknowledge an FYI note; `/decisions dismiss <id>` resolves it.
+
+The `/decisions` action list includes broken attention records instead of hiding them. A
 broken item is additive: it has `id`, `path`, and `reason` fields in attention
 payloads, and contains no request body. `reason` is one of `unreadable`,
 `invalid_name`, `invalid_json`, `invalid_schema`, `id_mismatch`, or `too_large`.

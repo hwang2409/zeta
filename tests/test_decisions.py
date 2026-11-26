@@ -436,7 +436,7 @@ async def test_decisions_refresh_table_renders_current_counts(
             await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
             broken = current.store.session_dir / "attention" / f"{records[0].id}.json"
             broken.write_bytes(b'{"why":"cut off"')
-            expected = (2, 1, "● 1 open, 1 staged")
+            expected = (1, 1, "● 0 open, 1 staged")
         elif case == "failure_recovery":
             calls = 0
 

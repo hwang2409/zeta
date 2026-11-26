@@ -10,6 +10,7 @@ import pytest
 from tests.support.owned import await_or_fail
 from tests.support.serve_close import close_serve
 from tests.test_server import (
+    _connect,
     _ready_extensions,
     _request,
     _seed_slash_fixtures,
@@ -58,6 +59,45 @@ def _seed_inbox(registry, tmp_path: Path, project_id: str, session_id: str) -> s
         title="seeded",
         body="deliver on the next poll",
     )
+
+
+@pytest.mark.asyncio
+async def test_serve_attention_split_and_dismiss(tmp_path: Path) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    try:
+        async def rpc(method, params):
+            return (await _request(reader, writer, method, method, params))[-1]["result"]
+
+        await rpc("hello", {"protocol_version": "1.0", "client_version": "1.1", "features": ["state_read_v1"]})
+        session_id = (await rpc("new_session", {"provider": "codex"}))["session"]["session_id"]
+        opened = server.controllers.attached().runtime.opened
+        assert opened is not None
+        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
+        decision, note = [
+            await asyncio.to_thread(
+                store.request, session_id=session_id, project_id=opened.metadata.project_id,
+                entry_id=None, entry_seq=None, title=title, why="context", kind=kind,
+                options=("yes",) if kind == "decision" else (),
+            )
+            for kind, title in (("decision", "Pick an option"), ("decided", "Build completed"))
+        ]
+        legacy = await rpc("state_attention", {"status": "open"})
+        assert {row["attention_id"] for row in legacy["items"]} == {decision.id, note.id}
+        for view, expected, excluded in (("action", decision, note), ("fyi", note, decision)):
+            text = (await rpc("slash_run", {"session_id": session_id, "text": f"/decisions {view}"}))["text"]
+            assert expected.title in text and excluded.title not in text, text
+            page = await rpc("state_attention", {"status": "open", "list": view})
+            assert [row["attention_id"] for row in page["items"]] == [expected.id]
+            assert page["items"][0]["requires_action"] is (view == "action")
+        await rpc("slash_run", {"session_id": session_id, "text": f"/decisions dismiss {note.id}"})
+        remaining = await rpc("state_attention", {"status": "open"})
+        assert [row["attention_id"] for row in remaining["items"]] == [decision.id]
+        done = await rpc("state_attention", {"status": "done", "list": "fyi"})
+        assert [row["attention_id"] for row in done["items"]] == [note.id]
+    finally:
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio

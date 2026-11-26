@@ -1163,7 +1163,7 @@ def _register_builtins(
         safe(
             "decisions",
             _delegate("slash_decisions"),
-            "read, reply, dismiss, or batch-reply to attention items",
+            "read attention or /decisions fyi; reply, dismiss, or batch-reply by id",
             serve=ServeSlash(mutates=_decisions_mutates),
             reason=native,
         )

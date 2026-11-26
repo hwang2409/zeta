@@ -151,7 +151,8 @@ class AttentionRecord:
 
         return {
             "attention_id": self.id, "project_id": self.project_id, "session_id": self.session_id,
-            "kind": self.kind, "status": "open" if self.status == "open" else "done",
+            "kind": self.kind, "requires_action": self.requires_action,
+            "status": "open" if self.status == "open" else "done",
             "title": self.title, "created_ns": timestamp_ns(self.created_at),
             "updated_ns": timestamp_ns(self.resolved_at or self.created_at),
         }
@@ -494,10 +495,15 @@ def state_attention_home_generation(sessions_dir: Path) -> object:
     return stamps([sessions_dir]), tuple(state_attention_generation(path) for path in _attention_sessions(sessions_dir))
 
 
-def state_attention_home_rows(sessions_dir: Path, epoch: int, project_id: str | None, status: str | None):
+def state_attention_home_rows(
+    sessions_dir: Path, epoch: int, project_id: str | None, status: str | None, *,
+    requires_action: bool | None = None,
+):
     return [
         row for path in _attention_sessions(sessions_dir) for row in state_attention_rows(path, epoch)
-        if (project_id is None or row["project_id"] == project_id) and (status is None or row["status"] == status)
+        if (project_id is None or row["project_id"] == project_id)
+        and (status is None or row["status"] == status)
+        and (requires_action is None or row["requires_action"] == requires_action)
     ]
 
 

@@ -52,10 +52,18 @@ def request(collection: str, params: dict[str, Any]) -> tuple[tuple, Resume | No
         value = params.get(field)
         if value is not None and value not in variants:
             raise InvalidParams("invalid filter")
+    attention_list = None
+    if collection == "attention":
+        allowed.add("list")
+        attention_list = params.get("list")
+        if attention_list is not None and attention_list not in ("action", "fyi"):
+            raise InvalidParams("invalid attention list")
     limit = params.get("limit", 50)
     if params.keys() - allowed - {"limit", "cursor"} or type(limit) is not int or not 1 <= limit <= 200:
         raise InvalidParams("invalid page params")
     scope = (collection, project_id, value)
+    if attention_list is not None:
+        scope += (attention_list,)
     return scope, resume(params.get("cursor"), scope, (), _order(collection)), limit
 
 
@@ -77,7 +85,7 @@ def page(collection, snapshot, start, limit, fits):
 
 
 def snapshot(home: Path, scope: tuple, stable: Callable) -> Any:
-    collection, project_id, selector = scope
+    collection, project_id, selector, *attention_list = scope
     resource = collection.removesuffix("_detail")
     manifest = home / "storage-format.json"
 
@@ -118,7 +126,10 @@ def snapshot(home: Path, scope: tuple, stable: Callable) -> Any:
                 return inbox.state_rows(project_id, status=selector)
             if collection == "inbox_detail":
                 return inbox.state_rows(project_id, message_id=selector)
-            return attention_records.state_attention_home_rows(sessions, epoch, project_id, selector)
+            return attention_records.state_attention_home_rows(
+                sessions, epoch, project_id, selector,
+                requires_action=attention_list[0] == "action" if attention_list else None,
+            )
 
     try:
         return stable(generation, rows)

@@ -35,6 +35,10 @@ class DecisionItem:
     project_name: str
     record: AttentionRecord | Broken
 
+    @property
+    def is_fyi(self) -> bool:
+        return isinstance(self.record, AttentionRecord) and not self.record.requires_action
+
 
 @dataclass(frozen=True, slots=True)
 class ProjectAttentionItem:
@@ -78,7 +82,7 @@ def _top_level_sessions(home: Path, project_id: str) -> tuple[tuple[str, Path], 
 
 
 def open_project_attention(
-    home: Path, project_id: str, *, offset: int = 0, limit: int = 100
+    home: Path, project_id: str, *, offset: int = 0, limit: int = 100, fyi: bool = False
 ) -> ProjectAttentionPage:
     """Read open attention from every top-level session in one project."""
     if type(offset) is not int or offset < 0:
@@ -86,18 +90,23 @@ def open_project_attention(
     if type(limit) is not int or limit < 1 or limit > 100:
         raise ValueError("limit must be between 1 and 100")
     rows: list[ProjectAttentionItem] = []
+    actions = info = broken = 0
     for session_id, session_dir in _top_level_sessions(Path(home), project_id):
         try:
             epoch = observed_epoch_for_session(session_dir)
             records = AttentionStore(session_dir, writer_epoch=epoch).list()
         except (OSError, ValueError):
             continue
-        rows.extend(
-            ProjectAttentionItem(session_id, record)
-            for record in records
-            if isinstance(record, Broken)
-            or (record.status == "open" and record.project_id == project_id and record.session_id == session_id)
-        )
+        for record in records:
+            if isinstance(record, Broken):
+                broken += 1
+                if not fyi:
+                    rows.append(ProjectAttentionItem(session_id, record))
+            elif record.status == "open" and record.project_id == project_id and record.session_id == session_id:
+                actions += record.requires_action
+                info += not record.requires_action
+                if record.requires_action != fyi:
+                    rows.append(ProjectAttentionItem(session_id, record))
     rows.sort(
         key=lambda item: (
             item.record.created_at if isinstance(item.record, AttentionRecord) else "",
@@ -105,17 +114,9 @@ def open_project_attention(
             item.record.id,
         )
     )
-    total = len(rows)
-    actions = info = 0
-    for item in rows:
-        if isinstance(item.record, AttentionRecord):
-            if item.record.requires_action:
-                actions += 1
-            else:
-                info += 1
     return ProjectAttentionPage(
-        tuple(rows[offset : offset + limit]), total, actions, info,
-        offset + limit if offset + limit < total else 0,
+        tuple(rows[offset : offset + limit]), actions + info + broken, actions, info,
+        offset + limit if offset + limit < len(rows) else 0,
     )
 
 
@@ -163,7 +164,7 @@ def _decision_sort_key(item: DecisionItem) -> tuple[bool, str]:
     record = item.record
     if isinstance(record, Broken):
         return True, record.path
-    return record.kind != "decision", record.created_at
+    return not record.requires_action, record.created_at
 
 
 def open_decisions(
@@ -189,6 +190,20 @@ def open_decisions(
         if isinstance(record, Broken) or record.status == "open"
     )
     return tuple(sorted(items, key=_decision_sort_key))
+
+
+def format_open_decisions(items: tuple[DecisionItem, ...], *, fyi: bool | None) -> str:
+    if fyi is not None:
+        items = tuple(item for item in items if item.is_fyi == fyi)
+    if not items:
+        return "no open FYI items" if fyi else "no open attention items"
+    title = "open FYI items:" if fyi else "open attention items:"
+    return title + "\n" + "\n".join(
+        f"  {record.id} [broken] {record.path}: {record.reason}"
+        if isinstance(record := item.record, Broken)
+        else f"  {record.id} [{record.kind}] {record.title} [{item.project_name}]"
+        for item in items
+    )
 
 
 __all__ = ["DecisionItem", "open_decisions"]

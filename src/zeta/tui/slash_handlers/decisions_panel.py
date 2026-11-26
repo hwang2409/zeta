@@ -17,6 +17,7 @@ from pathlib import Path
 
 from prompt_toolkit.document import Document
 
+from ...attention_decisions import format_open_decisions
 from ...attention_records import Broken, broken_record_refusal
 from ...protocol.types import StreamEvent, StreamEventType
 from ...runtime.project_registry_state import (
@@ -223,9 +224,10 @@ class DecisionsMixin:
 
     async def slash_decisions(self, args: str) -> str:
         full_screen_active = getattr(self, "_full_screen_active", lambda: False)
-        if not args.strip() and full_screen_active():
+        command = args.strip()
+        if command in {"", "fyi"} and full_screen_active():
             self._consume_overlay_submission()
-            await self._open_decisions_panel()
+            await self._open_decisions_panel(fyi=command == "fyi")
             return ""
         parts = args.split(maxsplit=2)
         if not parts or parts[0] not in {"reply", "dismiss"}:
@@ -255,16 +257,7 @@ class DecisionsMixin:
                 self.loop.store.session_id,
             )
             return f"replied to {attention_id}"
-        if not items:
-            return "no open attention items"
-        return "open attention items:\n" + "\n".join(
-            (
-                f"  {item.record.id} [broken] {item.record.path}: {item.record.reason}"
-                if isinstance(item.record, Broken)
-                else f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
-            )
-            for item in items
-        )
+        return format_open_decisions(items, fyi=command == "fyi")
 
     # -- status-bar count scan ----------------------------------------------
 
@@ -352,10 +345,9 @@ class DecisionsMixin:
             self._set_decisions_error(exc)
             items = await self._read_decisions(timeout=None, generation=generation)
         replies = self._attention_replies(self._decisions_session_id)
-        from ...attention_records import Broken
-
         open_ids = {
-            item.record.id for item in items if not isinstance(item.record, Broken)
+            item.record.id for item in items
+            if not isinstance(item.record, Broken) and item.record.requires_action
         }
         staged = await asyncio.to_thread(
             lambda: {
@@ -364,11 +356,11 @@ class DecisionsMixin:
                 if item_id in open_ids
             }
         )
-        changed = (len(items), len(staged)) != (
+        changed = (len(open_ids), len(staged)) != (
             self._decisions_count,
             self._decisions_staged_count,
         ) or self._decisions_error is not None
-        self._decisions_count = len(items)
+        self._decisions_count = len(open_ids)
         self._decisions_staged_count = len(staged)
         self._decisions_error = None
         if self._decisions_panel_open:
@@ -412,25 +404,26 @@ class DecisionsMixin:
         async with self._decisions_ops_lock:
             return await asyncio.to_thread(operation, *args, **kwargs)
 
-    def open_decisions_panel(self) -> asyncio.Future[None] | None:
+    def open_decisions_panel(self, *, fyi: bool = False) -> asyncio.Future[None] | None:
         return self._open_overlay(
-            self._show_decisions_panel,
+            lambda: self._show_decisions_panel(fyi=fyi),
             self._load_decisions_panel,
             on_loaded=self._refresh_decisions_panel,
         )
 
-    async def _open_decisions_panel(self) -> None:
-        load = self.open_decisions_panel()
+    async def _open_decisions_panel(self, *, fyi: bool = False) -> None:
+        load = self.open_decisions_panel(fyi=fyi)
         if load is not None:
             await load
 
-    def _show_decisions_panel(self) -> bool:
+    def _show_decisions_panel(self, *, fyi: bool = False) -> bool:
         session = self._active_session
         if not isinstance(session, FullScreenPromptSession) or self._decisions_panel_open:
             return False
         buffer = session.default_buffer
         self._decisions_restore_text = buffer.text
         self._decisions_restore_cursor = buffer.cursor_position
+        self._decisions_panel.show_fyi(fyi)
         self._decisions_panel_open = True
         self._decisions_panel_control.set_lines(
             self._decisions_panel.render_lines(loading=True), overflow_hint=True
@@ -495,17 +488,22 @@ class DecisionsMixin:
         elif key == "escape":
             self.close_decisions_panel()
             return
-        if key in {"up", "k"}:
+        if key == "f":
+            panel.show_fyi(not panel.fyi)
+        elif key in {"up", "k"}:
             panel.move(-1)
         elif key in {"down", "j"}:
             panel.move(1)
         elif (
             key == "d"
             and panel.selected is not None
+            and not isinstance(panel.selected.record, Broken)
             and panel.selected.record.kind != "decision"
         ):
             self._dismiss_selected()
             return
+        elif panel.fyi:
+            pass  # FYI notes can be read or dismissed, not answered.
         elif key == "a":
             panel.enter_answer()
             self._decisions_answer_field.reset()
