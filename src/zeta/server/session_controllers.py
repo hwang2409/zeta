@@ -21,8 +21,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 MAX_MULTI_CONTROLLERS = 16
-MAX_RESIDENT_RECORDS = 17
 MAX_PARKED_RECORDS = 3
+# resident records: multi controllers, one sessionless record, and parked records.
+MAX_RESIDENT_RECORDS = MAX_MULTI_CONTROLLERS + 1 + MAX_PARKED_RECORDS
 
 
 @dataclass(frozen=True, slots=True)
