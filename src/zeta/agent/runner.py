@@ -571,9 +571,10 @@ async def run_agent_tool(
 
 
 class ChildControlError(Exception):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, detail: str | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.detail = detail
 
 
 async def spawn_child(
@@ -654,9 +655,11 @@ async def _run_child(
         # Existing markers and cards use a call id; no tool execution is admitted.
         tool_call = ToolCall(f"spawn-{uuid4().hex}", "agent", arguments)
 
-    def failure(text: str, *, code: str = "invalid_params") -> dict[str, object]:
+    def failure(
+        text: str, *, code: str = "invalid_params", public_detail: bool = False
+    ) -> dict[str, object]:
         if external:
-            raise ChildControlError(code)
+            raise ChildControlError(code, detail=text if public_detail else None)
         return loop._child_result_payload(tool_call.id, text, state="failed")
 
     prompt = arguments.get("prompt")
@@ -710,20 +713,12 @@ async def _run_child(
             "agent error: max_turns must be a positive integer",
         )
     raw_cwd = arguments.get("cwd")
+    if raw_cwd is None and preset.requires_cwd:
+        return failure(
+            f"agent error: preset {preset.name!r} requires cwd; pass the intended worktree path",
+            public_detail=True,
+        )
     child_cwd = str(loop.store.cwd)
-    if raw_cwd is None and (
-        not preset.tool_names.isdisjoint({"edit", "write", "bash"})
-        if preset.tool_names is not None
-        else preset.source != "packaged"  # Keep inheritance for built-in general/run.
-    ):
-        parent_cwd = Path(child_cwd)
-        if await asyncio.to_thread(
-            lambda: (parent_cwd / ".git").is_dir() and (parent_cwd / ".worktrees").is_dir()
-        ):
-            return failure(
-                f"agent error: pass cwd explicitly for preset {preset.name!r} "
-                "when starting from the primary checkout; use the intended worktree"
-            )
     cwd_override: str | None = None
     if raw_cwd is not None:
         if type(raw_cwd) is not str or not raw_cwd.strip():

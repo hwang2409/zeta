@@ -6371,67 +6371,62 @@ async def test_child_registry_agent_schema_uses_its_catalog_snapshot(
 
 
 @pytest.mark.parametrize(
-    ("agent_type", "primary", "explicit", "refused"),
+    ("requires_cwd", "explicit", "refused"),
     [
-        pytest.param("worker", True, False, True, id="worker-omitted"),
-        pytest.param("worker", True, True, False, id="worker-explicit"),
-        pytest.param("reviewer", True, False, True, id="reviewer-with-bash"),
-        pytest.param("explore", True, False, False, id="read-only-inherits"),
-        pytest.param("general", True, False, False, id="general-inherits"),
-        pytest.param("worker", False, False, False, id="worktree-inherits"),
+        pytest.param(True, False, True, id="required-omitted"),
+        pytest.param(True, True, False, id="required-explicit"),
+        pytest.param(False, False, False, id="unset-inherits"),
     ],
 )
 @pytest.mark.asyncio
-async def test_agent_cwd_required_for_writable_profile_in_primary_checkout(
-    tmp_path: Path, agent_type: str, primary: bool, explicit: bool, refused: bool,
+async def test_agent_profile_requires_cwd(
+    tmp_path: Path, requires_cwd: bool, explicit: bool, refused: bool,
 ) -> None:
-    parent_cwd = tmp_path / "repo"
-    worktree = parent_cwd / ".worktrees" / "task"
-    worktree.mkdir(parents=True)
-    if primary:
-        (parent_cwd / ".git").mkdir()
-    else:
-        (parent_cwd / ".git").write_text("gitdir: ../main/.git/worktrees/task\n")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
 
     home = tmp_path / "home"
     profiles = home / "agents"
     profiles.mkdir(parents=True)
-    (profiles / "worker.md").write_text(
-        "---\nname: worker\ndescription: implementation\n---\nImplement.\n"
+    flag = "requires_cwd: true\n" if requires_cwd else ""
+    (profiles / "implementer.md").write_text(
+        f"---\nname: implementer\ndescription: implementation\n{flag}---\nImplement.\n"
     )
-    (profiles / "reviewer.md").write_text(
-        "---\nname: reviewer\ndescription: review\ntools: [read, bash]\n---\nReview.\n"
-    )
-    call = _agent_call(agent_type=agent_type)
+    call = _agent_call(agent_type="implementer")
     if explicit:
         call.arguments["cwd"] = str(worktree)
     backend = FakeBackend(
         [ScriptedTurn(tool_calls=[call]), ScriptedTurn([TextContent("complete")])]
     )
-    store = ConversationStore(tmp_path / "sessions", cwd=parent_cwd)
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
     registry = ToolRegistry(
-        parent_cwd, session_store=store, skill_catalog=SkillCatalog.empty(),
+        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty(),
         agent_catalog=discover_session_agents(home=home),
     )
     loop = AgentLoop(
         backend, store, registry=registry, max_turns=1, skill_catalog=SkillCatalog.empty(),
     )
     try:
-        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
-        result = next(
-            message.tool_result for message in branch_messages(store)
-            if message.tool_result and message.tool_result.tool_call_id == call.id
+        events = await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        completed = next(
+            event for event in events
+            if event.tool_result is not None and event.tool_result.tool_call_id == call.id
         )
+        result = completed.tool_result
         agents = store.session_dir / "agents"
         if refused:
-            assert result.is_error, "agent accepted a writable profile without cwd"
-            assert "pass cwd" in result.content
+            assert result.is_error, "agent accepted a profile that requires cwd"
+            assert "preset 'implementer' requires cwd" in result.content
+            assert "pass the intended worktree path" in result.content
             assert not agents.exists()
             assert len(backend.calls) == 1
+            output = StringIO()
+            Console(file=output, width=120).print(agent_card_module.render_agent_receipt(completed))
+            assert "pass the intended worktree path" in output.getvalue()
         else:
             assert not result.is_error, result.content
             state = json.loads((agents / "1" / "session_state.json").read_text())
-            assert state["bash_cwd"] == str(worktree if explicit else parent_cwd)
+            assert state["bash_cwd"] == str(worktree if explicit else tmp_path)
     finally:
         await loop.close()
         store.close()
