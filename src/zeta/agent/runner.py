@@ -14,7 +14,11 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ..core.abort import AbortSignal as ToolAbortSignal
-from ..core.agent_state import LoadedAgentLifecycle, MissingAgentLifecycle, _lifecycle_elapsed
+from ..core.agent_state import (
+    LoadedAgentLifecycle,
+    MissingAgentLifecycle,
+    _lifecycle_elapsed,
+)
 from ..core.checkpoints.mutation import AppendConversationRows, ConversationRow
 from ..core.child_runs import TERMINAL_AGENT_STATES, read_child_lifecycle
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
