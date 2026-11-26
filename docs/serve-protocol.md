@@ -1579,6 +1579,17 @@ public `run_id` is the existing child
 instance id. Child-local store ids and the agent tool's `handle` name are not
 exposed.
 
+A live row can also include `account_status` when a snapshot is available. It
+contains `account` (the child's pinned `provider:account` ID), `held` (boolean,
+whether the child is in a provider rate-limit hold), `usable_alternatives`
+(nonnegative integer, the number of other available accounts on that provider
+with fresh cached headroom), and `cached_used_percent` (number from 0 to 100,
+or null if unknown). The percentage is the highest usage among fresh, active
+cached limit windows; a known active exhaustion can still show 100 when the
+cache is stale. The server does not refresh usage to produce this row. A count
+of zero means no alternatives are known from the cache, not that the provider
+is exhausted. Rows without a snapshot and terminal rows omit `account_status`.
+
 `child_run_send` queues one message at the child's existing safe delivery
 point. Params are `session_id`, `run_id`, and nonempty `text`; success returns
 `{"accepted":true,"run_id":"..."}`. A missing or terminal child returns

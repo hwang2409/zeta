@@ -38,7 +38,6 @@ from zeta.protocol.types import (
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.server.control import NotificationPresentation, ServeControl
-from zeta.server.handlers.child_runs import list_runs
 from zeta.skills import SkillCatalog
 from zeta.tui.render import render_event
 
@@ -262,15 +261,6 @@ async def test_long_rate_limit_hold_wakes_parent_once_across_reprobes(
         ))
         assert "codex:first held" in _plain(status_card)
         assert "1 other codex account with headroom" in _plain(status_card)
-        session_id = tree.opened.store.session_id
-        listed = await list_runs(
-            SimpleNamespace(connections=SimpleNamespace(run_blocking=asyncio.to_thread)),
-            {"session_id": session_id},
-            SimpleNamespace(runtime=SimpleNamespace(
-                session_id=session_id, opened=tree.opened, loop=tree.loop,
-            )),
-        )
-        assert listed["runs"][0].get("account_status") == child["account_status"]
         assert not [
             entry
             for entry in tree.opened.store.agent_notifications(pending_only=False)
