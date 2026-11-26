@@ -183,7 +183,11 @@ async def consume_child(
             if await hold_wake.observe(event):
                 if not background and foreground_hold_abandoned(event.data):
                     raise ForegroundChildHeld(foreground_hold_text(event.data))
-                status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
+                account_text = hold_wake.held_account_text()
+                hold_text = rate_limit_hold_text(event.data, pinned=account_text is not None)
+                status = f"turn {child_turns() + 1}: {hold_text}"
+                if account_text is not None:
+                    status += f"; {account_text}"
                 update_step(status)
                 publish(status)
             elif event.type is StreamEventType.TOOL_APPROVAL_START:
@@ -1179,16 +1183,18 @@ async def _run_child(
         if spawn_ready is not None:
             await spawn_ready.wait()
         try:
+            hold_wake = HoldWake(
+                loop._background_owner.conversation_channel if background else None,
+                child_instance_id, child_path, description, child_account_pins, child_store,
+            )
+            await hold_wake.start()
             return await consume(
                 child_loop,
                 prompt,
                 **run_kwargs,
                 child_path=child_path,
                 publish=publish,
-                hold_wake=HoldWake(
-                    loop._background_owner.conversation_channel,
-                    child_instance_id, child_path, description, child_account_pins,
-                ) if background else NO_HOLD_WAKE,
+                hold_wake=hold_wake,
                 child_turns=child_turns,
                 update_turns=update_turns,
                 record_tool_call=record_tool_call,

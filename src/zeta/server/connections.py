@@ -1158,7 +1158,7 @@ class ConnectionRegistry(ReplayOutput):
             lifecycle = read_agent_lifecycle(reader.session_dir / "agent_lifecycle.json")
             item = lifecycle if isinstance(lifecycle, dict) else None
             if item is not None:
-                item = {"handle": item.get("handle"), "description": item.get("description", ""), "agent_type": item.get("agent_type", "general"), "state": item.get("state", "running"), "turns_used": item.get("turns_used", 0), "tool_calls": item.get("tool_calls", 0), "current_step": item.get("current_step", ""), "started_at": item.get("started_at"), "finished_at": item.get("finished_at"), "elapsed": item.get("elapsed", 0.0)}
+                item = {"handle": item.get("handle"), "description": item.get("description", ""), "agent_type": item.get("agent_type", "general"), "state": item.get("state", "running"), "turns_used": item.get("turns_used", 0), "tool_calls": item.get("tool_calls", 0), "current_step": item.get("current_step", ""), "started_at": item.get("started_at"), "finished_at": item.get("finished_at"), "elapsed": item.get("elapsed", 0.0), "account_status": item.get("account_status")}
             row = None
             if item is not None:
                 session_id, parent_run_id = run_row_identity(params["run_id"])

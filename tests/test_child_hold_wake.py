@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +23,7 @@ from tests.test_accounts_exhaustion import _account_context
 from tests.test_rate_limit_hold import _collect
 from zeta.accounts.exhaustion import classify_subscription_limit
 from zeta.accounts.store import AccountId
+from zeta.accounts.usage import UsageSnapshot, UsageWindow, record_subscription_limit
 from zeta.agent.conversation_channel import HoldWake
 from zeta.core.store import ConversationStore
 from zeta.core.store._step_delivery import NotificationInput
@@ -32,10 +33,12 @@ from zeta.protocol.types import (
     StreamEventType,
     TextContent,
     ToolCall,
+    ToolResult,
 )
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.server.control import NotificationPresentation, ServeControl
+from zeta.server.handlers.child_runs import list_runs
 from zeta.skills import SkillCatalog
 from zeta.tui.render import render_event
 
@@ -133,6 +136,7 @@ class HeldTree:
         self.loop.manager = self.context.manager
         self.loop.session_metadata = self.context.metadata
         self.loop.account_context = self.context
+        self.loop.tool_registry.account_context = self.context
         self.wakes = 0
         self.wake_published = asyncio.Event()
         self.loop._background_owner.set_wake_callback(self._woke)
@@ -208,8 +212,27 @@ async def test_long_rate_limit_hold_wakes_parent_once_across_reprobes(
         parent_turns=2,
     )
     tree = await asyncio.to_thread(HeldTree, tmp_path, backend)
+
+    def seed_usage() -> None:
+        now = datetime.now(UTC)
+        for name, percent in (("first", 85.0), ("second", 10.0)):
+            record_subscription_limit(
+                tree.context.store,
+                AccountId("codex", name),
+                UsageSnapshot(now, "usage_endpoint", (
+                    UsageWindow("primary", percent, 300, now + timedelta(hours=1)),
+                )),
+                now,
+            )
+
     before = time.time()
     try:
+        await asyncio.to_thread(seed_usage)
+        preflight = await tree.loop.tool_registry.execute(ToolCall("preflight", "agent_status", {}))
+        assert preflight["structuredContent"].get("session_account_status") == [{
+            "account": "codex:first", "held": False, "usable_alternatives": 1,
+            "cached_used_percent": 85.0,
+        }], "status must show cached headroom before any child starts"
         await tree.start_and_hold(wait_for_wake=True)
         holds = tree.holds()
         assert len(holds) == 1, "a long hold must wake the parent once"
@@ -223,9 +246,31 @@ async def test_long_rate_limit_hold_wakes_parent_once_across_reprobes(
         assert before + LONG_RETRY_AFTER <= until <= time.time() + LONG_RETRY_AFTER
         assert hold.get("display_only") is None
 
-        child = await tree.child_state()
+        call = ToolCall("held-status", "agent_status", {})
+        result = await tree.loop.tool_registry.execute(call)
+        child = result["structuredContent"]["children"][0]
         assert child["state"] == "running", "a held child is not idle or stalled"
         assert child.get("idle_since") is None
+        assert child.get("account_status") == {
+            "account": "codex:first", "held": True, "usable_alternatives": 1,
+            "cached_used_percent": 85.0,
+        }, "holding one account must not look like provider exhaustion"
+        status_card = render_event(StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END, tool_call=call,
+            tool_result=ToolResult(call.id, result["content"][0]["text"],
+                                   structured_content=result["structuredContent"]),
+        ))
+        assert "codex:first held" in _plain(status_card)
+        assert "1 other codex account with headroom" in _plain(status_card)
+        session_id = tree.opened.store.session_id
+        listed = await list_runs(
+            SimpleNamespace(connections=SimpleNamespace(run_blocking=asyncio.to_thread)),
+            {"session_id": session_id},
+            SimpleNamespace(runtime=SimpleNamespace(
+                session_id=session_id, opened=tree.opened, loop=tree.loop,
+            )),
+        )
+        assert listed["runs"][0].get("account_status") == child["account_status"]
         assert not [
             entry
             for entry in tree.opened.store.agent_notifications(pending_only=False)
@@ -246,6 +291,7 @@ async def test_long_rate_limit_hold_wakes_parent_once_across_reprobes(
         rendered = _plain(render_event(delivered[0]))
         assert "hold ←" in rendered and "worker" in rendered
         assert f"rate limit until {hold['until']}" in rendered
+        assert "1 other codex account with headroom" in rendered
         frames = await _serve_frames(delivered[0])
         assert [name for name, _fields in frames] == ["child_hold"]
         served = frames[0][1]["data"]
@@ -359,8 +405,11 @@ async def test_subscription_limit_days_away_wakes_parent_once(tmp_path: Path) ->
         assert hold["until"] == datetime.fromtimestamp(resets_at, UTC).isoformat()
         assert "subscription limit" in str(hold["text"])
         assert "as of " in str(hold["text"])
-        assert "a running child resumes by itself" in str(hold["text"])
-        assert (await tree.child_state())["state"] == "running"
+        assert "Switching the parent account affects new children" in str(hold["text"])
+        assert "0 other codex accounts with headroom" in str(hold["text"])
+        child = await tree.child_state()
+        assert child["state"] == "running"
+        assert child["account_status"]["usable_alternatives"] == 0
     finally:
         # the reset is days away; closing the tree cancels the held child
         await tree.close()
