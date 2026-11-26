@@ -510,6 +510,7 @@ async def _build_child_loop(
                 child_scope.project_dir if child_scope is not None else None
             ),
             freeze_live_config=child_scope is None,
+            configured_model=loop.configured_model,
             telemetry=loop.telemetry,
         )
 
@@ -712,6 +713,13 @@ async def _run_child(
         return failure(
             "agent error: max_turns must be a positive integer",
         )
+    if model is not None:
+        allowed = loop.allowed_child_models()
+        if allowed is not None and model not in allowed:
+            return failure(
+                "agent error: model override is not allowed; allowed models: "
+                + (", ".join(allowed) or "none"),
+            )
     raw_cwd = arguments.get("cwd")
     if raw_cwd is None and preset.requires_cwd:
         return failure(

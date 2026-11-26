@@ -51,6 +51,19 @@ class AgentCatalog:
     def names(self) -> list[str]:
         return [agent.name for agent in self.agents]
 
+    def model_names(self) -> tuple[str, ...]:
+        return tuple(sorted({agent.model for agent in self.agents if agent.model is not None}))
+
+    def allowed_model_names(
+        self, configured_model: str | None, parent_model: str | None,
+    ) -> tuple[str, ...] | None:
+        """Return None for legacy, unrestricted overrides with only built-in presets."""
+        models = set(self.model_names())
+        if not models and all(agent.source == "packaged" for agent in self.agents):
+            return None
+        models.update(model for model in (configured_model, parent_model) if model)
+        return tuple(sorted(models))
+
     def description(self) -> str:
         choices = "; ".join(
             f"{agent.name}: {agent.selection_guidance}" for agent in self.agents

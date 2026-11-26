@@ -9916,6 +9916,61 @@ async def test_agent_with_a_model_runs_the_child_on_that_provider(
     # The child talked to the substitute, never to the parent's backend.
     assert len(child_backend.calls) == 1
     assert len(parent_backend.calls) == 1
+    schema = next(schema for schema in parent_backend.calls[0][1] if schema["name"] == "agent")
+    model_parameter = schema["parameters"]["properties"]["model"]
+    assert "enum" not in model_parameter
+    assert "gpt-5.4" in model_parameter["description"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "configured_model", "expected_model"),
+    [
+        pytest.param("claude-opus-4-8", None, None, id="unconfigured"),
+        pytest.param("gpt-5.4", None, "gpt-5.4", id="profile"),
+        pytest.param(None, None, "gpt-5.4", id="omitted"),
+        pytest.param("claude-opus-5-5", "claude-opus-5-5", "claude-opus-5-5", id="settings"),
+        pytest.param("claude-sonnet-4-6", None, "claude-sonnet-4-6", id="parent"),
+    ],
+)
+async def test_agent_model_override_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    model: str | None, configured_model: str | None, expected_model: str | None,
+) -> None:
+    preset = replace(GENERAL_PRESET, model="gpt-5.4", source="user")
+    call = _agent_call()
+    call.arguments["background"] = False
+    if model is not None:
+        call.arguments["model"] = model
+    child_backend = FakeBackend([ScriptedTurn([TextContent("child done")])])
+    requested = _stub_backend_factory(monkeypatch, child_backend)
+    backend = FakeBackend([ScriptedTurn(tool_calls=[call])])
+    backend.model = "claude-sonnet-4-6"
+    with ConversationStore(tmp_path) as store:
+        kwargs = {"configured_model": configured_model} if configured_model else {}
+        loop = AgentLoop(
+            backend, store, max_turns=1, skill_catalog=SkillCatalog.empty(),
+            agent_catalog=AgentCatalog((preset,)), freeze_live_config=True, **kwargs,
+        )
+        try:
+            await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+            result = next(
+                message.tool_result for message in branch_messages(store) if message.tool_result
+            )
+            allowed = {"gpt-5.4", "claude-sonnet-4-6"}
+            if configured_model:
+                allowed.add(configured_model)
+            if expected_model is None:
+                assert result.is_error, "unconfigured provider model must not spawn a child"
+                assert not requested
+                assert f"allowed models: {', '.join(sorted(allowed))}" in result.content
+            else:
+                assert result.content.startswith("child done")
+                assert [name for _, name in requested] == [expected_model]
+            schema = next(schema for schema in backend.calls[0][1] if schema["name"] == "agent")
+            assert schema["parameters"]["properties"]["model"]["enum"] == sorted(allowed)
+        finally:
+            await loop.close()
 
 
 @pytest.mark.asyncio
