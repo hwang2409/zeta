@@ -415,7 +415,8 @@ def register(registry: ToolRegistry) -> None:
             "Paths outside the session cwd are allowed. "
             "Timeouts are in seconds, up to 3600 seconds. Commands that create "
             "their own session can outlive the timeout. For a long-running "
-            "command, use run_background instead."
+            "command, use run_background instead. Do not use sleep to wait for "
+            "background tasks or child agents; their completion wakes you."
         ),
         parameters={
             "type": "object",

@@ -2537,10 +2537,26 @@ async def test_task_output_reads_immediately_and_rejects_wait_argument(
     )
     task_id = started["structuredContent"]["task_id"]
     try:
-        immediate = await registry.execute(
-            ToolCall("immediate", "task_output", {"task_id": task_id})
-        )
+        call = ToolCall("immediate", "task_output", {"task_id": task_id, "since": 0})
+        immediate = await registry.execute(call)
         assert immediate["structuredContent"]["running"] is True
+        assert immediate["structuredContent"].get("no_new_output") is True
+        assert immediate["structuredContent"]["cursor"] == 0
+
+        event = StreamEvent(
+            StreamEventType.TOOL_EXECUTION_END,
+            tool_call=call,
+            tool_result=receipt_tool_result(call.id, immediate),
+        )
+        hint = "No new output. Completion wakes you automatically."
+        assert hint in event.tool_result.content
+        rendered = render_event(event)
+        assert rendered is not None
+        assert hint in _renderable_plain(rendered, width=120)
+        projected = event_contract.tool_end(event, fidelity=True)
+        assert hint in projected["tool_result"]["content"]
+        assert projected["tool_result"]["structured_content"]["no_new_output"] is True
+
         invalid = await registry.execute(
             ToolCall("invalid", "task_output", {"task_id": task_id, "wait_seconds": 1})
         )

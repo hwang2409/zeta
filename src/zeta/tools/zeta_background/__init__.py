@@ -9,6 +9,11 @@ from ...protocol.types import StructuredToolResult
 from .._shared.shell_cwd import bind_shell_cwd_async
 from ..registry import ToolExecutionContext, ToolRegistry, _success_result, text_block
 
+_COMPLETION_GUIDANCE = (
+    "Completion wakes you automatically. Do other work or end your turn; "
+    "do not poll or sleep to wait."
+)
+
 
 class BackgroundArguments(TypedDict, total=False):
     command: str
@@ -47,7 +52,7 @@ async def _run_background(
         environment=environment,
     )
     return _result(
-        f"started background task {task_id} (pid {pid})",
+        f"started background task {task_id} (pid {pid})\n{_COMPLETION_GUIDANCE}",
         {"task_id": task_id, "pid": pid, "running": True},
     )
 
@@ -85,6 +90,9 @@ async def _task_output(
                 f"retrieve with task_output (since={result['cursor']}); do not use read"
             )
         content = metadata + (output if output else (note or "")) + more
+        if result["running"] and not output and not result["has_more"]:
+            result["no_new_output"] = True
+            content = f"{content.rstrip()}\nNo new output. {_COMPLETION_GUIDANCE}"
         overflow = len(content) - registry.max_output_chars
         if overflow <= 0:
             break
@@ -145,8 +153,7 @@ def register(registry: ToolRegistry) -> None:
         binding="shared",
         approval_subject="command",
         description=(
-            "Start a shell command as a session-scoped background task. "
-            "Use task_output to monitor it."
+            f"Start a shell command as a session-scoped background task. {_COMPLETION_GUIDANCE}"
         ),
         parameters={
             "type": "object",
@@ -168,11 +175,10 @@ def register(registry: ToolRegistry) -> None:
         _task_output,
         binding="shared",
         description=(
-            "Read incremental output and status from a background task. Completion "
-            "is announced automatically and wakes the agent; task_output only reads "
-            "output/status using the since cursor. Large output uses a "
-            "task-output://<task-id> location; retrieve it only with repeated "
-            "task_output calls using the returned since cursor, not with read."
+            "Read background task status and available output at the since cursor. "
+            f"{_COMPLETION_GUIDANCE} If has_more is true, use the returned cursor "
+            "to retrieve remaining pages with task_output, not read, even when "
+            "the output location is task-output://<task-id>."
         ),
         parameters={
             "type": "object",
