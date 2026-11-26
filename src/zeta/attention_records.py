@@ -489,21 +489,21 @@ def _is_attention_id(value: str) -> bool:
     return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 
 
-def state_attention_home_generation(sessions_dir: Path) -> object:
+def state_attention_home_generation(sessions_dir: Path, *, include_owner: bool = False) -> object:
     from .state_snapshot import stamps
 
-    return stamps([sessions_dir]), tuple(state_attention_generation(path) for path in _attention_sessions(sessions_dir))
+    sessions = _attention_sessions(sessions_dir)
+    owner_paths = (path / "meta.json" for path in sessions) if include_owner else ()
+    return stamps((sessions_dir, *owner_paths)), tuple(state_attention_generation(path) for path in sessions)
 
 
 def state_attention_home_rows(
-    sessions_dir: Path, epoch: int, project_id: str | None, status: str | None, *,
-    requires_action: bool | None = None,
+    sessions_dir: Path, epoch: int, project_id: str | None, status: str | None,
 ):
     return [
         row for path in _attention_sessions(sessions_dir) for row in state_attention_rows(path, epoch)
         if (project_id is None or row["project_id"] == project_id)
         and (status is None or row["status"] == status)
-        and (requires_action is None or row["requires_action"] == requires_action)
     ]
 
 

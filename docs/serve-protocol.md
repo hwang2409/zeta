@@ -3393,14 +3393,18 @@ The shared slash registry has this order and surface availability:
 | `restart` | no | restart this session from the local checkout (reinstall after `pyproject` changes) |
 | `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
 
-`state_attention` accepts `list: "action"` for decisions and deferred items,
-or `list: "fyi"` for answers and decided notes. Without `list`, it still
-returns both. The derived `requires_action` field classifies each row; use
-`status: "open"` to exclude resolved records.
+`state_attention` accepts `list: "action"` for open decisions and deferred
+items, or `list: "fyi"` for open answers and decided notes. With
+`status: "open"` or a `list` selector, it uses the same project queue as
+`list_attention`, including open items from dead top-level predecessors.
+Supply `project_id` to scope to one project. The rows expose `requires_action`
+and include only valid records. Without `list`, omit `status` for all stored
+records or use `status: "done"` for resolved history.
 
 `/decisions action` and `/decisions fyi` select the corresponding open list
-for the attached session. Bare `/decisions` still lists both over serve. Reading
-does not acknowledge an FYI note; `/decisions dismiss <id>` resolves it.
+for the attached session's project. Bare `/decisions` still lists both over
+serve. Reading does not acknowledge an FYI note; `/decisions dismiss <id>`
+resolves it in the owning session.
 
 The `/decisions` action list includes broken attention records instead of hiding them. A
 broken item is additive: it has `id`, `path`, and `reason` fields in attention

@@ -1,7 +1,7 @@
 """Prompt-toolkit lifecycle for the in-TUI decisions popup.
 
 ``TUIApp`` mixes this in. The mixin owns everything that touches live state: it
-reads open attention decisions for the shown session (off the event loop), feeds
+reads open attention decisions for the shown session's project (off the event loop), feeds
 the pure :class:`DecisionsPanel` view model, delivers a quick answer to the
 asking orchestrator's inbox, and starts a discussion fork and switches the TUI
 to it. The read also drives the status-bar decisions count, which a bounded
@@ -344,23 +344,23 @@ class DecisionsMixin:
         except TimeoutError as exc:
             self._set_decisions_error(exc)
             items = await self._read_decisions(timeout=None, generation=generation)
-        replies = self._attention_replies(self._decisions_session_id)
-        open_ids = {
-            item.record.id for item in items
-            if not isinstance(item.record, Broken) and item.record.requires_action
+        action_items = {
+            (item.session_id, item.record.id) for item in items
+            if not isinstance(item.record, Broken) and not item.is_fyi
         }
         staged = await asyncio.to_thread(
             lambda: {
                 item_id: reply
-                for item_id, reply in (replies.staged() if items else ())
-                if item_id in open_ids
+                for owner in {owner for owner, _ in action_items}
+                for item_id, reply in self._attention_replies(owner).staged()
+                if (owner, item_id) in action_items
             }
         )
-        changed = (len(open_ids), len(staged)) != (
+        changed = (len(action_items), len(staged)) != (
             self._decisions_count,
             self._decisions_staged_count,
         ) or self._decisions_error is not None
-        self._decisions_count = len(open_ids)
+        self._decisions_count = len(action_items)
         self._decisions_staged_count = len(staged)
         self._decisions_error = None
         if self._decisions_panel_open:
@@ -569,7 +569,7 @@ class DecisionsMixin:
                 panel_item.record.id
                 for panel_item in self._decisions_panel.items
                 if panel_item.session_id == record.session_id
-                and not isinstance(panel_item.record, Broken)
+                and not isinstance(panel_item.record, Broken) and not panel_item.is_fyi
             }
             try:
                 replies = self._attention_replies(record.session_id)

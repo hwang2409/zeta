@@ -3,12 +3,21 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from tests.support.serve_close import close_serve
+from tests.test_attention_batch_ui import (
+    _make_app,
+    _press,
+    _rendered_text,
+    _session,
+    _wait_for_records,
+)
+from tests.test_attention_batch_ui import _request as _seed_attention
 from tests.test_server import (
     _connect,
     _ready_extensions,
@@ -20,6 +29,9 @@ from zeta.attention_replies import AttentionReplies
 from zeta.project_inbox import ProjectInbox
 from zeta.server import ZetaServer
 from zeta.server.slash_commands import ServerSlashSession
+from zeta.skills import SkillCatalog
+from zeta.tools.list_attention import register as register_list_attention
+from zeta.tools.registry import ToolRegistry
 
 
 def _start_publication_watcher(loop, *, turn_active: bool = False) -> asyncio.Task[None]:
@@ -62,41 +74,85 @@ def _seed_inbox(registry, tmp_path: Path, project_id: str, session_id: str) -> s
 
 
 @pytest.mark.asyncio
-async def test_serve_attention_split_and_dismiss(tmp_path: Path) -> None:
+async def test_project_attention_queue_matches_across_surfaces(tmp_path: Path) -> None:
     project = _seed_slash_fixtures(tmp_path)
-    server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    home = tmp_path / "home"
+    server = ZetaServer(home=home, cwd=project, port=0, provider="codex")
     reader, writer = await _connect(server)
+    predecessors = []
+    tools = None
     try:
         async def rpc(method, params):
-            return (await _request(reader, writer, method, method, params))[-1]["result"]
+            response = (await _request(reader, writer, method, method, params))[-1]
+            assert "result" in response, response
+            return response["result"]
 
         await rpc("hello", {"protocol_version": "1.0", "client_version": "1.1", "features": ["state_read_v1"]})
+        runtime = server.controllers.attached().runtime
+        await asyncio.to_thread(runtime.manager.project_registry.create_project, "local", "test", project)
         session_id = (await rpc("new_session", {"provider": "codex"}))["session"]["session_id"]
-        opened = server.controllers.attached().runtime.opened
-        assert opened is not None
-        store = AttentionStore(opened.store.session_dir, writer_epoch=5)
-        decision, note = [
-            await asyncio.to_thread(
-                store.request, session_id=session_id, project_id=opened.metadata.project_id,
-                entry_id=None, entry_seq=None, title=title, why="context", kind=kind,
-                options=("yes",) if kind == "decision" else (),
+        opened = runtime.opened
+        project_id = opened.metadata.project_id
+        foreign = await asyncio.to_thread(runtime.manager.project_registry.create_project, "foreign", "test")
+        for owner_project in (project_id, foreign.project_id):
+            predecessors.append(await asyncio.to_thread(_session, home, owner_project))
+        dead, other = predecessors
+        rows = []
+        for owner, kind, title, expected in (
+            (opened, "decision", "Pick a database", "action"),
+            (dead, "deferred", "Revisit the budget", "action"),
+            (dead, "answer", "Build finished", "fyi"),
+            (dead, "decided", "Use the blue theme", "fyi"),
+            (dead, "decided", "Already dismissed", None),
+            (other, "decision", "Foreign project choice", None),
+        ):
+            record = await asyncio.to_thread(_seed_attention, owner, owner.metadata.project_id, title, kind=kind)
+            rows.append((record, expected))
+            if title == "Already dismissed":
+                store = AttentionStore(owner.store.session_dir, writer_epoch=5)
+                await asyncio.to_thread(store.replace, replace(record, status="resolved", resolved_at=record.created_at))
+        dead.store.close()
+        tools = ToolRegistry(project, session_store=opened.store, skill_catalog=SkillCatalog.empty(), project_id=project_id)
+        register_list_attention(tools)
+        listing = tools.definitions_by_name["list_attention"].handler
+        app = await _make_app(home, opened, session_id)
+        async with owned_app(app):
+            rendered = _rendered_text(app)
+            assert "● 2 attention items" in rendered, rendered
+            for view in ("action", "fyi"):
+                if view == "fyi":
+                    _press(app, "f")
+                rendered = _rendered_text(app)
+                slash = (await rpc("slash_run", {"session_id": session_id, "text": f"/decisions {view}"}))["text"]
+                page = await rpc("state_attention", {"project_id": project_id, "list": view})
+                result = (await listing({"list": view}))["structuredContent"]
+                expected_ids = {record.id for record, expected in rows if expected == view}
+                assert {row["attention_id"] for row in page["items"]} == expected_ids
+                assert {row["id"] for row in result["items"]} == expected_ids
+                assert (result["action_required_total"], result["info_total"]) == (2, 2)
+                for record, expected in rows:
+                    assert (record.title in rendered) == (expected == view), rendered
+                    assert (record.title in slash) == (expected == view), slash
+            assert "● 2 attention items" in rendered
+            selected = app._decisions_panel.selected.record
+            _press(app, "d")
+            await await_or_fail(
+                asyncio.to_thread(_wait_for_records, home, dead.store.session_id, {selected.id}),
+                what="dismiss FYI from a dead predecessor in the TUI",
             )
-            for kind, title in (("decision", "Pick an option"), ("decided", "Build completed"))
-        ]
-        legacy = await rpc("state_attention", {"status": "open"})
-        assert {row["attention_id"] for row in legacy["items"]} == {decision.id, note.id}
-        for view, expected, excluded in (("action", decision, note), ("fyi", note, decision)):
-            text = (await rpc("slash_run", {"session_id": session_id, "text": f"/decisions {view}"}))["text"]
-            assert expected.title in text and excluded.title not in text, text
-            page = await rpc("state_attention", {"status": "open", "list": view})
-            assert [row["attention_id"] for row in page["items"]] == [expected.id]
-            assert page["items"][0]["requires_action"] is (view == "action")
-        await rpc("slash_run", {"session_id": session_id, "text": f"/decisions dismiss {note.id}"})
-        remaining = await rpc("state_attention", {"status": "open"})
-        assert [row["attention_id"] for row in remaining["items"]] == [decision.id]
-        done = await rpc("state_attention", {"status": "done", "list": "fyi"})
-        assert [row["attention_id"] for row in done["items"]] == [note.id]
+            await app._decisions_tick()
+            assert selected.title not in _rendered_text(app)
+            page = await rpc("state_attention", {"project_id": project_id, "status": "open", "list": "fyi"})
+            remaining = next(record for record, expected in rows if expected == "fyi" and record.id != selected.id)
+            assert [row["attention_id"] for row in page["items"]] == [remaining.id]
+            await rpc("slash_run", {"session_id": session_id, "text": f"/decisions dismiss {remaining.id}"})
+            result = (await listing({"list": "fyi"}))["structuredContent"]
+            assert result["items"] == [] and result["action_required_total"] == 2
     finally:
+        if tools is not None:
+            await tools.close()
+        for predecessor in predecessors:
+            predecessor.store.close()
         await close_serve(server, writer)
 
 
