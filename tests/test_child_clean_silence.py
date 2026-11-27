@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 import shlex
 import sys
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
 
 import pytest
 
 from tests.support.owned import await_or_fail
+from zeta.agent.pending_delivery import (
+    PreparedRequest,
+    StepDeliveryFlow,
+    delivery_disposition,
+)
 from zeta.agent.presets import AgentPreset
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -266,15 +271,38 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
     idle_count = 0
     status_at_clean_silence: dict[str, object] | None = None
     initial_idle = asyncio.Event()
-    silence_idle = asyncio.Event()
     silence_done = asyncio.Event()
     child_ended = asyncio.Event()
     terminal_done = asyncio.Event()
+    handle: str | None = None
+    deferred_update = False
+    child_flow: StepDeliveryFlow | None = None
+
+    def record_disposition(
+        flow: StepDeliveryFlow,
+        prepared: PreparedRequest,
+        *,
+        notification_turn: bool,
+        notice_sink: Callable[[str], None] | None,
+    ):
+        nonlocal deferred_update
+        disposition = delivery_disposition(
+            flow, prepared, notification_turn=notification_turn, notice_sink=notice_sink
+        )
+        if disposition == "deferred" and flow is child_flow:
+            deferred_update = True
+        return disposition
+
+    if ending == "low_capacity":
+        # test-contract: seam record actual admission, not a mutable capacity hint
+        monkeypatch.setattr("zeta.runtime.loop.agent.delivery_disposition", record_disposition)
+
     def observe(event: StreamEvent) -> None:
         nonlocal idle_count, status_at_clean_silence
         if (
             event.type is StreamEventType.AGENT_NOTIFICATION
             and event.data.get("kind") == "child_idle"
+            and (handle is None or event.data.get("child_instance_id") == handle)
         ):
             idle_count += 1
             if idle_count == 1:
@@ -287,13 +315,12 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
                     )[0]
                     silence_done.set()
                     terminal_done.set()
-            else:
+            elif ending != "low_capacity" or deferred_update:
                 status_at_clean_silence = _read_agent_status(
                     store,
                     requested_handle=str(event.data["child_instance_id"]),
                     running_handles=loop._background_owner.active_instance_ids,
                 )[0]
-                silence_idle.set()
                 silence_done.set()
         if (
             event.type is StreamEventType.TOOL_EXECUTION_END
@@ -312,7 +339,7 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             what=f"parent starts {ending} child",
         )
         handle = next(iter(store.agent_children()))
-        flow = (
+        child_flow = (
             loop._background_owner.conversation_channel._delivery_targets[handle].flow
             if ending == "low_capacity"
             else None
@@ -379,8 +406,12 @@ async def test_real_child_clean_silence_preserves_only_explicit_finish_idle(
             if ending == "thinking_only":
                 assert child_backend.notification_called.is_set()
             else:
-                assert flow is not None
-                assert flow._low_capacity_notifications is True
+                assert not child_ended.is_set(), "child ended instead of deferring the update"
+                assert child_flow is not None
+                assert any(
+                    entry.data.get("kind") == "agent_completion"
+                    for entry in child_flow.store.delivery_fold.active_notifications.values()
+                ), "deferred completion must remain pending"
         if ending == "non_explicit":
             rows = _read_agent_status(
                 store,
