@@ -10,7 +10,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..agent.receipt import valid_killed_task_fields
 from ..protocol.types import ToolCall
@@ -33,6 +33,9 @@ from .session_files import (
     write_session_file,
     write_session_file_if_absent,
 )
+
+if TYPE_CHECKING:
+    from ..accounts.status import AccountStatus
 
 _AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
 _TERMINAL_AGENT_STATES = {"completed", "canceled", "failed"}
@@ -617,12 +620,13 @@ class AgentStateMixin:
         self,
         *,
         current_step: str | None = None,
+        account_status: AccountStatus | None = None,
         turns_used: int | None = None,
         tool_calls: int | None = None,
         state: str | None = None,
         idle_since: str | None = None,
     ) -> None:
-        """Update a live child's progress; ``tool_calls`` adds to its total."""
+        """Update live progress and the account snapshot; ``tool_calls`` adds to its total."""
 
         if current_step is not None and not current_step:
             raise ValueError("agent lifecycle step must be nonempty")
@@ -639,7 +643,10 @@ class AgentStateMixin:
         before = (
             self._agent_lifecycle.get("current_step"),
             self._agent_lifecycle.get("state"),
+            self._agent_lifecycle.get("account_status"),
         )
+        if account_status is not None:
+            self._agent_lifecycle["account_status"] = account_status
         if current_step is not None:
             self._agent_lifecycle["current_step"] = current_step
         if turns_used is not None:
@@ -652,10 +659,11 @@ class AgentStateMixin:
             self._agent_lifecycle["idle_since"] = idle_since
         self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(self._agent_lifecycle)
         publish_live_agent_lifecycle(self.agent_lifecycle_path, self._agent_lifecycle)
-        # a parent-visible change: a new step or live state, not turns or elapsed
+        # Only semantic changes, not turns or elapsed, publish progress.
         if before != (
             self._agent_lifecycle.get("current_step"),
             self._agent_lifecycle.get("state"),
+            self._agent_lifecycle.get("account_status"),
         ):
             post_child_progress(self, self._agent_lifecycle)
 

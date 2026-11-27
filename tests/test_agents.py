@@ -185,7 +185,7 @@ def test_agent_snapshot_restores_the_same_set() -> None:
 
 def test_session_metadata_restores_agent_snapshot(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    _write_agent(home / "agents" / "custom.md", "custom", "custom", "body")
+    _write_agent(home / "agents" / "custom.md", "custom", "custom", "body", "requires_cwd: true\n")
     catalog = discover_session_agents(home=home)
     opened = SessionManager(home).create(
         provider="codex",
@@ -195,6 +195,8 @@ def test_session_metadata_restores_agent_snapshot(tmp_path: Path) -> None:
         agent_catalog=catalog,
     )
     stored = AgentCatalog.from_snapshot(opened.metadata.agent_catalog)
+    assert stored.find("custom").requires_cwd
+    assert not stored.find("general").requires_cwd
     (home / "agents" / "custom.md").unlink()
     reopened = SessionManager(home).open(opened.metadata.session_id)
     assert AgentCatalog.from_snapshot(reopened.metadata.agent_catalog) == stored

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ...accounts.session import SessionAccountContext
 from ...core.store import ConversationStore
 from ...core.store._history_index import HistoryIndexError
 from ...protocol.types import ToolCall
@@ -332,6 +333,7 @@ def read_status_result(
     limit: int | None,
     max_bytes: int,
     running_handles: frozenset[str] | None = None,
+    account_context: SessionAccountContext | None = None,
 ) -> dict[str, object]:
     from . import (
         _NONTERMINAL_AGENT_STATES,
@@ -355,6 +357,11 @@ def read_status_result(
         text_block,
     )
 
+    session_accounts = (
+        account_context.status_snapshot()
+        if requested_handle is None and isinstance(account_context, SessionAccountContext)
+        else []
+    )
     receipts = _discover(store, requested_handle)
     fresh_store = _open_snapshot(store.session_dir.absolute())
     try:
@@ -439,6 +446,7 @@ def read_status_result(
             next_offset=next_offset if truncated else None,
             finished_omitted=finished_omitted,
             idle_usage=root_idle_usage,
+            session_accounts=session_accounts,
         )
         try:
             if len(encode_json(result)) <= max_bytes:
@@ -458,8 +466,9 @@ def read_status_result(
         next_offset=None,
         finished_omitted=finished_omitted,
         idle_usage=root_idle_usage,
+        session_accounts=session_accounts,
     )
-    if count == 1:
+    if count == 1 and not session_accounts:
         result["content"] = [
             text_block(
                 f"agent status: {count} {label}"

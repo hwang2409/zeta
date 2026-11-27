@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ..accounts.status import project_account_status
 from ..protocol.types import StructuredContentValue, ToolCall
 from .agent_progress import live_agent_lifecycle
 from .agent_state import (
@@ -198,6 +199,7 @@ def _lost_agent_status(
     item: dict[str, StructuredContentValue], *, requested: bool
 ) -> dict[str, StructuredContentValue]:
     lost = dict(item)
+    lost.pop("account_status", None)
     lost.update(
         state="failed",
         finished_at="unknown",
@@ -265,6 +267,10 @@ def project_agent_status(
         "description": description,
         "cwd": cwd,
     }
+    if state in NONTERMINAL_AGENT_STATES and (
+        account_status := project_account_status(lifecycle.get("account_status"))
+    ) is not None:
+        item["account_status"] = dict(account_status)
     if state == "idle":
         idle_since = lifecycle.get("idle_since")
         if type(idle_since) is str:
@@ -358,8 +364,13 @@ def project_child_run_row(
     parent_run_id: str | None,
     accepts_follow_ups: bool,
 ) -> dict[str, StructuredContentValue]:
+    account = (
+        project_account_status(item.get("account_status"))
+        if item["state"] in NONTERMINAL_AGENT_STATES else None
+    )
     return {
         "run_id": str(item["handle"]),
+        **({"account_status": dict(account)} if account is not None else {}),
         "session_id": session_id,
         "parent_run_id": parent_run_id,
         "description": _bounded_text(item["description"], 3_998),

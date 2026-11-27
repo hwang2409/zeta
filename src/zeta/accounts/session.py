@@ -19,6 +19,7 @@ from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
 from ..protocol.types import is_owned_completion_backend
 from .availability import AccountDisplay
 from .exhaustion import classify_subscription_limit, recovery_alternatives
+from .status import AccountStatus, account_status
 from .store import AccountError, AccountId, AccountStore
 from .usage import read_usage, record_subscription_limit
 
@@ -218,6 +219,28 @@ class SessionAccountContext:
 
     def snapshot(self) -> dict[str, AccountId]:
         return dict(self._pins)
+
+    def status_snapshot(self, *, held: bool = False) -> list[AccountStatus]:
+        """Read cached usage off-loop; never resolve new pins or refresh remotely."""
+        if self._account_state_unknown:
+            return []
+        try:
+            pins = self.snapshot()
+            if self._frozen:
+                providers = (self._active_provider,) if self._active_provider else ()
+            else:
+                providers = ("anthropic", "codex")
+            accounts = [
+                account for provider in providers
+                if not api_key_mode(provider)
+                and (account := pins.get(provider) or self.store.default(provider)) is not None
+            ]
+            if not accounts:
+                return []
+            displays = self.store.list_display()
+        except (AccountError, OSError, ValueError):
+            return []
+        return [account_status(displays, account, held=held) for account in accounts]
 
     async def list_snapshot(self) -> AccountListSnapshot:
         selected = self.snapshot()
