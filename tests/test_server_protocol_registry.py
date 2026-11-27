@@ -215,7 +215,7 @@ _OWNER_FAILURE_CASES = {
     "child_run_spawn": ("zeta.agent.runner.spawn_child", {
         "session_id": "test-session", "agent_type": "worker", "task": "test task",
     }),
-    "child_run_cancel": ("zeta.agent.child_control.cancel_child_run", {
+    "child_run_cancel": ("zeta.agent.child_run_owner.cancel_child_run", {
         "session_id": "test-session", "run_id": "test-run",
     }),
     "skill_catalog": ("zeta.skills.catalog.discover_session_skills", {}),

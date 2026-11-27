@@ -50,7 +50,7 @@ def _active(runtime, params):
 
 
 async def child_run_spawn(client, request_id, params, controller):
-    from ....agent.child_control import ChildControlError
+    from ....agent.child_run_owner import ChildControlError
     from ....agent.runner import spawn_child
     from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
 
@@ -75,7 +75,7 @@ async def child_run_spawn(client, request_id, params, controller):
 
 
 async def child_run_cancel(client, request_id, params, controller):
-    from ....agent.child_control import ChildControlError, cancel_child_run
+    from ....agent.child_run_owner import ChildControlError, cancel_child_run
     from ...protocol import invalid_resource_params
 
     require_params(params, "session_id", "run_id", optional=("reason",))

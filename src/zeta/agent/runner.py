@@ -69,8 +69,7 @@ from .child_context import (
     consume_run,
     resolve_child_backend,
 )
-from .child_control import ChildControlError
-from .child_run_owner import ChildRunTransitionOwner
+from .child_run_owner import ChildControlError, ChildRunTransitionOwner
 from .conversation_channel import NO_HOLD_WAKE, HoldWake, has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
 from .explicit_finish import register_handoff
