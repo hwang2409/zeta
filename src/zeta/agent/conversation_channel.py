@@ -14,9 +14,11 @@ from ..accounts.status import AccountStatus, account_status_text
 from ..core.agent_progress import publish_child_ended
 from ..core.checkpoints import ConversationEntry
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
+from ..core.store._child_runs import child_run_segments
 from ..core.store._step_delivery import TerminalTargetSealedError
 from ..protocol.types import StreamEvent, StreamEventType
 from ..providers.rate_limit_hold import LONG_HOLD_WAKE_SECONDS
+from ..runtime.offload import await_joined_offload
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
@@ -256,7 +258,7 @@ class ConversationChannel:
         self._root_store = root_store
         self._wakes: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Event]] = {}
         self._delivery_targets: dict[str | None, _DeliveryTarget] = {}
-        self._pending_questions: dict[str, set[str]] = {}
+        self._legacy_pending_questions: dict[str, set[str]] = {}
         self._root_wake: Callable[[], None] | None = None
 
     def set_root_wake(self, callback: Callable[[], None] | None) -> None:
@@ -358,7 +360,10 @@ class ConversationChannel:
             loop.call_soon_threadsafe(event.set)
 
     def has_pending_question(self, child_instance_id: str) -> bool:
-        return bool(self._pending_questions.get(child_instance_id))
+        owner = self._owner.run_transition(child_instance_id)
+        if owner is not None and owner.durable_questions:
+            return bool(owner.pending_questions())
+        return bool(self._legacy_pending_questions.get(child_instance_id))
 
     async def publish_idle(
         self,
@@ -555,6 +560,7 @@ class ConversationChannel:
         question_id: str,
         question: str,
         options: list[str] | None,
+        existing: dict | None = None,
     ) -> ConversationStore:
         from .pending_delivery import NotificationInput
 
@@ -586,10 +592,22 @@ class ConversationChannel:
                 )
             return NotificationInput("child_question", data, dedupe_key=question_id)
 
-        _result, parent_store = await self.produce_to_live_parent(
-            child_instance_id, build
-        )
-        self._pending_questions.setdefault(child_instance_id, set()).add(question_id)
+        owner = self._owner.run_transition(child_instance_id)
+        if owner is not None and owner.durable_questions and existing is not None:
+            _result, parent_store = await self.produce_to_live_parent(child_instance_id, build)
+            await self._record_question_target(owner, existing, parent_store)
+        elif owner is not None and owner.durable_questions:
+            fact = {
+                "question_id": question_id, "question": question, "options": options or [],
+                "state": "pending", "held_at_turn_limit": False, "ancestor_target_ids": [],
+            }
+            async with owner._lock:
+                await owner.write_questions(fact)
+                _result, parent_store = await self.produce_to_live_parent(child_instance_id, build)
+                await self._record_question_target(owner, fact, parent_store)
+        else:
+            _result, parent_store = await self.produce_to_live_parent(child_instance_id, build)
+            self._legacy_pending_questions.setdefault(child_instance_id, set()).add(question_id)
         return parent_store
 
     async def drain_terminal(self, dead_parent: ConversationStore) -> int:
@@ -631,12 +649,19 @@ class ConversationChannel:
                 data["routing_note"] = (
                     "direct parent is no longer alive; routed to the next live ancestor"
                 )
-                await self.produce_to_live_parent(
-                    child_id,
-                    lambda _store, d=data: NotificationInput(
-                        "child_question", d, dedupe_key=str(d["question_id"])
-                    ),
-                )
+                def build(_store, data=data):
+                    return NotificationInput("child_question", data, dedupe_key=str(data["question_id"]))
+
+                owner = self._owner.run_transition(child_id)
+                if owner is not None and owner.durable_questions:
+                    async with owner._lock:
+                        question = next((q for q in owner.questions() if q["question_id"] == data["question_id"]), None)
+                        if question is not None and question["state"] == "pending":
+                            _, target = await self.produce_to_live_parent(child_id, build)
+                            await self._record_question_target(owner, question, target)
+                        await owner.reconcile_questions()
+                else:
+                    await self.produce_to_live_parent(child_id, build)
                 await self.produce_to(
                     dead_parent_id,
                     NotificationInput(
@@ -692,18 +717,70 @@ class ConversationChannel:
 
         await self.produce_to_live_parent(child_instance_id, build)
 
+    async def _record_question_target(self, owner, question: dict, store: ConversationStore) -> None:
+        target_id = self._target_for_store(store)
+        targets = question["ancestor_target_ids"]
+        if target_id not in targets:
+            await owner.write_questions({**question, "ancestor_target_ids": [*targets, target_id]})
+
+    async def reconcile_questions(self, child_id: str, questions: tuple[dict, ...]) -> None:
+        from .pending_delivery import NotificationInput
+
+        for q in questions:
+            if q["state"] == "pending":
+                if not q["ancestor_target_ids"]:
+                    await self.publish_question(
+                        child_instance_id=child_id, question_id=q["question_id"],
+                        question=q["question"], options=q["options"] or None,
+                        existing=q,
+                    )
+                continue
+            item = NotificationInput(
+                "question_answer_ack" if q["state"] == "answered" else "child_question_close",
+                {"child_instance_id": child_id, "question_id": q["question_id"], **(
+                    {"reason": "canceled"} if q["state"] == "withdrawn" else {}
+                )},
+            )
+            _, live_store = await self.produce_to_live_parent(child_id, lambda _store, item=item: item)
+            live_id = self._target_for_store(live_store)
+            for target_id in q["ancestor_target_ids"]:
+                if target_id == live_id:
+                    continue
+                if target_id in self._delivery_targets:
+                    await self.produce_to(target_id, item)
+                else:
+                    await await_joined_offload(self._settle_inactive_question, child_id, target_id, item)
+
+    def _settle_inactive_question(self, child_id: str, target_id: str, item: DeliveryInput) -> None:
+        root = self._root_store
+        segments = child_run_segments(root.session_id, target_id)
+        child = child_run_segments(root.session_id, child_id)
+        if len(segments) >= len(child) or child[:len(segments)] != segments:
+            raise ValueError("question target is not an ancestor")
+        path = root.session_dir
+        for segment in segments:
+            path = path / "agents" / str(segment)
+        if not path.is_dir():
+            return
+        with ConversationStore(path.parent, session_id=path.name, _storage_lease=root._storage_lease) as store:
+            store._commit_delivery_input(item)
+
     def question_answered(self, child_instance_id: str, question_id: str) -> None:
-        questions = self._pending_questions.get(child_instance_id)
+        questions = self._legacy_pending_questions.get(child_instance_id)
         if questions is None:
             return
         questions.discard(question_id)
         if not questions:
-            self._pending_questions.pop(child_instance_id, None)
+            self._legacy_pending_questions.pop(child_instance_id, None)
 
     async def close_questions(self, child_instance_id: str, *, reason: str) -> int:
         from .pending_delivery import NotificationInput
 
-        self._pending_questions.pop(child_instance_id, None)
+        owner = self._owner.run_transition(child_instance_id)
+        if owner is not None and owner.durable_questions and owner.questions():
+            # The transition owner already settled the child-first facts.
+            return 0
+        self._legacy_pending_questions.pop(child_instance_id, None)
         item = NotificationInput(
             "child_question_close",
             {"child_instance_id": child_instance_id, "reason": reason},

@@ -80,6 +80,7 @@ async def _resume_child(
     pins = saved["selected_accounts"]
     description = saved["description"]
     turns = max(marker["turns_used"], (store.agent_lifecycle() or {}).get("turns_used", 0))
+    turns = max(turns, *(entry.data.get("settlement_turn", 0) for entry in store._delivery_fold.child_questions.values()), 0)
     control = turn_control_for(saved["effective_max_turns"], str(store.session_dir))
     if control is not None:
         control.restore_used(turns)
@@ -147,6 +148,7 @@ async def _resume_child(
         parent._agent_child_turns[tool_call.id] = turns
         parent._agent_child_types[tool_call.id] = preset.name
         was = "suspended" if state["suspension_reason"] == "normal_exit" else "interrupted because the parent crashed"
+        held = control is not None and control.exhausted and (await owner.hold_at_limit() or owner.settlement_due())
         await _run_installed_child(
             parent, child, store, owner, tool_call,
             prompt=f"Execution was {was}. Review the durable context and verify any interrupted work before continuing.",
@@ -155,7 +157,7 @@ async def _resume_child(
             child_policy=policy, child_account_pins=context, external=False, abort_signal=AbortSignal(),
             publisher=None, validate_result=validated_tool_result, error_message=str,
             execution_context=None, activation=activation,
-            resumed_idle=state["resume_mode"] == "idle" and (control is None or not control.exhausted),
+            resumed_idle=held or state["resume_mode"] == "idle" and (control is None or not control.exhausted),
         )
         installed = True
         episode = state["suspension_episode"]
@@ -170,6 +172,7 @@ async def _resume_child(
         for descendant in store.agent_children().values():
             if nested := stores.get(Path(descendant["child_session_path"])):
                 await _resume_child(child, descendant, nested, stores, retained)
+        await owner.reconcile_questions()
         await owner.activate_recovered(episode)
         activation.set()
     finally:

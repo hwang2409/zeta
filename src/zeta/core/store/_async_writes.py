@@ -234,6 +234,7 @@ class _StageDeliveryRequestCommand(_StoreMutationCommand):
     token_counter: Any
     notification_selector: Any
     notification_context: Any
+    ignore_prompts: bool = False
 
     def apply(self, store: Any) -> Any:
         return store._stage_delivery_request(
@@ -241,6 +242,7 @@ class _StageDeliveryRequestCommand(_StoreMutationCommand):
             self.token_counter,
             self.notification_selector,
             self.notification_context,
+            self.ignore_prompts,
         )
 
 
@@ -280,10 +282,11 @@ class _AcceptExplicitFinishCommand(_StoreMutationCommand):
     report: dict[str, object]
     notification_ids: frozenset[str]
     prompt_id: str | None
+    question_settlement: bool = False
 
     def apply(self, store: Any) -> Any:
         return store._accept_explicit_finish(
-            self.report, self.notification_ids, self.prompt_id
+            self.report, self.notification_ids, self.prompt_id, self.question_settlement
         )
 
 
@@ -378,6 +381,50 @@ class _ChildTurnsCommand(_StoreMutationCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _ReserveQuestionSettlementCommand(_StoreMutationCommand):
+    question_ids: frozenset[str]
+    turn: int
+
+    def apply(self, store: ConversationStore) -> None:
+        from ...protocol.types import Message, MessageRole, TextContent
+        from ._pending_prompts import (
+            PENDING_PROMPT_ID_METADATA,
+            QUESTION_ANSWER_PATTERN,
+        )
+
+        with store.pending_prompt_queue._lock():
+            fold = store._delivery_fold
+            rows = [
+                ("child_question_state", {**fold.child_questions[q].data, "settlement_turn": self.turn})
+                for q in self.question_ids
+            ]
+            remaining = set(self.question_ids)
+            for prompt in store.pending_prompt_queue._pending_unlocked():
+                text = prompt.data["text"]
+                match = QUESTION_ANSWER_PATTERN.match(text)
+                if match is None or match.group(1) not in remaining:
+                    continue
+                remaining.remove(match.group(1))
+                if prompt.id not in fold.prompt_messages:
+                    message = Message(MessageRole.USER, [TextContent(text)], metadata={
+                        "zeta.origin": prompt.data["origin"], PENDING_PROMPT_ID_METADATA: prompt.id,
+                    })
+                    rows.append(("message", {"message": message.to_dict()}))
+                rows.append(("pending_prompt_ack", {"prompt_id": prompt.id}))
+            store._append_many_unlocked(rows)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ChildQuestionsCommand(_StoreMutationCommand):
+    rows: tuple[dict[str, Any], ...]
+
+    def apply(self, store: ConversationStore) -> None:
+        if not store.child_question_hold_enabled:
+            raise ValueError("child question state requires a newer home epoch")
+        store.append_many(("child_question_state", data) for data in self.rows)
+
+
+@dataclass(frozen=True, slots=True)
 class _ChildActivityCommand(_StoreMutationCommand):
     state: str | None = None
     turns: int | None = None
@@ -1082,6 +1129,8 @@ class AsyncDurableWritesMixin:
         token_counter: Any,
         notification_selector: Any,
         notification_context: Any,
+        *,
+        ignore_prompts: bool = False,
     ) -> Any:
         return await self._commit_storage_command(
             _StageDeliveryRequestCommand(
@@ -1089,6 +1138,7 @@ class AsyncDurableWritesMixin:
                 token_counter=token_counter,
                 notification_selector=notification_selector,
                 notification_context=notification_context,
+                ignore_prompts=ignore_prompts,
             )
         )
 
@@ -1125,12 +1175,15 @@ class AsyncDurableWritesMixin:
         report: dict[str, object],
         notification_ids: frozenset[str],
         prompt_id: str | None,
+        *,
+        question_settlement: bool = False,
     ) -> Any:
         return await self._commit_storage_command(
             _AcceptExplicitFinishCommand(
                 report=report,
                 notification_ids=notification_ids,
                 prompt_id=prompt_id,
+                question_settlement=question_settlement,
             )
         )
 

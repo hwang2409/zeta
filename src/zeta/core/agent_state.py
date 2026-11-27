@@ -472,6 +472,10 @@ class AgentStateMixin:
     def child_recovery_enabled(self) -> bool:
         return feature_enabled(self._storage_lease.observed_epoch, StorageFeature.CHILD_RECOVERY)
 
+    @property
+    def child_question_hold_enabled(self) -> bool:
+        return feature_enabled(self._storage_lease.observed_epoch, StorageFeature.CHILD_QUESTION_HOLD)
+
     def select_child_accounts(self, marker_key: str, pins: dict[str, str]) -> None:
         with self._append_lock():
             self._load_session_state()

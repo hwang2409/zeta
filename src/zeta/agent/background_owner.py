@@ -330,6 +330,9 @@ class BackgroundAgentOwner:
             self._store_close_tasks.add(close_task)
             self._store_close_stores[close_task] = store
 
+    def run_transition(self, run_id: str) -> ChildRunTransitionOwner | None:
+        return self._runs.get(run_id)
+
     def begin_run(
         self,
         instance_id: str,
@@ -348,6 +351,7 @@ class BackgroundAgentOwner:
             store, tool_call_id, explicit_finish=explicit_finish, background=background,
         )
         owner.attach_setup(self, setup_task, prepare_cancel)
+        owner.run_id = instance_id
         self.register(
             instance_id, owner.request_cancel, setup_task,
             parent_store=parent_store, parent_instance_id=parent_instance_id,

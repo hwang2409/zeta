@@ -37,6 +37,7 @@ class DeliveryFold:
         "active_prompts",
         "agent_call_ids",
         "agent_receipts",
+        "child_questions",
         "completions_by_child",
         "delivery_message",
         "last_message",
@@ -65,6 +66,7 @@ class DeliveryFold:
         self.completions_by_child: dict[str, ConversationEntry] = {}
         self.presented: set[str] = set()
         self.prompt_ids: set[str] = set()
+        self.child_questions: dict[str, ConversationEntry] = {}
         self.active_prompts: dict[str, ConversationEntry] = {}
         self.prompt_messages: dict[str, Message] = {}
         self.queue_closed = False
@@ -112,6 +114,7 @@ class DeliveryFold:
         new.completions_by_child = dict(self.completions_by_child)
         new.presented = set(self.presented)
         new.prompt_ids = set(self.prompt_ids)
+        new.child_questions = dict(self.child_questions)
         new.active_prompts = dict(self.active_prompts)
         new.prompt_messages = dict(self.prompt_messages)
         new.queue_closed = self.queue_closed
@@ -166,6 +169,8 @@ class DeliveryFold:
                     f"duplicate notification TUI presentation: {notification_id}"
                 )
             self.presented.add(notification_id)
+        elif entry_type == "child_question_state":
+            self.child_questions[entry.data["question_id"]] = entry
         elif entry_type == "pending_prompt":
             self.prompt_ids.add(entry.id)
             self.active_prompts[entry.id] = entry

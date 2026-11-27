@@ -25,6 +25,7 @@ from ..core.store import (
 )
 from ..core.store._pending_prompts import (
     PENDING_PROMPT_ID_METADATA,
+    QUESTION_ANSWER_PATTERN,
     PendingPromptWriterReloadedError,
 )
 from ..core.store._step_delivery import (
@@ -68,7 +69,6 @@ if TYPE_CHECKING:
 
 AGENT_SEND_COMMIT_TIMEOUT_SECONDS = 1.0
 SHUTDOWN_DELIVERY_TIMEOUT_SECONDS = 1.0
-QUESTION_ANSWER_PATTERN = re.compile(r"^Re ([^:\s]+):(?:\s|$)")
 _PREVIEW_WHITESPACE = re.compile(r"\s+")
 _LOGGER = logging.getLogger(__name__)
 
@@ -170,6 +170,7 @@ class StepDeliveryFlow:
         self._stalled_notice_published = False
         self._stalled_had_wake_source = False
         self._initialized = False
+        self.question_settlement = False
 
     async def initialize(self) -> None:
         """Warm the isolated writer before this flow accepts timed input."""
@@ -335,11 +336,13 @@ class StepDeliveryFlow:
         self._edges.clear()
         if assembler is None:
             staged = await self.store.stage_delivery_request(
-                None, None, _select_notification_delivery, notification_context
+                None, None, _select_notification_delivery, notification_context,
+                ignore_prompts=self.question_settlement,
             )
         else:
             staged = await self.store.stage_delivery_request(
-                0, assembler.estimate_messages, _select_notification_delivery, None
+                0, assembler.estimate_messages, _select_notification_delivery, None,
+                ignore_prompts=self.question_settlement,
             )
         self._active = staged
         self._active_steering = steering
@@ -540,6 +543,7 @@ class StepDeliveryFlow:
                 assembler.estimate_messages,
                 _select_notification_delivery,
                 notification_context,
+                ignore_prompts=self.question_settlement,
             )
         request = self._compose(
             selected,
@@ -828,7 +832,11 @@ async def send_to_run(
             f"agent_send rejected for {agent_type} child {child_instance_id!r}: "
             f"{reason}"
         )
-    try:
+    transition = owner.run_transition(child_instance_id)
+    match = QUESTION_ANSWER_PATTERN.match(message)
+    question_id = match.group(1) if match is not None else None
+
+    async def enqueue() -> None:
         await channel.produce_to(
             child_instance_id,
             PromptInput(
@@ -836,8 +844,17 @@ async def send_to_run(
                 origin,
                 time.monotonic() + AGENT_SEND_COMMIT_TIMEOUT_SECONDS,
                 starts_new_episode=True,
+                answer_question_id=question_id,
             ),
         )
+
+    durable = transition is not None and transition.durable_questions and bool(transition.questions())
+    try:
+        if durable:
+            assert transition is not None
+            await transition.send(enqueue)
+        else:
+            await enqueue()
     except PendingPromptCommitTimeoutError:
         return "pending prompt commit timed out before the queue could be changed"
     except ValueError as exc:
@@ -846,9 +863,7 @@ async def send_to_run(
         return no_live_run
     except (LookupError, PendingPromptsClosedError):
         return no_live_run
-    match = QUESTION_ANSWER_PATTERN.match(message)
-    if match is not None:
-        question_id = match.group(1)
+    if not durable and question_id is not None:
         channel.question_answered(child_instance_id, question_id)
         await channel.produce_to_live_parent(
             child_instance_id,

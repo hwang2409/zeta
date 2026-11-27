@@ -973,6 +973,8 @@ class AgentLoop(
                     steering = self.store.pending_client_steering()
                     notification_context = system_message if notification_turn else None
                     self._set_pre_dispatch_step("admitting request")
+                    if (owner := getattr(self, "_child_run_owner", None)) is not None:
+                        await owner.repair_before_replay()
                     prepared_delivery = await watchdog.wait(
                         "request admission", "admitting request",
                         partial(

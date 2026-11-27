@@ -44,16 +44,22 @@ class ChildTurnControl:
         self.used = 0
         self._reserved = False
         self._warned = False
+        self._settlement_ready = False
 
     def restore_used(self, used: int) -> None:
         self.used = used
         self._warned = used >= math.ceil(0.9 * self.limit)
 
+    def admit_settlement(self) -> None:
+        assert self.exhausted and not self.reserved
+        self._settlement_ready = True
+
     def begin_completion(self) -> Message | None:
         if self._reserved:
             return None
-        if self.used >= self.limit:
+        if self.exhausted and not self._settlement_ready:
             return None
+        self._settlement_ready = False
         self._reserved = True
         number = self.used + 1
         if not self._warned and number == math.ceil(0.9 * self.limit):
@@ -225,7 +231,9 @@ def background_turn_limit_state(
         result.get("structuredContent", {}) if isinstance(result, dict) else {}
     )
     control = getattr(child_loop, "child_turn_control", None)
-    turn_limited = control is not None and control.exhausted
+    turn_limited = control is not None and control.exhausted and not (
+        control.used > control.limit and isinstance(result, dict) and result.get("explicitFinishReport") is not None
+    )
     turns_used = max(child_turns(), int(structured.get("turns_used", 0)))
     if not turn_limited:
         return False, turns_used, None

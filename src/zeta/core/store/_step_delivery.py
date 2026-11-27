@@ -133,6 +133,7 @@ class PromptInput:
     origin: MessageOrigin
     deadline: float | None
     starts_new_episode: bool = False
+    answer_question_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +191,7 @@ def _commit_delivery_input(
             origin=item.origin,
             deadline=item.deadline,
             starts_new_episode=item.starts_new_episode,
+            answer_question_id=item.answer_question_id,
         )
         return ProducerResult((entry,), True, 1)
 
@@ -358,6 +360,7 @@ def _child_question_mutation_rows(
         for entry in store._delivery_fold.active_notifications.values()
         if entry.data.get("kind") == "child_question"
         and entry.data.get("child_instance_id") == child_id
+        and ("question_id" not in data or entry.data.get("question_id") == data["question_id"])
     ]
     rows: list[tuple[str, dict[str, Any]]] = []
     for entry in entries:
@@ -477,9 +480,10 @@ def _stage_delivery_request(
     token_counter: Callable[[Sequence[Message]], int] | None,
     notification_selector: NotificationSelector,
     notification_context: Message | None = None,
+    ignore_prompts: bool = False,
 ) -> StagedDelivery:
     with store.pending_prompt_queue._lock():
-        pending_prompts = store.pending_prompt_queue._pending_unlocked()
+        pending_prompts = [] if ignore_prompts else store.pending_prompt_queue._pending_unlocked()
         pending_notifications = [
             entry
             for entry in store._delivery_fold.active_notifications.values()
@@ -713,6 +717,7 @@ class StepDeliveryStoreMixin:
         token_counter: Callable[[Sequence[Message]], int] | None,
         notification_selector: NotificationSelector,
         notification_context: Message | None = None,
+        ignore_prompts: bool = False,
     ) -> StagedDelivery:
         return _stage_delivery_request(
             self,
@@ -720,6 +725,7 @@ class StepDeliveryStoreMixin:
             token_counter,
             notification_selector,
             notification_context,
+            ignore_prompts,
         )
 
     def _acknowledge_staged_delivery(

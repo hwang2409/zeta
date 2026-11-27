@@ -205,8 +205,42 @@ async def consume_run(
 
     safety_started: float | None = None
     safety_task: asyncio.Task[tuple[str, ...]] | None = None
+    owner = getattr(child_loop, "_child_run_owner", None)
+    control = getattr(child_loop, "child_turn_control", None)
+
+    def held_at_limit() -> bool:
+        return bool(control is not None and control.exhausted and owner is not None and owner.settlement_due())
+
+    async def wait_for_settlement():
+        assert owner is not None and control is not None
+        await child_store._commit_storage_command(_ChildActivityCommand(state="idle"))
+        channel = child_loop._background_owner.conversation_channel
+        await channel.publish_idle(
+            child_instance_id=owner.run_id, child_session_path=str(child_store.session_dir),
+            description=str(kwargs["explicit_finish_metadata"]["description"]), text="waiting for parent answer",
+        )
+        while not await owner.reserve_question_settlement(control.used + 1):
+            await channel.wait(child_loop.agent_instance_id)
+        flow = await child_loop._ensure_step_delivery()
+        control.admit_settlement()
+        flow.question_settlement = True
+        try:
+            await _transition_running(child_loop, child_store)
+            return await consume_child(
+                child_loop, "", origin=MessageOrigin.HARNESS_NUDGE,
+                harness_notice_message=harness_notice(
+                    "parent answer", "Use the parent answer to settle the existing work and call finish. Do not start new work.",
+                    event="child_question_settlement",
+                ), **kwargs,
+            )
+        finally:
+            flow.question_settlement = False
+            owner.question_settlement = False
+
     try:
-        if resumed_idle:
+        if held_at_limit():
+            result = await wait_for_settlement()
+        elif resumed_idle:
             flow = await child_loop._ensure_step_delivery()
             while not flow.has_pending_edge:
                 await child_loop._background_owner.conversation_channel.wait(child_loop.agent_instance_id)
@@ -219,6 +253,9 @@ async def consume_run(
                 child_loop, prompt, origin=MessageOrigin.AGENT_PROMPT, **kwargs
             )
         while not result.get("isError"):
+            if held_at_limit():
+                result = await wait_for_settlement()
+                continue
             structured = result.get("structuredContent")
             recoverable_error = (
                 structured.get("recoverable_error")
