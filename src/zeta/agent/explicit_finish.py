@@ -10,7 +10,7 @@ from .presets import AgentPreset
 
 if TYPE_CHECKING:
     from ..tools._shared.process import BackgroundTaskRegistry
-    from .terminal_fence import TerminalTransitionFence
+    from .child_run_owner import ChildRunTransitionOwner
 
 
 IDLE_CHILD_FD_FLOOR = 3
@@ -56,12 +56,12 @@ class IdleNudgeLifecycle:
         self._immediate_reminded = False
 
     async def reserve_immediate_reminder(
-        self, fence: TerminalTransitionFence
+        self, owner: ChildRunTransitionOwner
     ) -> bool:
-        """Reserve one immediate reminder, sharing the nudge limit and fence."""
+        """Reserve one immediate reminder, sharing the nudge limit and owner."""
         if self._immediate_reminded or self._nudge_count >= self._nudge_limit:
             return False
-        if not await fence.reserve_idle_nudge():
+        if not await owner.reserve_idle_nudge():
             return False
         self._nudge_count += 1
         self._immediate_reminded = True
@@ -73,9 +73,9 @@ class IdleNudgeLifecycle:
     async def wait_for_idle_action(
         self,
         wake: Callable[[], Awaitable[None]],
-        fence: TerminalTransitionFence,
+        owner: ChildRunTransitionOwner,
     ) -> IdleAction:
-        eligible = await fence.idle_nudge_eligible()
+        eligible = await owner.idle_nudge_eligible()
         if eligible and self._nudge_count < self._nudge_limit:
             now = self._clock()
             if self._idle_started is None:
@@ -88,7 +88,7 @@ class IdleNudgeLifecycle:
         if await self._wait(wake, timeout):
             self._idle_started = None
             return "external_input"
-        if not await fence.reserve_idle_nudge():
+        if not await owner.reserve_idle_nudge():
             self._idle_started = None
             return "external_input"
 

@@ -1022,21 +1022,16 @@ async def test_parent_receipt_installs_only_after_the_canceled_lifecycle_is_fina
     try:
         if route.live:
             mark_canceled = ConversationStore.mark_agent_canceled_async
-            skipped: list[str] = []
+            commit_entered, allow_commit = asyncio.Event(), asyncio.Event()
 
-            async def cleanup_did_not_finalize(self: Any, parent_tool_call_id: str) -> None:
-                # the runner's cancel cleanup finalizes through the async storage
-                # command; refuse it once (as when its terminal fence refuses) so
-                # only the receipt owner's synchronous finalize can make the
-                # lifecycle terminal before the receipt installs. the receipt owner
-                # uses the sync mark_agent_canceled, which this seam never touches.
-                if parent_tool_call_id == "agent-1" and not skipped:
-                    skipped.append(parent_tool_call_id)
-                    return
+            async def hold_cancellation(self: Any, parent_tool_call_id: str) -> None:
+                if parent_tool_call_id == "agent-1":
+                    commit_entered.set()
+                    await await_or_fail(allow_commit.wait(), what="allow durable cancellation")
                 await mark_canceled(self, parent_tool_call_id)
 
-            # test-contract: seam the runner's cancel cleanup does not finalize the lifecycle
-            monkeypatch.setattr(ConversationStore, "mark_agent_canceled_async", cleanup_did_not_finalize)
+            # test-contract: seam hold the owner's durable cancellation write
+            monkeypatch.setattr(ConversationStore, "mark_agent_canceled_async", hold_cancellation)
             backend = Actors(
                 {
                     "delegate": [ScriptedTurn(tool_calls=[_agent("agent-1", "child-work", False)]), _text("parent done")],
@@ -1050,11 +1045,16 @@ async def test_parent_receipt_installs_only_after_the_canceled_lifecycle_is_fina
             await serve.join(top, None)
             await serve.controller.request(serve.request_id(), "send", {"text": "delegate"})
             await await_or_fail(backend.entered["child-work"].wait(), what="child started")
-            aborted = await serve.controller.request(serve.request_id(), "abort", {})
+            abort = asyncio.create_task(serve.controller.request(serve.request_id(), "abort", {}))
+            try:
+                await await_or_fail(commit_entered.wait(), what="owner enters terminal write")
+                assert not installed
+            finally:
+                allow_commit.set()
+                backend.release_all()
+                aborted = await await_or_fail(abort, what="abort completes after terminal write")
             assert aborted["result"]["aborted"] is True, aborted
-            backend.release_all()
             await _until(top, "turn_aborted")
-            assert skipped == ["agent-1"]
         else:
             seeded = RecoveredRoute(route.background, route.nested, "canceled")
             session_id, session_dir = await asyncio.to_thread(_seed_crashed_session, tmp_path, seeded)
@@ -1253,7 +1253,7 @@ async def test_cancel_at_each_background_transition_await_still_publishes_one_co
 
     async def gated(self: Any, *args: Any, **kwargs: Any) -> Any:
         current = asyncio.current_task()
-        if current is not None and _coro_name(current).endswith("commit_adopt_publish"):
+        if current is not None and _coro_name(current).endswith("publish_background"):
             entered.set()
             await await_or_fail(release.wait(), what=f"release {method}")
         return await original(self, *args, **kwargs)

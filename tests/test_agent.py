@@ -48,6 +48,7 @@ from zeta.agent.background_lifecycle import (
 )
 from zeta.agent.background_owner import BackgroundAgentOwner, CancellationRequest
 from zeta.agent.child_context import _compose_child_system_prompt
+from zeta.agent.child_run_owner import ChildRunTransitionOwner
 from zeta.agent.conversation_channel import ConversationChannel
 from zeta.agent.finish_gate import (
     FinishGateControl,
@@ -60,7 +61,6 @@ from zeta.agent.presets import (
     AgentPreset,
 )
 from zeta.agent.runner import _child_base_system_prompt
-from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.config.settings import SettingsError, load_settings
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.approval import ApprovalDecision, ApprovalPolicy
@@ -831,6 +831,7 @@ async def test_background_owner_waits_for_child_close_before_unregister(
 
     watcher = asyncio.create_task(
         finish_background_child(
+            run_owner=ChildRunTransitionOwner(child_store, call.id),
             child_task=asyncio.create_task(
                 asyncio.sleep(
                     0,
@@ -973,6 +974,7 @@ async def test_finalization_cancel_completes_commit_adopt_publish_once(
 
     watcher = asyncio.create_task(
         finish_background_child(
+            run_owner=ChildRunTransitionOwner(child_store, call.id),
             child_task=asyncio.create_task(child_result()),
             child_store=child_store,
             parent_store=parent_store,
@@ -1073,7 +1075,9 @@ async def _assert_failed_child_waits_for_owned_descendant(
         agent_instance_id="child-1",
     )
     release_grandchild = asyncio.Event()
-    grandchild_watcher = asyncio.create_task(release_grandchild.wait())
+    grandchild_watcher = asyncio.create_task(await_or_fail(
+        release_grandchild.wait(), what="release grandchild watcher",
+    ))
     owner.register(
         "grandchild-1",
         grandchild_watcher.cancel,
@@ -1138,15 +1142,19 @@ async def _assert_failed_child_waits_for_owned_descendant(
         "error_message": str,
         "child_loop": child_loop,
         "background_owner": owner,
-        "explicit_finish": explicit_finish,
+        "run_owner": ChildRunTransitionOwner(child_store, call.id, explicit_finish=explicit_finish),
     }
     if "child_loop" not in finish_background_child.__code__.co_varnames:
         finish_kwargs.pop("child_loop")
     watcher = asyncio.create_task(finish_background_child(**finish_kwargs))
     owner.register("child-1", watcher.cancel, watcher, parent_store)
 
-    drain_wait = asyncio.create_task(drain_entered.wait())
-    completion_wait = asyncio.create_task(completion_published.wait())
+    drain_wait = asyncio.create_task(await_or_fail(
+        drain_entered.wait(), what="owned-work drain",
+    ))
+    completion_wait = asyncio.create_task(await_or_fail(
+        completion_published.wait(), what="completion publication",
+    ))
     done, _pending = await asyncio.wait(
         {drain_wait, completion_wait}, timeout=10, return_when=asyncio.FIRST_COMPLETED
     )
@@ -1257,6 +1265,7 @@ async def test_background_completion_truncates_long_killed_task_id(
     )
 
     await finish_background_child(
+        run_owner=ChildRunTransitionOwner(child_store, call.id),
         child_task=asyncio.create_task(
             asyncio.sleep(
                 0,
@@ -6710,6 +6719,7 @@ async def test_child_profile_allowlist_applies_to_inherited_and_late_registered_
         follow_up_loop=True,
         description="bounded",
         child_account_context=None,
+        run_owner=ChildRunTransitionOwner(child_store, "test-call"),
     )
     child_loop.tool_registry.register("late_hidden", available)
 
@@ -6957,6 +6967,7 @@ async def test_monitor_shape_resolves_against_the_live_session_registry(
         follow_up_loop=True,
         description="monitor",
         child_account_context=None,
+        run_owner=ChildRunTransitionOwner(child_store, "test-call"),
     )
 
     assert {schema["name"] for schema in child_loop.tool_registry.schemas} == requested
@@ -16727,6 +16738,9 @@ class _ExplicitFinishLoop:
         self, registry: ToolRegistry, owner: BackgroundAgentOwner | None = None
     ) -> None:
         self.tool_registry = registry
+        self._child_run_owner = ChildRunTransitionOwner(
+            registry._session_store, "test-call", explicit_finish=True,
+        )
         self._background_owner = owner or BackgroundAgentOwner(registry._session_store)
         self.agent_instance_id = "root:1"
         self.agent_depth = 1
@@ -17124,6 +17138,7 @@ async def test_explicit_finish_refused_for_owned_work_then_ends_when_accepted(
         skill_catalog=SkillCatalog.empty(),
     )
     loop.explicit_finish = True
+    loop._child_run_owner = ChildRunTransitionOwner(store, "test-call", explicit_finish=True)
     register_finish(registry, child_loop=loop)
     # test-contract: seam task intentionally stays live until owner cancellation
     owned = asyncio.create_task(asyncio.Event().wait())
@@ -17206,6 +17221,7 @@ async def test_explicit_finish_ends_after_other_tool_in_same_batch(
         skill_catalog=SkillCatalog.empty(),
     )
     loop.explicit_finish = True
+    loop._child_run_owner = ChildRunTransitionOwner(store, "test-call", explicit_finish=True)
     register_finish(registry, child_loop=loop)
     try:
         await _collect(loop.run_turn("start", origin=MessageOrigin.AGENT_PROMPT))
@@ -17418,8 +17434,8 @@ def _reminder_loop(
         agent_type="worker",
         description="work",
     )
-    loop._terminal_transition_fence = TerminalTransitionFence(
-        store,
+    loop._child_run_owner = ChildRunTransitionOwner(
+        store, "test-call", explicit_finish=True,
         owned_work=lambda: loop.background_work_descriptions,
         delivering_prompt_id=lambda: getattr(loop, "_delivering_prompt_id", None),
     )
@@ -17462,8 +17478,8 @@ async def _idle_notice_fixture(
         agent_type="worker",
         description="work",
     )
-    loop._terminal_transition_fence = TerminalTransitionFence(
-        child,
+    loop._child_run_owner = ChildRunTransitionOwner(
+        child, "test-call", explicit_finish=True,
         owned_work=lambda: loop.background_work_descriptions,
         delivering_prompt_id=lambda: getattr(loop, "_delivering_prompt_id", None),
     )
@@ -18136,7 +18152,7 @@ async def test_real_input_wins_over_immediate_reminder(
 ) -> None:
     store, registry, loop = _reminder_loop(tmp_path)
     calls: list[str] = []
-    original = loop._terminal_transition_fence.reserve_idle_nudge
+    original = loop._child_run_owner.reserve_idle_nudge
 
     async def reserve() -> bool:
         await loop.step_delivery.produce(
@@ -18148,7 +18164,7 @@ async def test_real_input_wins_over_immediate_reminder(
         )
         return await original()
 
-    loop._terminal_transition_fence.reserve_idle_nudge = reserve
+    loop._child_run_owner.reserve_idle_nudge = reserve
 
     async def consume(_loop, prompt, **kwargs):
         await _ack_fake_delivery(store, kwargs)
@@ -18346,16 +18362,16 @@ async def test_cancel_or_accepted_finish_racing_reminder_admission(
     release_admission = asyncio.Event()
     idle_waiting = asyncio.Event()
     prompts: list[str] = []
-    original = loop._terminal_transition_fence.reserve_idle_nudge
+    original = loop._child_run_owner.reserve_idle_nudge
 
     async def reserve() -> bool:
         admission_reached.set()
-        await release_admission.wait()
+        await await_or_fail(release_admission.wait(), what="release admission")
         return await original()
 
     async def wait_idle(_wake, _timeout):
         idle_waiting.set()
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="park idle child")
         return True
 
     async def consume(_loop, prompt, **kwargs):
@@ -18367,7 +18383,7 @@ async def test_cancel_or_accepted_finish_racing_reminder_admission(
             "structuredContent": {"status": "running"},
         }
 
-    loop._terminal_transition_fence.reserve_idle_nudge = reserve
+    loop._child_run_owner.reserve_idle_nudge = reserve
     monkeypatch.setattr(agent_runner_module, "consume_child", consume)
     run = asyncio.create_task(
         agent_runner_module.consume_run(
@@ -18376,7 +18392,7 @@ async def test_cancel_or_accepted_finish_racing_reminder_admission(
     )
     await asyncio.wait_for(admission_reached.wait(), 2)
     if terminal_action == "cancel":
-        assert await loop._terminal_transition_fence.cancel() is True
+        assert await loop._child_run_owner.cancel() is True
         accepted_report = None
     else:
         result = await registry.execute(
@@ -18399,10 +18415,10 @@ async def test_cancel_or_accepted_finish_racing_reminder_admission(
     )
     assert prompts == ["work"]
     assert run_consumer_module._IMMEDIATE_FINISH_REMINDER not in prompts
-    assert await loop._terminal_transition_fence.cancel() is False
+    assert await loop._child_run_owner.cancel() is False
     run.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await run
+        await await_or_fail(run, what="join canceled child")
     await registry.close()
     store.close()
 
@@ -18422,7 +18438,7 @@ async def test_immediate_reminder_counts_toward_nudge_limit(
         if timeout is not None:
             return False
         limit_reached.set()
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="park idle child")
         return True
 
     async def consume(_loop, prompt, **kwargs):
@@ -18450,7 +18466,7 @@ async def test_immediate_reminder_counts_toward_nudge_limit(
     ]
     run.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await run
+        await await_or_fail(run, what="join idle child")
     await registry.close()
     store.close()
 
@@ -18542,7 +18558,7 @@ async def test_explicit_finish_child_ending_with_text_gets_one_immediate_reminde
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(store)
     loop = _ExplicitFinishLoop(registry, owner)
-    loop._terminal_transition_fence = TerminalTransitionFence(store)
+    loop._child_run_owner = ChildRunTransitionOwner(store, "test-call", explicit_finish=True)
 
     idle_waiting = asyncio.Event()
 
@@ -18558,7 +18574,7 @@ async def test_explicit_finish_child_ending_with_text_gets_one_immediate_reminde
 
     async def wait_idle(_wake, _timeout):
         idle_waiting.set()
-        await asyncio.Event().wait()
+        await await_or_fail(asyncio.Event().wait(), what="park idle child")
         return True
 
     monkeypatch.setattr(agent_runner_module, "consume_child", fake_consume)
@@ -18577,7 +18593,7 @@ async def test_explicit_finish_child_ending_with_text_gets_one_immediate_reminde
     assert store.agent_lifecycle()["state"] == "idle"
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await await_or_fail(task, what="join idle child")
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
     store.close()
@@ -18613,7 +18629,7 @@ async def test_idle_child_is_running_during_wake_turn(
     registry.bind_session_store(child_store)
     loop = _ExplicitFinishLoop(registry, owner)
     loop.agent_instance_id = "parent:1"
-    loop._terminal_transition_fence = TerminalTransitionFence(child_store)
+    loop._child_run_owner = ChildRunTransitionOwner(child_store, "test-call", explicit_finish=True)
     first_idle = asyncio.Event()
     wake_started = asyncio.Event()
     release_wake = asyncio.Event()
@@ -18760,8 +18776,8 @@ async def test_account_lock_exhaustion_keeps_child_alive_for_follow_up(
     flow = await loop._ensure_step_delivery()
     channel = loop._background_owner.conversation_channel
     channel.register_loop("root:1")
-    loop._terminal_transition_fence = TerminalTransitionFence(
-        store,
+    loop._child_run_owner = ChildRunTransitionOwner(
+        store, "test-call", explicit_finish=True,
         notification_pending=lambda: flow.has_pending_edge,
     )
     run = asyncio.create_task(
@@ -18886,8 +18902,8 @@ async def test_idle_child_wakes_for_task_and_child_completion_only(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(store)
     loop = _ExplicitFinishLoop(registry, owner)
-    loop._terminal_transition_fence = TerminalTransitionFence(
-        store,
+    loop._child_run_owner = ChildRunTransitionOwner(
+        store, "test-call", explicit_finish=True,
         notification_pending=lambda: bool(
             loop.step_delivery and loop.step_delivery.has_pending_edge
         ),
@@ -18996,7 +19012,7 @@ async def test_idle_task_safety_window_starts_with_each_running_task_period(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(store)
     loop = _ExplicitFinishLoop(registry, owner)
-    loop._terminal_transition_fence = TerminalTransitionFence(store)
+    loop._child_run_owner = ChildRunTransitionOwner(store, "test-call", explicit_finish=True)
     now = 0.0
     idle_entries = [asyncio.Event() for _ in range(task_count * 2)]
     idle_releases = [asyncio.Event() for _ in idle_entries]
@@ -19124,8 +19140,8 @@ async def test_task_completion_turn_rearms_full_safety_window(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(store)
     loop = _ExplicitFinishLoop(registry, owner)
-    loop._terminal_transition_fence = TerminalTransitionFence(
-        store,
+    loop._child_run_owner = ChildRunTransitionOwner(
+        store, "test-call", explicit_finish=True,
         notification_pending=lambda: bool(
             loop.step_delivery and loop.step_delivery.has_pending_edge
         ),
@@ -19272,9 +19288,9 @@ async def _idle_nudge_run(
     registry = ToolRegistry(tmp_path, skill_catalog=SkillCatalog.empty())
     registry.bind_session_store(store)
     if fence is None:
-        fence = TerminalTransitionFence(store)
+        fence = ChildRunTransitionOwner(store, "test-call", explicit_finish=True)
     loop = _ExplicitFinishLoop(registry, owner)
-    loop._terminal_transition_fence = fence
+    loop._child_run_owner = fence
     prompts: list[str] = []
     notices: list[Message] = []
 
@@ -19384,7 +19400,7 @@ async def test_idle_nudge_loses_to_prompt_committed_after_eligibility_check(
     timed_out = False
     eligibility_checked = asyncio.Event()
     prompt_committed = asyncio.Event()
-    real_fence: TerminalTransitionFence | None = None
+    real_fence: ChildRunTransitionOwner | None = None
 
     class PromptAfterEligibilityFence:
         async def idle_nudge_eligible(self) -> bool:
@@ -19392,13 +19408,13 @@ async def test_idle_nudge_loses_to_prompt_committed_after_eligibility_check(
             eligible = await real_fence.idle_nudge_eligible()
             if timed_out and eligible:
                 eligibility_checked.set()
-                await prompt_committed.wait()
+                await await_or_fail(prompt_committed.wait(), what="prompt commit")
             return eligible
 
         async def reserve_idle_nudge(self) -> bool:
             assert real_fence is not None
             eligibility_checked.set()
-            await prompt_committed.wait()
+            await await_or_fail(prompt_committed.wait(), what="prompt commit")
             return await real_fence.reserve_idle_nudge()
 
     async def expire(_wait, _timeout):
@@ -19414,10 +19430,10 @@ async def test_idle_nudge_loses_to_prompt_committed_after_eligibility_check(
         fence=fence,
         finish_after_calls=2,
     )
-    real_fence = TerminalTransitionFence(store)
+    real_fence = ChildRunTransitionOwner(store, "test-call", explicit_finish=True)
 
     async def commit_prompt() -> None:
-        await eligibility_checked.wait()
+        await await_or_fail(eligibility_checked.wait(), what="eligibility check")
         await owner.conversation_channel.produce_to(
             "root:1",
             pending_delivery_module.PromptInput(
@@ -19430,7 +19446,7 @@ async def test_idle_nudge_loses_to_prompt_committed_after_eligibility_check(
 
     commit = asyncio.create_task(commit_prompt())
     await asyncio.wait_for(run, 1)
-    await commit
+    await await_or_fail(commit, what="join prompt commit")
     assert prompts == ["work", "real follow-up"]
     owner.conversation_channel.unregister_loop("root:1")
     await registry.close()
@@ -20303,7 +20319,7 @@ async def test_agent_cancel_reports_failed_confirmation_and_allows_retry(
     # test-contract: seam placeholder task models a live child watcher
     watcher = asyncio.create_task(asyncio.Event().wait())
     attempts = 0
-    fence = TerminalTransitionFence(child_store)
+    fence = ChildRunTransitionOwner(child_store, "test-call", explicit_finish=True)
 
     async def fail_confirmation() -> bool:
         raise OSError("durable write failed")
@@ -20373,7 +20389,7 @@ async def test_agent_cancel_reports_unconfirmed_on_timeout_without_claiming_succ
     release = asyncio.Event()
     wait_started = asyncio.Event()
     wait_gate = asyncio.Event()
-    fence = TerminalTransitionFence(child_store)
+    fence = ChildRunTransitionOwner(child_store, "test-call", explicit_finish=True)
     attempts = 0
 
     async def confirm() -> bool:
@@ -20881,7 +20897,7 @@ async def test_cancel_confirmed_makes_idle_child_tree_terminal_immediately(
 
 
 @pytest.mark.asyncio
-async def test_agent_cancel_retries_lifecycle_write_after_terminal_fence_wins(
+async def test_agent_cancel_retries_lifecycle_write_after_child_run_owner_wins(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -21676,7 +21692,7 @@ async def test_explicit_finish_accept_does_not_block_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store = ConversationStore(tmp_path, session_id="finish-off-loop")
-    fence = TerminalTransitionFence(store)
+    fence = ChildRunTransitionOwner(store, "test-call", explicit_finish=True)
 
     result = await _assert_fence_operation_does_not_block_loop(
         store,
@@ -21695,7 +21711,7 @@ async def test_cancel_and_idle_nudge_do_not_block_event_loop(
     assert (
         await _assert_fence_operation_does_not_block_loop(
             cancel_store,
-            TerminalTransitionFence(cancel_store).cancel,
+            ChildRunTransitionOwner(cancel_store, "test-call", explicit_finish=True).cancel,
             monkeypatch,
         )
         is True
@@ -21705,7 +21721,7 @@ async def test_cancel_and_idle_nudge_do_not_block_event_loop(
     assert (
         await _assert_fence_operation_does_not_block_loop(
             nudge_store,
-            TerminalTransitionFence(nudge_store).reserve_idle_nudge,
+            ChildRunTransitionOwner(nudge_store, "test-call", explicit_finish=True).reserve_idle_nudge,
             monkeypatch,
         )
         is True
@@ -22191,30 +22207,30 @@ async def test_pending_task_or_child_notification_rejects_finish(
 
 
 @pytest.mark.asyncio
-async def test_terminal_fence_serializes_finish_idle_nudge_cancel_and_recovery(
-    tmp_path: Path,
+async def test_child_run_owner_serializes_finish_idle_nudge_cancel_and_recovery(
+    tmp_path: Path, request: pytest.FixtureRequest,
 ) -> None:
-    from zeta.agent.terminal_fence import TerminalTransitionFence
-
     prompt_store = ConversationStore(tmp_path, session_id="prompt")
-    prompt_fence = TerminalTransitionFence(prompt_store)
+    request.addfinalizer(prompt_store.close)
+    prompt_fence = ChildRunTransitionOwner(prompt_store, "test-call", explicit_finish=True)
     prompt_ready = asyncio.Event()
 
     async def nudge_after_prompt() -> bool:
-        await prompt_ready.wait()
+        await await_or_fail(prompt_ready.wait(), what="terminal transition ready")
         return await prompt_fence.reserve_idle_nudge()
 
     nudge = asyncio.create_task(nudge_after_prompt())
     await asyncio.to_thread(prompt_store.append_pending_prompt, "real follow-up")
     prompt_ready.set()
-    assert await nudge is False
+    assert await await_or_fail(nudge, what="join terminal transition") is False
 
     finish_store = ConversationStore(tmp_path, session_id="finish")
-    finish_fence = TerminalTransitionFence(finish_store)
+    request.addfinalizer(finish_store.close)
+    finish_fence = ChildRunTransitionOwner(finish_store, "test-call", explicit_finish=True)
     finish_ready = asyncio.Event()
 
     async def nudge_after_finish() -> bool:
-        await finish_ready.wait()
+        await await_or_fail(finish_ready.wait(), what="terminal transition ready")
         return await finish_fence.reserve_idle_nudge()
 
     nudge = asyncio.create_task(nudge_after_finish())
@@ -22222,51 +22238,48 @@ async def test_terminal_fence_serializes_finish_idle_nudge_cancel_and_recovery(
         await finish_fence.accept_finish({"status": "done", "summary": "done"}) is None
     )
     finish_ready.set()
-    assert await nudge is False
+    assert await await_or_fail(nudge, what="join terminal transition") is False
     assert await finish_fence.cancel() is False
-    assert await finish_fence.recover() == {"status": "done", "summary": "done"}
+    assert (await finish_fence.background_outcome())[1] == {"status": "done", "summary": "done"}
 
     cancel_store = ConversationStore(tmp_path, session_id="cancel")
-    cancel_fence = TerminalTransitionFence(cancel_store)
+    request.addfinalizer(cancel_store.close)
+    cancel_fence = ChildRunTransitionOwner(cancel_store, "test-call", explicit_finish=True)
     cancel_ready = asyncio.Event()
 
     async def nudge_after_cancel() -> bool:
-        await cancel_ready.wait()
+        await await_or_fail(cancel_ready.wait(), what="terminal transition ready")
         return await cancel_fence.reserve_idle_nudge()
 
     nudge = asyncio.create_task(nudge_after_cancel())
     assert await cancel_fence.cancel() is True
     cancel_ready.set()
-    assert await nudge is False
+    assert await await_or_fail(nudge, what="join terminal transition") is False
 
 
 @pytest.mark.asyncio
 async def test_explicit_finish_cancel_wins_before_acceptance(tmp_path: Path) -> None:
-    from zeta.agent.terminal_fence import TerminalTransitionFence
-
     store = ConversationStore(tmp_path)
-    fence = TerminalTransitionFence(store)
+    fence = ChildRunTransitionOwner(store, "test-call", explicit_finish=True)
     cancel_won = asyncio.Event()
 
     async def finish_after_cancel() -> str | None:
-        await cancel_won.wait()
+        await await_or_fail(cancel_won.wait(), what="cancel won")
         return await fence.accept_finish({"status": "done", "summary": "late"})
 
     finish_task = asyncio.create_task(finish_after_cancel())
     assert await fence.cancel() is True
     cancel_won.set()
-    assert await finish_task == "child is canceled"
+    assert await await_or_fail(finish_task, what="join terminal transition") == "child is canceled"
 
 
 @pytest.mark.asyncio
 async def test_explicit_finish_cancel_after_acceptance_keeps_report(
     tmp_path: Path,
 ) -> None:
-    from zeta.agent.terminal_fence import TerminalTransitionFence
-
     store = ConversationStore(tmp_path)
     report = {"status": "blocked", "summary": "need approval"}
-    fence = TerminalTransitionFence(store)
+    fence = ChildRunTransitionOwner(store, "test-call", explicit_finish=True)
     finish_accepted = asyncio.Event()
 
     async def accept_finish() -> None:
@@ -22274,9 +22287,9 @@ async def test_explicit_finish_cancel_after_acceptance_keeps_report(
         finish_accepted.set()
 
     finish_task = asyncio.create_task(accept_finish())
-    await finish_accepted.wait()
+    await await_or_fail(finish_accepted.wait(), what="finish accepted")
     assert await fence.cancel() is False
-    await finish_task
+    await await_or_fail(finish_task, what="join terminal transition")
     assert (
         await asyncio.to_thread(store.pending_prompt_queue.explicit_finish_report)
         == report
@@ -23556,3 +23569,120 @@ async def test_pre_dispatch_timeout_delivers_queued_follow_up(tmp_path, monkeypa
         release.set()
         await loop.close()
         store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["finish", "cancel"])
+async def test_child_run_owner_serializes_finish_and_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first: str,
+) -> None:
+    with ConversationStore(tmp_path) as store:
+        owner = ChildRunTransitionOwner(store, "call", explicit_finish=True)
+        report = {"status": "done", "summary": "done"}
+        write_entered = asyncio.Event()
+        release_write = asyncio.Event()
+        contender_entered = asyncio.Event()
+        method = "accept_explicit_finish" if first == "finish" else "mark_agent_canceled_async"
+        original = getattr(store, method)
+
+        async def hold_write(*args):
+            write_entered.set()
+            await await_or_fail(release_write.wait(), what="release terminal write")
+            return await original(*args)
+
+        monkeypatch.setattr(store, method, hold_write)
+        async def finish():
+            return await owner.accept_finish(report)
+        winner, contender = (finish, owner.cancel) if first == "finish" else (owner.cancel, finish)
+
+        async def contend():
+            contender_entered.set()
+            return await contender()
+
+        winner_task = asyncio.create_task(winner())
+        contender_task = None
+        try:
+            await await_or_fail(write_entered.wait(), what="winner entered the write")
+            contender_task = asyncio.create_task(contend())
+            await await_or_fail(contender_entered.wait(), what="contender entered")
+            assert not contender_task.done()
+            release_write.set()
+            results = await await_or_fail(
+                asyncio.gather(winner_task, contender_task), what="terminal race",
+            )
+            if first == "finish":
+                assert results == [None, False]
+                assert owner.recovered_report() == report
+                assert store.agent_canceled() is None
+            else:
+                assert results == [True, "child is canceled"]
+                assert owner.recovered_report() is None
+                assert store.agent_canceled()["tool_call_id"] == "call"
+        finally:
+            release_write.set()
+            await await_or_fail(asyncio.gather(
+                *(task for task in (winner_task, contender_task) if task is not None),
+                return_exceptions=True,
+            ), what="join terminal race")
+
+
+@pytest.mark.asyncio
+async def test_child_run_owner_cancels_setup_before_runtime_attaches(tmp_path: Path) -> None:
+    with (
+        ConversationStore(tmp_path, session_id="parent") as parent,
+        ConversationStore(tmp_path, session_id="child") as child,
+    ):
+        tree = BackgroundAgentOwner(parent)
+        call = _agent_call()
+        handle = "parent:1"
+        setup_entered = asyncio.Event()
+        release_setup = asyncio.Event()
+        cancel_entered = asyncio.Event()
+        release_cancel = asyncio.Event()
+        runtime_attached = asyncio.Event()
+
+        async def prepare_cancel() -> None:
+            cancel_entered.set()
+            await await_or_fail(release_cancel.wait(), what="release setup cancellation")
+            await asyncio.to_thread(
+                child.start_agent_lifecycle, handle=handle,
+                started_at="2026-01-01T00:00:00+00:00", depth=1,
+                agent_type="general", description="setup",
+            )
+
+        async def setup() -> None:
+            task = asyncio.current_task()
+            assert task is not None
+            parent.register_agent_child(
+                call, child_session_path=str(child.session_dir), description="setup",
+                child_instance_id=handle, background=True,
+            )
+            owner = tree.begin_run(
+                handle, child, call.id, task, prepare_cancel, parent_store=parent,
+                parent_instance_id=None, description="setup", explicit_finish=False, background=True,
+            )
+            try:
+                setup_entered.set()
+                await await_or_fail(release_setup.wait(), what="release child setup")
+                runtime_attached.set()
+            except asyncio.CancelledError:
+                assert await owner.cancel()
+                raise
+            finally:
+                tree.unregister(handle)
+
+        task = tree.start_child_setup(setup)
+        try:
+            await await_or_fail(setup_entered.wait(), what="registered setup")
+            assert tree.cancel(handle)
+            await await_or_fail(cancel_entered.wait(), what="setup entered cancellation")
+            release_setup.set()
+            release_cancel.set()
+            await await_or_fail(tree.wait(), what="join canceled setup")
+            assert task.cancelled()
+            assert not runtime_attached.is_set()
+            assert child.agent_lifecycle()["state"] == "canceled"
+        finally:
+            release_setup.set()
+            release_cancel.set()
+            await await_or_fail(tree.wait(), what="join setup and cancellation")

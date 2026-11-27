@@ -8,6 +8,7 @@ import pytest
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.agent import runner
+from zeta.agent.child_run_owner import ChildRunTransitionOwner
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.child_runs import LoadedAgentLifecycle, read_child_lifecycle
 from zeta.core.store import ConversationStore
@@ -35,6 +36,7 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
     entered = asyncio.Event()
     release = asyncio.Event()
     running = asyncio.Event()
+    finish_model = asyncio.Event()
     cleanup_entered = asyncio.Event()
     tasks = []
     closed = False
@@ -50,7 +52,7 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
 
     async def consume(*args, **kwargs):
         running.set()
-        await await_or_fail(release.wait(), what="child runs until canceled")
+        await await_or_fail(finish_model.wait(), what="child runs until canceled")
 
     with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
         loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
@@ -73,8 +75,6 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
             }:
                 await pause()
             result = await original_offload(fn, *args, **kwargs)
-            if point == fn.__name__ == "start_lifecycle":
-                await pause()
             return result
 
         # test-contract: seam pause at the real owner operation, not a timed race.
@@ -94,15 +94,23 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
         if point in {"build_child_loop", "cleanup_cancel"}:
             # test-contract: seam pause loop construction while setup owns the child store.
             monkeypatch.setattr(runner, "_build_child_loop", pause)
+        if point == "start_lifecycle":
+            original_start = ChildRunTransitionOwner.start
+
+            async def start(self, initialize):
+                await original_start(self, initialize)
+                await pause()
+
+            monkeypatch.setattr(ChildRunTransitionOwner, "start", start)
         if gate_cleanup:
-            original_persist = runner.persist_confirmed_cancel
+            original_persist = ChildRunTransitionOwner.cancel
 
             async def persist(*args, **kwargs):
                 cleanup_entered.set()
                 await await_or_fail(release.wait(), what="release setup cancellation write")
                 return await original_persist(*args, **kwargs)
 
-            monkeypatch.setattr(runner, "persist_confirmed_cancel", persist)
+            monkeypatch.setattr(ChildRunTransitionOwner, "cancel", persist)
         if point == "refresh_live_config":
             monkeypatch.setattr(AgentLoop, "refresh_live_config", pause)
         if point == "step_delivery":
@@ -131,7 +139,8 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
                 result = await original_store_offload(self, fn)
                 if fn.__name__ == "open_child_store":
                     opened.append(result)
-                if fn.__name__ == point:
+                gate_name = "prepare_child_store" if point == "activate_runtime_lease" else point
+                if fn.__name__ == gate_name:
                     await pause()
                 return result
 
@@ -157,13 +166,13 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
                 assert owner.owns_running(run_id)
                 child_store, = owner._stores
                 if point == "cancel_confirmation":
-                    original_confirm = runner.persist_confirmed_cancel
+                    original_confirm = ChildRunTransitionOwner.cancel
 
                     async def confirm(*args, **kwargs):
                         await pause()
                         return await original_confirm(*args, **kwargs)
 
-                    monkeypatch.setattr(runner, "persist_confirmed_cancel", confirm)
+                    monkeypatch.setattr(ChildRunTransitionOwner, "cancel", confirm)
                 if point == "cancel_reread":
                     original_cancel = owner.cancel_and_wait
 
@@ -193,7 +202,7 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
                 if point not in BEFORE_MARKER:
                     child_store, = owner._stores
                     run_id, = store.agent_children()
-                    assert owner.owns_running(run_id) == (point == "serve_receipt")
+                    assert owner.owns_running(run_id)
                 if shutdown:
                     closing = asyncio.create_task(loop.close())
                     tasks.append(closing)
@@ -247,6 +256,7 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
                 for _ in range(2):
                     assert await asyncio.wait_for(runner.cancel_child_run(loop, run_id), 10) == "canceled"
         finally:
+            finish_model.set()
             release.set()
             for task in tasks:
                 if not task.done():
