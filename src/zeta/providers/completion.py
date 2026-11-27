@@ -124,6 +124,10 @@ class CompletionRetryBudget:
     max_attempts: int = MAX_PROVIDER_ATTEMPTS
     retry_wait_seconds: float = 0.0
     original_error: Any | None = None
+    first_failure_retryable: bool = False
+    first_failure_code: str = "provider_error"
+    first_failure_at: float | None = None
+    failure_elapsed: float = 0.0
     exhausted: bool = False
     max_stall_retries: int = MAX_STALL_RETRIES
     stall_retries: int = 0
@@ -173,8 +177,16 @@ class CompletionRetryBudget:
         event_data: Mapping[str, Any] | None = None,
     ) -> RetryPlan | None:
         first_failure = self.original_error is None
+        retryable = retryable_provider_error(source, event_data)
         if first_failure:
             self.original_error = source
+            self.first_failure_retryable = retryable
+            self.first_failure_at = now
+            code = getattr(source, "code", None)
+            if code in ("server_error", "timeout", "transport_error", "http_error", "stream_error", "account_lock_timeout"):
+                self.first_failure_code = code
+        assert self.first_failure_at is not None
+        self.failure_elapsed = max(0.0, now - self.first_failure_at)
         limit = getattr(source, "subscription_limit", None)
         if limit is not None and not self.exhausted:
             wait = subscription_limit_wait(limit.resets_at.timestamp(), time.time())
@@ -186,7 +198,7 @@ class CompletionRetryBudget:
                 retry_after=wait,
                 subscription_limit=limit,
             )
-        if self.exhausted or not retryable_provider_error(source, event_data):
+        if self.exhausted or not retryable:
             return None
         is_account_lock = getattr(source, "code", None) == "account_lock_timeout"
         if is_account_lock:

@@ -240,6 +240,7 @@ class EventDescriptor(StrEnum):
     SUB_AGENT_RECEIPT = "sub_agent_receipt"
     CHILD_IDLE = "child_idle"
     CHILD_RECOVERED = "child_recovered"
+    CHILD_SUSPENDED = "child_suspended"
     CHILD_HOLD = "child_hold"
     TASK_EXIT_NOTIFICATION = "task_exit_notification"
     PROJECT_INBOX_NOTIFICATION = "project_inbox_notification"

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..core.store import ConversationStore
+from ..providers.recovery_schedule import ProviderRecoveryCoordinator
 from .child_run_owner import ChildRunTransitionOwner
 from .conversation_channel import ConversationChannel
 from .finish_gate import CausalEpisodeRegistry
@@ -64,6 +65,7 @@ class BackgroundAgentOwner:
         ):
             raise ValueError("finish_gate_task_timeout must be positive")
         self.notification_store = notification_store
+        self.provider_recovery = ProviderRecoveryCoordinator()
         self._child_recovery_enabled = notification_store.child_recovery_enabled
         self.finish_gate_max_turns = finish_gate_max_turns
         self.finish_gate_timeout = float(finish_gate_timeout)
@@ -451,6 +453,7 @@ class BackgroundAgentOwner:
             return
         for owner in self._runs.values():
             owner.quiesce()
+        await self.provider_recovery.close()
         # asyncio.wait never propagates shutdown cancellation into a marker commit.
         if self._registrations:
             _, pending = await asyncio.wait(

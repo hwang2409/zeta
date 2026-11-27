@@ -160,6 +160,7 @@ _NOTIFICATION_EVENTS = (
     EventDescriptor.SUB_AGENT_RECEIPT,
     EventDescriptor.CHILD_IDLE,
     EventDescriptor.CHILD_RECOVERED,
+    EventDescriptor.CHILD_SUSPENDED,
     EventDescriptor.TASK_EXIT_NOTIFICATION,
     EventDescriptor.PROJECT_INBOX_NOTIFICATION,
     EventDescriptor.CHILD_QUESTION,

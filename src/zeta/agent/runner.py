@@ -1117,6 +1117,8 @@ async def _run_installed_child(
 
         loop._create_task(notify_parent())
 
+    if run_owner.provider_recovery_enabled:
+        run_owner.bind_provider_recovery(loop, child_loop.backend, description)
     child_loop._set_pre_dispatch_step = set_pre_dispatch_step
     child_loop._report_pre_dispatch_stall = report_pre_dispatch_stall
 

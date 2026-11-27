@@ -403,10 +403,23 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
         root = control.runtime.opened.store
         run_id = f"{session_id}:1"
 
+        next_at = "2026-11-08T00:00:05+00:00"
+        retry = {"retry_state": "retrying", "retry_started_at": "2026-11-08T00:00:00+00:00",
+                     "retry_deadline_at": "2026-11-08T01:00:00+00:00", "retry_probe_at": next_at, "retry_step": 0,
+                     "next_retry_at": next_at}
+
+        def check_row(row, status):
+            assert row["status"] == status
+            assert row.get("next_retry_at") == (next_at if status == "suspended" else None)
+            assert row.get("retry_state") == ("retrying" if status == "suspended" else None)
+
         def seed_child():
             with ConversationStore(root.session_dir / "agents", session_id="1", _storage_lease=root._storage_lease) as child:
                 child.start_agent_lifecycle(handle=run_id, started_at="2026-11-08T00:00:00+00:00", depth=1, agent_type="general", description="work")
-                child.transition_agent_suspension(reason="normal_exit")
+                if getattr(child, "provider_recovery_enabled", False):
+                    child.transition_agent_suspension(provider_retry=retry)
+                else:
+                    child.transition_agent_suspension(reason="normal_exit")
                 return str(child.session_dir)
 
         path = await asyncio.to_thread(seed_child)
@@ -424,12 +437,13 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
         peers = [(observer, "running"), (client, "suspended")]
         for peer, expected in peers:
             listed = await peer.request("list", "child_run_list", {"session_id": session_id})
-            assert [row["status"] for row in listed["result"]["runs"]] == [expected]
+            [row] = listed["result"]["runs"]
+            check_row(row, expected)
             history = await peer.request("history", "child_run_events", {"session_id": session_id, "run_id": run_id})
-            assert history["result"]["child"]["status"] == expected, "child history snapshot"
+            check_row(history["result"]["child"], expected)
             joined = await peer.request("baseline", "session_history_and_subscribe", {"session_id": session_id})
             [progress] = [row["child"] for row in joined["result"]["messages"] if row.get("event") == "child_progress"]
-            assert progress["status"] == expected, "session history baseline"
+            check_row(progress, expected)
 
         def publish_progress():
             with ConversationStore(root.session_dir / "agents", session_id="1", _storage_lease=root._storage_lease) as child:
@@ -440,15 +454,22 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
         await asyncio.to_thread(publish_progress)
         for peer, expected in peers:
             progress = await await_or_fail(peer.event("child_progress"), what="live suspended child progress")
-            assert progress["child"]["status"] == expected, "live child progress"
-        notice, _ = await root._commit_storage_command(_AppendChildRecoveredCommand(
-            run_id=run_id, episode=1, path=path, description="work",
-        ))
-        await control.control._event(StreamEvent(StreamEventType.AGENT_NOTIFICATION,
-            data={"notification_id": notice.id, **notice.data}, row_seq=notice.seq,
-        ), session_id=session_id, background=True)
-        frame = await await_or_fail(client.event("child_recovered"), what="serve recovery notification")
-        assert frame["data"]["logical_id"] == f"child-recovered:{run_id}:1"
+            check_row(progress["child"], expected)
+        for kind in ("child_suspended", "child_recovered"):
+            suspension = {"code": "server_error", "text": "suspended: provider unavailable, retrying", "next_retry_at": next_at}
+            notice, _ = await root._commit_storage_command(_AppendChildRecoveredCommand(
+                run_id=run_id, episode=1, path=path, description="work",
+                suspension=suspension if kind == "child_suspended" else None,
+            ))
+            await control.control._event(StreamEvent(StreamEventType.AGENT_NOTIFICATION,
+                data={"notification_id": notice.id, **notice.data}, row_seq=notice.seq,
+            ), session_id=session_id, background=True)
+            frame = await await_or_fail(client.event(kind), what=f"serve {kind} notification")
+            assert frame["data"]["logical_id"] == f"{kind.replace('_', '-')}:{run_id}:1"
+            if kind == "child_suspended":
+                assert frame["data"]["next_retry_at"] == next_at
+        legacy = await observer.request("after", "session_history_and_subscribe", {"session_id": session_id})
+        assert not any(row.get("event") == "child_suspended" for row in legacy["result"]["messages"])
     finally:
         if observer is not None:
             await observer.close()

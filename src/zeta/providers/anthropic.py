@@ -579,10 +579,11 @@ class AnthropicBackend(CompletionBackend):
         tool_schemas: Sequence[ToolSchema],
         *,
         token: str | None = None,
+        probe: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         async with self._lease.borrow("anthropic completion") as client:
             events = self._complete_once_with_client(
-                client, messages, tool_schemas, token=token
+                client, messages, tool_schemas, token=token, probe=probe
             )
             try:
                 async for event in events:
@@ -597,6 +598,7 @@ class AnthropicBackend(CompletionBackend):
         tool_schemas: Sequence[ToolSchema],
         *,
         token: str | None = None,
+        probe: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         stream_context = None
         entered = False
@@ -604,7 +606,10 @@ class AnthropicBackend(CompletionBackend):
         primary_exception: BaseException | None = None
         try:
             token = token if token is not None else await self.token_store.access_token(client)
-            payload = build_request_payload(
+            payload = {
+                "model": self.model, "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 1, "stream": True,
+            } if probe else build_request_payload(
                 messages,
                 tool_schemas,
                 model=self.model,

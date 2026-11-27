@@ -1707,7 +1707,7 @@ def test_every_durable_notification_kind_has_non_error_rendering() -> None:
         event = StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=payloads[kind])
         rendered = render_agent_notification(event)
         assert rendered is not None, kind
-        assert "unavailable" not in renderable_plain(rendered).lower(), kind
+        assert rendered.style != theme.ERROR, kind
         assert render_event(event) is not None, kind
 
 

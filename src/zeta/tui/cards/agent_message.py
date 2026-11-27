@@ -330,6 +330,8 @@ def _agent_status_row(
             fields.append(value)
     row = " · ".join(fields)
     reason = child.get("reason")
+    if child.get("suspension_reason") == "provider_unavailable":
+        reason = _provider_retry_text(child)
     if isinstance(reason, str) and reason:
         row = f"{row} — {reason}"
     account = project_account_status(child.get("account_status"))
@@ -458,10 +460,12 @@ def render_agent_notification_message(
         return _render_child_question(event, identities)
     if kind == "child_question_withdrawn":
         return _render_child_question_withdrawn(event, identities)
-    if kind == "child_recovered":
+    if kind in {"child_recovered", "child_suspended"}:
         identity = _notification_identity(event, identities)
         if identity is None:
             return _unavailable_notification()
+        if kind == "child_suspended":
+            return render_agent_message(agent_header("suspended", "←", identity, state="suspended"), result=_provider_retry_text(event.data), state="suspended")
         return render_agent_message(agent_header("recovered", "←", identity, state="running"), state="running")
     if kind == "child_idle":
         return _render_child_idle(event, identities)
@@ -470,6 +474,14 @@ def render_agent_notification_message(
     if kind == "agent_completion":
         return _render_child_completion(event, identities)
     return None
+
+
+def _provider_retry_text(data: Mapping[str, object]) -> str:
+    next_at = data.get("next_retry_at")
+    text = "suspended: provider unavailable"
+    if isinstance(next_at, str):
+        text += f", retrying (next retry: {next_at})"
+    return text
 
 
 def _notification_identity(

@@ -104,6 +104,7 @@ TERMINAL_DISPOSITION: Mapping[str, TerminalRoute] = MappingProxyType(
         CHILD_QUESTION_NOTIFICATION_KIND: TerminalRoute("keep", "reroute"),
         CHILD_IDLE_NOTIFICATION_KIND: TerminalRoute("keep", "reroute"),
         "child_recovered": TerminalRoute("keep", "keep"),
+        "child_suspended": TerminalRoute("keep", "keep"),
         CHILD_HOLD_NOTIFICATION_KIND: TerminalRoute("keep", "reroute"),
         PROJECT_INBOX_NOTIFICATION_KIND: TerminalRoute("keep", "keep"),
         TASK_EXITED_NOTIFICATION_KIND: TerminalRoute("ack_moot", "ack_moot"),

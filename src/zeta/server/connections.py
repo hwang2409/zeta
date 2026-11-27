@@ -100,6 +100,7 @@ EVENT_FEATURES = {
     EventDescriptor.SUB_AGENT_RECEIPT: NO_FEATURE,
     EventDescriptor.CHILD_IDLE: NO_FEATURE,
     EventDescriptor.CHILD_RECOVERED: _EventRoute(frozenset({"child_recovery"})),
+    EventDescriptor.CHILD_SUSPENDED: _EventRoute(frozenset({"child_recovery"})),
     EventDescriptor.CHILD_HOLD: NO_FEATURE,
     EventDescriptor.TASK_EXIT_NOTIFICATION: NO_FEATURE,
     EventDescriptor.PROJECT_INBOX_NOTIFICATION: NO_FEATURE,

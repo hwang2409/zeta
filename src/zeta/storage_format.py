@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, open_created, shape_lock
 
-WRITER_EPOCH: Final = 14
+WRITER_EPOCH: Final = 15
 P06_FEATURE_EPOCH: Final = 6
 CHILD_QUESTION_STATES: Final = frozenset({"pending", "answered", "withdrawn"})
 
@@ -42,6 +42,7 @@ class StorageFeature(StrEnum):
     INBOX_DURABLE_INTENT = "inbox_durable_intent"
     TRANSCRIPT_TAIL_EVIDENCE = "transcript_tail_evidence"
     CHILD_RECOVERY = "child_recovery"
+    PROVIDER_RECOVERY = "provider_recovery"
     CHILD_QUESTION_HOLD = "child_question_hold"
 
 
@@ -57,6 +58,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.TRANSCRIPT_TAIL_EVIDENCE: 12,
     StorageFeature.CHILD_RECOVERY: 13,
     StorageFeature.CHILD_QUESTION_HOLD: 14,
+    StorageFeature.PROVIDER_RECOVERY: 15,
     # APPROVAL_RESTART_REASON and INBOX_DURABLE_INTENT must be fixed int literals
     # (test_storage_feature_epochs forbids referencing WRITER_EPOCH here).
     # Recheck main+1 at the final merge.
@@ -128,6 +130,9 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "child_question_state": frozenset({
         "question_id", "state", "question", "options", "held_at_turn_limit",
         "ancestor_target_ids", "settlement_turn",
+    }),
+    "child_suspended_notification": frozenset({
+        "kind", "origin", "logical_id", "child_instance_id", "child_session_path", "description", "episode", "text", "display_only", "code", "next_retry_at",
     }),
     "child_recovered_notification": frozenset({
         "kind", "origin", "logical_id", "child_instance_id", "child_session_path", "description", "episode", "text", "display_only",
@@ -280,10 +285,12 @@ BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
 
 CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
     "child_question_state.state": CHILD_QUESTION_STATES,
+    "notification.child_suspended": frozenset({"child_suspended"}),
     "notification.child_recovered": frozenset({"child_recovered"}),
     "child_lifecycle.state": frozenset({"running", "idle", "finishing", "completed", "canceled", "failed", "suspended"}),
     "child_lifecycle.resume_mode": frozenset({"idle", "active"}),
-    "child_lifecycle.suspension_reason": frozenset({"normal_exit", "owner_lost"}),
+    "child_lifecycle.suspension_reason": frozenset({"normal_exit", "owner_lost", "provider_unavailable"}),
+    "child_lifecycle.retry_state": frozenset({"retrying", "stopped"}),
     "child_resume.account_pins": frozenset({"pending", "selected"}),
     "approval.resolution_reason": APPROVAL_RESOLUTION_REASONS,
     "attention.kind": frozenset({"decision", "answer", "decided", "deferred"}),

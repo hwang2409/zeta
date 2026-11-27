@@ -247,7 +247,7 @@ class DeliveryFold:
             self.question_cards[handle, entry.data["question_id"]] = entry
         elif kind == "child_question_withdrawn":
             self.question_cards.pop((handle, entry.data["question_id"]), None)
-        if kind == "child_recovered":
+        if kind in {"child_recovered", "child_suspended"}:
             self.recoveries_by_id.setdefault(entry.data["logical_id"], entry)
         elif type(handle) is str and handle and type(child_path) is str and child_path:
             self.agent_receipts.append((handle, child_path))
