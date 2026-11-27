@@ -18,7 +18,6 @@ from zeta.skills import SkillCatalog
 from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tools.registry import ToolRegistry
 
-
 ALLOWLIST = ("agent", "agent_cancel", "agent_status", "read", "bash", "ask_parent", "agent_handoff", "finish")
 FINISH_BLOCK = "current policy blocks required explicit-finish tools: finish"
 PROFILE_BLOCK = "current tool policy cannot satisfy the saved profile's required tools"
