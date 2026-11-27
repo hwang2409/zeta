@@ -438,9 +438,6 @@ NOTIFICATIONS: dict[EventDescriptor, Callable[[Any], None]] = {
     EventDescriptor.SUB_AGENT_RECEIPT: lambda store: store.append_agent_notification(
         "child-done", child_session_path="/tmp/child", description="child", status="completed", text="done"
     ),
-    EventDescriptor.CHILD_RECOVERED: lambda store: store.append_child_recovered(
-        f"{store.session_id}:1", 1, path="/tmp/child", description="child"
-    ),
     EventDescriptor.CHILD_IDLE: lambda store: store.append_child_idle_notification(
         "child-idle", child_session_path="/tmp/child", description="child", text="idle"
     ),
@@ -464,7 +461,19 @@ NOTIFICATIONS: dict[EventDescriptor, Callable[[Any], None]] = {
 
 def _notification(event: EventDescriptor) -> Callable[[Serve, Any], Awaitable[None]]:
     async def run(serve: Serve, backend: Any) -> None:
-        NOTIFICATIONS[event](serve.store)
+        if event is EventDescriptor.CHILD_RECOVERED:
+            # Recovery publishes immediately, not as part of the next model turn.
+            store = serve.store
+            notice, _ = store.append_child_recovered(
+                f"{store.session_id}:1", 1, path="/tmp/child", description="child"
+            )
+            await serve.server.controllers.attached().control._event(
+                StreamEvent(StreamEventType.AGENT_NOTIFICATION,
+                            data={"notification_id": notice.id, **notice.data}, row_seq=notice.seq),
+                session_id=store.session_id, background=True,
+            )
+        else:
+            NOTIFICATIONS[event](serve.store)
         await serve.controller.request(serve.request_id(), "send", {"text": "go"})
         await _wait_event(serve.observer, event.value)
         await _wait_event(serve.observer, "agent_end")
@@ -538,7 +547,7 @@ SCENARIOS = {
             lambda tmp: _text_backend("ok"),
             _notification(event),
         )
-        for event in NOTIFICATIONS
+        for event in (*NOTIFICATIONS, EventDescriptor.CHILD_RECOVERED)
     },
 }
 
@@ -556,7 +565,8 @@ PREMISE_SCENARIOS: dict[Route, tuple[str, ...]] = {
     (EventDescriptor.DELIVERY_STATUS, ""): ("dropped_steer",),
     (EventDescriptor.CHILD_STARTED, ""): ("background_child",),
     (EventDescriptor.CHILD_ENDED, ""): ("background_child",),
-    **{(event, "durable"): (f"notification_{event.value}",) for event in NOTIFICATIONS},
+    **{(event, "durable"): (f"notification_{event.value}",)
+       for event in (*NOTIFICATIONS, EventDescriptor.CHILD_RECOVERED)},
 }
 ROW_BACKED = [
     route for route, source in rows.ROUTES.items() if source is not rows.LIVE
