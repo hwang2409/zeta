@@ -486,7 +486,13 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
         "child_instance_id": "root:1", "episode": 1, "child_session_path": "/tmp/agents/1",
         "description": "work", "text": "child recovered", "display_only": True,
     }
+    question = {
+        "question_id": "q", "state": "answered", "question": "continue?", "options": [],
+        "held_at_turn_limit": True, "ancestor_target_ids": [None], "settlement_turn": 2,
+    }
     cases = [
+        ShapeCase("child_question_state", store_entry("child_question_state"), question,
+                  frozenset(question) - {"settlement_turn"}),
         ShapeCase("child_resume", validate_child_resume, resume, frozenset(resume)),
         ShapeCase("child_resume_preset", lambda data: validate_child_resume({**resume, "preset": data}), preset, frozenset(preset)),
         ShapeCase("child_recovered_notification", validate_child_recovered, recovered, frozenset(recovered)),
