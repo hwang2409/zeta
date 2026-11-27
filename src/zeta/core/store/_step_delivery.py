@@ -168,7 +168,8 @@ class StagedDelivery:
     notification_ids: tuple[str, ...]
     prompt_message: Message | None
     prompt_id: str | None
-    more_pending: bool
+    more_prompts: bool
+    more_notifications: bool
     publications: DeliveryPublications
 
 
@@ -363,8 +364,14 @@ def _child_question_mutation_rows(
         and ("question_id" not in data or entry.data.get("question_id") == data["question_id"])
     ]
     rows: list[tuple[str, dict[str, Any]]] = []
+    if kind == "child_question_close" and "question_id" in data and not entries:
+        # An acknowledgement consumes model input, not the displayed card.
+        historical_card = store._delivery_fold.question_cards.get((child_id, data["question_id"]))
+        if historical_card is not None:
+            entries.append(historical_card)
     for entry in entries:
-        rows.append(("notification_ack", {"notification_id": entry.id}))
+        if entry.id in store._delivery_fold.active_notifications:
+            rows.append(("notification_ack", {"notification_id": entry.id}))
         if kind == "child_question_close":
             rows.append(
                 (
@@ -515,8 +522,8 @@ def _stage_delivery_request(
             represented_ids,
             prompt_message,
             prompt_entry.id if prompt_entry is not None else None,
-            len(pending_prompts) > 1
-            or len(pending_notifications) > len(notification_entries),
+            len(pending_prompts) > 1,
+            len(pending_notifications) > len(notification_entries),
             DeliveryPublications(
                 tuple(store._snapshot_entry(entry) for entry in notification_entries),
                 store._snapshot_entry(prompt_entry) if prompt_entry is not None else None,

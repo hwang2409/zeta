@@ -625,6 +625,7 @@ async def finish_background_child(
             status = "error"
         turn_limited, turns_used, turn_limit_handoff = background_turn_limit_state(
             result=result,
+            exhausted_control=run_owner.exhausted_turn_limit(getattr(child_loop, "child_turn_control", None)),
             child_turns=child_turns,
             child_loop=child_loop,
             child_instance_id=child_instance_id,
