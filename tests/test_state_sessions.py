@@ -124,12 +124,11 @@ async def test_session_state_websocket(tmp_path, monkeypatch, case):
                 stat_calls = Counter()
                 page_limit = 2
                 counted_ids = []
-                real_counts = attention_records.state_attention_counts
+                real_slots = attention_records.state_attention_slots
 
-                def counts(root, session_ids):
-                    batch = list(session_ids)
-                    counted_ids.append(batch)
-                    return real_counts(root, batch)
+                def slots(session_dir):
+                    counted_ids.append(session_dir.name)
+                    return real_slots(session_dir)
 
                 def count(calls, original):
                     def wrapped(name, *args, **kwargs):
@@ -142,7 +141,7 @@ async def test_session_state_websocket(tmp_path, monkeypatch, case):
                 with monkeypatch.context() as patch:
                     patch.setattr(os, "open", count(opens, os.open))
                     patch.setattr(os, "stat", count(stat_calls, os.stat))
-                    patch.setattr(attention_records, "state_attention_counts", counts)
+                    patch.setattr("zeta.attention_decisions.state_attention_slots", slots)
                     result = (await call("state_sessions", {"limit": page_limit}))["result"]
                 assert opens["conversation.jsonl"] == 0, "session list opened child transcripts"
                 assert opens["agent_lifecycle.json"] == 0, "session list opened child lifecycles"
@@ -151,10 +150,10 @@ async def test_session_state_websocket(tmp_path, monkeypatch, case):
                 assert opens["agents"] == opens["background_tasks.json"] == stat_calls["conversation.jsonl"] == page_limit
                 assert result["next_cursor"]
                 session, older = result["items"]
-                assert counted_ids == [[session["session_id"], older["session_id"]]], "one attention read per page"
-                assert not any(opens[f"{ident}.json"] for ident in attention), "session list opened attention bodies"
+                assert counted_ids == [session["session_id"], older["session_id"]], "one store walk per selected row"
+                assert all(opens[f"{ident}.json"] == 1 for ident in attention), "read each record once"
                 assert session["attention_count"] == 5
-                assert older["attention_count"] == 0
+                assert older["attention_count"] == older["attention_open"] == 0
                 assert session["session_id"] == sid
                 assert session["child_count"] == 1
                 assert session["background_count"] == 5

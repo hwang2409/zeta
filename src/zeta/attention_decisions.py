@@ -11,6 +11,8 @@ from .attention_records import (
     AttentionRecord,
     AttentionStore,
     Broken,
+    Loaded,
+    state_attention_slots,
 )
 from .core.session import SessionMetadata, read_session_metadata
 from .core.session_files import SessionError
@@ -80,6 +82,28 @@ def attention_owners(
         yield metadata, session_dir
 
 
+def _is_open_for_owner(record: AttentionRecord, owner: SessionMetadata) -> bool:
+    return (
+        record.status == "open"
+        and record.project_id == owner.project_id
+        and record.session_id == owner.session_id
+    )
+
+
+def session_attention_counts(sessions: Path, owner: SessionMetadata, epoch: int) -> tuple[int, int]:
+    """Return stored slots and the session's open action count in one store walk."""
+    session_dir = sessions / owner.session_id
+    store = AttentionStore(session_dir, writer_epoch=epoch)
+    stored = action_required = 0
+    for attention_id in state_attention_slots(session_dir):
+        stored += 1
+        if owner.parent_session_id is None:
+            state = store.record_state(attention_id)
+            if isinstance(state, Loaded) and _is_open_for_owner(state.value, owner) and state.value.requires_action:
+                action_required += 1
+    return stored, action_required
+
+
 def open_attention_items(
     home: Path,
     project_id: str | None,
@@ -93,7 +117,6 @@ def open_attention_items(
     instead reads only its own records.
     """
     for metadata, session_dir in attention_owners(home, project_id, unassigned_session=unassigned_session):
-        sid, owner_project = metadata.session_id, metadata.project_id
         try:
             if epoch is None:
                 epoch = verify(home).writer_epoch
@@ -101,10 +124,8 @@ def open_attention_items(
         except (OSError, ValueError):
             continue
         for record in records:
-            if isinstance(record, Broken) or (
-                record.status == "open" and record.project_id == owner_project and record.session_id == sid
-            ):
-                yield ProjectAttentionItem(sid, record)
+            if isinstance(record, Broken) or _is_open_for_owner(record, metadata):
+                yield ProjectAttentionItem(metadata.session_id, record)
 
 
 def open_project_attention(
