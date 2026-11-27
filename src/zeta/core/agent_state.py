@@ -714,6 +714,21 @@ class AgentStateMixin:
         ):
             post_child_progress(self, self._agent_lifecycle)
 
+    def persist_child_activity(self, *, state: str | None, turns: int | None) -> None:
+        live = live_agent_lifecycle(self.agent_lifecycle_path)
+        with self._append_lock():
+            self._load_session_state()
+            if self._agent_lifecycle is None or self._agent_lifecycle["state"] not in {"running", "idle", "finishing"}:
+                return
+            if live is not None:
+                self._agent_lifecycle.update(live)
+            self.update_agent_lifecycle(
+                state=state, turns_used=turns,
+                current_step={"idle": "idle, waiting for follow-up", "running": "running follow-up"}.get(state),
+                idle_since=_now() if state == "idle" else None,
+            )
+            self._write_agent_lifecycle()
+
     def transition_agent_suspension(
         self, *, reason: str | None = None, activate: int | None = None, blocked: str | None = None,
     ) -> dict[str, Any] | None:

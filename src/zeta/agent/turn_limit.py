@@ -369,15 +369,20 @@ def make_child_progress_callbacks(
     child_store: Any,
     child_marker_key: str,
     child_tool_call_id: str,
+    recoverable: bool,
 ) -> tuple[Callable[[int], Awaitable[None] | None], Callable[[], None]]:
-    from ..core.store._async_writes import _ChildTurnsCommand
+    from ..core.store._async_writes import _ChildActivityCommand, _ChildTurnsCommand
+
+    async def persist_turns(turns: int) -> None:
+        await child_store._commit_storage_command(_ChildActivityCommand(turns=turns))
+        parent = loop._background_owner.parent_store(child_marker_key, loop.store)
+        await parent._commit_storage_command(_ChildTurnsCommand(run_id=child_marker_key, turns=turns))
 
     def update_turns(turns: int) -> Awaitable[None] | None:
         loop._agent_child_turns[child_tool_call_id] = turns
+        if recoverable:
+            return persist_turns(turns)
         child_store.update_agent_lifecycle(turns_used=turns)
-        if child_store.child_recovery_enabled:
-            parent = loop._background_owner.parent_store(child_marker_key, loop.store)
-            return parent._commit_storage_command(_ChildTurnsCommand(run_id=child_marker_key, turns=turns))
         loop.store.update_agent_child_turns(child_marker_key, turns)
         return None
 

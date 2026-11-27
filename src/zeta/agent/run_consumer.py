@@ -11,6 +11,7 @@ from ..core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
     ConversationStore,
 )
+from ..core.store._async_writes import _ChildActivityCommand
 from ..protocol.types import (
     MessageOrigin,
     StreamEvent,
@@ -41,8 +42,10 @@ _IDLE_NUDGE_PROMPT = (
 )
 
 
-def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
-    if getattr(child_loop, "explicit_finish", False):
+async def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
+    if child_loop._child_run_owner is not None and child_loop._child_run_owner.recoverable:
+        await child_store._commit_storage_command(_ChildActivityCommand(state="running"))
+    elif getattr(child_loop, "explicit_finish", False):
         child_store.update_agent_lifecycle(
             state="running",
             current_step="running follow-up",
@@ -179,7 +182,7 @@ async def consume_run(
         if not callable(child_turns):
             return {}
         idle = state == "idle"
-        if idle:
+        if idle and not child_store.child_recovery_enabled:
             _transition_idle(child_store)
         return agent_stats(
             child_store.agent_lifecycle(),
@@ -207,7 +210,7 @@ async def consume_run(
             flow = await child_loop._ensure_step_delivery()
             while not flow.has_pending_edge:
                 await child_loop._background_owner.conversation_channel.wait(child_loop.agent_instance_id)
-            _transition_running(child_loop, child_store)
+            await _transition_running(child_loop, child_store)
             result = await consume_child(
                 child_loop, "", origin=MessageOrigin.NOTIFICATION, notification_turn=True, **kwargs,
             )
@@ -256,7 +259,7 @@ async def consume_run(
                 flow.reset_stalled_episode()
                 ordinary_idle_presented = False
                 idle_lifecycle.reset_idle_period()
-                _transition_running(child_loop, child_store)
+                await _transition_running(child_loop, child_store)
                 result = await consume_child(
                     child_loop,
                     "",
@@ -266,7 +269,11 @@ async def consume_run(
                 )
                 continue
             if idle:
-                _transition_idle(child_store)
+                owner = child_loop._child_run_owner
+                if owner is not None and owner.recoverable:
+                    await child_store._commit_storage_command(_ChildActivityCommand(state="idle"))
+                else:
+                    _transition_idle(child_store)
                 content = result.get("content")
                 text = "child is idle"
                 if (
@@ -333,7 +340,7 @@ async def consume_run(
                         child_loop._child_run_owner
                     )
                 ):
-                    _transition_running(child_loop, child_store)
+                    await _transition_running(child_loop, child_store)
                     result = await consume_child(
                         child_loop,
                         _IMMEDIATE_FINISH_REMINDER,
@@ -364,7 +371,7 @@ async def consume_run(
                     continue
                 if (await flow.admit_terminal("nudge")).pending:
                     continue
-                _transition_running(child_loop, child_store)
+                await _transition_running(child_loop, child_store)
                 result = await consume_child(
                     child_loop,
                     _IDLE_NUDGE_PROMPT,

@@ -378,6 +378,15 @@ class _ChildTurnsCommand(_StoreMutationCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _ChildActivityCommand(_StoreMutationCommand):
+    state: str | None = None
+    turns: int | None = None
+
+    def apply(self, store: Any) -> None:
+        store.persist_child_activity(state=self.state, turns=self.turns)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _ChildSuspensionCommand(_StoreMutationCommand):
     reason: str | None = None
     activate: int | None = None

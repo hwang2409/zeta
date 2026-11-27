@@ -1235,6 +1235,7 @@ async def _run_installed_child(
         child_store=child_store,
         child_marker_key=child_instance_id,
         child_tool_call_id=tool_call.id,
+        recoverable=run_owner.recoverable,
     )
 
     consume = consume_run if follow_up_loop else consume_child
