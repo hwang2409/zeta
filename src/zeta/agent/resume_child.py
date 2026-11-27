@@ -169,14 +169,21 @@ async def _resume_child(
         )
         installed = True
         episode = state["suspension_episode"]
-        notice, created = await parent.store._commit_storage_command(_AppendChildRecoveredCommand(
-            run_id=run_id, episode=episode, path=str(store.session_dir), description=description,
-        ))
-        if created:
-            parent._publish_background_event(StreamEvent(
-                StreamEventType.AGENT_NOTIFICATION,
-                data={"notification_id": notice.id, **notice.data}, row_seq=notice.seq,
+        # The child sidecar can commit before the parent gets its suspension notice.
+        suspension = None
+        if state["suspension_reason"] == "provider_unavailable":
+            suspension = {"code": "provider_unavailable", "text": state["current_step"]}
+            if "next_retry_at" in state:
+                suspension["next_retry_at"] = state["next_retry_at"]
+        for payload in (None,) if suspension is None else (suspension, None):
+            notice, created = await parent.store._commit_storage_command(_AppendChildRecoveredCommand(
+                run_id=run_id, episode=episode, path=str(store.session_dir), description=description, suspension=payload,
             ))
+            if created:
+                parent._publish_background_event(StreamEvent(
+                    StreamEventType.AGENT_NOTIFICATION,
+                    data={"notification_id": notice.id, **notice.data}, row_seq=notice.seq,
+                ))
         for descendant in store.agent_children().values():
             if nested := stores.get(Path(descendant["child_session_path"])):
                 await _resume_child(child, descendant, nested, stores, retained)

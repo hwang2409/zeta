@@ -97,7 +97,7 @@ class _RecoveryBackend(_AttemptBackend):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["false-positive", "send", "cancel", "cancel-activation", "restart"])
+@pytest.mark.parametrize("scenario", ["false-positive", "send", "cancel", "cancel-suspension", "cancel-activation", "restart"])
 async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, scenario):
     from datetime import UTC, datetime, timedelta
     from io import StringIO
@@ -134,9 +134,14 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
     commit = ConversationStore._commit_storage_command
 
     async def publish_commit(store, command):
-        if scenario == "cancel-activation" and isinstance(command, _ChildSuspensionCommand) and command.activate is not None:
+        if isinstance(command, _ChildSuspensionCommand) and (
+            scenario == "cancel-suspension" and command.provider_retry is not None
+            or scenario == "cancel-activation" and command.activate is not None
+        ):
             commit_entered.set()
-            await await_or_fail(commit_release.wait(), what="release the activate write")
+            if scenario == "cancel-suspension":
+                notices.put_nowait(("suspending", None))
+            await await_or_fail(commit_release.wait(), what="release the child lifecycle write")
         result = await commit(store, command)
         if isinstance(command, _AppendChildRecoveredCommand) and getattr(command, "suspension", None) is not None:
             notices.put_nowait(("suspended", result[0].data))
@@ -176,6 +181,19 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
                 recovery._probe = probe
             try:
                 run_id = await await_or_fail(runner.spawn_child(loop, agent_type="general", task="work", cwd=None), what="spawn retained child")
+                if scenario == "cancel-suspension":
+                    kind, _ = await await_or_fail(notices.get(), what="suspension or terminal write")
+                    assert kind == "suspending", "cancel must be possible during a nonterminal suspension write"
+                    transition = tree.run_transition(run_id)
+                    assert transition is not None
+                    request = transition.request_cancel()
+                    commit_release.set()
+                    assert await await_or_fail(request.confirmation, what="cancel during suspension")
+                    _, row = await await_or_fail(ended.get(), what="cancel writes one terminal receipt")
+                    assert row["status"] == "canceled"
+                    assert len(backend.requests) == 5
+                    assert ended.empty()
+                    return
                 notice = await suspended()
                 state = lifecycle(store, run_id)
                 assert state["turns_used"] == 0
