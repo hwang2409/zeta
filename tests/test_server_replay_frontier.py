@@ -129,7 +129,7 @@ async def _serve(tmp_path: Path, transport: Transport, backend: Any) -> Serve:
     observer = await connect_replay(server, transport)
     await negotiate(controller, extra=CONTROLLER_FEATURES, protocol_version="1.2")
     created = await controller.request(2, "new_session", {"provider": "codex"})
-    await negotiate(observer, observer=True, extra=("child_recovery",), protocol_version="1.2")
+    await negotiate(observer, observer=True, extra=("child_runs", "child_recovery"), protocol_version="1.2")
     serve = Serve(server, transport, controller, observer, created["result"]["session"]["session_id"])
     assert server.connections is not None
     original = server.connections._replay_covers

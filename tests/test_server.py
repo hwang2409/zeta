@@ -962,7 +962,7 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
     reader, writer = await _connect(server)
     try:
         hello = (
-            await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["child_recovery"]})
+            await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["child_runs", "child_recovery"]})
         )[-1]["result"]
         assert hello["protocol_version"] == "1.2"
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
