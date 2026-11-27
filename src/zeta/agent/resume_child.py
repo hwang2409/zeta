@@ -10,12 +10,11 @@ from typing import TYPE_CHECKING, Any
 from ..core.abort import AbortSignal
 from ..core.checkpoints import _now
 from ..core.store._async_writes import (
-    _AppendChildRecoveredCommand,
     _CloseChildApprovalHistoryCommand,
     _RepairChildInterruptionCommand,
     _SelectChildAccountsCommand,
 )
-from ..protocol.types import StreamEvent, StreamEventType, ToolCall
+from ..protocol.types import ToolCall
 from ..runtime.approval_recovery import _end_payload
 from ..runtime.offload import await_joined_offload
 from .background_lifecycle import _recoverable_marker
@@ -106,6 +105,8 @@ async def _resume_child(
         if state is None:
             return
 
+        await owner.repair_activation_notice(parent, description, state)
+
         def load_backend() -> tuple[Any, Any, dict[str, str] | None]:
             context = getattr(parent, "account_context", None)
             if saved["account_pins"] == "pending":
@@ -170,25 +171,16 @@ async def _resume_child(
         installed = True
         episode = state["suspension_episode"]
         # The child sidecar can commit before the parent gets its suspension notice.
-        suspension = None
         if state["suspension_reason"] == "provider_unavailable":
             suspension = {"code": "provider_unavailable", "text": state["current_step"]}
             if "next_retry_at" in state:
                 suspension["next_retry_at"] = state["next_retry_at"]
-        for payload in (None,) if suspension is None else (suspension, None):
-            notice, created = await parent.store._commit_storage_command(_AppendChildRecoveredCommand(
-                run_id=run_id, episode=episode, path=str(store.session_dir), description=description, suspension=payload,
-            ))
-            if created:
-                parent._publish_background_event(StreamEvent(
-                    StreamEventType.AGENT_NOTIFICATION,
-                    data={"notification_id": notice.id, **notice.data}, row_seq=notice.seq,
-                ))
+            await owner.publish_suspension_notice(parent, description, episode, suspension)
         for descendant in store.agent_children().values():
             if nested := stores.get(Path(descendant["child_session_path"])):
                 await _resume_child(child, descendant, nested, stores, retained)
         await owner.reconcile_questions()
-        await owner.activate_recovered(episode)
+        await owner.activate_recovered(parent, description, episode)
         activation.set()
     finally:
         if not installed:

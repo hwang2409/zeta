@@ -7,6 +7,7 @@ import math
 import os
 import time
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -124,6 +125,10 @@ def _validate_status_lifecycle(value: object) -> dict[str, Any]:
     episode = lifecycle.get("suspension_episode")
     if "suspension_episode" in lifecycle and (type(episode) is not int or episode < 1):
         raise ValueError("invalid suspension episode")
+    if "last_activated_episode" in lifecycle:
+        activated = lifecycle["last_activated_episode"]
+        if type(activated) is not int or episode is None or not 1 <= activated <= episode:
+            raise ValueError("invalid activated episode")
     if state == "suspended":
         suspended_at = lifecycle.get("suspended_at")
         if (
@@ -789,6 +794,7 @@ class AgentStateMixin:
         self, *, reason: str | None = None, activate: int | None = None, blocked: str | None = None,
         provider_retry: dict[str, str | int] | None = None, retry_progress: bool = False,
         retry_schedule: tuple[str, int] | None = None,
+        activation_stopped: Callable[[], bool] | None = None,
     ) -> dict[str, Any] | None:
         if not self.child_recovery_enabled:
             raise ValueError("child recovery is unavailable at this epoch")
@@ -812,7 +818,14 @@ class AgentStateMixin:
                     suspension_reason=reason, suspension_episode=lifecycle.get("suspension_episode", 0) + ("retry_started_at" not in lifecycle),
                     resume_mode="idle" if lifecycle["state"] == "idle" else "active",
                 )
-            elif lifecycle["state"] == "suspended" and activate == lifecycle["suspension_episode"]:
+            elif activate is not None:
+                if lifecycle["state"] != "suspended" or activate != lifecycle["suspension_episode"]:
+                    return None
+                # Once admitted under the append lock, this write owns activation.
+                if activation_stopped is not None and activation_stopped():
+                    return None
+                if self.provider_recovery_enabled:
+                    lifecycle["last_activated_episode"] = activate
                 lifecycle["state"] = "idle" if lifecycle["resume_mode"] == "idle" else "running"
                 lifecycle["current_step"] = "idle, waiting for follow-up" if lifecycle["state"] == "idle" else "recovering interrupted work"
                 if retry_schedule is not None:

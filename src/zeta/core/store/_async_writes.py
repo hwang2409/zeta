@@ -437,11 +437,13 @@ class _ChildSuspensionCommand(_StoreMutationCommand):
     provider_retry: dict[str, str | int] | None = None
     retry_progress: bool = False
     retry_schedule: tuple[str, int] | None = None
+    activation_stopped: Callable[[], bool] | None = None
 
     def apply(self, store: Any) -> Any:
         return store.transition_agent_suspension(
             reason=self.reason, activate=self.activate, blocked=self.blocked,
             provider_retry=self.provider_retry, retry_progress=self.retry_progress, retry_schedule=self.retry_schedule,
+            activation_stopped=self.activation_stopped,
         )
 
 

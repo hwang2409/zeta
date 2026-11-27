@@ -81,8 +81,8 @@ async def test_shutdown_joins_marker_registration_before_suspending(tmp_path, mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("boundary", ["install", "notice"])
-async def test_recovery_reuses_episode_after_failure_before_activation(tmp_path, monkeypatch, boundary):
+@pytest.mark.parametrize("boundary", ["before-notice", "after-notice"])
+async def test_recovery_preserves_activated_episode_across_notice_interruption(tmp_path, monkeypatch, boundary):
     from zeta.core.store._async_writes import _AppendChildRecoveredCommand
 
     def backend(loop, model, **kwargs):
@@ -121,16 +121,16 @@ async def test_recovery_reuses_episode_after_failure_before_activation(tmp_path,
             if isinstance(command, _AppendChildRecoveredCommand):
                 # test-contract: seam force interruption after runtime installation.
                 assert loop._background_owner.owns_running(run_id)
-                if boundary == "notice":
+                if boundary == "after-notice":
                     await original(command)
-                raise InterruptedError("interrupted before activation")
+                raise InterruptedError("interrupted at recovery notice")
             return await original(command)
 
         try:
             with monkeypatch.context() as crash:
                 # test-contract: seam interrupt the two durable notice boundaries.
                 crash.setattr(store, "_commit_storage_command", interrupt_notice)
-                with pytest.raises(InterruptedError, match="interrupted before activation"):
+                with pytest.raises(InterruptedError, match="interrupted at recovery notice"):
                     await await_or_fail(activate_agent_children(loop), what="force crash boundary")
             assert prompts == ["work"]
             assert not store.agent_completion_notifications_by_child()
@@ -146,11 +146,13 @@ async def test_recovery_reuses_episode_after_failure_before_activation(tmp_path,
             assert len(prompts) == 2
             assert "suspended" in prompts[-1]
             assert store.agent_children()[run_id]["child_session_path"] == marker["child_session_path"]
-            notice, = [row for row in store.agent_notifications(pending_only=False) if row.data.get("kind") == "child_recovered"]
-            assert notice.data["logical_id"] == f"child-recovered:{run_id}:1"
+            notices = [row for row in store.agent_notifications(pending_only=False) if row.data.get("kind") == "child_recovered"]
+            assert [row.data["logical_id"] for row in notices] == [
+                f"child-recovered:{run_id}:1", f"child-recovered:{run_id}:2",
+            ]
             assert not store.agent_completion_notifications_by_child()
             output = StringIO()
-            Console(file=output, width=100).print(render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=notice.data)))
+            Console(file=output, width=100).print(render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=notices[0].data)))
             assert "recovered" in output.getvalue()
         finally:
             await await_or_fail(loop.close(), what="close recovered runtime")

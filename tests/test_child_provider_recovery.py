@@ -97,7 +97,7 @@ class _RecoveryBackend(_AttemptBackend):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["false-positive", "send", "restart", "shutdown-suspension"])
+@pytest.mark.parametrize("scenario", ["false-positive", "send", "restart", "shutdown-suspension", "activation-crash"])
 async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, scenario):
     from datetime import UTC, datetime, timedelta
     from io import StringIO
@@ -134,7 +134,14 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
     unregister = register_child_run_sink(observe)
     commit = ConversationStore._commit_storage_command
 
+    crash_before_notice = scenario == "activation-crash"
+
     async def publish_commit(store, command):
+        nonlocal crash_before_notice
+        if crash_before_notice and isinstance(command, _AppendChildRecoveredCommand) and command.suspension is None:
+            crash_before_notice = False
+            assert lifecycle(store, command.run_id)["state"] == "running", "crash gap starts after activation commits"
+            raise OSError("injected loss before notice append")
         if scenario == "shutdown-suspension" and isinstance(command, _ChildSuspensionCommand) and command.provider_retry is not None:
             notices.put_nowait(("suspending", None))
             await await_or_fail(commit_release.wait(), what="release the child lifecycle write")
@@ -212,7 +219,11 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
                     Console(file=output, width=120).print(render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=notice)))
                     assert "suspended: provider unavailable, retrying" in output.getvalue()
                     assert state["next_retry_at"] in output.getvalue()
-                    if scenario != "restart":
+                    if scenario == "activation-crash":
+                        with pytest.raises(OSError, match="injected loss before notice append"):
+                            await await_or_fail(send_to_run(store, run_id, "queued", owner=tree, channel=tree.conversation_channel), what="interrupt after activation commit")
+                        assert not any(row.data.get("kind") == "child_recovered" for row in store.agent_notifications(pending_only=False))
+                    elif scenario != "restart":
                         clock.advance(5)
                         await await_or_fail(probe_entered.wait(), what="one account probe begins")
                         if scenario == "false-positive":
@@ -240,7 +251,20 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
                 commit_release.set()
                 probe_release.set()
                 await await_or_fail(loop.close(), what="close suspended or resumed tree")
-        if scenario in {"restart", "shutdown-suspension"}:
+        if scenario == "activation-crash":
+            with ConversationStore(root, session_id=session_id, cwd=tmp_path) as store:
+                loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
+                try:
+                    # The missing notice must be repaired even if this resume cannot activate.
+                    with monkeypatch.context() as patch:
+                        patch.setattr("zeta.agent.resume_child.resolve_child_backend", lambda *_a, **_kw: (None, "offline"))
+                        await await_or_fail(activate_agent_children(loop), what="repair notice with no backend")
+                    assert lifecycle(store, run_id)["state"] == "suspended"
+                    repaired = [row for row in store.agent_notifications(pending_only=False) if row.data.get("kind") == "child_recovered"]
+                    assert [row.data["episode"] for row in repaired] == [state["suspension_episode"]]
+                finally:
+                    await await_or_fail(loop.close(), what="close blocked recovery")
+        if scenario in {"restart", "shutdown-suspension", "activation-crash"}:
             backend.offline = False
             with ConversationStore(root, session_id=session_id, cwd=tmp_path) as store:
                 loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
@@ -249,6 +273,9 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
                     await await_or_fail(activate_agent_children(loop), what="explicit parent resume")
                     _, terminal = await await_or_fail(ended.get(), what="restored child completes")
                     assert terminal["turns_used"] == 1
+                    if scenario == "activation-crash":
+                        recovered = [row for row in store.agent_notifications(pending_only=False) if row.data.get("kind") == "child_recovered"]
+                        assert [row.id for row in recovered] == [repaired[0].id]
                     assert lifecycle(store, run_id)["suspension_episode"] == state["suspension_episode"]
                     assert "retry_deadline_at" not in lifecycle(store, run_id)
                 finally:
@@ -341,8 +368,11 @@ async def test_provider_owner_transition_table(tmp_path, monkeypatch, phase, wri
                 if edge is not None and edge == write and not entered.is_set():
                     entered.set()
                     await await_or_fail(release.wait(), what=f"release {edge}")
+                if edge == "activate-notice":
+                    state = child.agent_lifecycle()
+                    assert state is not None and state["state"] == "running", "recovery notice must follow durable activation"
                 value = await commit(store, command)
-                if edge == "activate-state":
+                if edge == "activate-state" and value is not None and value["state"] == "running":
                     activations.append(value)
                 return value
 
@@ -432,6 +462,11 @@ async def test_provider_owner_transition_table(tmp_path, monkeypatch, phase, wri
                 await await_or_fail(finalizer, what="join terminal publication or restart preservation")
                 state = child.agent_lifecycle()
                 assert state is not None
+                committed = len(activations)
+                recovered = [row for row in parent.agent_notifications(pending_only=False) if row.data.get("kind") == "child_recovered"]
+                assert len(recovered) == committed <= 1
+                if phase == "activating" and event in {"shutdown", "cancel", "finish"}:
+                    assert committed == (write == "activate-notice")
                 if event == "shutdown":
                     assert state["state"] == "suspended"
                     assert state.get("finished_at") is None
