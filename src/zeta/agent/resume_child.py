@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..accounts.session import account_provider, api_key_mode
 from ..core.abort import AbortSignal
 from ..core.checkpoints import _now
 from ..core.store._async_writes import (
@@ -115,7 +116,7 @@ async def _resume_child(
                 return _resolve_backend(parent, saved, context), context, selected
             elif context is not None:
                 context = context.restore_child_snapshot(saved["provider"], pins)
-            elif pins:
+            elif account_provider(saved["provider"]) in pins and not api_key_mode(saved["provider"]):
                 raise ValueError("saved account context is unavailable")
             return _resolve_backend(parent, saved, context), context, None
 

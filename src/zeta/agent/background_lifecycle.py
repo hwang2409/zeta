@@ -736,7 +736,7 @@ async def finish_background_child(
         if turn_limited:
             terminal_payload = project_payload(terminal_payload, child_path)
 
-        async def commit_adopt_publish() -> ConversationEntry:
+        async def commit_adopt_publish(current_step: str) -> ConversationEntry:
             persisted_text = notification_text
             if turn_limit_handoff is not None:
                 persisted_text = await write_background_turn_limit(
@@ -748,6 +748,7 @@ async def finish_background_child(
             transferred = await child_store.finalize_background_agent(
                 parent_store=effective_parent_store,
                 terminal_state=lifecycle_state,
+                current_step=current_step,
                 final_result=persisted_text,
                 turns_used=turns_used,
                 killed_task_ids=killed_task_metadata or None,
@@ -782,7 +783,7 @@ async def finish_background_child(
                 child_lifecycle=child_store.agent_lifecycle(),
             )
 
-        transition = asyncio.create_task(run_owner.publish_background(commit_adopt_publish))
+        transition = asyncio.create_task(run_owner.publish_background(lifecycle_state, commit_adopt_publish))
         deferred_cancel = False
         while not transition.done():
             try:

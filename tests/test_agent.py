@@ -3461,10 +3461,10 @@ async def test_foreground_cancel_wins_when_child_finishes_before_cancel_write(
 
     mark = ConversationStore.mark_agent_canceled_async
 
-    async def held_mark(self, tool_call_id):
+    async def held_mark(self, tool_call_id, **kwargs):
         if tool_call_id == "child":
             await await_or_fail(child_returned.wait(), what="foreground child return")
-        await mark(self, tool_call_id)
+        await mark(self, tool_call_id, **kwargs)
 
     monkeypatch.setattr(agent_runner_module, "consume_child", tracked_consume)
     monkeypatch.setattr(ConversationStore, "mark_agent_canceled_async", held_mark)
@@ -20916,11 +20916,11 @@ async def test_cancel_confirmed_makes_idle_child_tree_terminal_immediately(
 
     @wraps(mark_agent_canceled)
     def observe_cancellation_write(
-        child_store: ConversationStore, parent_tool_call_id: str
+        child_store: ConversationStore, parent_tool_call_id: str, **kwargs
     ) -> None:
         if parent_tool_call_id == "start-child":
             cancellation_write_threads.append(threading.get_ident())
-        mark_agent_canceled(child_store, parent_tool_call_id)
+        mark_agent_canceled(child_store, parent_tool_call_id, **kwargs)
 
     monkeypatch.setattr(
         ConversationStore, "mark_agent_canceled", observe_cancellation_write
@@ -21052,7 +21052,7 @@ async def test_agent_cancel_retries_lifecycle_write_after_child_run_owner_wins(
 
     @wraps(mark_agent_canceled)
     def fail_first_lifecycle_write(
-        child_store: ConversationStore, parent_tool_call_id: str
+        child_store: ConversationStore, parent_tool_call_id: str, **kwargs
     ) -> None:
         nonlocal write_attempts
         lifecycle = child_store.agent_lifecycle() or {}
@@ -21060,7 +21060,7 @@ async def test_agent_cancel_retries_lifecycle_write_after_child_run_owner_wins(
             write_attempts += 1
             if write_attempts == 1:
                 raise OSError("durable lifecycle write failed")
-        mark_agent_canceled(child_store, parent_tool_call_id)
+        mark_agent_canceled(child_store, parent_tool_call_id, **kwargs)
 
     def count_child_cleanup(child_loop: AgentLoop) -> None:
         nonlocal cleanup_calls
@@ -21171,10 +21171,10 @@ async def test_concurrent_cancel_requests_write_once_and_retry_after_failure(
     admit_abort = AgentLoop.admit_abort
 
     async def hold_first_cancel_write(
-        child_store: ConversationStore, parent_tool_call_id: str
+        child_store: ConversationStore, parent_tool_call_id: str, **kwargs
     ) -> None:
         if parent_tool_call_id != "grandchild":
-            return await original_write(child_store, parent_tool_call_id)
+            return await original_write(child_store, parent_tool_call_id, **kwargs)
         writes.append("mark_agent_canceled")
         if len(writes) == 1:
             first_write_entered.set()
@@ -21183,7 +21183,7 @@ async def test_concurrent_cancel_requests_write_once_and_retry_after_failure(
                 raise OSError("durable lifecycle write failed")
         else:
             second_write_entered.set()
-        return await original_write(child_store, parent_tool_call_id)
+        return await original_write(child_store, parent_tool_call_id, **kwargs)
 
     def count_cleanup(child_loop: AgentLoop) -> None:
         nonlocal cleanup_calls

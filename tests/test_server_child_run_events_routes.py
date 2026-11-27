@@ -1024,11 +1024,11 @@ async def test_parent_receipt_installs_only_after_the_canceled_lifecycle_is_fina
             mark_canceled = ConversationStore.mark_agent_canceled_async
             commit_entered, allow_commit = asyncio.Event(), asyncio.Event()
 
-            async def hold_cancellation(self: Any, parent_tool_call_id: str) -> None:
+            async def hold_cancellation(self: Any, parent_tool_call_id: str, **kwargs) -> None:
                 if parent_tool_call_id == "agent-1":
                     commit_entered.set()
                     await await_or_fail(allow_commit.wait(), what="allow durable cancellation")
-                await mark_canceled(self, parent_tool_call_id)
+                await mark_canceled(self, parent_tool_call_id, **kwargs)
 
             # test-contract: seam hold the owner's durable cancellation write
             monkeypatch.setattr(ConversationStore, "mark_agent_canceled_async", hold_cancellation)

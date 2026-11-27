@@ -609,7 +609,7 @@ class AgentStateMixin:
                 self._agent_parent = None
             self._write_session_state(self.bash_cwd, self._todo_items)
 
-    def mark_agent_canceled(self, parent_tool_call_id: str) -> None:
+    def mark_agent_canceled(self, parent_tool_call_id: str, *, current_step: str | None = None) -> None:
         """Persist a child cancellation and its terminal lifecycle."""
 
         if not parent_tool_call_id:
@@ -637,6 +637,8 @@ class AgentStateMixin:
                 for key in _SUSPENSION_FIELDS:
                     self._agent_lifecycle.pop(key, None)
                 self._agent_lifecycle["state"] = "canceled"
+                if current_step is not None:
+                    self._agent_lifecycle["current_step"] = current_step
                 self._agent_lifecycle["finished_at"] = _now()
                 self._agent_lifecycle["final_result"] = "tool execution canceled"
                 self._agent_lifecycle["elapsed"] = _lifecycle_elapsed(
@@ -857,6 +859,7 @@ class AgentStateMixin:
         killed_task_count: int | None = None,
         killed_task_ids_truncated: bool | None = None,
         canonical_receipt: bool = False,
+        current_step: str | None = None,
     ) -> None:
         """Persist a terminal child state and its final result text."""
 
@@ -897,6 +900,8 @@ class AgentStateMixin:
                 raise ValueError("invalid killed task fields")
             resolved_finished_at = finished_at or _now()
             self._agent_lifecycle["state"] = state
+            if current_step is not None:
+                self._agent_lifecycle["current_step"] = current_step
             for key in _SUSPENSION_FIELDS:
                 self._agent_lifecycle.pop(key, None)
             self._agent_lifecycle["finished_at"] = resolved_finished_at
@@ -998,6 +1003,7 @@ class AgentStateMixin:
         killed_task_count: int | None,
         killed_task_ids_truncated: bool,
         canceled_tool_call_id: str | None = None,
+        current_step: str | None = None,
     ) -> tuple[str, ...]:
         """Transfer direct markers and durably publish one terminal lifecycle."""
 
@@ -1012,7 +1018,7 @@ class AgentStateMixin:
         transferred: list[str] = []
         if canceled_tool_call_id is not None:
             await self._commit_storage_command(
-                _MarkAgentCanceledCommand(tool_call_id=canceled_tool_call_id)
+                _MarkAgentCanceledCommand(tool_call_id=canceled_tool_call_id, current_step=current_step)
             )
         else:
             for marker_key, marker in self.agent_children().items():
@@ -1040,6 +1046,7 @@ class AgentStateMixin:
                 killed_task_count=killed_task_count,
                 killed_task_ids_truncated=killed_task_ids_truncated,
                 canonical_receipt=True,
+                current_step=current_step,
             )
         )
         return tuple(transferred)
