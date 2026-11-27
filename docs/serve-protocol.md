@@ -298,7 +298,6 @@ feature. Observer connections receive only methods with `read` access.
 | `session_history` | `1.1` | `none` | `read` |
 | `session_history_and_subscribe` | `1.1` | `session_replay_seq` | `read` |
 | `child_run_history` | `1.1` | `child_run_history` | `read` |
-| `child_recovery` | exposes suspended status and the child recovery notice; requires `child_runs` |
 | `child_run_events` | `1.1` | `child_run_events` | `read` |
 | `content_read` | `1.1` | `content_read` | `read` |
 | `switch_branch` | `1.1` | `none` | `session_mutation` |
@@ -3473,6 +3472,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, `telemetry_trace`, `telemetry_overview`, `telemetry_models`, `telemetry_tools`, `telemetry_errors`, `telemetry_series`, and `telemetry_agent_tree` methods |
 | `state_read_v1` | enables `state_catalog`, `state_projects`, `state_memory`, `state_memory_detail`, `state_inbox`, `state_inbox_detail`, `state_attention`, `state_sessions`, `state_session`, `state_agents`, `state_background_tasks`, `state_settings`, `state_accounts`, `state_storage`, and `state_retention` |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
+| `child_recovery` | exposes suspended status and the child recovery notice; requires `child_runs` |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
 | `child_run_events` | enables the atomic newest-page and live child lifecycle join; the server advertises the feature and request only when the client also requests `session_replay_seq`, `child_run_history`, and `child_runs` |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |
