@@ -44,6 +44,8 @@ async def test_shutdown_joins_marker_registration_before_suspending(tmp_path, mo
                 await await_or_fail(release.wait(), what="release marker commit")
             return await commit(command)
 
+        # test-contract: seam observe shutdown before releasing the marker commit.
+
         async def close_children():
             closed_admission.set()
             await close()
@@ -118,6 +120,8 @@ async def test_recovery_reuses_episode_after_failure_before_activation(tmp_path,
 
         async def interrupt_notice(command):
             if isinstance(command, _AppendChildRecoveredCommand):
+                # test-contract: seam force interruption after runtime installation.
+
                 assert loop._background_owner.owns_running(run_id)
                 if boundary == "notice":
                     await original(command)
