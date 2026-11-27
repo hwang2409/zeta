@@ -22,7 +22,7 @@ from .background_lifecycle import _recoverable_marker
 from .child_context import resolve_child_backend
 from .recovery_lease import acquire_recovery_subtree
 from .resume_descriptor import restore_preset
-from .runner import _build_child_loop, _run_installed_child
+from .runner import ChildRecoveryPolicyError, _build_child_loop, _run_installed_child
 from .tool_results import validated_tool_result
 from .turn_limit import turn_control_for
 
@@ -135,8 +135,11 @@ async def _resume_child(
                 description=description, child_account_context=context, run_owner=owner,
                 child_turn_control=control, recovered_explicit_finish=saved["explicit_finish"],
             )
+        except ChildRecoveryPolicyError as exc:
+            await owner.block_recovery(str(exc))
+            return
         except (OSError, ValueError, RuntimeError):
-            await owner.block_recovery("saved child runtime is unavailable under current policy")
+            await owner.block_recovery("saved child runtime could not be reconstructed")
             return
         store.accepts_follow_ups = saved["follow_up"]
         child.agent_background = True
