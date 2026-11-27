@@ -393,6 +393,10 @@ async def consume_child(
     return terminal_result(state="completed", text=final_text)
 
 
+class ChildRecoveryPolicyError(ValueError):
+    """A policy conflict with a safe, user-facing recovery reason."""
+
+
 async def _build_child_loop(
     loop: AgentLoop,
     *,
@@ -431,7 +435,7 @@ async def _build_child_loop(
         recovering = recovered_explicit_finish is not None
         if recovering:
             if recovered_explicit_finish and not explicit_finish:
-                raise ValueError("saved finish tools are unavailable under current policy")
+                raise ChildRecoveryPolicyError("saved explicit finish is disabled by current settings")
             explicit_finish = recovered_explicit_finish
         runtime_tool_names = {"ask_parent"} if follow_up_loop else set()
         if explicit_finish:
@@ -441,16 +445,25 @@ async def _build_child_loop(
             for name in runtime_tool_names
             if loop.tool_registry.tool_is_allowed_by_policy(name)
         )
-        excluded_names, profile_tool_allow = resolve_child_profile_tools(
-            preset=preset,
-            policy_allowed_names=loop.tool_registry.policy_allowed_registered_names,
-            runtime_tool_names=policy_allowed_runtime_names,
-        )
-        if recovering and (
-            policy_allowed_runtime_names != runtime_tool_names
-            or preset.tool_names is not None and profile_tool_allow != preset.tool_names
-        ):
-            raise ValueError("saved tools are unavailable under current policy")
+        if recovering and explicit_finish:
+            missing_finish_tools = {"finish", "agent_handoff"} - policy_allowed_runtime_names
+            if missing_finish_tools:
+                raise ChildRecoveryPolicyError(
+                    "current policy blocks required explicit-finish tools: "
+                    + ", ".join(sorted(missing_finish_tools))
+                )
+        try:
+            excluded_names, profile_tool_allow = resolve_child_profile_tools(
+                preset=preset,
+                policy_allowed_names=loop.tool_registry.policy_allowed_registered_names,
+                runtime_tool_names=policy_allowed_runtime_names,
+            )
+        except ValueError as exc:
+            if recovering:
+                raise ChildRecoveryPolicyError(
+                    "current tool policy cannot satisfy the saved profile's required tools"
+                ) from exc
+            raise
         child_provider = getattr(child_backend, "provider", None)
         child_image_policy = (
             image_policy_for_provider(child_provider)
