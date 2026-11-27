@@ -387,10 +387,7 @@ class _ReserveQuestionSettlementCommand(_StoreMutationCommand):
 
     def apply(self, store: ConversationStore) -> None:
         from ...protocol.types import Message, MessageRole, TextContent
-        from ._pending_prompts import (
-            PENDING_PROMPT_ID_METADATA,
-            QUESTION_ANSWER_PATTERN,
-        )
+        from ._pending_prompts import PENDING_PROMPT_ID_METADATA
 
         with store.pending_prompt_queue._lock():
             fold = store._delivery_fold
@@ -398,13 +395,9 @@ class _ReserveQuestionSettlementCommand(_StoreMutationCommand):
                 ("child_question_state", {**fold.child_questions[q].data, "settlement_turn": self.turn})
                 for q in self.question_ids
             ]
-            remaining = set(self.question_ids)
+            # The single settlement turn must see the entire queued follow-up batch.
             for prompt in store.pending_prompt_queue._pending_unlocked():
                 text = prompt.data["text"]
-                match = QUESTION_ANSWER_PATTERN.match(text)
-                if match is None or match.group(1) not in remaining:
-                    continue
-                remaining.remove(match.group(1))
                 if prompt.id not in fold.prompt_messages:
                     message = Message(MessageRole.USER, [TextContent(text)], metadata={
                         "zeta.origin": prompt.data["origin"], PENDING_PROMPT_ID_METADATA: prompt.id,

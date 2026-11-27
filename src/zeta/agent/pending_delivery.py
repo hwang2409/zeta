@@ -346,9 +346,9 @@ class StepDeliveryFlow:
             )
         self._active = staged
         self._active_steering = steering
-        if staged.more_pending:
-            if staged.prompt_id is not None:
-                self._edges.add("prompt")
+        if staged.more_prompts:
+            self._edges.add("prompt")
+        if staged.more_notifications:
             self._edges.add("notification")
         return staged
 
@@ -552,7 +552,7 @@ class StepDeliveryFlow:
             include_notification=selected.notification_message is not None,
         )
         deferred = (
-            "notification" in self._edges and selected.notification_message is None
+            selected.more_notifications and selected.notification_message is None
         )
         notice = None
         if deferred:
@@ -573,10 +573,10 @@ class StepDeliveryFlow:
         else:
             self._low_capacity_notifications = False
             self._low_capacity_notice_emitted = False
-        if not selected.more_pending:
+        if not selected.more_notifications:
             self._edges.discard("notification")
-            if selected.prompt_id is not None:
-                self._edges.discard("prompt")
+        if not selected.more_prompts and selected.prompt_id is not None:
+            self._edges.discard("prompt")
         self._active = selected
         return replace(
             request,
@@ -619,7 +619,8 @@ class StepDeliveryFlow:
             staged.notification_ids if notification else (),
             staged.prompt_message if prompt else None,
             staged.prompt_id if prompt else None,
-            staged.more_pending or bool(staged.notification_ids and not notification),
+            staged.more_prompts or bool(staged.prompt_id and not prompt),
+            staged.more_notifications or bool(staged.notification_ids and not notification),
             DeliveryPublications(
                 staged.publications.notifications if notification else (),
                 staged.publications.delivered_prompt if prompt else None,

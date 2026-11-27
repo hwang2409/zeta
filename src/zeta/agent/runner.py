@@ -271,7 +271,7 @@ async def consume_child(
         ):
             return terminal_result(state="idle", text="waiting for parent answer", status="running")
         limited_result = await finalize_exhausted_child(
-            control=None if explicit_report is not None and owner is not None and owner.question_settlement else control,
+            control=owner.exhausted_turn_limit(control) if owner is not None else control,
             text=assistant_text(last_message) if last_message is not None else "",
             child_session_path=child_path,
             child_instance_id=child_loop.agent_instance_id or "unknown",
