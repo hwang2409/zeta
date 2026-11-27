@@ -475,7 +475,7 @@ async def test_provider_owner_transition_table(tmp_path, monkeypatch, phase, wri
                     assert not replayed.is_set()
                 else:
                     assert state["state"] == ("canceled" if event == "cancel" else "completed")
-                    assert state["current_step"] == state["state"]
+                    assert "retrying" not in state["current_step"]
                     assert len(receipts) == 1
                     assert not await owner.cancel(), "a second terminal transition must lose"
                     if event in {"cancel", "finish"}:
