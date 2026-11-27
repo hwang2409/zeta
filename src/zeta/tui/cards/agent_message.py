@@ -460,12 +460,18 @@ def render_agent_notification_message(
         return _render_child_question(event, identities)
     if kind == "child_question_withdrawn":
         return _render_child_question_withdrawn(event, identities)
-    if kind in {"child_recovered", "child_suspended"}:
+    if kind == "child_suspended":
+        presentation = child_suspension_presentation({
+            "status": "suspended",
+            "suspension_reason": "provider_unavailable",
+            "retry_state": "retrying",
+            "next_retry_at": event.data.get("next_retry_at"),
+        })
+        return render_child_suspension_message(event, identities, presentation)
+    if kind == "child_recovered":
         identity = _notification_identity(event, identities)
         if identity is None:
             return _unavailable_notification()
-        if kind == "child_suspended":
-            return render_agent_message(agent_header("suspended", "←", identity, state="suspended"), result=_provider_retry_text(event.data), state="suspended")
         return render_agent_message(agent_header("recovered", "←", identity, state="running"), state="running")
     if kind == "child_idle":
         return _render_child_idle(event, identities)
@@ -474,6 +480,39 @@ def render_agent_notification_message(
     if kind == "agent_completion":
         return _render_child_completion(event, identities)
     return None
+
+
+ChildSuspensionPresentation = tuple[str, str, str | None]
+
+
+def child_suspension_presentation(row: Mapping[str, object]) -> ChildSuspensionPresentation:
+    """Map the current child-run row to the original suspension card's copy."""
+    status = row.get("status")
+    if status == "suspended":
+        if row.get("suspension_reason") != "provider_unavailable":
+            return "suspended", "suspended", "suspended for restart"
+        if row.get("retry_state") == "stopped":
+            return "suspended", "suspended", "suspended: provider unavailable, retry stopped"
+        if row.get("retry_state") == "retrying":
+            return "suspended", "suspended", _provider_retry_text(row)
+        return "suspended", "suspended", "suspended: provider unavailable"
+    if status in ("completed", "failed", "canceled"):
+        return "finished", str(status), None
+    return "recovered", str(status), "provider recovered"
+
+
+def render_child_suspension_message(
+    event: StreamEvent,
+    identities: AgentIdentityIndex,
+    presentation: ChildSuspensionPresentation,
+) -> Panel | Text:
+    identity = _notification_identity(event, identities)
+    if identity is None:
+        return _unavailable_notification()
+    verb, state, text = presentation
+    return render_agent_message(
+        agent_header(verb, "←", identity, state=state), result=text, state=state
+    )
 
 
 def _provider_retry_text(data: Mapping[str, object]) -> str:

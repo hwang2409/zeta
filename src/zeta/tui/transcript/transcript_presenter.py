@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.live import Live
@@ -14,7 +14,12 @@ from rich.text import Text
 from ...core.agent_progress import register_child_run_sink
 from ...protocol.types import StreamEvent, StreamEventType
 from .. import theme
-from ..cards.agent_message import AgentIdentityIndex
+from ..cards.agent_message import (
+    AgentIdentityIndex,
+    ChildSuspensionPresentation,
+    child_suspension_presentation,
+    render_child_suspension_message,
+)
 from ..cards.agent_sync import refresh_agent_cards
 from ..cards.base import compact_tool_card
 from ..layout import CONTENT_MARGIN
@@ -75,8 +80,8 @@ class TranscriptPresenter:
         self._assistant_unit: _TranscriptUnit | None = None
         self._assistant_message_units: list[_TranscriptUnit] = []
         self._assistant_message_region: list[_TranscriptUnit] = []
-        self._suspension_notices: dict[str, _SuspensionNotice] = {}
-        self._provider_retries: dict[str, str | None] = {}
+        self._suspension_notices: dict[str, list[_SuspensionNotice]] = {}
+        self._suspension_presentations: dict[str, ChildSuspensionPresentation] = {}
 
     @property
     def tool_region(self) -> Live | None:
@@ -349,36 +354,35 @@ class TranscriptPresenter:
         loop = asyncio.get_running_loop()
         watching = True
 
-        def apply(run_id: str, suspended: bool, next_at: str | None) -> None:
+        def apply(run_id: str, row: dict[str, object]) -> None:
             if not watching:
                 return
-            if suspended:
-                self._provider_retries[run_id] = next_at
-            else:
-                self._provider_retries.pop(run_id, None)
-                self._suspension_notices.pop(run_id, None)
+            notices = self._suspension_notices.get(run_id)
+            previous = self._suspension_presentations.get(run_id)
+            if previous is None and not notices and not (
+                row.get("status") == "suspended"
+                and row.get("suspension_reason") == "provider_unavailable"
+            ):
                 return
-            notice = self._suspension_notices.get(run_id)
-            if notice is not None and notice.event.data.get("next_retry_at") != next_at:
-                notice.event = self._with_retry_time(notice.event, next_at)
-                notice.card = render_event(notice.event, self._agent_identities)
-                notice.revision += 1
-                self.transcript.touch_renderable(notice)
+            presentation = child_suspension_presentation(row)
+            if presentation == previous:
+                return
+            # Keep the latest copy even if delivery of the suspension notice trails recovery.
+            self._suspension_presentations[run_id] = presentation
+            if notices:
+                for notice in notices:
+                    notice.card = render_child_suspension_message(
+                        notice.event, self._agent_identities, presentation
+                    )
+                    notice.revision += 1
+                    self.transcript.touch_renderable(notice)
                 invalidate()
 
         def sink(
             kind: str, run_id: str, row: dict[str, object], _number: int, _store: object
         ) -> None:
-            if kind == "started" or row.get("session_id") != session_id:
-                return
-            suspended = (
-                row.get("status") == "suspended"
-                and row.get("suspension_reason") == "provider_unavailable"
-            )
-            next_at = row.get("next_retry_at")
-            loop.call_soon_threadsafe(
-                apply, run_id, suspended, next_at if isinstance(next_at, str) else None
-            )
+            if kind != "started" and row.get("session_id") == session_id:
+                loop.call_soon_threadsafe(apply, run_id, row)
 
         unregister = register_child_run_sink(sink)
 
@@ -386,19 +390,10 @@ class TranscriptPresenter:
             nonlocal watching
             watching = False
             unregister()
-            self._provider_retries.clear()
+            self._suspension_presentations.clear()
             self._suspension_notices.clear()
 
         return stop
-
-    @staticmethod
-    def _with_retry_time(event: StreamEvent, next_at: str | None) -> StreamEvent:
-        data = dict(event.data)
-        if next_at is None:
-            data.pop("next_retry_at", None)
-        else:
-            data["next_retry_at"] = next_at
-        return replace(event, data=data)
 
     def render_event(self, event: StreamEvent) -> RenderableType | None:
         self._agent_identities.observe(event)
@@ -408,12 +403,16 @@ class TranscriptPresenter:
             and event.data.get("kind") == "child_suspended"
             else None
         )
-        if isinstance(run_id, str) and run_id in self._provider_retries:
-            event = self._with_retry_time(event, self._provider_retries[run_id])
-        rendered = render_event(event, self._agent_identities)
+        presentation = (
+            self._suspension_presentations.get(run_id) if isinstance(run_id, str) else None
+        )
+        rendered = (
+            render_child_suspension_message(event, self._agent_identities, presentation)
+            if presentation is not None else render_event(event, self._agent_identities)
+        )
         if isinstance(run_id, str) and rendered is not None:
             notice = _SuspensionNotice(event, rendered)
-            self._suspension_notices[run_id] = notice
+            self._suspension_notices.setdefault(run_id, []).append(notice)
             return notice
         return rendered
 
