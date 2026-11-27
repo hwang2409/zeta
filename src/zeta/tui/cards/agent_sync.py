@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ...core.agent_progress import read_agent_lifecycle
+from ...core.agent_progress import live_agent_lifecycle, read_agent_lifecycle
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
@@ -103,10 +103,12 @@ def agent_tree_signature(
 ) -> tuple[object, ...]:
     state = path_signature(path / "session_state.json")
     registration = state, path_signature(path / "agents")
-    lifecycles = tuple(
-        (child, path_signature(child / "agent_lifecycle.json")) for child in running
-    )
-    return path, selected_index, registration, lifecycles
+    lifecycles = []
+    for child in running:
+        marker = child / "agent_lifecycle.json"
+        live = live_agent_lifecycle(marker)
+        lifecycles.append((child, path_signature(marker), live.get("state") if live else None))
+    return path, selected_index, registration, tuple(lifecycles)
 
 
 def _read_agent_lifecycle(path: Path) -> dict[str, object] | None:

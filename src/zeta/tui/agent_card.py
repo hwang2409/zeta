@@ -21,6 +21,7 @@ from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from rich.console import Console
 from rich.text import Text
 
+from ..core.agent_progress import live_agent_lifecycle, overlay_agent_progress
 from ..core.checkpoints import ConversationIntegrityError
 from ..core.session_files import SessionError
 from ..core.store import ConversationStore
@@ -32,6 +33,7 @@ from .agent_view_state import (
     MAX_AGENT_VIEW_LINES,
     AgentEntry,
     _agent_metadata,
+    _durable_agent_metadata,
     agent_navigation_style_rules,
     capture_inactive_view,
     read_agent_transcript,
@@ -1163,11 +1165,10 @@ class AgentNavigation:
             except OSError:
                 key = (0, 0, 0, 0)
         cached = self._metadata_cache.get(path)
-        if cached is not None and cached[0] == key:
-            return cached[1]
-        metadata = _agent_metadata(path, fallback)
-        self._metadata_cache[path] = (key, metadata)
-        return metadata
+        if cached is None or cached[0] != key:
+            cached = (key, _durable_agent_metadata(path, fallback))
+            self._metadata_cache[path] = cached
+        return overlay_agent_progress(cached[1], live_agent_lifecycle(lifecycle_path))
 
     def _root_entry(self) -> AgentEntry:
         metadata = self._cached_agent_metadata(self.root_path)
