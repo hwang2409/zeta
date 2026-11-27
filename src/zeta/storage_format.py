@@ -125,9 +125,6 @@ ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
     "child_recovered_notification": frozenset({
         "kind", "origin", "logical_id", "child_instance_id", "child_session_path", "description", "episode", "text", "display_only",
     }),
-    "child_suspension": frozenset({
-        "resume_mode", "suspension_reason", "suspended_at", "suspension_episode", "recovery_blocked",
-    }),
     "child_resume": frozenset({
         "preset", "requested_model", "model", "provider", "requested_max_turns",
         "effective_max_turns", "depth", "cwd", "description", "background",

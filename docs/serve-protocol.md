@@ -298,6 +298,7 @@ feature. Observer connections receive only methods with `read` access.
 | `session_history` | `1.1` | `none` | `read` |
 | `session_history_and_subscribe` | `1.1` | `session_replay_seq` | `read` |
 | `child_run_history` | `1.1` | `child_run_history` | `read` |
+| `child_recovery` | exposes suspended status and the child recovery notice; requires `child_runs` |
 | `child_run_events` | `1.1` | `child_run_events` | `read` |
 | `content_read` | `1.1` | `content_read` | `read` |
 | `switch_branch` | `1.1` | `none` | `session_mutation` |
@@ -1577,7 +1578,10 @@ Each row contains `run_id`, the top-level `session_id`, nullable
 child run, cumulative across its follow-up segments, and never decreases. The
 public `run_id` is the existing child
 instance id. Child-local store ids and the agent tool's `handle` name are not
-exposed.
+exposed. If `child_recovery` is negotiated with `child_runs`, a suspended run
+has `status: "suspended"`; clients without it receive `status: "running"`.
+The negotiated `child_recovered` event carries a durable display-only notification
+with `child_instance_id`, `episode`, and `logical_id` (`child-recovered:<run_id>:<episode>`).
 
 `child_run_send` queues one message at the child's existing safe delivery
 point. Params are `session_id`, `run_id`, and nonempty `text`; success returns
@@ -2821,6 +2825,7 @@ Event fields are:
 | `project_inbox_health` (protocol 1.2 only) | `event`, `data: object` | `session_id` |
 | `child_question` | `event`, `data: object` | `session_id` |
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
+| `child_recovered` | `event`, `data: object` | `session_id` |
 | `child_idle` | `event`, `data: object` | `session_id` |
 | `child_hold` | `event`, `data: object` | `session_id` |
 | `child_message_delivered` | `event`, `data: object` | `session_id` |

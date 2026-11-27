@@ -48,12 +48,15 @@ def _resolve_backend(parent: AgentLoop, saved: dict[str, Any], context: Any) -> 
 
 
 async def repair_interrupted_child(root: ConversationStore, store: ConversationStore, run_id: str) -> None:
-    pending = {
-        item.tool_call.id
-        for message in store.messages()
-        for item in message.content
-        if isinstance(item, ToolUseContent) and store.tool_result(item.tool_call.id) is None
-    }
+    def pending_calls() -> set[str]:
+        return {
+            item.tool_call.id
+            for ref in store.branch_refs() if ref.type == "message"
+            for item in Message.from_dict(store.entry(ref).data["message"]).content
+            if isinstance(item, ToolUseContent) and item.tool_call.id not in store._delivery_fold.tool_result_seqs
+        }
+
+    pending = await store._to_thread_store(pending_calls)
     await store._commit_storage_command(_AbortChildApprovalsCommand())
     for wire_id, tool_call in root.delegated_unmatched_requests(run_id):
         request_id = tool_call.get("id")
@@ -62,7 +65,7 @@ async def repair_interrupted_child(root: ConversationStore, store: ConversationS
                 payload=_end_payload(wire_id, tool_call, resolution),
             ))
     for call_id in sorted(pending):
-        if store.tool_result(call_id) is None:
+        if call_id not in store._delivery_fold.tool_result_seqs:
             result = canceled_result(call_id)
             await store.append_message_async(Message(
                 MessageRole.TOOL_RESULT, [TextContent(result.content)], tool_result=result,
