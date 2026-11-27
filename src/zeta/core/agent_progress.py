@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -17,7 +18,8 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 _lock = threading.Lock()
-_lifecycles: dict[Path, dict[str, Any]] = {}
+# Writers replace the map, so readers never wait behind a publication sink.
+_lifecycles: dict[str, dict[str, Any]] = {}
 # serve's lifecycle projection sinks: sink(kind, run_id, row, number, store), where
 # kind is "progress" (number = revision), "started" or "ended" (number = parent row seq)
 ChildRunSink = Callable[[str, str, dict[str, object], int, object | None], None]
@@ -93,18 +95,18 @@ def publish_child_ended(run_id: str, receipt_sequence: int, lifecycle: object) -
 def publish_live_agent_lifecycle(path: Path, lifecycle: dict[str, Any]) -> None:
     """Publish a detached lifecycle snapshot without touching disk."""
 
-    resolved = path.resolve()
+    global _lifecycles
+    key = os.path.abspath(path)
+    snapshot = copy.deepcopy(lifecycle)
     with _lock:
-        _lifecycles[resolved] = copy.deepcopy(lifecycle)
+        _lifecycles = {**_lifecycles, key: snapshot}
 
 
 def live_agent_lifecycle(path: str | Path) -> dict[str, Any] | None:
     """Return live progress for this process, when it owns the child."""
 
-    resolved = Path(path).resolve()
-    with _lock:
-        lifecycle = _lifecycles.get(resolved)
-        return copy.deepcopy(lifecycle) if lifecycle is not None else None
+    lifecycle = _lifecycles.get(os.path.abspath(path))
+    return copy.deepcopy(lifecycle) if lifecycle is not None else None
 
 
 def overlay_agent_progress(
@@ -141,6 +143,10 @@ def read_agent_lifecycle(path: str | Path) -> object:
 def remove_live_agent_lifecycle(path: str | Path) -> None:
     """Stop publishing a child after its terminal transition is durable."""
 
-    resolved = Path(path).resolve()
+    global _lifecycles
+    key = os.path.abspath(path)
     with _lock:
-        _lifecycles.pop(resolved, None)
+        if key in _lifecycles:
+            remaining = _lifecycles.copy()
+            del remaining[key]
+            _lifecycles = remaining
