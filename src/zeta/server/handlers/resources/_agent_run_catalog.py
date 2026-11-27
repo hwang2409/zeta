@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .... import storage_format
+from ....core.agent_progress import live_agent_lifecycle, overlay_agent_progress
 from ....core.agent_state import _validate_status_lifecycle
 from ....core.checkpoints import load_session_json
 from ....core.child_runs import (
@@ -74,9 +75,13 @@ def _follow_ups(fd: int, run_id: str) -> bool:
         return False
 
 
-def _row(fd: int, parent_fd: int, run_id: str, state: str | None) -> dict[str, Any] | None:
+def _row(
+    fd: int, parent_fd: int, path: Path, run_id: str, state: str | None,
+) -> dict[str, Any] | None:
     try:
+        live = live_agent_lifecycle(path / "agent_lifecycle.json")
         lifecycle = _validate_status_lifecycle(_metadata(fd, "agent_lifecycle.json"))
+        lifecycle = overlay_agent_progress(lifecycle, live)
         if state is not None and lifecycle["state"] != state:
             return None
         item = project_agent_status(lifecycle, run_id, notifications=())
@@ -150,10 +155,11 @@ def read_page(
     rows = []
     keys = []
     scanned = after
+    sessions = home / "sessions"
     try:
         with (
             storage_format.open_reader(home),
-            session_root(home / "sessions") as fd,
+            session_root(sessions) as fd,
             closing(_candidates(fd, root_id, after)) as candidates,
         ):
             for index, (key, child_fd, parent_fd) in enumerate(candidates):
@@ -161,7 +167,11 @@ def read_page(
                     return rows, keys, scanned
                 scanned = key
                 if child_fd is not None:
-                    row = _row(child_fd, parent_fd, f"{key[1]}:{key[2]}", state)
+                    _, sid, child_id = key
+                    path = sessions / sid
+                    for segment in child_id.split(":"):
+                        path = path / "agents" / segment
+                    row = _row(child_fd, parent_fd, path, f"{sid}:{child_id}", state)
                     if row is not None:
                         rows.append(row)
                         keys.append(key)
