@@ -2093,9 +2093,9 @@ async def test_send_after_turn_end_and_queued_steer_start_one_turn(
 
 
 @pytest.mark.asyncio
-async def test_late_steer_is_dropped_when_mcp_bindings_left(tmp_path: Path) -> None:
-    # the next turn would run without the client's required MCP bindings, and
-    # a send is refused then too, so the late steer ends as a disconnect drop.
+async def test_late_steer_is_dropped_when_connected_client_loses_mcp_bindings(
+    tmp_path: Path,
+) -> None:
     backend = HeldLaterStepBackend([])
     server = ZetaServer(
         provider="codex",
@@ -2104,25 +2104,17 @@ async def test_late_steer_is_dropped_when_mcp_bindings_left(tmp_path: Path) -> N
         backend_factory=lambda provider, model, home: (backend, model or "offline"),
     )
     reader, writer = await _connect(server)
-    deliveries = server.controllers.attached().control.deliveries
-    original_continue = deliveries.continue_after_turn
-    decided = asyncio.Event()
 
-    async def record_decision(*args: Any, **kwargs: Any) -> None:
-        try:
-            await original_continue(*args, **kwargs)
-        finally:
-            decided.set()
-
-    # test-contract: seam serve has no public end-of-turn decision observation
-    deliveries.continue_after_turn = record_decision
     try:
         await _request(
             reader,
             writer,
             1,
             "hello",
-            {"protocol_version": "1.1", "features": ["delivery_id"]},
+            {
+                "protocol_version": "1.2",
+                "features": ["delivery_id", "session_history_fidelity"],
+            },
         )
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})
         await _request(reader, writer, 3, "send", {"text": "first"})
@@ -2140,13 +2132,14 @@ async def test_late_steer_is_dropped_when_mcp_bindings_left(tmp_path: Path) -> N
         server.controllers.attached().control._active_mcp_bindings = {}
 
         backend.release.set()
-        await await_or_fail(decided.wait(), what="end-of-turn decision")
+        dropped = await _event(reader, "delivery_status")
+        assert dropped["delivery_id"] == "unbound-steer"
+        assert dropped["status"] == "dropped"
+        assert dropped["reason"] == "turn_end"
         status = await _request(
             reader, writer, 5, "delivery_status", {"delivery_id": "unbound-steer"}
         )
         assert status[-1]["result"]["status"] == "dropped", status[-1]
-        store = server.controllers.attached().runtime.opened.store
-        assert store.client_delivery("unbound-steer").reason == "disconnect"
         assert backend.calls == 1
         assert not server.controllers.attached().runtime.loop.has_pending_steering
     finally:

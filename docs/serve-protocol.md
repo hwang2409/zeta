@@ -1307,10 +1307,12 @@ reply streams, is not dropped when that turn completes. After the turn's
 `turn_end` and `agent_end`, the server starts the next turn with no new user
 message, and that turn's first provider request carries the steer, so its
 `delivery_status` becomes `delivered`. This turn emits the usual `agent_start`
-through `agent_end` events. The next turn does not start, and the steer is
-`dropped` with reason `disconnect`, if the server is closing, a `send` would be
-refused because the session is not attached, or the controller is gone with no
-`turn_reconnect` grace running. A `send` that arrives right after
+through `agent_end` events. If the server is closing or the session has no
+controller and no reconnect grace, the steer is `dropped` with reason
+`disconnect`. If the session still has a controller or reconnect grace but the
+finished turn cannot start a successor (for example, required bindings are
+missing or the runtime state was replaced), the reason is `turn_end`.
+A `send` that arrives right after
 `turn_end` either starts the turn that carries the steer, or gets `-32004`
 because that turn has already started; the client should then retry the text as
 a `steer`.
@@ -1586,6 +1588,17 @@ child run, cumulative across its follow-up segments, and never decreases. The
 public `run_id` is the existing child
 instance id. Child-local store ids and the agent tool's `handle` name are not
 exposed.
+
+A live row can also include `account_status` when a snapshot is available. It
+contains `account` (the child's pinned `provider:account` ID), `held` (boolean,
+whether the child is in a provider rate-limit hold), `usable_alternatives`
+(nonnegative integer, the number of other available accounts on that provider
+with fresh cached headroom), and `cached_used_percent` (number from 0 to 100,
+or null if unknown). The percentage is the highest usage among fresh, active
+cached limit windows; a known active exhaustion can still show 100 when the
+cache is stale. The server does not refresh usage to produce this row. A count
+of zero means no alternatives are known from the cache, not that the provider
+is exhausted. Rows without a snapshot and terminal rows omit `account_status`.
 
 `child_run_send` queues one message at the child's existing safe delivery
 point. Params are `session_id`, `run_id`, and nonempty `text`; success returns

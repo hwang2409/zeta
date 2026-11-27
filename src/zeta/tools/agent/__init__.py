@@ -13,6 +13,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from ...accounts.status import (
+    AccountStatus,
+    account_status_text,
+    project_account_status,
+)
 from ...agent.explicit_finish import (
     format_idle_resource_usage,
     idle_resource_usage,
@@ -443,6 +448,7 @@ def _lost_agent_status(
     item: dict[str, StructuredContentValue], *, requested: bool
 ) -> dict[str, StructuredContentValue]:
     lost = dict(item)
+    lost.pop("account_status", None)
     lost.update(
         state="failed",
         finished_at="unknown",
@@ -518,6 +524,10 @@ def _project_agent_status(
         "description": description,
         "cwd": cwd,
     }
+    if state in _NONTERMINAL_AGENT_STATES and (
+        account_status := project_account_status(lifecycle.get("account_status"))
+    ) is not None:
+        item["account_status"] = dict(account_status)
     if projection is not None:
         item["handoff_path"] = projection.handoff_path
         item["final_result"] = projection.readable_text
@@ -592,6 +602,7 @@ def _status_response(
     next_offset: int | None,
     finished_omitted: int,
     idle_usage: dict[str, object] | None = None,
+    session_accounts: Sequence[AccountStatus] = (),
 ) -> dict[str, object]:
     details = "\n".join(
         (
@@ -617,6 +628,9 @@ def _status_response(
             }
         )
         + format_agent_stats(child)
+        + (f"; account: {account_status_text(status)}" if (
+            status := project_account_status(child.get("account_status"))
+        ) is not None else "")
         for child in children
     )
     omission_notice = (
@@ -636,8 +650,11 @@ def _status_response(
         if idle_usage["idle_child_count"]
         else ""
     )
+    account_text = "".join(
+        f"\nsession account: {account_status_text(status)}" for status in session_accounts
+    )
     content_text = (
-        f"agent status: {len(children)} children{resource_text}"
+        f"agent status: {len(children)} children{resource_text}{account_text}"
         f"{details_text}{notice}{omission_notice}"
     )
     structured: dict[str, object] = {
@@ -646,6 +663,8 @@ def _status_response(
         "truncated": truncated,
         "total": total,
     }
+    if session_accounts:
+        structured["session_account_status"] = list(session_accounts)
     if idle_usage["idle_child_count"]:
         structured.update(idle_usage)
     if finished_omitted:
@@ -870,6 +889,7 @@ async def _agent_status(
             limit=limit,
             max_bytes=max_bytes,
             running_handles=running_handles,
+            account_context=registry.account_context,
         )
     except (TypeError, ValueError) as exc:
         return _agent_error(str(exc), max_bytes)
@@ -1033,6 +1053,7 @@ def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
 
     agent_names = catalog.names()
     agent_description = catalog.description()
+    cwd_required = ", ".join(preset.name for preset in catalog.agents if preset.requires_cwd)
     description = (
         "Delegate multi-step exploration or research that would pollute the "
         "main context. The child has its own bounded context and may spawn "
@@ -1075,7 +1096,8 @@ def agent_tool_schema(catalog: AgentCatalog) -> tuple[str, dict[str, object]]:
                     "existing directory (a symlinked directory is rejected). "
                     "Pass this when delegating work in another directory or "
                     "git worktree so the child does not run in your checkout. "
-                    "Omit to inherit your starting directory."
+                    "Omit to inherit your starting directory unless the preset requires cwd."
+                    + (f" Required for these presets: {cwd_required}." if cwd_required else "")
                 ),
             },
             "background": {
@@ -1114,6 +1136,10 @@ def register(registry: ToolRegistry) -> None:
             "one child, or omit it to list unfinished children plus terminal "
             "lost or unreadable records. Other finished children are omitted from "
             "list responses; query by handle for their results. "
+            "Without a handle, shows session account selections and cached usage before "
+            "fan-out. Child account status is a snapshot from spawn or hold. A zero "
+            "count means no alternative with confirmed cached headroom, not provider "
+            "exhaustion. Parent switches apply to new children only. "
             "Completion is announced automatically. Use this for on-demand "
             "inspection, not polling."
         ),
