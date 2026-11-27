@@ -64,6 +64,7 @@ class BackgroundAgentOwner:
         ):
             raise ValueError("finish_gate_task_timeout must be positive")
         self.notification_store = notification_store
+        self._child_recovery_enabled = notification_store.child_recovery_enabled
         self.finish_gate_max_turns = finish_gate_max_turns
         self.finish_gate_timeout = float(finish_gate_timeout)
         # This internal bound lets tasks outlive a turn but stops abandoned tasks
@@ -440,7 +441,7 @@ class BackgroundAgentOwner:
     async def close_children(self) -> None:
         """Stop admission and cancel and join the whole child tree."""
         self._setup_closed = True
-        if not self.notification_store.child_recovery_enabled:
+        if not self._child_recovery_enabled:
             self.cancel_all()
             await self.wait()
             return
