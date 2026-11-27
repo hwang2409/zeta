@@ -19487,6 +19487,8 @@ async def test_idle_nudge_waits_for_task_child_active_turn_and_input(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     class Fence:
+        finish_waits_for_answer = False
+
         def __init__(self) -> None:
             self.checks = iter([False, False, False, False, False, True, True])
 
@@ -19527,6 +19529,8 @@ async def test_idle_nudge_loses_to_prompt_committed_after_eligibility_check(
     real_fence: ChildRunTransitionOwner | None = None
 
     class PromptAfterEligibilityFence:
+        finish_waits_for_answer = False
+
         async def idle_nudge_eligible(self) -> bool:
             assert real_fence is not None
             eligible = await real_fence.idle_nudge_eligible()
