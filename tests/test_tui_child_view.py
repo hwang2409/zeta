@@ -479,7 +479,7 @@ async def test_finder_return_respects_new_navigation(
 )
 @pytest.mark.asyncio
 async def test_real_tui_child_view_journey(
-    child_view_fixture: ChildViewHome,
+    child_view_fixture: ChildViewHome, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = child_view_fixture
     store = await asyncio.to_thread(
@@ -820,14 +820,29 @@ async def test_real_tui_child_view_journey(
                 ),
                 what="visible selected child prompt and transcript before PageUp",
             )
-            await _send(pipe, "\x1b[5~")
-            await _wait_until(
-                lambda: (
-                    child_transcript.durable_scroll_anchor is not None
-                    and child_transcript.durable_scroll_anchor != prior_child_anchor
-                ),
-                what="child anchor after PageUp",
-            )
+            page_up = app._page_history_up
+            page_up_handled = False
+            page_up_drawn = asyncio.Event()
+
+            def mark_page_up():
+                nonlocal page_up_handled
+                page_up()
+                page_up_handled = True
+
+            def after_page_up_frame(_):
+                if page_up_handled:
+                    page_up_drawn.set()
+
+            # A redraw of the taller composer can move the tail anchor before PageUp.
+            with monkeypatch.context() as patch:
+                # test-contract: seam observe key handling without changing the scroll
+                patch.setattr(app, "_page_history_up", mark_page_up)
+                session.app.after_render += after_page_up_frame
+                try:
+                    pipe.send_text("\x1b[5~")
+                    await await_or_fail(page_up_drawn.wait(), what="drawn child PageUp")
+                finally:
+                    session.app.after_render -= after_page_up_frame
             scrolled_rows = (await _child_rows(app))[:3]
             scrolled_anchor = child_transcript.durable_scroll_anchor
             assert scrolled_anchor is not None and scrolled_anchor != prior_child_anchor

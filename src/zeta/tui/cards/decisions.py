@@ -73,6 +73,8 @@ class DecisionsPanel:
     """Interactive state for the open-decisions list and the answer field."""
 
     def __init__(self, answer_field: OverlayTextField) -> None:
+        self._snapshot: tuple[DecisionItem, ...] = ()
+        self._fyi = False
         self._items: tuple[DecisionItem, ...] = ()
         self._staged: dict[str, str] = {}
         self._selected_id: str | None = None
@@ -85,8 +87,20 @@ class DecisionsPanel:
         self, items: Sequence[DecisionItem], staged: dict[str, str] | None = None
     ) -> None:
         """Show ``items``; ``staged`` maps an item id to its staged reply."""
-        self._items = tuple(items)
+        self._snapshot = tuple(items)
         self._staged = dict(staged or {})
+        self._select_list()
+
+    @property
+    def fyi(self) -> bool:
+        return self._fyi
+
+    def show_fyi(self, show: bool) -> None:
+        self._fyi = show
+        self._select_list()
+
+    def _select_list(self) -> None:
+        self._items = tuple(item for item in self._snapshot if item.is_fyi == self._fyi)
         ids = [item.record.id for item in self._items]
         if self._selected_id not in ids:
             self._selected_id = ids[0] if ids else None
@@ -151,11 +165,13 @@ class DecisionsPanel:
 
     def render_lines(self, *, loading: bool = False) -> list[FragmentLine]:
         lines: list[FragmentLine] = [
-            overlay.title("Attention"),
+            overlay.title("FYI" if self._fyi else "Attention"),
+            overlay.hint("f action list" if self._fyi else "f FYI list"),
             overlay.rule(),
         ]
         if loading or not self._items:
-            text = "loading…" if loading else "No open attention items."
+            empty = "No open FYI items." if self._fyi else "No open attention items."
+            text = "loading…" if loading else empty
             lines.append([overlay.value(text, theme.DIM)])
             lines.append(overlay.rule())
             lines.append(overlay.hint("esc close"))

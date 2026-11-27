@@ -17,7 +17,7 @@ from typing import Protocol
 
 from ..accounts.store import rename_account_command
 from ..accounts.usage import format_usage_lines
-from ..attention_decisions import DecisionItem, open_decisions
+from ..attention_decisions import DecisionItem, format_open_decisions, open_decisions
 from ..attention_records import Broken
 from ..config.settings import load_settings
 from ..core.commands.plan_commands import run_implement_command, run_plan_command
@@ -205,16 +205,8 @@ class ServerSlashSession:
             opened.metadata.session_id,
             registry_state,
         )
-        if not items:
-            return "no open attention items"
-        return "open attention items:\n" + "\n".join(
-            (
-                f"  {item.record.id} [broken] {item.record.path}: {item.record.reason}"
-                if isinstance(item.record, Broken)
-                else f"  {item.record.id} [{item.record.kind}] {item.record.title} [{item.project_name}]"
-            )
-            for item in items
-        )
+        fyi = {"action": False, "fyi": True}.get(command)
+        return format_open_decisions(items, fyi=fyi)
 
     def _active_loop_and_session(self):
         loop = self._runtime.loop
