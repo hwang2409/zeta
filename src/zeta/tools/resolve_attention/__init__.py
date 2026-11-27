@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import TypedDict
 
-from ...attention_decisions import _top_level_sessions
+from ...attention_decisions import attention_owners
 from ...attention_forks import validate_attention_fork
 from ...attention_records import (
     AttentionRecord,
@@ -44,9 +44,10 @@ def _foreign_matches(
     if registry.project_id is None:
         raise ValueError("attention record ownership does not match the current project")
     matches: list[tuple[str, Path]] = []
-    for session_id, session_dir in _top_level_sessions(
+    for metadata, session_dir in attention_owners(
         store.session_dir.parent.parent, registry.project_id
     ):
+        session_id = metadata.session_id
         if session_id == store.session_id:
             continue
         try:

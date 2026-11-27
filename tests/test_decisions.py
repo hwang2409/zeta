@@ -217,7 +217,7 @@ async def test_direct_tick_discards_scan_delivered_before_resolution(
 
 
 @pytest.mark.asyncio
-async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -> None:
+async def test_decisions_tick_counts_project_while_viewing_agent(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
@@ -230,7 +230,7 @@ async def test_decisions_tick_counts_only_current_root_session(tmp_path: Path) -
     app._agent_navigation.current_path = child.session_dir
     await app._decisions_tick()
 
-    assert app.decisions_count == 1
+    assert app.decisions_count == 2
 
     await app.close()
     child.close()
@@ -243,8 +243,6 @@ async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> 
     manager = SessionManager(tmp_path)
     project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
-    other = await asyncio.to_thread(lambda: _session(tmp_path, project.project_id))
-    await asyncio.to_thread(_request, other, project.project_id, "Other", "Not this one.")
     anchor = current.store.append_message(
         Message(MessageRole.ASSISTANT, [TextContent("Need a choice")])
     )
@@ -292,7 +290,6 @@ async def test_decisions_tick_clears_after_resolve_attention(tmp_path: Path) -> 
     fork.store.close()
     await app.close()
     current.store.close()
-    other.store.close()
 
 
 @pytest.mark.asyncio
@@ -436,7 +433,7 @@ async def test_decisions_refresh_table_renders_current_counts(
             await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 10)
             broken = current.store.session_dir / "attention" / f"{records[0].id}.json"
             broken.write_bytes(b'{"why":"cut off"')
-            expected = (2, 1, "● 1 open, 1 staged")
+            expected = (1, 1, "● 0 open, 1 staged")
         elif case == "failure_recovery":
             calls = 0
 
@@ -702,33 +699,8 @@ def test_stuck_decisions_scan_does_not_block_asyncio_run_shutdown(
         thread.join(timeout=5)
 
 
-def test_open_decisions_lists_live_open_items_for_one_session(tmp_path: Path) -> None:
-    manager = SessionManager(tmp_path)
-    project = manager.project_registry.create_project("alpha", "git")
-    first = _session(tmp_path, project.project_id)
-    second = _session(tmp_path, project.project_id)
-    _request(first, project.project_id, "Pick DB", "Choose one.", options=["SQLite"])
-    resolved = _request(second, project.project_id, "Old", "Historical.")
-    AttentionStore(second.store.session_dir, writer_epoch=5).replace(
-        replace(resolved, status="resolved", resolved_at=resolved.created_at)
-    )
-    _request(second, project.project_id, "Pick region", "Where to deploy.")
-
-    first_items = open_decisions(tmp_path, first.store.session_id)
-    assert {item.record.title for item in first_items} == {"Pick DB"}
-    assert all(item.project_name == "alpha" for item in first_items)
-
-    second_items = open_decisions(tmp_path, second.store.session_id)
-    assert {item.record.title for item in second_items} == {"Pick region"}
-
-    first.store.close()
-    second.store.close()
-    # A closed (not live) session no longer contributes a pending decision.
-    assert open_decisions(tmp_path, first.store.session_id) == ()
-
-
 @pytest.mark.asyncio
-async def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> None:
+async def test_decisions_slash_labels_project_queue_owners(tmp_path: Path) -> None:
     manager = SessionManager(tmp_path)
     project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
     current = await asyncio.to_thread(_session, tmp_path, project.project_id)
@@ -752,8 +724,9 @@ async def test_decisions_slash_lists_only_current_session(tmp_path: Path) -> Non
     )
     output = await DecisionsMixin.slash_decisions(app, "")
     assert "Current" in output
-    assert "Other" not in output
-    assert current.store.session_id[:8] not in output
+    assert "Other" in output
+    assert current.store.session_id[:8] in output
+    assert other.store.session_id[:8] in output
 
     await asyncio.to_thread(current.store.close)
     await asyncio.to_thread(other.store.close)
@@ -765,16 +738,16 @@ def test_discussion_fork_decisions_use_source_session(tmp_path: Path) -> None:
     source = _session(tmp_path, project.project_id)
     other = _session(tmp_path, project.project_id)
     record = _request(source, project.project_id, "Source", "Discuss this.")
-    _request(other, project.project_id, "Other", "Not this one.")
+    other_record = _request(other, project.project_id, "Other", "Another owner.")
     app = SimpleNamespace(
         _fork_context=SimpleNamespace(source_session_id=source.store.session_id),
         loop=SimpleNamespace(store=SimpleNamespace(session_id="fork")),
     )
     session_id = DecisionsMixin._decisions_session_id.fget(app)
     assert session_id == source.store.session_id
-    assert [item.record.title for item in open_decisions(tmp_path, session_id)] == [
-        record.title
-    ]
+    assert {item.record.title for item in open_decisions(tmp_path, session_id)} == {
+        record.title, other_record.title
+    }
     source.store.close()
     other.store.close()
 
