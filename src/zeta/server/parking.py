@@ -70,7 +70,9 @@ class ParkedPairs:
         if not control.holds_work() and not self._controllers.parked_in_grace(control):
             self.close(control)
 
-    def _publish(self, control: ServeControl, row: dict[str, object]) -> None:
+    def _publish(
+        self, control: ServeControl, row: dict[str, object], *, after: asyncio.Task[None] | None = None
+    ) -> None:
         """Send ``parked_session_changed`` when the row differs from the last one
         sent. The parked control's own frames stay dropped."""
         record = self._controllers.record_for(control)
@@ -84,10 +86,18 @@ class ParkedPairs:
         if record.parked_last_sent == data or connections is None:
             return
         record.parked_last_sent = data
-        if (parked_by := record.parked_by) is not None:
+        if (parked_by := record.parked_by) is None:
+            return
+
+        def publish() -> None:
             connections.publish_connection(
                 parked_by, EventDescriptor.PARKED_SESSION_CHANGED, session_id, data=data
             )
+
+        if after is None:
+            publish()
+        else:
+            after.add_done_callback(lambda _: publish())
 
     def close(
         self, control: ServeControl, settlement_timeout: float | None = None
@@ -95,10 +105,12 @@ class ParkedPairs:
         """Close a parked pair now; its turn ends ``disconnect``."""
         if control in self._controllers.parked_controls():
             session_id = control.runtime.session_id
-            self._controllers.retire(self._controllers.record_for(control), settlement_timeout)
+            task = self._controllers.retire(self._controllers.record_for(control), settlement_timeout)
+            # The close releases the resident slot even when cleanup fails.
             self._publish(
                 control,
                 {"session_id": session_id, "state": "closed", "pending_approvals": 0},
+                after=task,
             )
 
     async def claim(
