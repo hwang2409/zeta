@@ -237,7 +237,25 @@ def validate_agent_notification_data(data: Mapping[str, Any]) -> None:
         raise ValueError("invalid agent notification")
 
 
+def validate_child_recovered(data: Mapping[str, Any]) -> None:
+    from ...storage_format import reject_unknown_keys
+
+    reject_unknown_keys(data, "child_recovered_notification")
+    if (
+        data.get("origin") != "notification" or data.get("kind") != "child_recovered"
+        or data.get("display_only") is not True
+        or any(type(data.get(key)) is not str or not 0 < len(data[key]) <= 4096 for key in (
+            "child_instance_id", "child_session_path", "description", "text",
+        ))
+        or type(data.get("episode")) is not int or not 0 < data["episode"] < 2**63
+        or data.get("logical_id") != f"child-recovered:{data['child_instance_id']}:{data['episode']}"
+        or len(data["logical_id"]) > 512
+    ):
+        raise ValueError("invalid child recovery notice")
+
+
 NOTIFICATION_VALIDATORS = {
+    "child_recovered": validate_child_recovered,
     AGENT_COMPLETION_NOTIFICATION_KIND: validate_agent_notification_data,
     CHILD_IDLE_NOTIFICATION_KIND: validate_child_idle_notification_data,
     CHILD_HOLD_NOTIFICATION_KIND: validate_child_hold_notification_data,

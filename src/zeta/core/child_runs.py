@@ -28,7 +28,7 @@ from .store import ConversationStore
 from .store._child_runs import parse_child_run_id, run_row_identity
 
 TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
-NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
+NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing", "suspended"})
 _VALID_AGENT_STATES = NONTERMINAL_AGENT_STATES | TERMINAL_AGENT_STATES
 _MISSING = object()
 _STATUS_REASON_FALLBACK = "child status unavailable"
@@ -310,6 +310,10 @@ def read_agent_status(
     notifications = getattr(store, "agent_notifications", lambda **_kwargs: [])(
         pending_only=False
     )
+    recoverable = {
+        marker.get("child_instance_id") for marker in getattr(store, "agent_children", dict)().values()
+        if marker.get("background") and "resume" in marker
+    }
     for handle, child_path in active_receipts.items():
         if requested_handle is not None and handle != requested_handle:
             continue
@@ -334,9 +338,10 @@ def read_agent_status(
                     and owner_state in {None, "recovery"}
                     and item["state"] in NONTERMINAL_AGENT_STATES
                 ):
-                    item = _lost_agent_status(
-                        item, requested=requested_handle is not None
-                    )
+                    if handle in recoverable:
+                        item.update(state="suspended", current_step="suspended")
+                    elif item["state"] != "suspended":
+                        item = _lost_agent_status(item, requested=requested_handle is not None)
             else:
                 raise TypeError("unknown lifecycle read result")
         except Exception as exc:  # noqa: BLE001 - every child needs a safe row
@@ -349,6 +354,12 @@ def read_agent_status(
             continue
         children.append(item)
     return sorted(children, key=lambda child: str(child["started_at"]))
+
+
+def child_run_for_features(row: dict, *, child_recovery: bool) -> dict:
+    if not child_recovery and row.get("status") == "suspended" and "run_id" in row:
+        return {**row, "status": "running"}
+    return row
 
 
 def project_child_run_row(

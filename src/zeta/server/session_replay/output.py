@@ -607,16 +607,21 @@ class ReplayOutput:
         """Strip ``server_restarted`` from projected approval rows for a legacy
         connection (no ``approval_restart_reason`` feature). One output seam for
         every history page; returns the same object when nothing is stripped."""
-        if "approval_restart_reason" in self._connections[connection].features:
-            return history
+        from ...core.child_runs import child_run_for_features
+
+        features = self._connections[connection].features
         if not isinstance(history, dict):
             return history
         rows = history.get("messages")
         if not isinstance(rows, list):
             return history
         shaped = event_contract.shape_approval_history_rows(
-            rows, include_restart_reason=False
+            rows, include_restart_reason="approval_restart_reason" in features,
         )
+        if "child_recovery" not in features:
+            projected = [child_run_for_features(row, child_recovery=False) if isinstance(row, dict) else row for row in shaped]
+            if any(a is not b for a, b in zip(shaped, projected, strict=True)):
+                shaped = projected
         if shaped is rows:
             return history
         return {**history, "messages": shaped}

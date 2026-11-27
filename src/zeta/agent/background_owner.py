@@ -14,6 +14,7 @@ from .conversation_channel import ConversationChannel
 from .finish_gate import CausalEpisodeRegistry
 
 _AGENT_CANCEL_CONFIRM_TIMEOUT = 1.0
+_CHILD_REGISTRATION_SHUTDOWN_TIMEOUT = 5.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,9 @@ class BackgroundAgentOwner:
         self._observed_close_failures: set[asyncio.Task[Any]] = set()
         self._setup_tasks: set[asyncio.Task[Any]] = set()
         self._setup_closed = False
+        self._registrations: set[asyncio.Task[Any]] = set()
+        self._registration_setups: set[asyncio.Task[Any]] = set()
+        self._runs: dict[str, ChildRunTransitionOwner] = {}
         self._cancellation_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
             str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
@@ -120,6 +124,23 @@ class BackgroundAgentOwner:
         task = asyncio.create_task(setup())
         self._setup_tasks.add(task)
         task.add_done_callback(self._setup_tasks.discard)
+        return task
+
+    def register_child_setup(
+        self, registration: Callable[[], Coroutine[Any, Any, ChildRunTransitionOwner]],
+        setup: asyncio.Task[Any],
+    ) -> asyncio.Task[ChildRunTransitionOwner]:
+        if self._setup_closed:
+            raise asyncio.CancelledError
+        task = asyncio.create_task(registration())
+        self._registrations.add(task)
+        self._registration_setups.add(setup)
+
+        def finished(task: asyncio.Task[Any]) -> None:
+            self._registrations.discard(task)
+            self._registration_setups.discard(setup)
+
+        task.add_done_callback(finished)
         return task
 
     def create_cancellation_task[TaskResult](
@@ -335,6 +356,9 @@ class BackgroundAgentOwner:
             parent_store=parent_store, parent_instance_id=parent_instance_id,
             active_store=store, description=description,
         )
+        self._runs[instance_id] = owner
+        if self._setup_closed and owner.recoverable:
+            owner.quiesce()
         return owner
 
     def finish_child_setup(self, task: asyncio.Task[Any]) -> None:
@@ -373,6 +397,7 @@ class BackgroundAgentOwner:
             self._request_cancellation(instance_id)
 
     def unregister(self, instance_id: str) -> None:
+        self._runs.pop(instance_id, None)
         self._cancellers.pop(instance_id, None)
         self._watchers.pop(instance_id, None)
         self._parent_stores.pop(instance_id, None)
@@ -419,7 +444,36 @@ class BackgroundAgentOwner:
     async def close_children(self) -> None:
         """Stop admission and cancel and join the whole child tree."""
         self._setup_closed = True
-        self.cancel_all()
+        if not self.notification_store.child_recovery_enabled:
+            self.cancel_all()
+            await self.wait()
+            return
+        for owner in self._runs.values():
+            owner.quiesce()
+        # asyncio.wait never propagates shutdown cancellation into a marker commit.
+        if self._registrations:
+            _, pending = await asyncio.wait(
+                tuple(self._registrations), timeout=_CHILD_REGISTRATION_SHUTDOWN_TIMEOUT,
+            )
+            if pending:
+                raise TimeoutError("child registration did not settle at shutdown")
+        owned_setups = set(self._watchers.values())
+        for setup in self._setup_tasks - owned_setups:
+            setup.cancel()
+        remaining = set(self._watchers)
+        while remaining:
+            leaves = remaining - {self._parent_ids.get(child) for child in remaining}
+            assert leaves, "child ownership cycle"
+            for child in leaves:
+                watcher = self._watchers.get(child)
+                owner = self._runs.get(child)
+                if owner is not None and owner.recoverable:
+                    await owner.suspend()
+                else:
+                    self._request_cancellation(child)
+                if watcher is not None:
+                    await asyncio.gather(asyncio.shield(watcher), return_exceptions=True)
+            remaining -= leaves
         await self.wait()
 
     def cancel_all(self) -> None:

@@ -45,7 +45,9 @@ async def list_runs(client: Any, params: dict[str, Any], controller) -> dict[str
         raise ProtocolError(
             ErrorDescriptor.STATE_UNAVAILABLE, "child run state is unavailable"
         )
-    page = rows[offset : offset + limit]
+    from ...core.child_runs import child_run_for_features
+
+    page = [child_run_for_features(row, child_recovery="child_recovery" in client.features) for row in rows[offset : offset + limit]]
     result: dict[str, object] = {"runs": page}
     next_offset = offset + len(page)
     if next_offset < len(rows):

@@ -80,7 +80,7 @@ _TERMINAL_AGENT_STATES = frozenset(
     {"completed", "failed", "canceled", "turn_limit"}
 )
 _DURABLE_TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
-_NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
+_NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing", "suspended"})
 _VALID_AGENT_STATES = _NONTERMINAL_AGENT_STATES | _DURABLE_TERMINAL_AGENT_STATES
 _STATUS_REASON_FALLBACK = "child status unavailable"
 _STATUS_REASON_MAX_BYTES = MAX_AGENT_RESULT_BYTES

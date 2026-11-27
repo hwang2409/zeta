@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +44,10 @@ class ChildTurnControl:
         self.used = 0
         self._reserved = False
         self._warned = False
+
+    def restore_used(self, used: int) -> None:
+        self.used = used
+        self._warned = used >= math.ceil(0.9 * self.limit)
 
     def begin_completion(self) -> Message | None:
         if self._reserved:
@@ -365,11 +369,17 @@ def make_child_progress_callbacks(
     child_store: Any,
     child_marker_key: str,
     child_tool_call_id: str,
-) -> tuple[Callable[[int], None], Callable[[], None]]:
-    def update_turns(turns: int) -> None:
+) -> tuple[Callable[[int], Awaitable[None] | None], Callable[[], None]]:
+    from ..core.store._async_writes import _ChildTurnsCommand
+
+    def update_turns(turns: int) -> Awaitable[None] | None:
         loop._agent_child_turns[child_tool_call_id] = turns
         child_store.update_agent_lifecycle(turns_used=turns)
+        if child_store.child_recovery_enabled:
+            parent = loop._background_owner.parent_store(child_marker_key, loop.store)
+            return parent._commit_storage_command(_ChildTurnsCommand(run_id=child_marker_key, turns=turns))
         loop.store.update_agent_child_turns(child_marker_key, turns)
+        return None
 
     def record_tool_call() -> None:
         child_store.update_agent_lifecycle(tool_calls=1)

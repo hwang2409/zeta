@@ -48,6 +48,7 @@ class DeliveryFold:
         "prompt_ids",
         "prompt_messages",
         "queue_closed",
+        "recoveries_by_id",
         "tool_result_receipts",
         "tool_result_seqs",
     )
@@ -60,6 +61,7 @@ class DeliveryFold:
         self.agent_receipts: list[tuple[str, str]] = []
         self.notification_ids: set[str] = set()
         self.active_notifications: dict[str, ConversationEntry] = {}
+        self.recoveries_by_id: dict[str, ConversationEntry] = {}
         self.completions_by_child: dict[str, ConversationEntry] = {}
         self.presented: set[str] = set()
         self.prompt_ids: set[str] = set()
@@ -106,6 +108,7 @@ class DeliveryFold:
         new.agent_receipts = list(self.agent_receipts)
         new.notification_ids = set(self.notification_ids)
         new.active_notifications = dict(self.active_notifications)
+        new.recoveries_by_id = dict(self.recoveries_by_id)
         new.completions_by_child = dict(self.completions_by_child)
         new.presented = set(self.presented)
         new.prompt_ids = set(self.prompt_ids)
@@ -231,7 +234,9 @@ class DeliveryFold:
     def _apply_notification(self, entry: ConversationEntry) -> None:
         handle = entry.data.get("child_instance_id")
         child_path = entry.data.get("child_session_path")
-        if type(handle) is str and handle and type(child_path) is str and child_path:
+        if entry.data.get("kind") == "child_recovered":
+            self.recoveries_by_id.setdefault(entry.data["logical_id"], entry)
+        elif type(handle) is str and handle and type(child_path) is str and child_path:
             self.agent_receipts.append((handle, child_path))
         self.notification_ids.add(entry.id)
         self.active_notifications[entry.id] = entry

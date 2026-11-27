@@ -153,6 +153,7 @@ async def consume_run(
     *,
     child_store: ConversationStore,
     tool_call_id: str = "",
+    resumed_idle: bool = False,
     max_receipt_bytes: int = MAX_AGENT_RESULT_BYTES,
     receipt_components: dict[str, str] | None = None,
     **kwargs: Any,
@@ -202,9 +203,18 @@ async def consume_run(
     safety_started: float | None = None
     safety_task: asyncio.Task[tuple[str, ...]] | None = None
     try:
-        result = await consume_child(
-            child_loop, prompt, origin=MessageOrigin.AGENT_PROMPT, **kwargs
-        )
+        if resumed_idle:
+            flow = await child_loop._ensure_step_delivery()
+            while not flow.has_pending_edge:
+                await child_loop._background_owner.conversation_channel.wait(child_loop.agent_instance_id)
+            _transition_running(child_loop, child_store)
+            result = await consume_child(
+                child_loop, "", origin=MessageOrigin.NOTIFICATION, notification_turn=True, **kwargs,
+            )
+        else:
+            result = await consume_child(
+                child_loop, prompt, origin=MessageOrigin.AGENT_PROMPT, **kwargs
+            )
         while not result.get("isError"):
             structured = result.get("structuredContent")
             recoverable_error = (

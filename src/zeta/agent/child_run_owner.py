@@ -34,6 +34,8 @@ class ChildRunTransitionOwner:
         self._background = background
         self._cancellation: CancellationRequest | None = None
         self._winner: str | None = None
+        self.quiescing = False
+        self._close_admission: Callable[[], None] | None = None
         self._setup_task: asyncio.Task | None = None
         self._execution: asyncio.Task | None = None
         self._abort_runtime: Callable[[], None] | None = None
@@ -61,8 +63,12 @@ class ChildRunTransitionOwner:
         execution: asyncio.Task,
         abort: Callable[[], None],
         cleanup: Callable[[], Awaitable[None]],
+        close_admission: Callable[[], None] | None = None,
     ) -> None:
         self._execution = execution
+        self._close_admission = close_admission
+        if self.quiescing and close_admission is not None:
+            close_admission()
         self._abort_runtime = abort
         self._cleanup_runtime = cleanup
         self._setup_task = None
@@ -85,6 +91,58 @@ class ChildRunTransitionOwner:
         async with self._lock:
             if self._winner is None:
                 await self._store._to_thread_store(initialize)
+
+    @property
+    def recoverable(self) -> bool:
+        return self._background and self._store.child_recovery_enabled
+
+    @property
+    def suspending(self) -> bool:
+        return self._winner == "suspend"
+
+    def quiesce(self) -> None:
+        self.quiescing = True
+        if self._close_admission is not None:
+            self._close_admission()
+
+    async def suspend(self) -> None:
+        async with self._lock:
+            if self._winner is not None or self._cancellation is not None:
+                return
+            if self._execution is not None and self._execution.done():
+                return
+            if self._explicit_finish and await self._store.explicit_finish_report() is not None:
+                self._winner = "finish"
+                return
+            self._winner = "suspend"
+            if self._abort_runtime is not None:
+                self._abort_runtime()
+            task = self._execution if self._execution is not None else self._setup_task
+            if task is not None and not task.done() and task is not asyncio.current_task():
+                task.cancel()
+
+    async def activate_recovered(self, episode: int) -> None:
+        from ..core.store._async_writes import _ChildSuspensionCommand
+
+        async with self._lock:
+            if self.quiescing or self._winner is not None:
+                raise asyncio.CancelledError
+            await self._store._to_thread_store(self._store.activate_runtime_lease)
+            await self._store._commit_storage_command(_ChildSuspensionCommand(activate=episode))
+
+    async def block_recovery(self, reason: str) -> None:
+        from ..core.store._async_writes import _ChildSuspensionCommand
+
+        async with self._lock:
+            await self._store._commit_storage_command(_ChildSuspensionCommand(blocked=reason))
+
+    async def persist_suspension(self, reason: str) -> dict | None:
+        from ..core.store._async_writes import _ChildSuspensionCommand
+
+        async with self._lock:
+            if self._prepare_cancel is not None:
+                await self._prepare_cancel()
+            return await self._store._commit_storage_command(_ChildSuspensionCommand(reason=reason))
 
     def request_cancel(self) -> CancellationRequest:
         from .background_owner import CancellationRequest
@@ -149,7 +207,7 @@ class ChildRunTransitionOwner:
         async with self._lock:
             if self._winner == "cancel":
                 return "child is canceled"
-            if self._winner is not None:
+            if self._winner is not None or self.quiescing:
                 return "child is finishing"
             if refusal := self.owned_work_refusal():
                 return refusal
@@ -195,7 +253,7 @@ class ChildRunTransitionOwner:
         self, state: str, text: str, turns_used: int, *, canonical: bool = False,
     ) -> None:
         async with self._lock:
-            if self._winner == "cancel":
+            if self._winner in {"cancel", "suspend"}:
                 raise asyncio.CancelledError
             if self._winner is None:
                 await self._store._commit_storage_command(_FinishAgentLifecycleCommand(
@@ -257,7 +315,7 @@ class ChildRunTransitionOwner:
             return await self._idle_nudge_eligible()
 
     async def _idle_nudge_eligible(self) -> bool:
-        if self._winner is not None or self._notification_pending() or self._owned_work():
+        if self.quiescing or self._winner is not None or self._notification_pending() or self._owned_work():
             return False
         return await self._store.idle_nudge_eligible(
             self._persisted_notification_ids()

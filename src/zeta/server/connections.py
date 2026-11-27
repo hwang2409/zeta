@@ -99,6 +99,7 @@ EVENT_FEATURES = {
     EventDescriptor.TOOL_END: NO_FEATURE,
     EventDescriptor.SUB_AGENT_RECEIPT: NO_FEATURE,
     EventDescriptor.CHILD_IDLE: NO_FEATURE,
+    EventDescriptor.CHILD_RECOVERED: NO_FEATURE,
     EventDescriptor.CHILD_HOLD: NO_FEATURE,
     EventDescriptor.TASK_EXIT_NOTIFICATION: NO_FEATURE,
     EventDescriptor.PROJECT_INBOX_NOTIFICATION: NO_FEATURE,
@@ -461,6 +462,10 @@ class ConnectionRegistry(ReplayOutput):
     def _shape_event_fields(
         event: EventDescriptor, fields: dict[str, object], features: frozenset[str],
     ) -> dict[str, object]:
+        from ..core.child_runs import child_run_for_features
+
+        if event in {EventDescriptor.CHILD_STARTED, EventDescriptor.CHILD_PROGRESS, EventDescriptor.CHILD_ENDED}:
+            fields = child_run_for_features(fields, child_recovery="child_recovery" in features)
         if event is EventDescriptor.TOOL_START and "tool_approval_origin" not in features:
             tool_call = fields.get("tool_call")
             if isinstance(tool_call, dict) and "approval_origin" in tool_call:
@@ -1167,7 +1172,9 @@ class ConnectionRegistry(ReplayOutput):
                 raise ProtocolError(ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found")
             return result, row
         result = await self.run_read(connection, read, controller)
-        return result[0], 0, result[1]
+        from ..core.child_runs import child_run_for_features
+
+        return result[0], 0, child_run_for_features(result[1], child_recovery="child_recovery" in features)
 
     def _child_reader_for(
         self, root_store: ConversationStore, run_id: str, *, allow_stale: bool = False

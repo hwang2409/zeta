@@ -342,6 +342,7 @@ class _RegisterAgentChildCommand(_StoreMutationCommand):
     accepts_follow_ups: bool
     explicit_finish: bool
     turns_used: int
+    resume: dict[str, Any] | None = None
 
     def apply(self, store: Any) -> Any:
         return store.register_agent_child(
@@ -354,7 +355,47 @@ class _RegisterAgentChildCommand(_StoreMutationCommand):
             accepts_follow_ups=self.accepts_follow_ups,
             explicit_finish=self.explicit_finish,
             turns_used=self.turns_used,
+            resume=self.resume,
         )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _SelectChildAccountsCommand(_StoreMutationCommand):
+    run_id: str
+    pins: dict[str, str]
+
+    def apply(self, store: Any) -> None:
+        store.select_child_accounts(self.run_id, self.pins)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ChildTurnsCommand(_StoreMutationCommand):
+    run_id: str
+    turns: int
+
+    def apply(self, store: Any) -> None:
+        store.persist_agent_child_turns(self.run_id, self.turns)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ChildSuspensionCommand(_StoreMutationCommand):
+    reason: str | None = None
+    activate: int | None = None
+    blocked: str | None = None
+
+    def apply(self, store: Any) -> Any:
+        return store.transition_agent_suspension(reason=self.reason, activate=self.activate, blocked=self.blocked)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _AppendChildRecoveredCommand(_StoreMutationCommand):
+    run_id: str
+    episode: int
+    path: str
+    description: str
+
+    def apply(self, store: Any) -> Any:
+        return store.append_child_recovered(self.run_id, self.episode, path=self.path, description=self.description)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

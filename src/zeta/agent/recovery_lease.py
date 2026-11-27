@@ -80,6 +80,7 @@ def acquire_recovery_subtree(
     child_path: Path,
     leases: ExitStack,
     recovery_stores: dict[Path, ConversationStore],
+    *, retained: set[ConversationStore] | None = None,
 ) -> bool:
     """Lease a complete child subtree before any recovery mutation.
 
@@ -96,7 +97,13 @@ def acquire_recovery_subtree(
         return False
     if child_store is None:
         return True
-    leases.enter_context(child_store)
+    if retained is None:
+        leases.enter_context(child_store)
+    else:
+        def release() -> None:
+            if child_store not in retained:
+                child_store.close()
+        leases.callback(release)
     if not leases.enter_context(child_store.orphan_recovery_lease()):
         return False
     lifecycle = read_agent_lifecycle_state(
@@ -115,7 +122,7 @@ def acquire_recovery_subtree(
             child_store,
             Path(marker["child_session_path"]),
             leases,
-            recovery_stores,
+            recovery_stores, retained=retained,
         )
         for marker in child_store.agent_children().values()
     )
@@ -136,7 +143,7 @@ def bootstrap_agent_children(loop: AgentLoopForRecovery, home_epoch: int) -> Non
     from .background_lifecycle import recover_agent_children
 
     recover_agent_children(loop, home_epoch)
-    loop._children_recovered = True
+    loop._children_recovered = not loop.store.child_recovery_enabled
 
 
 def _has_recovery_work(loop: AgentLoopForRecovery) -> bool:
@@ -150,6 +157,10 @@ async def activate_agent_children(loop: AgentLoopForRecovery) -> None:
     if not loop._children_recovered:
         if _has_recovery_work(loop):
             await recover_agent_children_off_loop(loop)
+            if loop.store.child_recovery_enabled:
+                from .resume_child import resume_agent_children
+
+                await resume_agent_children(loop)
         loop._children_recovered = True
 
 

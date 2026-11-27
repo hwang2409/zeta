@@ -597,7 +597,7 @@ def render_agent_notification(
         )
     )
     if (
-        kind in {"child_question", "child_idle", "child_hold", "child_question_withdrawn"}
+        kind in {"child_question", "child_idle", "child_hold", "child_question_withdrawn", "child_recovered"}
         or readable_completion
     ):
         rendered = render_agent_notification_message(event, identity_index)

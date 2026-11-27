@@ -13,11 +13,15 @@ from pathlib import Path
 from typing import Any, Literal
 
 from ..agent.receipt import valid_killed_task_fields
+from ..agent.resume_descriptor import validate_child_resume
 from ..protocol.types import ToolCall
 from ..storage_format import (
+    CLOSED_VARIANTS,
     DeleteValue,
     Mutation,
     SetValue,
+    StorageFeature,
+    feature_enabled,
     mapping_mutations,
 )
 from .agent_progress import (
@@ -34,7 +38,7 @@ from .session_files import (
     write_session_file_if_absent,
 )
 
-_AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
+_AGENT_STATES = CLOSED_VARIANTS["child_lifecycle.state"]
 _TERMINAL_AGENT_STATES = {"completed", "canceled", "failed"}
 
 
@@ -77,6 +81,22 @@ def _validate_status_lifecycle(value: object) -> dict[str, Any]:
             datetime.fromisoformat(timestamp)
         except ValueError as exc:
             raise ValueError("invalid child timestamps") from exc
+    episode = lifecycle.get("suspension_episode")
+    if "suspension_episode" in lifecycle and (type(episode) is not int or episode < 1):
+        raise ValueError("invalid suspension episode")
+    if state == "suspended":
+        suspended_at = lifecycle.get("suspended_at")
+        if (
+            episode is None
+            or lifecycle.get("resume_mode") not in ("idle", "active")
+            or lifecycle.get("suspension_reason") not in ("normal_exit", "owner_lost")
+            or type(suspended_at) is not str or len(suspended_at) > 40
+        ):
+            raise ValueError("invalid child suspension")
+        datetime.fromisoformat(suspended_at)
+    blocked = lifecycle.get("recovery_blocked")
+    if "recovery_blocked" in lifecycle and (state != "suspended" or type(blocked) is not str or not 0 < len(blocked) <= 160):
+        raise ValueError("invalid child recovery reason")
     if state in _TERMINAL_AGENT_STATES and finished_at is None:
         raise ValueError("terminal state has no finished_at")
     if state not in _TERMINAL_AGENT_STATES and finished_at is not None:
@@ -223,6 +243,7 @@ def _agent_child_registration_values(
         "accepts_follow_ups": marker.get("accepts_follow_ups", False) is True,
         "explicit_finish": marker.get("explicit_finish", False) is True,
         "turns_used": turns_used if type(turns_used) is int else 0,
+        "resume": marker.get("resume"),
     }
 
 
@@ -303,6 +324,8 @@ def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any
             )
         try:
             ToolCall.from_dict(marker["tool_call"])
+            if "resume" in marker:
+                validate_child_resume(marker["resume"])
         except ValueError as exc:
             raise ConversationIntegrityError(
                 f"session state child tool call is invalid: {state_path}"
@@ -402,6 +425,7 @@ class AgentStateMixin:
         accepts_follow_ups: bool = False,
         explicit_finish: bool = False,
         turns_used: int = 0,
+        resume: dict[str, Any] | None = None,
     ) -> None:
         """Persist a running child marker before the child starts."""
 
@@ -413,6 +437,10 @@ class AgentStateMixin:
             or turns_used < 0
         ):
             raise ValueError("child marker fields must be valid")
+        if resume is not None:
+            if not self.child_recovery_enabled or not background:
+                raise ValueError("child recovery is unavailable for this marker")
+            validate_child_resume(resume)
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -424,6 +452,8 @@ class AgentStateMixin:
             }
             if background:
                 marker["background"] = True
+            if resume is not None:
+                marker["resume"] = copy.deepcopy(resume)
             if accepts_follow_ups:
                 marker["accepts_follow_ups"] = True
             if explicit_finish:
@@ -433,6 +463,23 @@ class AgentStateMixin:
             marker.update(_agent_type_metadata(agent_type))
             marker_key = child_instance_id or tool_call.id
             self._agent_children[marker_key] = marker
+            self._write_session_state(self.bash_cwd, self._todo_items)
+
+    @property
+    def child_recovery_enabled(self) -> bool:
+        return feature_enabled(self._storage_lease.observed_epoch, StorageFeature.CHILD_RECOVERY)
+
+    def select_child_accounts(self, marker_key: str, pins: dict[str, str]) -> None:
+        with self._append_lock():
+            self._load_session_state()
+            descriptor = self._agent_children[marker_key]["resume"]
+            if descriptor["account_pins"] == "selected":
+                if descriptor["selected_accounts"] != pins:
+                    raise ValueError("child accounts are already pinned")
+                return
+            candidate = {**descriptor, "account_pins": "selected", "selected_accounts": pins}
+            validate_child_resume(candidate)
+            self._agent_children[marker_key]["resume"] = candidate
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def agent_children(self) -> dict[str, dict[str, Any]]:
@@ -448,6 +495,14 @@ class AgentStateMixin:
         marker = self._agent_children.get(marker_key)
         if marker is not None:
             marker["turns_used"] = turns_used
+
+    def persist_agent_child_turns(self, marker_key: str, turns: int) -> None:
+        with self._append_lock():
+            self._load_session_state()
+            marker = self._agent_children.get(marker_key)
+            if marker is not None and "resume" in marker and turns > marker["turns_used"]:
+                self.update_agent_child_turns(marker_key, turns)
+                self._write_session_state(self.bash_cwd, self._todo_items)
 
     def _finish_agent_child_unlocked(self, marker_key: str) -> bool:
         self._load_session_state()
@@ -658,6 +713,44 @@ class AgentStateMixin:
             self._agent_lifecycle.get("state"),
         ):
             post_child_progress(self, self._agent_lifecycle)
+
+    def transition_agent_suspension(
+        self, *, reason: str | None = None, activate: int | None = None, blocked: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not self.child_recovery_enabled:
+            raise ValueError("child recovery is unavailable at this epoch")
+        live = live_agent_lifecycle(self.agent_lifecycle_path)
+        with self._append_lock():
+            self._load_session_state()
+            lifecycle = self._agent_lifecycle
+            if lifecycle is None or lifecycle.get("finished_at") is not None:
+                return None
+            if reason is not None and lifecycle["state"] != "suspended":
+                if live is not None:
+                    lifecycle.update(live)
+                lifecycle.update(
+                    state="suspended", current_step="suspended", suspended_at=_now(),
+                    suspension_reason=reason, suspension_episode=lifecycle.get("suspension_episode", 0) + 1,
+                    resume_mode="idle" if lifecycle["state"] == "idle" else "active",
+                )
+            elif lifecycle["state"] == "suspended" and activate == lifecycle["suspension_episode"]:
+                lifecycle["state"] = "idle" if lifecycle["resume_mode"] == "idle" else "running"
+                lifecycle["current_step"] = "idle, waiting for follow-up" if lifecycle["state"] == "idle" else "recovering interrupted work"
+                for key in ("recovery_blocked", "suspended_at", "suspension_reason", "resume_mode"):
+                    lifecycle.pop(key, None)
+            elif lifecycle["state"] == "suspended" and blocked is not None:
+                lifecycle["recovery_blocked"] = blocked[:160]
+                lifecycle["current_step"] = f"recovery blocked: {blocked[:160]}"
+            else:
+                return copy.deepcopy(lifecycle)
+            _validate_status_lifecycle(lifecycle)
+            self._write_agent_lifecycle()
+            if lifecycle["state"] == "suspended":
+                remove_live_agent_lifecycle(self.agent_lifecycle_path)
+            else:
+                publish_live_agent_lifecycle(self.agent_lifecycle_path, lifecycle)
+            post_child_progress(self, lifecycle)
+            return copy.deepcopy(lifecycle)
 
     def finish_agent_lifecycle(
         self,

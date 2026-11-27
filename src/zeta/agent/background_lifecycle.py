@@ -213,6 +213,21 @@ def _settle_recovered_child_from_receipt(
     owner.repair_terminal(status, result.content)
 
 
+def _recoverable_marker(
+    marker: dict[str, Any], child_store: ConversationStore | None, parent: ConversationStore,
+) -> bool:
+    if not (parent.child_recovery_enabled and marker.get("background") and "resume" in marker):
+        return False
+    if child_store is None:
+        return True
+    run_id = marker.get("child_instance_id")
+    if run_id in parent.agent_completion_notifications_by_child() or child_store.agent_canceled():
+        return False
+    lifecycle = child_store.agent_lifecycle()
+    owner = ChildRunTransitionOwner(child_store, ToolCall.from_dict(marker["tool_call"]).id)
+    return not (lifecycle and lifecycle.get("finished_at")) and owner.recovered_report() is None
+
+
 def _recover_nested_children(
     store: ConversationStore,
     history_store: ConversationStore,
@@ -239,6 +254,8 @@ def _recover_nested_children(
         child_instance_id = marker.get(
             "child_instance_id", f"{store.session_id}:{child_path.name}"
         )
+        if _recoverable_marker(marker, child_store, store):
+            continue
         with nullcontext():
             if child_store is not None:
                 _recover_nested_children(
@@ -405,6 +422,9 @@ def _recover_agent_children(
                 busy_child_subtrees.add(child_instance_id)
                 continue
             child_store = recovery_stores.get(child_path)
+            if _recoverable_marker(marker, child_store, loop.store):
+                busy_child_subtrees.add(child_instance_id)
+                continue
             if child_store is not None:
                 _recover_nested_children(
                     child_store,
@@ -571,6 +591,10 @@ async def finish_background_child(
         except Exception as exc:  # noqa: BLE001 - child failures become receipts
             execution_error = exc
         canceled, explicit_finish_report = await run_owner.background_outcome()
+        if run_owner.suspending:
+            await close_child("child suspended")
+            await run_owner.persist_suspension("normal_exit")
+            return
         if isinstance(result, dict):
             structured = result.get("structuredContent")
             if isinstance(structured, dict):
