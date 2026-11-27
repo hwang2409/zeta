@@ -58,6 +58,7 @@ class ChildRunTransitionOwner:
         self._lock = asyncio.Lock()
         self.run_id = ""
         self.question_settlement = False
+        self.finish_waits_for_answer = False
 
     def attach_setup(
         self,
@@ -292,6 +293,7 @@ class ChildRunTransitionOwner:
                 return "child is finishing"
             await self.reconcile_questions()
             if self.pending_questions():
+                self.finish_waits_for_answer = True
                 return "wait for your parent to answer the pending question before finish"
             if refusal := self.owned_work_refusal():
                 return refusal

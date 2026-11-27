@@ -1396,7 +1396,8 @@ class AgentLoop(
             finally:
                 await dispatch.aclose()
                 await self._background_owner.wait_for_store_closes()
-            if self._explicit_finish_report is not None:
+            owner = getattr(self, "_child_run_owner", None)
+            if self._explicit_finish_report is not None or (owner is not None and owner.finish_waits_for_answer):
                 if self.child_turn_control is not None:
                     self.child_turn_control.finish_completion()
                 yield StreamEvent(

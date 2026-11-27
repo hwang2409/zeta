@@ -85,11 +85,10 @@ async def test_pending_question_precedes_finish(tmp_path, monkeypatch, mode, obs
     restart = mode != "late-answer"
     root = tmp_path / "sessions"
     first = ScriptedTurn(tool_calls=[ASK, _finish("early")])
-    idle = ScriptedTurn([TextContent("waiting for the answer")])
     done = ScriptedTurn(tool_calls=[_finish("settled")])
     with ConversationStore(root, cwd=tmp_path) as store:
         session_id = store.session_id
-        loop = _loop(store, monkeypatch, [first] if restart else [first, idle, idle, done],
+        loop = _loop(store, monkeypatch, [first] if restart else [first, done],
                      limit=1 if restart else None)
         reached, ended = observe
         try:
@@ -106,8 +105,10 @@ async def test_pending_question_precedes_finish(tmp_path, monkeypatch, mode, obs
             assert not ended
             assert not (path / "turn-limit-handoff.md").exists()
             if not restart:
+                assert len(loop.backend.calls) == 1, "refused finish must not dispatch again before the answer"
                 assert await _answer(loop, run_id, card) is None
                 await await_or_fail(loop._background_owner.wait(), what="one terminal answer finish")
+                assert len(loop.backend.calls) == 2
                 assert len(ended) == 1
                 assert not _cards(store)
         finally:

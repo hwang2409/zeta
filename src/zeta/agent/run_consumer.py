@@ -211,8 +211,8 @@ async def consume_run(
     def held_at_limit() -> bool:
         return bool(control is not None and control.exhausted and owner is not None and owner.settlement_due())
 
-    async def wait_for_settlement():
-        assert owner is not None and control is not None
+    async def wait_for_answers(*, settlement: bool = False):
+        assert owner is not None
         text = "waiting for parent's answer"
         await child_store._commit_storage_command(_ChildActivityCommand(state="idle", current_step=text))
         channel = child_loop._background_owner.conversation_channel
@@ -229,12 +229,22 @@ async def consume_run(
             ))
 
         show_idle()
-        while not await owner.reserve_question_settlement(control.used + 1):
+        while owner.pending_questions():
             action = await idle_lifecycle.wait_for_idle_action(
                 lambda: channel.wait(owner.run_id), owner, display_only=True,
             )
             if action == "nudge" and owner.pending_questions():
                 show_idle()
+        owner.finish_waits_for_answer = False
+        if not settlement:
+            await _transition_running(child_loop, child_store)
+            return await consume_child(
+                child_loop, "", origin=MessageOrigin.NOTIFICATION, notification_turn=True, **kwargs,
+            )
+        assert control is not None
+        if not await owner.reserve_question_settlement(control.used + 1):
+            # Suspension or cancellation won before admission. The owner will settle the run.
+            raise asyncio.CancelledError
         flow = await child_loop._ensure_step_delivery()
         control.admit_settlement()
         flow.question_settlement = True
@@ -253,7 +263,9 @@ async def consume_run(
 
     try:
         if held_at_limit():
-            result = await wait_for_settlement()
+            result = await wait_for_answers(settlement=True)
+        elif resumed_idle and owner is not None and owner.pending_questions():
+            result = await wait_for_answers()
         elif resumed_idle:
             flow = await child_loop._ensure_step_delivery()
             while not flow.has_pending_edge:
@@ -268,7 +280,10 @@ async def consume_run(
             )
         while not result.get("isError"):
             if held_at_limit():
-                result = await wait_for_settlement()
+                result = await wait_for_answers(settlement=True)
+                continue
+            if owner is not None and owner.finish_waits_for_answer:
+                result = await wait_for_answers()
                 continue
             structured = result.get("structuredContent")
             recoverable_error = (

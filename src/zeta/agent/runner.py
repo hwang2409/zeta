@@ -285,6 +285,8 @@ async def consume_child(
         )
         if limited_result is not None:
             return limited_result
+        if owner is not None and owner.finish_waits_for_answer:
+            return terminal_result(state="idle", text="waiting for parent answer", status="running")
         if explicit_report is not None:
             report_status = explicit_report["status"]
             summary = explicit_report["summary"]
