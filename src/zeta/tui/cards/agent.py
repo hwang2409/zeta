@@ -329,7 +329,11 @@ class AgentCard:
     ) -> list[_TailLine]:
         """Project a bounded recursive card tail from immutable snapshots."""
 
-        from .agent_message import AgentIdentityIndex, agent_send_tail_lines
+        from .agent_message import (
+            AgentIdentityIndex,
+            _provider_retry_text,
+            agent_send_tail_lines,
+        )
 
         seen = set() if seen is None else seen
         identities = identities or AgentIdentityIndex()
@@ -388,6 +392,12 @@ class AgentCard:
                 )
                 lines.extend(projected)
                 if nested_path is not None:
+                    structured = tool_result.get("structured_content")
+                    if isinstance(structured, dict) and (handle := structured.get("child_instance_id")):
+                        for lifecycle in tree.lifecycles:
+                            if lifecycle.get("handle") == handle and lifecycle.get("suspension_reason") == "provider_unavailable":
+                                lines.append(_TailLine(f"  {_provider_retry_text(lifecycle)}", wrap=True))
+                                break
                     nested_tail = cls._tail_lines(
                         tree,
                         nested_path,
@@ -676,7 +686,11 @@ class AgentCard:
         usage = idle_resource_usage(snapshot.lifecycles)
         status_lines: list[_TailLine] = []
         root_lifecycle = snapshot.lifecycles[0] if snapshot.lifecycles else {}
-        if root_lifecycle.get("state") == "idle":
+        if root_lifecycle.get("suspension_reason") == "provider_unavailable":
+            from .agent_message import _provider_retry_text
+
+            status_lines.append(_TailLine(_provider_retry_text(root_lifecycle), wrap=True))
+        elif root_lifecycle.get("state") == "idle":
             idle_since = root_lifecycle.get("idle_since")
             try:
                 idle_seconds = max(
