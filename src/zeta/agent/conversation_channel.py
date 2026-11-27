@@ -776,10 +776,6 @@ class ConversationChannel:
     async def close_questions(self, child_instance_id: str, *, reason: str) -> int:
         from .pending_delivery import NotificationInput
 
-        owner = self._owner.run_transition(child_instance_id)
-        if owner is not None and owner.durable_questions and owner.questions():
-            # The transition owner already settled the child-first facts.
-            return 0
         self._legacy_pending_questions.pop(child_instance_id, None)
         item = NotificationInput(
             "child_question_close",

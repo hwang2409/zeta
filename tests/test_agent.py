@@ -1642,7 +1642,7 @@ class IdleParentRoutingBackend(CompletionBackend):
                     )
                 )
             ]
-        if call == 2:
+        if call >= 2:
             return [
                 ToolUseContent(
                     ToolCall(
@@ -21377,7 +21377,6 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
 
         backend.release_worker_question.set()
         await asyncio.wait_for(backend.lead_question_seen.wait(), 10)
-        await asyncio.wait_for(backend.lead_completion_seen.wait(), 10)
         questions = [
             entry
             for entry in branch_entries(lead_store)
@@ -21386,6 +21385,9 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         ]
         assert len(questions) == 1
         assert questions[0].data.get("routing_note") is None
+        question_data = questions[0].data
+        await _send_follow_up(loop, question_data["child_instance_id"], f"Re {question_data['question_id']}: continue")
+        await asyncio.wait_for(backend.lead_completion_seen.wait(), 10)
         assert not any(
             entry.type == "notification" and entry.data.get("kind") == "child_question"
             for entry in branch_entries(store)

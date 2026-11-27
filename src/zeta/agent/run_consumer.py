@@ -213,14 +213,28 @@ async def consume_run(
 
     async def wait_for_settlement():
         assert owner is not None and control is not None
-        await child_store._commit_storage_command(_ChildActivityCommand(state="idle"))
+        text = "waiting for parent's answer"
+        await child_store._commit_storage_command(_ChildActivityCommand(state="idle", current_step=text))
         channel = child_loop._background_owner.conversation_channel
-        await channel.publish_idle(
-            child_instance_id=owner.run_id, child_session_path=str(child_store.session_dir),
-            description=str(kwargs["explicit_finish_metadata"]["description"]), text="waiting for parent answer",
-        )
+
+        def show_idle() -> None:
+            child_loop._publish_background_event(StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "origin": "notification", "kind": "child_idle", "status": "child_idle",
+                    "child_instance_id": owner.run_id, "child_session_path": str(child_store.session_dir),
+                    "description": child_loop._background_owner.description(owner.run_id),
+                    "text": text, "display_only": True,
+                },
+            ))
+
+        show_idle()
         while not await owner.reserve_question_settlement(control.used + 1):
-            await channel.wait(child_loop.agent_instance_id)
+            action = await idle_lifecycle.wait_for_idle_action(
+                lambda: channel.wait(owner.run_id), owner, display_only=True,
+            )
+            if action == "nudge" and owner.pending_questions():
+                show_idle()
         flow = await child_loop._ensure_step_delivery()
         control.admit_settlement()
         flow.question_settlement = True

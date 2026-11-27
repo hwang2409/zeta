@@ -429,8 +429,10 @@ class _ChildActivityCommand(_StoreMutationCommand):
     state: str | None = None
     turns: int | None = None
 
+    current_step: str | None = None
+
     def apply(self, store: Any) -> None:
-        store.persist_child_activity(state=self.state, turns=self.turns)
+        store.persist_child_activity(state=self.state, turns=self.turns, current_step=self.current_step)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
