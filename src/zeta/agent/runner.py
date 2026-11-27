@@ -852,13 +852,6 @@ async def _run_child(
         loop._background_owner.finish_store(child_instance_id, child_store)
         await loop._background_owner.wait_for_store_closes()
 
-    def foreground_terminal_stats(state: str, turns_used: int) -> dict[str, object]:
-        lifecycle = child_store.agent_lifecycle() or {}
-        stats = agent_stats(lifecycle, status=state, turns_used=turns_used)
-        stats["turns_used"] = turns_used
-        stats["elapsed"] = _lifecycle_elapsed(lifecycle)
-        return stats
-
     async def prepare_setup_cancel() -> None:
         if child_store.agent_lifecycle() is None:
             await await_joined_offload(start_lifecycle, {})
@@ -938,7 +931,6 @@ async def _run_child(
         loop._agent_child_stores[tool_call.id] = child_store
         loop._agent_child_turns[tool_call.id] = 0
         loop._agent_child_types[tool_call.id] = preset.name
-        child_marker_key = child_instance_id
         if publisher is not None:
             publisher.set_metadata(
                 {"child_session_path": child_path, "depth": child_depth}
@@ -972,7 +964,7 @@ async def _run_child(
             raise
         loop._background_owner.conversation_channel.unregister_loop(child_instance_id)
         failure_text = f"agent error: {error_message(exc)}"
-        terminal_stats = foreground_terminal_stats("failed", 0)
+        terminal_stats = _foreground_terminal_stats(child_store, "failed", 0)
         failure_payload = loop._child_result_payload(
             tool_call.id,
             failure_text,
@@ -997,6 +989,52 @@ async def _run_child(
                 raise asyncio.CancelledError
             raise ChildControlError("state_unavailable") from None
         return failure_payload
+    return await _run_installed_child(
+        loop, child_loop, child_store, run_owner, tool_call,
+        prompt=prompt, description=description, preset=preset, child_depth=child_depth,
+        child_instance_id=child_instance_id, background=background, follow_up_loop=follow_up_loop,
+        child_policy=child_policy, child_account_pins=child_account_pins, external=external,
+        abort_signal=abort_signal, publisher=publisher, validate_result=validate_result,
+        error_message=error_message, execution_context=execution_context,
+    )
+
+
+def _foreground_terminal_stats(
+    child_store: ConversationStore, state: str, turns_used: int,
+) -> dict[str, object]:
+    lifecycle = child_store.agent_lifecycle() or {}
+    stats = agent_stats(lifecycle, status=state, turns_used=turns_used)
+    stats["turns_used"] = turns_used
+    stats["elapsed"] = _lifecycle_elapsed(lifecycle)
+    return stats
+
+
+async def _run_installed_child(
+    loop: AgentLoop,
+    child_loop: AgentLoop,
+    child_store: ConversationStore,
+    run_owner: ChildRunTransitionOwner,
+    tool_call: ToolCall,
+    *,
+    prompt: str,
+    description: str,
+    preset: AgentPreset,
+    child_depth: int,
+    child_instance_id: str,
+    background: bool,
+    follow_up_loop: bool,
+    child_policy: ChildApprovalPolicy | None,
+    child_account_pins: Any,
+    external: bool,
+    abort_signal: ToolAbortSignal,
+    publisher: ToolStreamPublisher | None,
+    validate_result: Callable[[object, str], ToolResult],
+    error_message: Callable[[BaseException], str],
+    execution_context: ToolExecutionContext | None,
+) -> dict[str, object] | str:
+    child_path = str(child_store.session_dir)
+    setup_task = asyncio.current_task()
+    assert setup_task is not None
     lifecycle_sink = (
         execution_context.lifecycle_sink if execution_context is not None else None
     )
@@ -1063,7 +1101,7 @@ async def _run_child(
             child_store.update_agent_lifecycle(turns_used=turns_used)
             return agent_stats(child_store.agent_lifecycle(), turns_used=turns_used)
         terminal_state, terminal_text = state, text
-        return foreground_terminal_stats(state, turns_used)
+        return _foreground_terminal_stats(child_store, state, turns_used)
 
     def child_result(
         text: str,
@@ -1152,7 +1190,7 @@ async def _run_child(
     update_turns, record_tool_call = make_child_progress_callbacks(
         loop=loop,
         child_store=child_store,
-        child_marker_key=child_marker_key,
+        child_marker_key=child_instance_id,
         child_tool_call_id=tool_call.id,
     )
 
@@ -1315,7 +1353,7 @@ async def _run_child(
                     cleanup=cleanup_background_child,
                     close_child=close_background_child,
                     error_message=error_message,
-                    marker_key=child_marker_key,
+                    marker_key=child_instance_id,
                     agent_instance_id=loop.agent_instance_id,
                     background_owner=loop._background_owner,
                     max_receipt_bytes=background_receipt_bytes,
