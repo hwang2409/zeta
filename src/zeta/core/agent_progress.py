@@ -107,6 +107,22 @@ def live_agent_lifecycle(path: str | Path) -> dict[str, Any] | None:
         return copy.deepcopy(lifecycle) if lifecycle is not None else None
 
 
+def overlay_agent_progress(
+    durable: dict[str, Any], live: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Overlay progress only; durable identity and terminal state win."""
+
+    if (
+        live is None or durable.get("handle") != live.get("handle")
+        or durable.get("state") not in ("running", "idle", "finishing")
+    ):
+        return durable
+    return {
+        **durable,
+        **{key: live[key] for key in ("state", "current_step", "turns_used", "tool_calls") if key in live},
+    }
+
+
 def read_agent_lifecycle(path: str | Path) -> object:
     """Read one legacy projection with durable terminal precedence."""
 

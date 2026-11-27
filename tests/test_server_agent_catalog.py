@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
 
 import pytest
 
-from tests.support.serve_contract import ServeContract
+from tests.support.owned import await_or_fail
+from tests.support.serve_contract import ServeClient, ServeContract
+from tests.support.sockets import short_socket_path
+from zeta.core.agent_progress import remove_live_agent_lifecycle
+from zeta.core.store import ConversationStore
 from zeta.server.handlers.resources import _agent_run_catalog as catalog
+from zeta.server.server import ZetaServer
 from zeta.storage_format import open_writer
 
 METHOD = "agent_run_catalog"
@@ -113,3 +119,56 @@ def test_catalog_bounds_metadata_reads_across_nonmatches(tmp_path: Path, monkeyp
         assert (after[2] if after is not None else None) == expected_path
         assert reads == ["agent_lifecycle.json"] * expected_count
         reads.clear()
+
+
+@pytest.mark.asyncio
+async def test_catalog_reads_local_live_progress(formatted_home: Path) -> None:
+    server = ZetaServer(
+        provider="codex", home=formatted_home, cwd=formatted_home.parent,
+        socket_path=short_socket_path(formatted_home.parent),
+    )
+    try:
+        await await_or_fail(server.start(), what="serve start")
+        reader, writer = await await_or_fail(
+            asyncio.open_unix_connection(str(server.socket_path)), what="catalog connect",
+        )
+        client = ServeClient(reader=reader, writer=writer)
+        try:
+            await client.request("hello", "hello", {
+                "protocol_version": "1.2", "features": ["agent_run_catalog_v1"],
+            })
+            with ConversationStore(formatted_home / "sessions" / "root" / "agents", session_id="1") as child:
+                try:
+                    child.start_agent_lifecycle(
+                        handle="root:1", started_at="2026-11-19T00:00:00+00:00",
+                        depth=1, agent_type="worker", description="test child",
+                    )
+                    durable = child.agent_lifecycle_path.read_bytes()
+                    for state, step, turns, calls in (
+                        ("running", "working", 2, 3),
+                        ("idle", "waiting", 3, 4),
+                        ("finishing", "reporting", 4, 5),
+                    ):
+                        child.update_agent_lifecycle(
+                            state=state, current_step=step, turns_used=turns,
+                            tool_calls=3 if state == "running" else 1,
+                        )
+                        reply = await client.request(state, METHOD)
+                        row, = reply["result"]["data"]["items"]
+                        assert (row["status"], row["current_step"], row["turns_used"], row["tool_count"]) == (
+                            state, step, turns, calls,
+                        )
+                        filtered = await client.request(state, METHOD, {"state": state})
+                        assert [item["run_id"] for item in filtered["result"]["data"]["items"]] == ["root:1"]
+                    assert child.agent_lifecycle_path.read_bytes() == durable
+                finally:
+                    remove_live_agent_lifecycle(child.agent_lifecycle_path)
+                reply = await client.request("durable", METHOD)
+                row, = reply["result"]["data"]["items"]
+                assert (row["status"], row["current_step"], row["turns_used"], row["tool_count"]) == (
+                    "running", "starting", 0, 0,
+                )
+        finally:
+            await client.close()
+    finally:
+        await server.close()

@@ -23,6 +23,7 @@ from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.agent.pending_delivery import StepDeliveryFlow
+from zeta.core.agent_progress import remove_live_agent_lifecycle
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -926,6 +927,29 @@ def _list_lines(navigation: AgentNavigation, width: int = 80) -> list[str]:
         text = "".join(fragment for _, fragment in fragments)
         console.print(Text(text))
     return output.getvalue().splitlines()
+
+
+def test_agent_list_refresh_shows_live_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 100.0
+    # test-contract: seam advances list debounce without sleeping
+    monkeypatch.setattr(agent_card, "_monotonic", lambda: now)
+    with (
+        ConversationStore(tmp_path / "sessions", session_id="root") as root,
+        ConversationStore(root.session_dir / "agents", session_id="1") as child,
+    ):
+        try:
+            child.start_agent_lifecycle(
+                handle="root:1", started_at="2026-11-19T00:00:00+00:00",
+                depth=1, agent_type="worker", description="test child",
+            )
+            navigation = AgentNavigation(root)
+            assert any("test child · worker · running" in line for line in _list_lines(navigation))
+            for state in ("idle", "finishing"):
+                child.update_agent_lifecycle(state=state)
+                now += 2
+                assert any(f"test child · worker · {state}" in line for line in _list_lines(navigation))
+        finally:
+            remove_live_agent_lifecycle(child.agent_lifecycle_path)
 
 
 def _list_fragments(
