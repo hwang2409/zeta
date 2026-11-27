@@ -44,12 +44,11 @@ async def test_shutdown_joins_marker_registration_before_suspending(tmp_path, mo
                 await await_or_fail(release.wait(), what="release marker commit")
             return await commit(command)
 
-        # test-contract: seam observe shutdown before releasing the marker commit.
-
         async def close_children():
             closed_admission.set()
             await close()
 
+        # test-contract: seam gate the real durable registration.
         monkeypatch.setattr(store, "_commit_storage_command", gated_commit)
         monkeypatch.setattr(loop._background_owner, "close_children", close_children)
         spawn = asyncio.create_task(runner.spawn_child(loop, agent_type="general", task="work", cwd=None))
@@ -121,7 +120,6 @@ async def test_recovery_reuses_episode_after_failure_before_activation(tmp_path,
         async def interrupt_notice(command):
             if isinstance(command, _AppendChildRecoveredCommand):
                 # test-contract: seam force interruption after runtime installation.
-
                 assert loop._background_owner.owns_running(run_id)
                 if boundary == "notice":
                     await original(command)
@@ -130,6 +128,7 @@ async def test_recovery_reuses_episode_after_failure_before_activation(tmp_path,
 
         try:
             with monkeypatch.context() as crash:
+                # test-contract: seam interrupt the two durable notice boundaries.
                 crash.setattr(store, "_commit_storage_command", interrupt_notice)
                 with pytest.raises(InterruptedError, match="interrupted before activation"):
                     await await_or_fail(activate_agent_children(loop), what="force crash boundary")

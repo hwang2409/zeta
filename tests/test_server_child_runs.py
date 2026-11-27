@@ -401,6 +401,7 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
         await root._commit_storage_command(_RegisterAgentChildCommand(
             tool_call=ToolCall("agent-call", "agent", {"background": True}),
             child_session_path=path, child_instance_id=run_id, description="work", background=True,
+            agent_type="general", accepts_follow_ups=False, explicit_finish=False, turns_used=0,
         ))
         for peer, expected in [(client, "suspended"), (observer, "running")]:
             listed = await peer.request("list", "child_run_list", {"session_id": session_id})
