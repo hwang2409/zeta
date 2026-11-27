@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ...core.agent_progress import read_agent_lifecycle
 from ...core.agent_state import LoadedAgentLifecycle
 from ...core.checkpoints import (
     ConversationEntry,
@@ -111,17 +112,21 @@ def agent_tree_signature(
 
 
 def _read_agent_lifecycle(path: Path) -> dict[str, object] | None:
-    root = path.absolute()
-    while root.parent.name == "agents":
-        root = root.parent.parent
-    if root == path.absolute():
-        return None
     try:
-        with ConversationStore(root.parent, session_id=root.name, _read_only=True, _must_exist=True) as parent:
-            lifecycle, _ = read_child_lifecycle(parent, path.absolute())
+        lifecycle = read_agent_lifecycle(path / "agent_lifecycle.json")
+        if not isinstance(lifecycle, dict):
+            return None
+        root = path.absolute()
+        while root.parent.name == "agents":
+            root = root.parent.parent
+        if root != path.absolute() and lifecycle.get("state") in {"running", "idle", "finishing"}:
+            with ConversationStore(root.parent, session_id=root.name, _read_only=True, _must_exist=True) as parent:
+                durable, _ = read_child_lifecycle(parent, path.absolute())
+                if isinstance(durable, LoadedAgentLifecycle) and durable.value.get("state") == "suspended":
+                    return durable.value
+        return lifecycle
     except (ConversationIntegrityError, OSError, ValueError):
         return None
-    return lifecycle.value if isinstance(lifecycle, LoadedAgentLifecycle) else None
 
 
 

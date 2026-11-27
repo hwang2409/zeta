@@ -154,3 +154,90 @@ async def test_recovery_reuses_episode_after_failure_before_activation(tmp_path,
             assert "recovered" in output.getvalue()
         finally:
             await await_or_fail(loop.close(), what="close recovered runtime")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["pending", "selected", "unavailable"])
+async def test_resume_reconstructs_saved_model_accounts_and_lifetime_budget(tmp_path, monkeypatch, phase):
+    from types import SimpleNamespace
+
+    from zeta.agent.presets import GENERAL_PRESET
+    from zeta.agent.resume_descriptor import preset_snapshot
+    from zeta.protocol.types import ToolCall
+
+    accounts = {"codex": "codex:saved"}
+    restarts = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    model = "gpt-5.6-luna"
+
+    class Accounts:
+        def child_snapshot(self, provider):
+            restarts.append(("select", provider))
+            return SimpleNamespace(snapshot=lambda: accounts)
+
+        def restore_child_snapshot(self, provider, pins):
+            restarts.append(("restore", provider, pins))
+            return SimpleNamespace(snapshot=lambda: pins)
+
+    def resolve(loop, requested, *, pinned_context):
+        assert requested == model
+        assert pinned_context.snapshot() == accounts
+        if phase == "unavailable":
+            return None, "model unavailable"
+        return loop.backend, None
+
+    async def consume(child, prompt, **kwargs):
+        control = child.child_turn_control
+        restarts.append(("execute", control.used, control.limit, prompt))
+        entered.set()
+        await await_or_fail(release.wait(), what="release resumed child")
+
+    monkeypatch.setattr("zeta.agent.resume_child.resolve_child_backend", resolve)
+    monkeypatch.setattr(runner, "consume_child", consume)
+    root = tmp_path / "sessions"
+    with ConversationStore(root, cwd=tmp_path) as store:
+        session_id = store.session_id
+        run_id = f"{session_id}:1"
+        with ConversationStore(store.session_dir / "agents", session_id="1") as child:
+            child.start_agent_lifecycle(handle=run_id, started_at="2026-11-08T00:00:00+00:00", depth=1, agent_type="general", description="saved work")
+            path = child.session_dir
+        store.register_agent_child(
+            ToolCall("saved-call", "agent", {"model": model, "max_turns": 4}),
+            child_session_path=str(path), child_instance_id=run_id, description="saved work",
+            background=True, agent_type="general", turns_used=3,
+            resume={
+                "preset": preset_snapshot(GENERAL_PRESET), "requested_model": model,
+                "model": model, "provider": "codex", "requested_max_turns": 4,
+                "effective_max_turns": 4, "depth": 1, "cwd": str(tmp_path),
+                "description": "saved work", "background": True, "follow_up": False,
+                "explicit_finish": False, "account_pins": "pending" if phase == "pending" else "selected",
+                "selected_accounts": {} if phase == "pending" else accounts,
+            },
+        )
+
+    with ConversationStore(root, session_id=session_id, cwd=tmp_path) as store:
+        loop = _loop(store)
+        loop.account_context = Accounts()
+        try:
+            before, _ = read_child_lifecycle(store, path)
+            assert isinstance(before, LoadedAgentLifecycle)
+            assert before.value["state"] == "suspended"
+            await await_or_fail(activate_agent_children(loop), what="resume saved descriptor")
+            assert restarts[0] == (("select", "codex") if phase == "pending" else ("restore", "codex", accounts))
+            descriptor = store.agent_children()[run_id]["resume"]
+            assert (descriptor["account_pins"], descriptor["selected_accounts"]) == ("selected", accounts)
+            if phase == "unavailable":
+                blocked, _ = read_child_lifecycle(store, path)
+                assert isinstance(blocked, LoadedAgentLifecycle)
+                assert blocked.value["state"] == "suspended"
+                assert "unavailable" in blocked.value["recovery_blocked"]
+                assert not entered.is_set()
+                assert not store.agent_notifications(pending_only=False)
+            else:
+                await await_or_fail(entered.wait(), what="resumed child executes")
+                assert restarts[1][:3] == ("execute", 3, 4)
+                assert "parent crashed" in restarts[1][3]
+        finally:
+            await await_or_fail(loop.close(), what="close reconstructed runtime")
+            release.set()
