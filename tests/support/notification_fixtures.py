@@ -12,6 +12,17 @@ def notification_payloads() -> dict[str, dict[str, object]]:
             "status": "completed",
             "text": "done",
         },
+        "child_recovered": {
+            "origin": "notification",
+            "kind": "child_recovered",
+            "logical_id": "child-recovered:root:1:1",
+            "child_instance_id": "root:1",
+            "episode": 1,
+            "child_session_path": "/sessions/root/agents/1",
+            "description": "worker",
+            "text": "child recovered",
+            "display_only": True,
+        },
         "child_idle": {
             "origin": "notification",
             "kind": "child_idle",

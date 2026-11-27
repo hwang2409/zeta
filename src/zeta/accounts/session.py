@@ -279,6 +279,15 @@ class SessionAccountContext:
             _unavailable_accounts=self._unavailable_accounts,
         )
 
+    def restore_child_snapshot(self, provider: str, pins: dict[str, str]) -> SessionAccountContext:
+        context = SessionAccountContext(
+            self.home, self.store, None, self.metadata,
+            {name: AccountId(*value.split(":", 1)) for name, value in pins.items()},
+            _frozen=True, _active_provider=account_provider(provider),
+        )
+        context._validate_pins()
+        return context
+
     async def switch_active(
         self,
         loop: Any,

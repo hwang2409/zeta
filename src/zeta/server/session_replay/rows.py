@@ -159,6 +159,7 @@ def _notification(fields: Mapping[str, Any], facts: RowFacts, owner: str | None)
 _NOTIFICATION_EVENTS = (
     EventDescriptor.SUB_AGENT_RECEIPT,
     EventDescriptor.CHILD_IDLE,
+    EventDescriptor.CHILD_RECOVERED,
     EventDescriptor.TASK_EXIT_NOTIFICATION,
     EventDescriptor.PROJECT_INBOX_NOTIFICATION,
     EventDescriptor.CHILD_QUESTION,

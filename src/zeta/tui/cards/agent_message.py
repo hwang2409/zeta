@@ -458,6 +458,11 @@ def render_agent_notification_message(
         return _render_child_question(event, identities)
     if kind == "child_question_withdrawn":
         return _render_child_question_withdrawn(event, identities)
+    if kind == "child_recovered":
+        identity = _notification_identity(event, identities)
+        if identity is None:
+            return _unavailable_notification()
+        return render_agent_message(agent_header("recovered", "←", identity, state="running"), state="running")
     if kind == "child_idle":
         return _render_child_idle(event, identities)
     if kind == "child_hold":

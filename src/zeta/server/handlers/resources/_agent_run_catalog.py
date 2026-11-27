@@ -15,11 +15,14 @@ from ....core.child_runs import (
     NONTERMINAL_AGENT_STATES,
     TERMINAL_AGENT_STATES,
     child_run_directories,
+    child_run_for_features,
     project_agent_status,
     project_child_run_row,
+    project_orphaned_lifecycle,
     run_row_identity,
 )
 from ....core.session import validate_session_id
+from ....core.session_execution import execution_owner_state
 from ....core.session_files import child_directory, open_session_file, session_root
 from ....core.store._child_runs import parse_child_run_id
 
@@ -63,28 +66,38 @@ def _metadata(fd: int, name: str) -> Any:
     return load_session_json(raw)
 
 
-def _follow_ups(fd: int, run_id: str) -> bool:
+def _marker(fd: int, run_id: str) -> dict[str, Any]:
     try:
-        markers = _metadata(fd, "session_state.json").get("agent_children", {})
-        return any(
-            isinstance(marker, dict) and marker.get("child_instance_id") == run_id
-            and marker.get("accepts_follow_ups") is True for marker in markers.values()
-        )
+        marker = _metadata(fd, "session_state.json").get("agent_children", {}).get(run_id)
+        return marker if isinstance(marker, dict) else {}
     except (OSError, ValueError, AttributeError):
-        return False
+        return {}
 
 
-def _row(fd: int, parent_fd: int, run_id: str, state: str | None) -> dict[str, Any] | None:
+def _row(fd: int, parent_fd: int, run_id: str, state: str | None, child_recovery: bool, home: Path) -> dict[str, Any] | None:
     try:
         lifecycle = _validate_status_lifecycle(_metadata(fd, "agent_lifecycle.json"))
-        if state is not None and lifecycle["state"] != state:
+        if state in TERMINAL_AGENT_STATES and lifecycle["state"] != state:
             return None
+        if lifecycle["state"] in TERMINAL_AGENT_STATES and state is not None and lifecycle["state"] != state:
+            return None
+        marker = _marker(parent_fd, run_id)
+        root, *segments = run_id.split(":")
+        path = home / "sessions" / root
+        for segment in segments:
+            path = path / "agents" / segment
+        lifecycle = project_orphaned_lifecycle(lifecycle, execution_owner_state(fd), marker, child_path=path)
         item = project_agent_status(lifecycle, run_id, notifications=())
         session_id, parent_run_id = run_row_identity(run_id)
-        return project_child_run_row(
+        row = project_child_run_row(
             item, session_id=session_id, parent_run_id=parent_run_id,
-            accepts_follow_ups=_follow_ups(parent_fd, run_id),
+            accepts_follow_ups=False,
         )
+        row = child_run_for_features(row, child_recovery=child_recovery)
+        if state is not None and row["status"] != state:
+            return None
+        row["accepts_follow_ups"] = marker.get("accepts_follow_ups") is True
+        return row
     except (OSError, ValueError, TypeError, OverflowError, RecursionError):
         return None
 
@@ -140,7 +153,7 @@ def _candidates(
 
 
 def read_page(
-    home: Path, *, root_id: str | None, state: str | None, after: Position | None, limit: int,
+    home: Path, *, root_id: str | None, state: str | None, after: Position | None, limit: int, child_recovery: bool = False,
 ) -> tuple[list[dict[str, Any]], list[Position], Position | None]:
     """Return public rows, their keys, and a continuation after the last scan position.
 
@@ -161,7 +174,7 @@ def read_page(
                     return rows, keys, scanned
                 scanned = key
                 if child_fd is not None:
-                    row = _row(child_fd, parent_fd, f"{key[1]}:{key[2]}", state)
+                    row = _row(child_fd, parent_fd, f"{key[1]}:{key[2]}", state, child_recovery, home)
                     if row is not None:
                         rows.append(row)
                         keys.append(key)

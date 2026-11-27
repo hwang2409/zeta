@@ -65,6 +65,7 @@ async def agent_run_catalog(client, request_id, params, controller):
     return await run_owner(
         client, lambda: catalog.read_page(
             client.server.home, root_id=root_id, state=state, after=start.position, limit=limit,
+            child_recovery="child_recovery" in client.features,
         ),
         family="agent_run_catalog",
         project=lambda page: _public_page(page, start, lambda result: client.codec.response_fits(request_id, result)),

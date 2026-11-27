@@ -387,6 +387,8 @@ def select_legacy_child_lifecycle(
     """Select a read projection; a valid durable terminal value always wins."""
 
     if type(durable) is dict:
+        if durable.get("state") == "suspended":
+            return dict(durable)
         try:
             record = parse_legacy_child_lifecycle(durable)
         except ValueError:

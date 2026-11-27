@@ -7,7 +7,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
-from zeta.agent import runner
+from zeta.agent import child_run_owner, runner
 from zeta.agent.child_run_owner import ChildRunTransitionOwner
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.child_runs import LoadedAgentLifecycle, read_child_lifecycle
@@ -54,6 +54,8 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
         running.set()
         await await_or_fail(finish_model.wait(), what="child runs until canceled")
 
+    # Keep the original cancellation matrix at the last pre-recovery epoch.
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":12}\n')
     with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
         loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
         owner = loop._background_owner
@@ -79,6 +81,7 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
 
         # test-contract: seam pause at the real owner operation, not a timed race.
         monkeypatch.setattr(runner, "await_joined_offload", offload)
+        monkeypatch.setattr(child_run_owner, "await_joined_offload", offload)
         if point == "lineage":
             def publish(link):
                 pass
@@ -183,9 +186,9 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
 
                     monkeypatch.setattr(owner, "cancel_and_wait", cancel_after_exit)
                 if point == "success":
-                    assert await asyncio.wait_for(runner.cancel_child_run(loop, run_id), 10) == "cancelling"
+                    assert await asyncio.wait_for(child_run_owner.cancel_child_run(loop, run_id), 10) == "cancelling"
                 else:
-                    task = asyncio.create_task(runner.cancel_child_run(loop, run_id))
+                    task = asyncio.create_task(child_run_owner.cancel_child_run(loop, run_id))
                     tasks.append(task)
                     await await_or_fail(entered.wait(), what=point)
                     task.cancel()
@@ -254,7 +257,7 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
             assert child_store.directory_fd == -1
             if not closed:
                 for _ in range(2):
-                    assert await asyncio.wait_for(runner.cancel_child_run(loop, run_id), 10) == "canceled"
+                    assert await asyncio.wait_for(child_run_owner.cancel_child_run(loop, run_id), 10) == "canceled"
         finally:
             finish_model.set()
             release.set()

@@ -342,6 +342,7 @@ class _RegisterAgentChildCommand(_StoreMutationCommand):
     accepts_follow_ups: bool
     explicit_finish: bool
     turns_used: int
+    resume: dict[str, Any] | None = None
 
     def apply(self, store: Any) -> Any:
         return store.register_agent_child(
@@ -354,7 +355,86 @@ class _RegisterAgentChildCommand(_StoreMutationCommand):
             accepts_follow_ups=self.accepts_follow_ups,
             explicit_finish=self.explicit_finish,
             turns_used=self.turns_used,
+            resume=self.resume,
         )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _SelectChildAccountsCommand(_StoreMutationCommand):
+    run_id: str
+    pins: dict[str, str]
+
+    def apply(self, store: Any) -> None:
+        store.select_child_accounts(self.run_id, self.pins)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ChildTurnsCommand(_StoreMutationCommand):
+    run_id: str
+    turns: int
+
+    def apply(self, store: Any) -> None:
+        store.persist_agent_child_turns(self.run_id, self.turns)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ChildActivityCommand(_StoreMutationCommand):
+    state: str | None = None
+    turns: int | None = None
+
+    def apply(self, store: Any) -> None:
+        store.persist_child_activity(state=self.state, turns=self.turns)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ChildSuspensionCommand(_StoreMutationCommand):
+    reason: str | None = None
+    activate: int | None = None
+    blocked: str | None = None
+
+    def apply(self, store: Any) -> Any:
+        return store.transition_agent_suspension(reason=self.reason, activate=self.activate, blocked=self.blocked)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _RepairChildInterruptionCommand(_StoreMutationCommand):
+    def apply(self, store: Any) -> None:
+        from ...protocol.types import Message, MessageRole, TextContent, ToolUseContent
+        from ...runtime.approval_recovery import recover_store_approvals
+        from ..approval import canceled_result
+
+        pending = dict.fromkeys(
+            item.tool_call.id
+            for ref in store.branch_refs() if ref.type == "message"
+            for item in Message.from_dict(store.entry(ref).data["message"]).content
+            if isinstance(item, ToolUseContent) and item.tool_call.id not in store._delivery_fold.tool_result_seqs
+        )
+        recover_store_approvals(store, store._storage_lease.observed_epoch)
+        for call_id in pending:
+            if store.tool_result(call_id) is None:
+                result = canceled_result(call_id)
+                store.append_message(Message(
+                    MessageRole.TOOL_RESULT, [TextContent(result.content)], tool_result=result,
+                ))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _CloseChildApprovalHistoryCommand(_StoreMutationCommand):
+    payload: dict[str, object]
+
+    def apply(self, store: Any) -> None:
+        store.append_approval_history_end_if_absent(self.payload)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _AppendChildRecoveredCommand(_StoreMutationCommand):
+    run_id: str
+    episode: int
+    path: str
+    description: str
+
+    def apply(self, store: Any) -> Any:
+        return store.append_child_recovered(self.run_id, self.episode, path=self.path, description=self.description)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

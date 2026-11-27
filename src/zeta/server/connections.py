@@ -99,6 +99,7 @@ EVENT_FEATURES = {
     EventDescriptor.TOOL_END: NO_FEATURE,
     EventDescriptor.SUB_AGENT_RECEIPT: NO_FEATURE,
     EventDescriptor.CHILD_IDLE: NO_FEATURE,
+    EventDescriptor.CHILD_RECOVERED: _EventRoute(frozenset({"child_recovery"})),
     EventDescriptor.CHILD_HOLD: NO_FEATURE,
     EventDescriptor.TASK_EXIT_NOTIFICATION: NO_FEATURE,
     EventDescriptor.PROJECT_INBOX_NOTIFICATION: NO_FEATURE,
@@ -461,6 +462,14 @@ class ConnectionRegistry(ReplayOutput):
     def _shape_event_fields(
         event: EventDescriptor, fields: dict[str, object], features: frozenset[str],
     ) -> dict[str, object]:
+        from ..core.child_runs import child_run_for_features
+
+        if event in {EventDescriptor.CHILD_STARTED, EventDescriptor.CHILD_PROGRESS, EventDescriptor.CHILD_ENDED}:
+            child = fields.get("child")
+            if isinstance(child, dict):
+                row = child_run_for_features(child, child_recovery="child_recovery" in features)
+                if row is not child:
+                    fields = {**fields, "child": row}
         if event is EventDescriptor.TOOL_START and "tool_approval_origin" not in features:
             tool_call = fields.get("tool_call")
             if isinstance(tool_call, dict) and "approval_origin" in tool_call:
@@ -1068,7 +1077,7 @@ class ConnectionRegistry(ReplayOutput):
                 ),
                 selected,
             )
-        return self._strip_restart_reason(connection, result)
+        return self._shape_history_for_features(connection, result)
 
     async def read_content(
         self, connection: Any, params: dict[str, Any], controller: SessionUse
@@ -1133,7 +1142,7 @@ class ConnectionRegistry(ReplayOutput):
                 ),
                 selected,
             )
-        return self._strip_restart_reason(connection, result)
+        return self._shape_history_for_features(connection, result)
 
     async def read_child_run_events(
         self, connection: Any, params: dict[str, Any], controller: SessionUse
@@ -1152,11 +1161,11 @@ class ConnectionRegistry(ReplayOutput):
                 fidelity="session_history_fidelity" in features,
                 approval_origin="tool_approval_origin" in features,
             )
-            from ..core.agent_progress import read_agent_lifecycle
-            from ..core.child_runs import project_child_run_row
+            from ..core.agent_state import LoadedAgentLifecycle
+            from ..core.child_runs import project_child_run_row, read_child_lifecycle
             reader = self._child_reader_for(target[1], params["run_id"])
-            lifecycle = read_agent_lifecycle(reader.session_dir / "agent_lifecycle.json")
-            item = lifecycle if isinstance(lifecycle, dict) else None
+            lifecycle, _ = read_child_lifecycle(target[1], reader.session_dir.absolute())
+            item = lifecycle.value if isinstance(lifecycle, LoadedAgentLifecycle) else None
             if item is not None:
                 item = {"handle": item.get("handle"), "description": item.get("description", ""), "agent_type": item.get("agent_type", "general"), "state": item.get("state", "running"), "turns_used": item.get("turns_used", 0), "tool_calls": item.get("tool_calls", 0), "current_step": item.get("current_step", ""), "started_at": item.get("started_at"), "finished_at": item.get("finished_at"), "elapsed": item.get("elapsed", 0.0), "account_status": item.get("account_status")}
             row = None
