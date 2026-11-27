@@ -192,7 +192,11 @@ async def consume_child(
             if await hold_wake.observe(event):
                 if not background and foreground_hold_abandoned(event.data):
                     raise ForegroundChildHeld(foreground_hold_text(event.data))
-                status = f"turn {child_turns() + 1}: {rate_limit_hold_text(event.data)}"
+                account_text = hold_wake.held_account_text()
+                hold_text = rate_limit_hold_text(event.data, pinned=account_text is not None)
+                status = f"turn {child_turns() + 1}: {hold_text}"
+                if account_text is not None:
+                    status += f"; {account_text}"
                 update_step(status)
                 publish(status)
             elif event.type is StreamEventType.TOOL_APPROVAL_START:
@@ -532,6 +536,7 @@ async def _build_child_loop(
                 child_scope.project_dir if child_scope is not None else None
             ),
             freeze_live_config=child_scope is None,
+            configured_model=loop.configured_model,
             telemetry=loop.telemetry,
         )
 
@@ -595,9 +600,10 @@ async def run_agent_tool(
 
 
 class ChildControlError(Exception):
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, detail: str | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.detail = detail
 
 
 async def spawn_child(
@@ -678,9 +684,11 @@ async def _run_child(
         # Existing markers and cards use a call id; no tool execution is admitted.
         tool_call = ToolCall(f"spawn-{uuid4().hex}", "agent", arguments)
 
-    def failure(text: str, *, code: str = "invalid_params") -> dict[str, object]:
+    def failure(
+        text: str, *, code: str = "invalid_params", public_detail: bool = False
+    ) -> dict[str, object]:
         if external:
-            raise ChildControlError(code)
+            raise ChildControlError(code, detail=text if public_detail else None)
         return loop._child_result_payload(tool_call.id, text, state="failed")
 
     prompt = arguments.get("prompt")
@@ -733,7 +741,19 @@ async def _run_child(
         return failure(
             "agent error: max_turns must be a positive integer",
         )
+    if model is not None:
+        allowed = loop.allowed_child_models()
+        if allowed is not None and model not in allowed:
+            return failure(
+                "agent error: model override is not allowed; allowed models: "
+                + (", ".join(allowed) or "none"),
+            )
     raw_cwd = arguments.get("cwd")
+    if raw_cwd is None and preset.requires_cwd:
+        return failure(
+            f"agent error: preset {preset.name!r} requires cwd; pass the intended worktree path",
+            public_detail=True,
+        )
     child_cwd = str(loop.store.cwd)
     cwd_override: str | None = None
     if raw_cwd is not None:
@@ -1300,16 +1320,18 @@ async def _run_installed_child(
     async def run_child() -> dict[str, object]:
         if spawn_ready is not None:
             await spawn_ready.wait()
+        hold_wake = HoldWake(
+            loop._background_owner.conversation_channel if background else None,
+            child_instance_id, child_path, description, child_account_pins, child_store,
+        )
+        await hold_wake.start()
         result = await consume(
             child_loop,
             prompt,
             **run_kwargs,
             child_path=child_path,
             publish=publish,
-            hold_wake=HoldWake(
-                loop._background_owner.conversation_channel,
-                child_instance_id, child_path, description, child_account_pins,
-            ) if background else NO_HOLD_WAKE,
+            hold_wake=hold_wake,
             child_turns=child_turns,
             update_turns=update_turns,
             record_tool_call=record_tool_call,

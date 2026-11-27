@@ -20,9 +20,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-MAX_MULTI_CONTROLLERS = 4
-MAX_RESIDENT_RECORDS = 8
+MAX_MULTI_CONTROLLERS = 16
 MAX_PARKED_RECORDS = 3
+# resident cap bounds total loaded records: 16 session holders, one sessionless record,
+# and three records of room for parked, grace, or closing records across all connections.
+MAX_RESIDENT_RECORDS = MAX_MULTI_CONTROLLERS + 1 + MAX_PARKED_RECORDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,7 +230,8 @@ class SessionControllers:
                     "another client is already connected",
                 )
         elif self._controller_mode != requested or (
-            requested == "legacy" or len(self._controller_members) >= MAX_MULTI_CONTROLLERS
+            requested == "legacy"
+            or len(self._by_connection) >= MAX_MULTI_CONTROLLERS
         ):
             raise ProtocolError(
                 ErrorDescriptor.CONNECTION_CAPACITY,

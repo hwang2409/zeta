@@ -34,6 +34,7 @@ class AgentPreset:
     explicit_finish: bool = False
     max_child_depth: int | None = None
     max_turns: int | None = None
+    requires_cwd: bool = False
 
     @property
     def description(self) -> str:

@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from ..accounts.session import account_provider
+from ..accounts.session import SessionAccountContext, account_provider
+from ..accounts.status import AccountStatus, account_status_text
 from ..core.agent_progress import publish_child_ended
 from ..core.checkpoints import ConversationEntry
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
@@ -148,9 +149,8 @@ class HoldWake:
     """Wake the parent once per long provider hold of one background child.
 
     A long hold is a stall with a known end. Re-probes that re-enter the hold
-    are the same hold; a response, turn end, or error ends it. A foreground
-    parent is blocked on the agent call, so foreground children get the inert
-    ``NO_HOLD_WAKE``, which only recognizes hold events.
+    are the same hold; a response, turn end, or error ends it. Foreground children
+    record their status but do not wake their blocked parent.
     """
 
     def __init__(
@@ -159,24 +159,57 @@ class HoldWake:
         child_instance_id: str = "",
         child_session_path: str = "",
         description: str = "",
-        accounts: Mapping[str, object] | None = None,
+        accounts: Mapping[str, object] | SessionAccountContext | None = None,
+        child_store: ConversationStore | None = None,
     ) -> None:
         self._channel = channel
         self._child = (child_instance_id, child_session_path, description)
         self._accounts = accounts or {}
         self._woken = False
+        self._store = child_store
+        self._status: AccountStatus | None = None
+
+    async def start(self) -> None:
+        await self._update_status(held=False)
+
+    async def _update_status(self, *, held: bool) -> None:
+        if self._store is None or not isinstance(self._accounts, SessionAccountContext):
+            return
+        statuses = await asyncio.to_thread(self._accounts.status_snapshot, held=held)
+        if statuses:
+            self._status = statuses[0]
+        elif self._status is not None:
+            self._status = {
+                **self._status, "held": held, "usable_alternatives": 0,
+                "cached_used_percent": None,
+            }
+        if self._status is not None:
+            self._store.update_agent_lifecycle(account_status=self._status)
+
+    def held_account_text(self) -> str | None:
+        if self._status is not None and self._status["held"]:
+            return account_status_text(self._status)
+        return None
 
     async def observe(self, event: StreamEvent) -> bool:
         """Return whether ``event`` is a provider hold; wake on the first long one."""
 
         if event.type in _HOLD_ENDS:
             self._woken = False
+            if self._status is not None and self._status["held"]:
+                self._status = {**self._status, "held": False}
+                assert self._store is not None
+                self._store.update_agent_lifecycle(
+                    account_status=self._status, current_step="provider hold ended"
+                )
         if (
             event.type is not StreamEventType.RETRY
             or event.data.get("kind") != "provider_rate_limit_hold"
         ):
             return False
         hold = event.data
+        if self._status is None or not self._status["held"]:
+            await self._update_status(held=True)
         if (
             self._channel is None
             or self._woken
@@ -200,6 +233,7 @@ class HoldWake:
                 description=description,
                 hold=hold,
                 account=hold.get("account") or (None if pinned is None else str(pinned)),
+                status=self._status,
             )
         return True
 
@@ -360,6 +394,7 @@ class ConversationChannel:
         description: str,
         hold: Mapping[str, Any],
         account: str | None,
+        status: AccountStatus | None = None,
     ) -> None:
         """Wake the parent once: a long provider hold is a stall with a known end."""
 
@@ -384,8 +419,13 @@ class ConversationChannel:
             "text": (
                 f"child {child_instance_id} is held by a {cause} on "
                 f"{account or hold['provider']} until {until} (as of {observed_at}); "
-                "a running child resumes by itself; cancel and restart it on another model or "
-                "account if you cannot wait."
+                + (f"{account_status_text(status)}. " if status is not None else "")
+                + (
+                    "This child waits and retries on its pinned account. Switching the parent "
+                    "account affects new children, not this hold. "
+                    if account is not None else "This child waits and retries. "
+                )
+                + "A hold on one child does not mean the provider is exhausted."
             ),
         }
         await self.produce_to_live_parent(

@@ -76,14 +76,15 @@ def foreground_hold_text(data: Mapping[str, Any]) -> str:
     )
 
 
-def rate_limit_hold_text(data: Mapping[str, Any]) -> str:
+def rate_limit_hold_text(data: Mapping[str, Any], *, pinned: bool = False) -> str:
     """Describe a rate-limit hold event as local wall time plus the next probe."""
 
     until = datetime.fromtimestamp(data["until"]).astimezone()
     today = datetime.now().astimezone().date()
     stamp = until.strftime("%H:%M" if until.date() == today else "%b %d %H:%M")
     if data.get("limit") == "subscription":
-        return f"subscription limit until {stamp}; switch account or log in to resume"
+        recovery = "log in on the pinned account to retry sooner" if pinned else "switch account or log in to resume"
+        return f"subscription limit until {stamp}; {recovery}"
     return (
         f"rate-limited until {stamp} (provider asks {format_duration(data['retry_after'])}); "
         f"checking again in {format_duration(data['delay'])}"

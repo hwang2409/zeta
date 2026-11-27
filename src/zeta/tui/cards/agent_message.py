@@ -11,6 +11,7 @@ from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
 
+from ...accounts.status import account_status_text, project_account_status
 from ...agent.receipt import (
     finish_report_truncation_note,
     has_agent_receipt_suffix,
@@ -329,7 +330,12 @@ def _agent_status_row(
             fields.append(value)
     row = " · ".join(fields)
     reason = child.get("reason")
-    return f"{row} — {reason}" if isinstance(reason, str) and reason else row
+    if isinstance(reason, str) and reason:
+        row = f"{row} — {reason}"
+    account = project_account_status(child.get("account_status"))
+    if account is not None and account["held"]:
+        row += "\n  " + account_status_text(account)
+    return row
 
 
 def _render_agent_status(
@@ -370,7 +376,13 @@ def _render_agent_status(
     finished_omitted = structured.get("finished_omitted")
     if type(finished_omitted) is int and finished_omitted > 0:
         pagination.append(f"{finished_omitted} finished omitted")
-    body_rows = ([" · ".join(pagination)] if pagination else []) + rows
+    accounts = structured.get("session_account_status")
+    account_rows = [
+        "session account: " + account_status_text(status)
+        for value in accounts
+        if (status := project_account_status(value)) is not None
+    ] if isinstance(accounts, list) else []
+    body_rows = ([" · ".join(pagination)] if pagination else []) + account_rows + rows
     body = "\n".join(body_rows) or "no children"
     return render_agent_message(header, body=body)
 

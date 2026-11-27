@@ -61,6 +61,12 @@ class ReplyConflict(ValueError):
     """A terminal conflict between an existing and requested reply."""
 
 
+class TerminalReplyConflict(ReplyConflict):
+    def __init__(self, record: AttentionRecord) -> None:
+        super().__init__("attention item is already resolved with a different reply")
+        self.record = record
+
+
 class AttentionReplies:
     """The only owner of terminal attention transitions for one source session."""
 
@@ -118,9 +124,7 @@ class AttentionReplies:
             self._check_session(record)
             if record.status == "resolved":
                 if record.decision != reply:
-                    self._raise_conflict(
-                        "attention item is already resolved with a different reply"
-                    )
+                    raise TerminalReplyConflict(record)
                 return self._outcome(
                     recovered,
                     items=(ReplyItemOutcome(attention_id, "already-resolved"),),
@@ -315,9 +319,7 @@ class AttentionReplies:
             message_id = self._message_id([(attention_id, reply)])
             if record.status == "resolved":
                 if record.decision != reply:
-                    self._raise_conflict(
-                        "attention item is already resolved with a different reply"
-                    )
+                    raise TerminalReplyConflict(record)
                 return self._outcome(
                     recovered,
                     items=(ReplyItemOutcome(attention_id, "already-resolved"),),

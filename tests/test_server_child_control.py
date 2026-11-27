@@ -94,6 +94,29 @@ async def test_child_control_rejects_observer_and_invalid_inputs_before_persiste
 
 
 @pytest.mark.asyncio
+async def test_serve_spawn_reports_required_profile_cwd(tmp_path):
+    profiles = tmp_path / "agents"
+    profiles.mkdir()
+    (profiles / "implementer.md").write_text(
+        "---\nname: implementer\ndescription: implementation\nrequires_cwd: true\n"
+        "---\nImplement.\n"
+    )
+    backend = FakeBackend([ScriptedTurn([TextContent("unexpected spawn")])])
+    async with _session(tmp_path, backend) as (server, controller, session_id):
+        reply = await controller.request(3, "child_run_spawn", {
+            "session_id": session_id, "agent_type": "implementer", "task": "test spawn",
+        })
+        assert "error" in reply, "serve accepted a profile that requires cwd"
+        assert reply["error"]["code"] == -32602
+        assert reply["error"]["data"]["detail"] == (
+            "agent error: preset 'implementer' requires cwd; pass the intended worktree path"
+        )
+        store = server.controllers.attached().runtime.loop.store
+        assert not (store.session_dir / "agents").exists()
+        assert not backend.calls
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("winner", ["completed", "canceled"])
 async def test_serve_spawn_lifecycle_and_cancel_race(tmp_path, monkeypatch, winner):
     backend = _GatedChild()
