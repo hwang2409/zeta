@@ -376,6 +376,7 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
 
 @pytest.mark.asyncio
 async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: Path) -> None:
+    from zeta.agent.child_run_owner import ChildRunTransitionOwner
     from zeta.agent.turn_limit import append_child_start
     from zeta.core.agent_progress import post_child_progress
     from zeta.protocol.types import StreamEvent, StreamEventType
@@ -470,6 +471,19 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
                 assert frame["data"]["next_retry_at"] == next_at
         legacy = await observer.request("after", "session_history_and_subscribe", {"session_id": session_id})
         assert not any(row.get("event") == "child_suspended" for row in legacy["result"]["messages"])
+
+        child = await asyncio.to_thread(
+            ConversationStore, root.session_dir / "agents", session_id="1", _storage_lease=root._storage_lease,
+        )
+        try:
+            owner = ChildRunTransitionOwner(child, "agent-call", background=True)
+            assert await owner.cancel()
+        finally:
+            await asyncio.to_thread(child.close)
+        listed = await client.request("after-cancel", "child_run_list", {"session_id": session_id})
+        [row] = listed["result"]["runs"]
+        check_row(row, "canceled")
+        assert "retrying" not in row["current_step"]
     finally:
         if observer is not None:
             await observer.close()
