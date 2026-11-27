@@ -20,6 +20,7 @@ from ..runtime.offload import await_joined_offload
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
     from .background_owner import BackgroundAgentOwner, CancellationRequest
+    from .turn_limit import ChildTurnControl
 
 
 class ChildRunTransitionOwner:
@@ -349,6 +350,12 @@ class ChildRunTransitionOwner:
                     killed_task_ids_truncated=None, canonical_receipt=canonical,
                 ))
                 self._winner = "complete"
+
+    def exhausted_turn_limit(self, control: ChildTurnControl | None) -> ChildTurnControl | None:
+        """Return the exhausted budget only if no durable finish won."""
+        if control is None or not control.exhausted or self.recovered_report() is not None:
+            return None
+        return control
 
     async def background_outcome(self) -> tuple[bool, dict[str, object] | None]:
         """Read the winning outcome after execution settles, before publication."""

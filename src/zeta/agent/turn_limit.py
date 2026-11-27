@@ -220,6 +220,7 @@ def project_payload(payload: dict[str, object], child_session_path: str) -> dict
 def background_turn_limit_state(
     *,
     result: object,
+    exhausted_control: ChildTurnControl | None,
     child_turns: Callable[[], int],
     child_loop: Any,
     child_instance_id: str,
@@ -230,18 +231,14 @@ def background_turn_limit_state(
     structured = (
         result.get("structuredContent", {}) if isinstance(result, dict) else {}
     )
-    control = getattr(child_loop, "child_turn_control", None)
-    turn_limited = control is not None and control.exhausted and not (
-        control.used > control.limit and isinstance(result, dict) and result.get("explicitFinishReport") is not None
-    )
     turns_used = max(child_turns(), int(structured.get("turns_used", 0)))
-    if not turn_limited:
+    if exhausted_control is None:
         return False, turns_used, None
     return (
         True,
         turns_used,
         background_fallback_handoff(
-            control=control,
+            control=exhausted_control,
             child_instance_id=child_instance_id,
             child_session_path=child_session_path,
             final_text=final_text,

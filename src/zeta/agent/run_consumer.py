@@ -228,8 +228,9 @@ async def consume_run(
                 },
             ))
 
+        flow = await child_loop._ensure_step_delivery()
         show_idle()
-        while owner.pending_questions():
+        while owner.pending_questions() and (settlement or not flow.has_pending_edge):
             action = await idle_lifecycle.wait_for_idle_action(
                 lambda: channel.wait(owner.run_id), owner, display_only=True,
             )
@@ -245,7 +246,6 @@ async def consume_run(
         if not await owner.reserve_question_settlement(control.used + 1):
             # Suspension or cancellation won before admission. The owner will settle the run.
             raise asyncio.CancelledError
-        flow = await child_loop._ensure_step_delivery()
         control.admit_settlement()
         flow.question_settlement = True
         try:

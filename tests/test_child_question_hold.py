@@ -223,3 +223,155 @@ async def test_reconciles_question_before_replay(tmp_path, monkeypatch, observe,
             assert len(loop.backend.calls) == 1
         finally:
             await await_or_fail(loop.close(), what="close resumed parent")
+
+
+def _tui_text(event):
+    from io import StringIO
+
+    from rich.console import Console
+
+    from zeta.tui.render import render_event
+
+    output = StringIO()
+    Console(file=output, width=100, color_system=None).print(render_event(event))
+    return output.getvalue()
+
+
+def _serve_notices(store):
+    from zeta.server.handlers.history_projection import _history_entry_rows
+
+    return [row["notification"] for entry in store.agent_notifications(pending_only=False)
+            for row in _history_entry_rows(entry, {})]
+
+
+@pytest.mark.asyncio
+async def test_cancel_closes_acknowledged_question(tmp_path, monkeypatch, observe):
+    from zeta.protocol.types import StreamEvent, StreamEventType
+
+    with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
+        loop = _loop(store, monkeypatch, [ScriptedTurn(tool_calls=[ASK, _finish("early")])])
+        reached, _ = observe
+        try:
+            run_id = await await_or_fail(runner.spawn_child(loop, agent_type="run", task="work", cwd=None),
+                                         what="start asking child")
+            await await_or_fail(reached.wait(), what="hold for answer")
+            card, = _cards(store)
+            assert "pending" in _tui_text(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=card.data))
+            store.acknowledge_agent_notification(card.id)
+            canceled = await loop.tool_registry.execute(ToolCall("cancel", "agent_cancel", {"handle": run_id}))
+            assert not canceled.get("isError"), canceled
+            await await_or_fail(loop._background_owner.wait(), what="finish cancellation")
+            assert store.agent_completion_notifications_by_child()[run_id].data["status"] == "canceled"
+            close_cards = [row for row in store.agent_notifications(pending_only=False)
+                           if row.data.get("kind") == "child_question_withdrawn"]
+            assert len(close_cards) == 1, "cancel must close the acknowledged question card once"
+            close, = close_cards
+            assert close.data["question_id"] == card.data["question_id"]
+            assert "withdrawn" in _tui_text(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=close.data))
+            assert [row["status"] for row in _serve_notices(store)
+                    if row.get("kind") == "child_question_withdrawn"] == ["withdrawn"]
+        finally:
+            await await_or_fail(loop.close(), what="close parent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["separate", "queued-together", "at-limit"])
+async def test_held_child_delivers_follow_ups_and_answer(tmp_path, monkeypatch, observe, mode):
+    first = ScriptedTurn(tool_calls=[ASK, _finish("early")])
+    follow_up = ScriptedTurn(tool_calls=[_finish("still-early")])
+    done = ScriptedTurn(tool_calls=[_finish("settled")])
+    with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
+        limit = mode == "at-limit"
+        loop = _loop(store, monkeypatch, [first, done] if limit else [first, follow_up, done],
+                     limit=1 if limit else None)
+        reached, ended = observe
+        release = asyncio.Event()
+        checkpoint = asyncio.Event()
+        channel = loop._background_owner.conversation_channel
+        if mode != "separate":
+            wait = channel.wait
+
+            async def hold_wake(run_id):
+                await wait(run_id)
+                await await_or_fail(release.wait(), what="queue both follow-ups before delivering either")
+
+            # test-contract: force both real deliveries to be queued before the child wakes.
+            monkeypatch.setattr(channel, "wait", hold_wake)
+        if mode == "queued-together":
+            consume = runner.consume_child
+
+            async def observe_delivery(*args, **kwargs):
+                result = await consume(*args, **kwargs)
+                if kwargs.get("notification_turn"):
+                    checkpoint.set()
+                return result
+
+            # test-contract: observe whether the real follow-up turn reached the model.
+            monkeypatch.setattr(runner, "consume_child", observe_delivery)
+        try:
+            run_id = await await_or_fail(runner.spawn_child(loop, agent_type="run", task="work", cwd=None),
+                                         what="start asking child")
+            await await_or_fail(reached.wait(), what="hold for answer")
+            card, = _cards(store)
+            owner = loop._background_owner
+            reached.clear()
+            assert await send_to_run(store, run_id, "plain follow-up", owner=owner,
+                                     channel=owner.conversation_channel) is None
+            if mode == "separate":
+                await await_or_fail(reached.wait(), what="return to hold after follow-up")
+                assert len(loop.backend.calls) == 2, "plain delivery must wake a child held for an answer"
+                assert not ended and _cards(store) == [card]
+            assert await _answer(loop, run_id, card) is None
+            release.set()
+            if mode == "queued-together":
+                await await_or_fail(checkpoint.wait(), what="process queued follow-ups")
+                assert len(loop.backend.calls) >= 2, "a second queued prompt must not defer the first provider call"
+            await await_or_fail(owner.wait(), what="finish after answer")
+            assert len(loop.backend.calls) == (2 if limit else 3)
+            assert b"plain follow-up" in loop.backend.request_bytes[1], "queued follow-up must reach the model"
+            assert loop.backend.request_bytes[-1].count(f"Re {card.data['question_id']}: approved".encode()) == 1
+            assert ended == [run_id]
+            receipts = [row for row in store.agent_notifications(pending_only=False)
+                        if row.data.get("kind") == "agent_completion"]
+            assert [row.data["status"] for row in receipts] == ["completed"]
+        finally:
+            release.set()
+            await await_or_fail(loop.close(), what="close parent")
+
+
+@pytest.mark.asyncio
+async def test_last_turn_finish_card_matches_durable_status(tmp_path, monkeypatch, observe):
+    from zeta.agent.turn_limit import project_notification_data
+    from zeta.protocol.types import StreamEvent, StreamEventType
+    from zeta.server.event_contract import tool_end
+
+    first = ScriptedTurn(tool_calls=[ASK, _finish("early")])
+    done = ScriptedTurn(tool_calls=[_finish("settled")])
+    with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
+        loop = _loop(store, monkeypatch, [first, done], limit=2)
+        events = []
+        loop.set_background_event_sink(events.append)
+        reached, _ = observe
+        try:
+            run_id = await await_or_fail(runner.spawn_child(loop, agent_type="run", task="work", cwd=None),
+                                         what="start asking child")
+            await await_or_fail(reached.wait(), what="hold for answer")
+            card, = _cards(store)
+            assert await _answer(loop, run_id, card) is None
+            await await_or_fail(loop._background_owner.wait(), what="finish on last allowed turn")
+            receipt = store.agent_completion_notifications_by_child()[run_id]
+            assert receipt.data["status"] == "completed"
+            terminal, = [event for event in events if event.type is StreamEventType.TOOL_EXECUTION_END
+                         and event.data.get("notification_id") == receipt.id]
+            rendered = _tui_text(terminal)
+            assert "completed" in rendered and "turn_limit" not in rendered, "TUI finish card must match durable completion"
+            assert tool_end(terminal)["tool_result"]["structured_content"].get("status") != "turn_limit", (
+                "serve tool_end must not project a turn limit over accepted finish"
+            )
+            notice = StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=project_notification_data(receipt.data))
+            rendered = _tui_text(notice)
+            assert "completed" in rendered and "turn_limit" not in rendered
+            assert [row["status"] for row in _serve_notices(store)
+                    if row.get("kind") == "agent_completion"] == ["completed"]
+        finally:
+            await await_or_fail(loop.close(), what="close parent")
