@@ -1630,7 +1630,7 @@ class IdleParentRoutingBackend(CompletionBackend):
             self.lead_follow_up_seen.set()
         return [TextContent("WAIT")] if call == 3 or new_question or follow_up else []
 
-    async def _worker_blocks(self, call: int) -> list[TextContent | ToolUseContent]:
+    async def _worker_blocks(self, call: int, messages: Sequence[Message]) -> list[TextContent | ToolUseContent]:
         if call == 1:
             await asyncio.wait_for(self.release_worker_question.wait(), 10)
             return [
@@ -1642,7 +1642,11 @@ class IdleParentRoutingBackend(CompletionBackend):
                     )
                 )
             ]
-        if call >= 2:
+        if any(
+            isinstance(block, TextContent) and block.text.startswith("Re ") and block.text.endswith(": continue")
+            for message in messages if message.role is MessageRole.USER
+            for block in message.content
+        ):
             return [
                 ToolUseContent(
                     ToolCall(
@@ -1680,7 +1684,7 @@ class IdleParentRoutingBackend(CompletionBackend):
         elif actor == "lead":
             blocks = self._lead_blocks(call, messages)
         else:
-            blocks = await self._worker_blocks(call)
+            blocks = await self._worker_blocks(call, messages)
         yield StreamEvent(StreamEventType.MESSAGE_START)
         for block in blocks:
             yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
@@ -21400,7 +21404,7 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
             ToolCall("cancel-lead", "agent_cancel", {"handle": lead_handle})
         )
         assert canceled["isError"] is False
-        await asyncio.wait_for(loop._background_owner.wait(), 10)
+        await await_or_fail(loop._background_owner.wait(), what="nested routes settle")
         terminal = await loop.tool_registry.execute(
             ToolCall("dead-lead-status", "agent_status", {"handle": lead_handle})
         )
@@ -21431,9 +21435,10 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
     finally:
         backend.release_worker_question.set()
         loop._background_owner.cancel_all()
-        await asyncio.wait_for(loop._background_owner.wait(), 10)
-        await loop.close()
-        store.close()
+        try:
+            await await_or_fail(loop.close(), what="close nested routing test")
+        finally:
+            store.close()
 
 
 class _QuietReplyChildBackend(CompletionBackend):
