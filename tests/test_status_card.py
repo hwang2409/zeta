@@ -1,10 +1,7 @@
 import asyncio
 import contextlib
-import json
 import time
-from dataclasses import fields
 from io import StringIO
-from types import SimpleNamespace
 
 import pytest
 from prompt_toolkit.application.current import set_app
@@ -21,9 +18,9 @@ from rich.text import Text
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from tests.support.submissions import await_submission_pipeline
-from zeta.attention_decisions import DecisionItem
 from zeta.attention_records import AttentionStore
 from zeta.core.commands.slash_registry import SlashCommand
+from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import Message, MessageRole, TextContent
 from zeta.runtime.loop import AgentLoop
@@ -279,35 +276,29 @@ async def test_status_card_renders_compaction_with_or_without_fact_floor(
 async def test_decisions_popup_renders_kinds_and_dismisses_information(
     tmp_path, monkeypatch
 ) -> None:
-    store = ConversationStore(tmp_path / "sessions")
+    opened = await asyncio.to_thread(
+        SessionManager(tmp_path).create,
+        provider="codex", model="offline", cwd=tmp_path, auto_project=False,
+    )
+    store = opened.store
     attention = AttentionStore(store.session_dir, writer_epoch=5)
-    decision = attention.request(
-        session_id=store.session_id,
-        project_id=None,
-        entry_id=None,
-        entry_seq=None,
-        title="choose",
-        why="choose a value " + "with supporting context " * 20,
-    )
-    information = attention.request(
-        session_id=store.session_id,
-        project_id=None,
-        entry_id=None,
-        entry_seq=None,
-        title="answer",
-        why="the answer is ready " + "with supporting context " * 20,
-    )
-    information_path = attention.directory / f"{information.id}.json"
-    information_value = json.loads(information_path.read_text())
-    information_value["kind"] = "answer"
-    information_path.write_text(json.dumps(information_value))
-    if hasattr(information, "kind"):
-        information = attention.get(information.id)
-    else:
-        information = SimpleNamespace(
-            **{field.name: getattr(information, field.name) for field in fields(information)},
-            kind="answer",
+    decision, deferred, information, decided = [
+        attention.request(
+            session_id=store.session_id,
+            project_id=None,
+            entry_id=None,
+            entry_seq=None,
+            title=title,
+            why="with supporting context " * 20,
+            kind=kind,
         )
+        for kind, title in (
+            ("decision", "Choose a value"),
+            ("deferred", "Review the proposal"),
+            ("answer", "Build completed"),
+            ("decided", "Database selected"),
+        )
+    ]
     app = TUIApp(
         AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty()),
         provider="codex",
@@ -318,45 +309,45 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
     session = app._make_session()
     app._active_session = session
     app._install_full_screen_layout(session)
-    app._decisions_panel.set_items(
-        [
-            DecisionItem(store.session_id, None, "Unassigned", decision),
-            DecisionItem(store.session_id, None, "Unassigned", information),
-        ]
-    )
-    await app._open_decisions_panel()
-    try:
-        with set_app(session.app):
-            session.app.key_processor.feed(KeyPress("j"))
-            session.app.key_processor.process_keys()
+
+    async def rendered_text() -> str:
         screen = await _render_status(session, 100, 50)
-        rows = [
+        return "\n".join(
             "".join(screen.data_buffer[y][x].char for x in range(100))
             for y in range(50)
-        ]
-        text = "\n".join(rows)
-        assert "decision" in text and "answer" in text
-        assert text.index("decision") < text.index("answer")
+        )
+
+    try:
+        await app._open_decisions_panel()
+        action = await rendered_text()
+        assert f"{decision.title}  decision ·" in action, action
+        assert f"{deferred.title}  deferred ·" in action
+        assert information.title not in action and decided.title not in action
         decision_badge = next(
             style
-            for style, text in app._decisions_panel._list_row(
-                app._decisions_panel.items[0]
-            )
+            for style, text in app._decisions_panel._list_row(app._decisions_panel.items[0])
             if text.startswith("  decision ·")
         )
+
+        with set_app(session.app):
+            session.app.key_processor.feed(KeyPress("f"))
+            session.app.key_processor.process_keys()
+        fyi = await rendered_text()
+        assert f"{information.title}  answer ·" in fyi
+        assert f"{decided.title}  decided ·" in fyi
+        assert decision.title not in fyi and deferred.title not in fyi
         answer_badge = next(
             style
-            for style, text in app._decisions_panel._list_row(
-                app._decisions_panel.items[1]
-            )
+            for style, text in app._decisions_panel._list_row(app._decisions_panel.items[0])
             if text.startswith("  answer ·")
         )
+
         def foreground(style: str) -> str:
             return style.split(" on ", 1)[0].split(" bg:", 1)[0]
 
         assert foreground(decision_badge) != foreground(answer_badge)
-        assert "d dismiss" in text
-        assert app._decisions_panel.selected.record.kind == "answer"
+        assert "d dismiss" in fyi
+        assert app._decisions_panel.selected.record.id == information.id
         await _render_status(session, 100, 24)
         with set_app(session.app):
             for _ in range(20):
@@ -398,6 +389,7 @@ async def test_decisions_popup_renders_kinds_and_dismisses_information(
         dismissed = attention.get(information.id)
         assert dismissed.status == "resolved"
         assert dismissed.decision is None
+        assert attention.get(decided.id).status == "open"
         assert app._decisions_panel_control.offset > 0
     finally:
         app.close_decisions_panel()
