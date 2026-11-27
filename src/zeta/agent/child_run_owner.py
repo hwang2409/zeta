@@ -504,7 +504,7 @@ class ChildRunTransitionOwner:
     async def background_outcome(self) -> tuple[bool, dict[str, object] | None]:
         """Read the winning outcome after execution settles, before publication."""
         request = self._cancellation
-        if request is not None and not request.confirmation.done():
+        if self.provider_suspended and request is not None and not request.confirmation.done():
             await asyncio.gather(asyncio.shield(request.confirmation), return_exceptions=True)
         async with self._lock:
             report = None
