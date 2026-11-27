@@ -44,6 +44,7 @@ from ..protocol.types import (
     ToolResult,
     ToolUseContent,
     assistant_text,
+    harness_notice,
     is_owned_completion_backend,
 )
 from ..providers.rate_limit_hold import (
@@ -1275,6 +1276,10 @@ async def _run_installed_child(
         consume = consume_run
         run_kwargs.setdefault("tool_call_id", tool_call.id)
         run_kwargs.pop("origin", None)
+    if activation is not None and not resumed_idle:
+        run_kwargs["harness_notice_message"] = harness_notice(
+            "child recovery", prompt, event="child_recovery", visible=False,
+        )
     spawn_ready = activation if activation is not None else asyncio.Event() if external else None
 
     async def commit_foreground_terminal(result: dict[str, object]) -> None:

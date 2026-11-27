@@ -8,23 +8,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..core.abort import AbortSignal
-from ..core.approval import canceled_result
 from ..core.checkpoints import _now
 from ..core.store._async_writes import (
-    _AbortChildApprovalsCommand,
     _AppendChildRecoveredCommand,
     _CloseChildApprovalHistoryCommand,
+    _RepairChildInterruptionCommand,
     _SelectChildAccountsCommand,
 )
-from ..protocol.types import (
-    Message,
-    MessageRole,
-    StreamEvent,
-    StreamEventType,
-    TextContent,
-    ToolCall,
-    ToolUseContent,
-)
+from ..protocol.types import StreamEvent, StreamEventType, ToolCall
 from ..runtime.approval_recovery import _end_payload
 from ..runtime.offload import await_joined_offload
 from .background_lifecycle import _recoverable_marker
@@ -48,27 +39,12 @@ def _resolve_backend(parent: AgentLoop, saved: dict[str, Any], context: Any) -> 
 
 
 async def repair_interrupted_child(root: ConversationStore, store: ConversationStore, run_id: str) -> None:
-    def pending_calls() -> set[str]:
-        return {
-            item.tool_call.id
-            for ref in store.branch_refs() if ref.type == "message"
-            for item in Message.from_dict(store.entry(ref).data["message"]).content
-            if isinstance(item, ToolUseContent) and item.tool_call.id not in store._delivery_fold.tool_result_seqs
-        }
-
-    pending = await store._to_thread_store(pending_calls)
-    await store._commit_storage_command(_AbortChildApprovalsCommand())
+    await store._commit_storage_command(_RepairChildInterruptionCommand())
     for wire_id, tool_call in root.delegated_unmatched_requests(run_id):
         request_id = tool_call.get("id")
         if isinstance(request_id, str) and (resolution := store.approval_resolution_now(request_id)) is not None:
             await root._commit_storage_command(_CloseChildApprovalHistoryCommand(
                 payload=_end_payload(wire_id, tool_call, resolution),
-            ))
-    for call_id in sorted(pending):
-        if call_id not in store._delivery_fold.tool_result_seqs:
-            result = canceled_result(call_id)
-            await store.append_message_async(Message(
-                MessageRole.TOOL_RESULT, [TextContent(result.content)], tool_result=result,
             ))
 
 

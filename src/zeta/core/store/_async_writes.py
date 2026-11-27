@@ -388,11 +388,25 @@ class _ChildSuspensionCommand(_StoreMutationCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class _AbortChildApprovalsCommand(_StoreMutationCommand):
+class _RepairChildInterruptionCommand(_StoreMutationCommand):
     def apply(self, store: Any) -> None:
+        from ...protocol.types import Message, MessageRole, TextContent, ToolUseContent
         from ...runtime.approval_recovery import recover_store_approvals
+        from ..approval import canceled_result
 
+        pending = dict.fromkeys(
+            item.tool_call.id
+            for ref in store.branch_refs() if ref.type == "message"
+            for item in Message.from_dict(store.entry(ref).data["message"]).content
+            if isinstance(item, ToolUseContent) and item.tool_call.id not in store._delivery_fold.tool_result_seqs
+        )
         recover_store_approvals(store, store._storage_lease.observed_epoch)
+        for call_id in pending:
+            if store.tool_result(call_id) is None:
+                result = canceled_result(call_id)
+                store.append_message(Message(
+                    MessageRole.TOOL_RESULT, [TextContent(result.content)], tool_result=result,
+                ))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
