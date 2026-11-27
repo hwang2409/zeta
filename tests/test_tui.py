@@ -10094,62 +10094,75 @@ def _test_tui_app(store: ConversationStore, output: StringIO) -> TUIApp:
     )
 
 
-async def test_provider_suspension_notice_tracks_retry_progress(tmp_path: Path) -> None:
-    from zeta.core.store._async_writes import _ChildSuspensionCommand
+@pytest.mark.parametrize(
+    "states",
+    [
+        (("running", "provider recovered"), ("completed", "· completed")),
+        (("stopped", "suspended: provider unavailable, retry stopped"),),
+        (("failed", "· failed"),),
+        (("canceled", "· canceled"),),
+        (("running", "provider recovered"), ("normal_exit", "suspended for restart")),
+        (("idle", "provider recovered"), ("finishing", "provider recovered")),
+    ],
+    ids=["completed", "retry-cap", "failed", "canceled", "restart", "active"],
+)
+async def test_provider_suspension_notice_tracks_lifecycle(
+    tmp_path: Path, states: tuple[tuple[str, str], ...]
+) -> None:
+    from zeta.core.agent_progress import post_child_progress, publish_child_ended
 
     store = ConversationStore(tmp_path / "sessions")
     app = _test_tui_app(store, StringIO())
     run_id = f"{store.session_id}:1"
     first = "2026-11-27T08:11:48+00:00"
     later = "2026-11-27T08:12:18+00:00"
-    deadline = "2026-11-27T09:11:43+00:00"
-    retry = {
-        "retry_started_at": "2026-11-27T08:11:43+00:00",
-        "retry_deadline_at": deadline,
-        "retry_state": "retrying",
-        "retry_step": 0,
-        "retry_probe_at": first,
-        "next_retry_at": first,
+    retrying = "suspended: provider unavailable, retrying (next retry: {})"
+    lifecycle = {
+        "handle": run_id, "description": "worker", "agent_type": "general",
+        "turns_used": 0, "tool_calls": 0, "current_step": "thinking",
+        "started_at": first, "finished_at": None, "elapsed": 0.0,
     }
     with create_pipe_input() as pipe:
         task = asyncio.create_task(app.run(_display_session(app, pipe, True)))
         try:
             await wait_until(lambda: app._full_screen_active() and app.interaction_ready())
-            with ConversationStore(
-                store.session_dir / "agents", session_id="1", _storage_lease=store._storage_lease
-            ) as child:
-                child.start_agent_lifecycle(
-                    handle=run_id, started_at=retry["retry_started_at"], depth=1,
-                    agent_type="general", description="worker",
-                )
-                await child._commit_storage_command(_ChildSuspensionCommand(provider_retry=retry))
-                notice, _ = store.append_child_recovered(
-                    run_id, 1, path=str(child.session_dir), description="worker",
-                    suspension={
-                        "code": "server_error", "text": "suspended: provider unavailable, retrying",
-                        "next_retry_at": first,
-                    },
-                )
-                app._handle_background_event(
-                    StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=notice.data)
-                )
-                assert first in app._transcript.render(120)
+            post_child_progress(store, {
+                **lifecycle, "state": "suspended", "suspension_reason": "provider_unavailable",
+                "retry_state": "retrying", "next_retry_at": first,
+            })
+            await asyncio.sleep(0)  # Drain the already queued lifecycle callback.
+            app._handle_background_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data={
+                "kind": "child_suspended", "child_instance_id": run_id,
+                "description": "worker", "next_retry_at": first,
+            }))
+            assert retrying.format(first) in app._transcript.render(120)
 
-                await child._commit_storage_command(_ChildSuspensionCommand(provider_retry={
-                    **retry, "retry_step": 1, "retry_probe_at": later, "next_retry_at": later,
-                }))
-                display = app._transcript.render(120)
-                assert later in display, "the rendered suspension notice must show the updated retry time"
-                assert first not in display
+            post_child_progress(store, {
+                **lifecycle, "state": "suspended", "suspension_reason": "provider_unavailable",
+                "retry_state": "retrying", "next_retry_at": later,
+            })
+            await asyncio.sleep(0)
+            display = Text.from_ansi(app._transcript.render(120)).plain
+            assert retrying.format(later) in display
+            assert first not in display
 
-                retry.pop("next_retry_at")
-                await child._commit_storage_command(_ChildSuspensionCommand(provider_retry={
-                    **retry, "retry_step": 2, "retry_probe_at": deadline, "retry_state": "stopped",
-                }))
-                display = app._transcript.render(120)
-                assert display.count("suspended: provider unavailable") == 1
-                assert "retrying" not in display
-                assert later not in display
+            mismatches = []
+            for state, expected in states:
+                row = {**lifecycle, "state": state}
+                if state in {"completed", "failed", "canceled"}:
+                    publish_child_ended(run_id, 1, {**row, "finished_at": later})
+                else:
+                    if state == "stopped":
+                        row.update(state="suspended", suspension_reason="provider_unavailable", retry_state="stopped")
+                    elif state == "normal_exit":
+                        row.update(state="suspended", suspension_reason="normal_exit")
+                    post_child_progress(store, row)
+                await asyncio.sleep(0)
+                display = Text.from_ansi(app._transcript.render(120)).plain
+                if expected not in display or "retrying" in display or later in display:
+                    lines = [line.strip(" │") for line in display.splitlines() if "│" in line]
+                    mismatches.append((state, expected, lines))
+            assert not mismatches, "the same card must replace the retry text at each lifecycle transition"
         finally:
             pipe.send_text("\x04")
             try:
