@@ -108,15 +108,24 @@ async def test_project_attention_queue_matches_across_surfaces(tmp_path: Path) -
             (dead, "deferred", "Revisit the budget", "action"),
             (dead, "answer", "Build finished", "fyi"),
             (dead, "decided", "Use the blue theme", "fyi"),
-            (dead, "decided", "Already dismissed", None),
+            (opened, "decision", "Already resolved", None),
             (other, "decision", "Foreign project choice", None),
         ):
             record = await asyncio.to_thread(_seed_attention, owner, owner.metadata.project_id, title, kind=kind)
             rows.append((record, expected))
-            if title == "Already dismissed":
+            if title == "Already resolved":
                 store = AttentionStore(owner.store.session_dir, writer_epoch=5)
                 await asyncio.to_thread(store.replace, replace(record, status="resolved", resolved_at=record.created_at))
+        # A record in the right session directory still has to match its owner's project.
+        await asyncio.to_thread(_seed_attention, opened, foreign.project_id, "Mismatched project")
         dead.store.close()
+        sessions = await rpc("state_sessions", {"project_id": project_id})
+        assert {row["session_id"]: (row["attention_open"], row["attention_count"]) for row in sessions["items"]} == {
+            session_id: (1, 3),  # live decision; resolved and mismatched records count only as stored slots
+            dead.metadata.session_id: (1, 3),  # deferred; open answer and decided records are FYI
+        }
+        detail = await rpc("state_session", {"session_id": session_id, "collection": "agents"})
+        assert (detail["session"]["attention_open"], detail["session"]["attention_count"]) == (1, 3)
         tools = ToolRegistry(project, session_store=opened.store, skill_catalog=SkillCatalog.empty(), project_id=project_id)
         register_list_attention(tools)
         listing = tools.definitions_by_name["list_attention"].handler

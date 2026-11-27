@@ -7,7 +7,7 @@ import json
 import os
 import stat
 import uuid
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -432,20 +432,15 @@ def _state_attention_files(session_dir: Path) -> tuple[Path, ...]:
     return tuple(sorted(directory.glob("*.json")))
 
 
-def state_attention_counts(sessions_dir: Path, session_ids: Iterable[str]) -> dict[str, int]:
-    """Count regular attention slots without opening any record body."""
-    counts = {}
-    for session_id in session_ids:
-        count = 0
-        for path in _state_attention_files(sessions_dir / session_id):
-            try:
-                _check_id(path.stem)
-                if stat.S_ISREG(path.lstat().st_mode):
-                    count += 1
-            except (ValueError, FileNotFoundError):
-                continue
-        counts[session_id] = count
-    return counts
+def state_attention_slots(session_dir: Path) -> Iterator[str]:
+    """Yield ids of regular attention slots without opening any record body."""
+    for path in _state_attention_files(session_dir):
+        try:
+            _check_id(path.stem)
+            if stat.S_ISREG(path.lstat().st_mode):
+                yield path.stem
+        except (ValueError, FileNotFoundError):
+            continue
 
 
 def state_attention_rows(session_dir: Path, observed_epoch: int) -> list[dict[str, Any]]:

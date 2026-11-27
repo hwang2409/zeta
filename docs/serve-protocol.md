@@ -1199,7 +1199,12 @@ nanoseconds; missing times are null.
 - Session rows contain `session_id`, `project_id`, `title`, `profile`, `model`,
   `created_ns`, `updated_ns`, `status` (`idle`, `running`, `approval`, `failed`,
   or `unknown`), `child_count` (direct child slots), `background_count` (session
-  tasks), `attention_count` (stored attention records), and `bytes` (top-level transcript size, read from file metadata).
+  tasks), `attention_count` (stored attention records, including resolved and FYI records),
+  `attention_open` (open action-required items), and `bytes` (top-level transcript size, read from file metadata).
+  `attention_open` counts only `decision` and `deferred` items owned by that
+  top-level session and matching its project (including null for an unassigned
+  session). It is not a project-wide total. It excludes resolved, FYI (`answer`
+  and `decided`), and broken records, and is zero for non-owner sessions.
 - Agent rows contain `run_id`, `session_id`, `parent_run_id`, `profile`, `status`
   (`running`, `idle`, `waiting`, `finished`, `failed`, `cancelled`, or `unknown`),
   `background` (`true` or `false` or `null`), `started_ns`, and `ended_ns`.
