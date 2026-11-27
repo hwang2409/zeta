@@ -19,6 +19,7 @@ class RuntimeCloseMixin:
         self._closed = False
         self._closing = False
         self._close_task: asyncio.Task[None] | None = None
+        self._stop_provider_retry_watch: Callable[[], None] | None = None
 
     async def close(self) -> None:
         if self._closed:
@@ -68,6 +69,9 @@ class RuntimeCloseMixin:
                     first_error = exc
 
         try:
+            if self._stop_provider_retry_watch is not None:
+                attempt(self._stop_provider_retry_watch)
+                self._stop_provider_retry_watch = None
             attempt(self._cancel_background_invalidation)
             await attempt_async(self.stop_decisions_poll)
             await attempt_async(self._cancel_account_switch)

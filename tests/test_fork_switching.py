@@ -221,6 +221,7 @@ def test_tui_run_replays_transcript_only_on_initial_start(
         app._startup_submissions = []
         app._begin_startup_replay = lambda: None
         app._attach_draft = lambda session: None
+        app._stop_provider_retry_watch = lambda: None
         app._rebuild_transcript_async = rebuild
         app._finish_startup_replay = lambda **kwargs: None
         app._present_pending_approvals = lambda: None
@@ -310,6 +311,7 @@ def test_tui_run_releases_ui_ownership_before_restoring_terminal(
         app._ui_generation = 0
         app._begin_startup_replay = lambda: None
         app._attach_draft = lambda session: None
+        app._stop_provider_retry_watch = lambda: None
         app._install_full_screen_layout = lambda session: None
         app._prepare_prompt = prepare_prompt
         app._run_full_screen = nothing
@@ -375,6 +377,7 @@ def test_fork_suspend_continues_after_failed_draft_save(
         app._startup_submissions = []
         app._begin_startup_replay = lambda: None
         app._attach_draft = lambda session: None
+        app._stop_provider_retry_watch = lambda: None
         app._prepare_prompt = lambda *, resume_ui: nothing()
         app._read_prompt = read_prompt
         app._prepare_ui_session_change = nothing
