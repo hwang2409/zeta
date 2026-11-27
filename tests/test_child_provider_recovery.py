@@ -142,6 +142,7 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
             notices.put_nowait(("suspended", result[0].data))
         return result
 
+    # test-contract: seam gate the durable write to control cancellation order.
     monkeypatch.setattr(ConversationStore, "_commit_storage_command", publish_commit)
 
     async def suspended():
@@ -297,3 +298,66 @@ async def test_provider_probe_fans_out_per_account_then_stops_at_original_deadli
             assert actions.empty()
         finally:
             await await_or_fail(loop.close(), what="close tree and coordinator")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex", "ollama"])
+async def test_provider_readiness_uses_context_free_generation(tmp_path, provider):
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    import httpx
+
+    from tests.test_codex import message_stream, sse, store_for
+    from zeta.providers import recovery_probe
+    from zeta.providers.anthropic import AnthropicApiKeyCredential, AnthropicBackend
+    from zeta.providers.codex import CodexBackend
+    from zeta.providers.ollama import OllamaBackend
+
+    requests = []
+    exhausted = True
+
+    def handler(request):
+        requests.append(request)
+        if request.method == "GET":
+            reset = int((datetime.now(UTC) + timedelta(hours=1)).timestamp())
+            return httpx.Response(200, json={"rate_limit": {"primary_window": {
+                "used_percent": 100 if exhausted else 0, "limit_window_seconds": 3600,
+                "reset_after_seconds": 3600, "reset_at": reset,
+            }}})
+        if provider == "codex":
+            return httpx.Response(200, text=sse(message_stream()))
+        if provider == "claude":
+            return httpx.Response(200, text=(
+                'data: {"type":"message_start","message":{"id":"probe","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x"}}\n\n'
+            ))
+        return httpx.Response(200, text='{"message":{"role":"assistant","content":"x"},"done":false}\n')
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        if provider == "codex":
+            backend = CodexBackend(client=client, token_store=store_for(tmp_path / "codex.json"))
+        elif provider == "claude":
+            backend = AnthropicBackend(client=client, token_store=AnthropicApiKeyCredential("fixture"))
+        else:
+            backend = OllamaBackend(client=client)
+        try:
+            if provider == "codex":
+                assert await recovery_probe.probe_readiness(backend) is recovery_probe.Readiness.RETRY
+                assert [request.method for request in requests] == ["GET"]
+                exhausted = False
+            assert await recovery_probe.probe_readiness(backend) is recovery_probe.Readiness.READY
+            assert [request.method for request in requests] == (["GET", "GET", "POST"] if provider == "codex" else ["POST"])
+            payload = json.loads(requests[-1].content)
+            assert payload["model"] == backend.model
+            assert not payload.get("tools") and not payload.get("system")
+            if provider == "codex":
+                assert payload["instructions"] == "Reply with one character."
+                assert [part["text"] for entry in payload["input"] for part in entry["content"]] == ["x"]
+                assert "max_output_tokens" not in payload
+            else:
+                assert payload["messages"] == [{"role": "user", "content": "x"}]
+                assert (payload["max_tokens"] if provider == "claude" else payload["options"]["num_predict"]) == 1
+        finally:
+            await backend.aclose()
