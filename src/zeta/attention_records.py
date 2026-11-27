@@ -109,6 +109,10 @@ class AttentionRecord:
     decision: str | None = None
     kind: AttentionKind = "decision"
 
+    @property
+    def requires_action(self) -> bool:
+        return self.kind in {"decision", "deferred"}
+
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> AttentionRecord:
         reject_unknown_keys(value, "attention_record")

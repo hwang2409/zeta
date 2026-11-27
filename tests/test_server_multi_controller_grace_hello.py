@@ -19,7 +19,7 @@ from tests.support.replay_transport import (
 )
 from tests.test_server_replay_table import _backend_factory
 from tests.test_server_session_park import _until
-from zeta.server.session_controllers import _MultiGrace
+from zeta.server.session_controllers import MAX_MULTI_CONTROLLERS, _MultiGrace
 
 MULTI = ("multi_controller",)
 ATTACH = (*MULTI, "resume_attach")
@@ -72,10 +72,13 @@ async def test_fresh_multi_hello_is_admitted_while_only_grace_holds_multi(
         assert "result" in admitted, f"fresh multi hello refused during grace: {admitted}"
 
         if row == "cap":
-            for _ in range(3):
-                assert "result" in await negotiate(await connect(), replay=False, extra=MULTI)
-            fifth = await negotiate(await connect(), replay=False, extra=MULTI)
-            assert fifth.get("error") == CAPACITY, fifth
+            assert "result" in await fresh.request(2, "new_session", {})
+            for _ in range(MAX_MULTI_CONTROLLERS - 1):
+                holder = await connect()
+                assert "result" in await negotiate(holder, replay=False, extra=MULTI)
+                assert "result" in await holder.request(2, "new_session", {})
+            refused = await negotiate(await connect(), replay=False, extra=MULTI)
+            assert refused.get("error") == CAPACITY, refused
             assert graced(), "admitting fresh controllers ended the grace"
             return
 
