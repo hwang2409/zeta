@@ -182,7 +182,7 @@ async def consume_run(
         if not callable(child_turns):
             return {}
         idle = state == "idle"
-        if idle and not getattr(getattr(child_loop, "_child_run_owner", None), "recoverable", False):
+        if idle:
             _transition_idle(child_store)
         return agent_stats(
             child_store.agent_lifecycle(),

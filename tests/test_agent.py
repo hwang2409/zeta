@@ -3789,8 +3789,9 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
 ) -> None:
     backend = FinishGateBackend("handoff", background_child=True)
     # This test exercises cancel-on-close before the recovery epoch.
+    tmp_path.mkdir(exist_ok=True)
     (tmp_path / "storage-format.json").write_text('{"writer_epoch":12}\n')
-    store = ConversationStore(tmp_path)
+    store = ConversationStore(tmp_path / "sessions")
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     owner = loop._background_owner
     completion_published = asyncio.Event()
@@ -19564,7 +19565,7 @@ async def test_idle_nudge_loses_to_prompt_committed_after_eligibility_check(
         prompt_committed.set()
 
     commit = asyncio.create_task(commit_prompt())
-    await asyncio.wait_for(run, 1)
+    await await_or_fail(run, what="idle nudge yields to the committed prompt")
     await await_or_fail(commit, what="join prompt commit")
     assert prompts == ["work", "real follow-up"]
     owner.conversation_channel.unregister_loop("root:1")
