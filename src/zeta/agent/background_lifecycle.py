@@ -592,7 +592,10 @@ async def finish_background_child(
             execution_error = exc
         canceled, explicit_finish_report = await run_owner.background_outcome()
         if run_owner.suspending:
+            from .resume_child import repair_interrupted_child
+
             await close_child("child suspended")
+            await repair_interrupted_child(run_owner.history_store, child_store, child_instance_id)
             await run_owner.persist_suspension("normal_exit")
             return
         if isinstance(result, dict):

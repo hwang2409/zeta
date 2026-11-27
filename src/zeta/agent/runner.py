@@ -918,7 +918,7 @@ async def _run_child(
 
     # Join a submitted marker commit and register its owner even if interrupted.
     try:
-        registration = loop._background_owner.register_child_setup(register_run, setup_task)
+        registration = loop._background_owner.register_child_setup(register_run)
         setup_interrupted = await _complete_despite_cancellation(registration)
     except BaseException:
         await release_setup_store()

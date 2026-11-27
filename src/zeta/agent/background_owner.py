@@ -80,7 +80,6 @@ class BackgroundAgentOwner:
         self._setup_tasks: set[asyncio.Task[Any]] = set()
         self._setup_closed = False
         self._registrations: set[asyncio.Task[Any]] = set()
-        self._registration_setups: set[asyncio.Task[Any]] = set()
         self._runs: dict[str, ChildRunTransitionOwner] = {}
         self._cancellation_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
@@ -128,17 +127,14 @@ class BackgroundAgentOwner:
 
     def register_child_setup(
         self, registration: Callable[[], Coroutine[Any, Any, ChildRunTransitionOwner]],
-        setup: asyncio.Task[Any],
     ) -> asyncio.Task[ChildRunTransitionOwner]:
         if self._setup_closed:
             raise asyncio.CancelledError
         task = asyncio.create_task(registration())
         self._registrations.add(task)
-        self._registration_setups.add(setup)
 
         def finished(task: asyncio.Task[Any]) -> None:
             self._registrations.discard(task)
-            self._registration_setups.discard(setup)
 
         task.add_done_callback(finished)
         return task

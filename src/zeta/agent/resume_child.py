@@ -11,7 +11,9 @@ from ..core.abort import AbortSignal
 from ..core.approval import canceled_result
 from ..core.checkpoints import _now
 from ..core.store._async_writes import (
+    _AbortChildApprovalsCommand,
     _AppendChildRecoveredCommand,
+    _CloseChildApprovalHistoryCommand,
     _SelectChildAccountsCommand,
 )
 from ..protocol.types import (
@@ -23,13 +25,14 @@ from ..protocol.types import (
     ToolCall,
     ToolUseContent,
 )
-from ..runtime.approval_recovery import repair_delegated_child
+from ..runtime.approval_recovery import _end_payload
 from ..runtime.offload import await_joined_offload
 from .background_lifecycle import _recoverable_marker
 from .child_context import resolve_child_backend
 from .recovery_lease import acquire_recovery_subtree
 from .resume_descriptor import restore_preset
-from .runner import _build_child_loop, _run_installed_child, validated_tool_result
+from .runner import _build_child_loop, _run_installed_child
+from .tool_results import validated_tool_result
 from .turn_limit import turn_control_for
 
 if TYPE_CHECKING:
@@ -44,18 +47,24 @@ def _resolve_backend(parent: AgentLoop, saved: dict[str, Any], context: Any) -> 
     return backend
 
 
-def repair_interrupted_child(root: ConversationStore, store: ConversationStore, run_id: str) -> None:
+async def repair_interrupted_child(root: ConversationStore, store: ConversationStore, run_id: str) -> None:
     pending = {
         item.tool_call.id
         for message in store.messages()
         for item in message.content
         if isinstance(item, ToolUseContent) and store.tool_result(item.tool_call.id) is None
     }
-    repair_delegated_child(root, store, run_id, store._storage_lease.observed_epoch)
+    await store._commit_storage_command(_AbortChildApprovalsCommand())
+    for wire_id, tool_call in root.delegated_unmatched_requests(run_id):
+        request_id = tool_call.get("id")
+        if isinstance(request_id, str) and (resolution := store.approval_resolution_now(request_id)) is not None:
+            await root._commit_storage_command(_CloseChildApprovalHistoryCommand(
+                payload=_end_payload(wire_id, tool_call, resolution),
+            ))
     for call_id in sorted(pending):
         if store.tool_result(call_id) is None:
             result = canceled_result(call_id)
-            store.append_message(Message(
+            await store.append_message_async(Message(
                 MessageRole.TOOL_RESULT, [TextContent(result.content)], tool_result=result,
             ))
 
@@ -136,11 +145,13 @@ async def _resume_child(
         except (OSError, ValueError, RuntimeError):
             await owner.block_recovery("saved model or account is unavailable")
             return
+        if state["resume_mode"] == "active":
+            await repair_interrupted_child(tree.notification_store, store, run_id)
         store.bind_owner_thread()
         try:
             child, policy = await _build_child_loop(
                 parent, child_backend=backend, child_store=store, child_instance_id=run_id,
-                child_depth=saved["depth"], preset=preset, model=saved["requested_model"],
+                child_depth=saved["depth"], preset=preset, model=saved["model"],
                 cwd_override=saved["cwd"], follow_up_loop=saved["follow_up"],
                 description=description, child_account_context=context, run_owner=owner,
                 child_turn_control=control, recovered_explicit_finish=saved["explicit_finish"],
@@ -177,8 +188,6 @@ async def _resume_child(
                 StreamEventType.AGENT_NOTIFICATION,
                 data={"notification_id": notice.id, **notice.data}, row_seq=notice.seq,
             ))
-        if state["resume_mode"] == "active":
-            await await_joined_offload(repair_interrupted_child, tree.notification_store, store, run_id)
         for descendant in store.agent_children().values():
             if nested := stores.get(Path(descendant["child_session_path"])):
                 await _resume_child(child, descendant, nested, stores, retained)

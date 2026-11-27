@@ -388,6 +388,22 @@ class _ChildSuspensionCommand(_StoreMutationCommand):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class _AbortChildApprovalsCommand(_StoreMutationCommand):
+    def apply(self, store: Any) -> None:
+        from ...runtime.approval_recovery import recover_store_approvals
+
+        recover_store_approvals(store, store._storage_lease.observed_epoch)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _CloseChildApprovalHistoryCommand(_StoreMutationCommand):
+    payload: dict[str, object]
+
+    def apply(self, store: Any) -> None:
+        store.append_approval_history_end_if_absent(self.payload)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class _AppendChildRecoveredCommand(_StoreMutationCommand):
     run_id: str
     episode: int

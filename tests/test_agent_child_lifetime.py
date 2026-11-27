@@ -54,6 +54,8 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
         running.set()
         await await_or_fail(finish_model.wait(), what="child runs until canceled")
 
+    # Keep the original cancellation matrix at the last pre-recovery epoch.
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":12}\n')
     with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
         loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
         owner = loop._background_owner

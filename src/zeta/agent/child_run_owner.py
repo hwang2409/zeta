@@ -93,6 +93,11 @@ class ChildRunTransitionOwner:
                 await self._store._to_thread_store(initialize)
 
     @property
+    def history_store(self) -> ConversationStore:
+        assert self._tree is not None
+        return self._tree.notification_store
+
+    @property
     def recoverable(self) -> bool:
         return self._background and self._store.child_recovery_enabled
 
@@ -127,8 +132,8 @@ class ChildRunTransitionOwner:
         async with self._lock:
             if self.quiescing or self._winner is not None:
                 raise asyncio.CancelledError
-            await self._store._to_thread_store(self._store.activate_runtime_lease)
             await self._store._commit_storage_command(_ChildSuspensionCommand(activate=episode))
+            await self._store._to_thread_store(self._store.activate_runtime_lease)
 
     async def block_recovery(self, reason: str) -> None:
         from ..core.store._async_writes import _ChildSuspensionCommand
