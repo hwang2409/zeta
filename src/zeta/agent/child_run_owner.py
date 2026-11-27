@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 from ..core.agent_state import LoadedAgentLifecycle, MissingAgentLifecycle
 from ..core.child_runs import TERMINAL_AGENT_STATES, read_child_lifecycle
 from ..core.store import ConversationStore
-from ..core.store._async_writes import _FinishAgentLifecycleCommand
+from ..core.store._async_writes import (
+    _ChildQuestionsCommand,
+    _FinishAgentLifecycleCommand,
+    _ReserveQuestionSettlementCommand,
+)
 from ..core.store._child_runs import child_run_segments
 from ..runtime.offload import await_joined_offload
 
@@ -52,6 +56,9 @@ class ChildRunTransitionOwner:
         self._owned_work = owned_work
         self._delivering_prompt_id = delivering_prompt_id
         self._lock = asyncio.Lock()
+        self.run_id = ""
+        self.question_settlement = False
+        self.finish_waits_for_answer = False
 
     def attach_setup(
         self,
@@ -105,6 +112,71 @@ class ChildRunTransitionOwner:
     @property
     def recoverable(self) -> bool:
         return self._background and self._store.child_recovery_enabled
+
+    @property
+    def durable_questions(self) -> bool:
+        return self._background and self._store.child_question_hold_enabled
+
+    def questions(self) -> tuple[dict, ...]:
+        if not self.durable_questions:
+            return ()
+        return tuple(entry.data for entry in self._store._delivery_fold.child_questions.values())
+
+    def pending_questions(self) -> tuple[dict, ...]:
+        return tuple(q for q in self.questions() if q["state"] == "pending")
+
+    async def write_questions(self, *rows: dict) -> None:
+        if rows:
+            await self._store._commit_storage_command(_ChildQuestionsCommand(rows=rows))
+
+    async def reconcile_questions(self) -> None:
+        if self.durable_questions:
+            assert self._tree is not None
+            await self._tree.conversation_channel.reconcile_questions(self.run_id, self.questions())
+
+    async def repair_before_replay(self) -> None:
+        if self.durable_questions:
+            async with self._lock:
+                await self.reconcile_questions()
+
+    async def send(self, enqueue: Callable[[], Awaitable[None]]) -> None:
+        async with self._lock:
+            if self._winner is not None or self.quiescing or self._cancellation is not None:
+                raise LookupError(self.run_id)
+            await enqueue()
+            await self.reconcile_questions()
+
+    async def hold_at_limit(self) -> bool:
+        async with self._lock:
+            pending = self.pending_questions()
+            await self.write_questions(*(
+                {**q, "held_at_turn_limit": True} for q in pending if not q["held_at_turn_limit"]
+            ))
+            return bool(pending)
+
+    def settlement_due(self) -> bool:
+        return any(q["held_at_turn_limit"] and "settlement_turn" not in q for q in self.questions() if q["state"] != "withdrawn")
+
+    async def reserve_question_settlement(self, turn: int) -> bool:
+        async with self._lock:
+            if self.quiescing or self._winner is not None or self._cancellation is not None or self.pending_questions():
+                return False
+            ready = frozenset(
+                q["question_id"] for q in self.questions()
+                if q["held_at_turn_limit"] and q["state"] == "answered" and "settlement_turn" not in q
+            )
+            if not ready:
+                return False
+            await self.reconcile_questions()
+            await self._store._commit_storage_command(_ReserveQuestionSettlementCommand(question_ids=ready, turn=turn))
+            if self.quiescing or self._cancellation is not None:
+                return False
+            self.question_settlement = True
+            return True
+
+    async def withdraw_questions(self) -> None:
+        await self.write_questions(*({**q, "state": "withdrawn"} for q in self.pending_questions()))
+        await self.reconcile_questions()
 
     @property
     def suspending(self) -> bool:
@@ -219,6 +291,10 @@ class ChildRunTransitionOwner:
                 return "child is canceled"
             if self._winner is not None or self.quiescing:
                 return "child is finishing"
+            await self.reconcile_questions()
+            if self.pending_questions():
+                self.finish_waits_for_answer = True
+                return "wait for your parent to answer the pending question before finish"
             if refusal := self.owned_work_refusal():
                 return refusal
             if self._notification_pending():
@@ -227,6 +303,7 @@ class ChildRunTransitionOwner:
                 report,
                 self._persisted_notification_ids(),
                 self._delivering_prompt_id(),
+                question_settlement=self.question_settlement,
             )
             if reason is None:
                 self._winner = "finish"
@@ -295,6 +372,7 @@ class ChildRunTransitionOwner:
 
     async def publish_background[Result](self, publish: Callable[[], Awaitable[Result]]) -> Result:
         async with self._lock:
+            await self.withdraw_questions()
             return await publish()
 
     def recovered_report(self) -> dict[str, object] | None:

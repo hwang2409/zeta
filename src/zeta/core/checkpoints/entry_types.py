@@ -13,7 +13,7 @@ from ...protocol.types import (
     ToolUseContent,
     is_passive_harness_message,
 )
-from ...storage_format import reject_unknown_keys
+from ...storage_format import CHILD_QUESTION_STATES, reject_unknown_keys
 
 
 class EntryValidationContext(Protocol):
@@ -186,6 +186,33 @@ def _notification_tui_presented(_context: EntryValidationContext, entry: Any) ->
     reject_unknown_keys(entry.data, "notification_marker")
 
 
+def _child_question_state(_context: EntryValidationContext, entry: Any) -> None:
+    data = entry.data
+    reject_unknown_keys(data, "child_question_state")
+    for key, limit in (("question_id", 128), ("question", 4_000)):
+        value = data.get(key)
+        if type(value) is not str or not value.strip() or len(value) > limit:
+            raise ValueError(f"invalid child question {key}")
+    if data.get("state") not in CHILD_QUESTION_STATES or type(data.get("held_at_turn_limit")) is not bool:
+        raise ValueError("invalid child question state")
+    options = data.get("options")
+    if type(options) is not list or len(options) > 10 or any(
+        type(option) is not str or not option.strip() or len(option) > 1_000 for option in options
+    ):
+        raise ValueError("invalid child question options")
+    targets = data.get("ancestor_target_ids")
+    if type(targets) is not list or len(targets) > 5 or any(
+        target is not None and (type(target) is not str or not target or len(target) > 128)
+        for target in targets
+    ) or len(set(targets)) != len(targets):
+        raise ValueError("invalid child question ancestor targets")
+    if "settlement_turn" in data and (
+        type(data["settlement_turn"]) is not int or data["settlement_turn"] <= 0
+        or data["state"] != "answered" or not data["held_at_turn_limit"]
+    ):
+        raise ValueError("invalid child question settlement turn")
+
+
 def _pending_prompt(_context: EntryValidationContext, entry: Any) -> None:
     from ..store._pending_prompts import MAX_PENDING_PROMPT_TEXT
 
@@ -226,6 +253,7 @@ CONVERSATION_ENTRY_SPECS: dict[str, ConversationEntrySpec] = {
     "notification": ConversationEntrySpec(_notification),
     "notification_ack": ConversationEntrySpec(_notification_ack),
     "notification_tui_presented": ConversationEntrySpec(_notification_tui_presented),
+    "child_question_state": ConversationEntrySpec(_child_question_state),
     "pending_prompt": ConversationEntrySpec(_pending_prompt),
     "pending_prompt_ack": ConversationEntrySpec(_pending_prompt_ack),
     "pending_queue_closed": ConversationEntrySpec(_pending_queue_closed),

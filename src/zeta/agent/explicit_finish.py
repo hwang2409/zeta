@@ -74,8 +74,10 @@ class IdleNudgeLifecycle:
         self,
         wake: Callable[[], Awaitable[None]],
         owner: ChildRunTransitionOwner,
+        *,
+        display_only: bool = False,
     ) -> IdleAction:
-        eligible = await owner.idle_nudge_eligible()
+        eligible = display_only or await owner.idle_nudge_eligible()
         if eligible and self._nudge_count < self._nudge_limit:
             now = self._clock()
             if self._idle_started is None:
@@ -88,7 +90,7 @@ class IdleNudgeLifecycle:
         if await self._wait(wake, timeout):
             self._idle_started = None
             return "external_input"
-        if not await owner.reserve_idle_nudge():
+        if not display_only and not await owner.reserve_idle_nudge():
             self._idle_started = None
             return "external_input"
 

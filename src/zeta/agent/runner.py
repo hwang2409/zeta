@@ -263,8 +263,15 @@ async def consume_child(
             await consume_events(events)
         finally:
             await events.aclose()
+        control = getattr(child_loop, "child_turn_control", None)
+        owner = getattr(child_loop, "_child_run_owner", None)
+        if (
+            control is not None and control.exhausted and owner is not None and owner.durable_questions
+            and (await owner.hold_at_limit() or owner.settlement_due())
+        ):
+            return terminal_result(state="idle", text="waiting for parent answer", status="running")
         limited_result = await finalize_exhausted_child(
-            control=getattr(child_loop, "child_turn_control", None),
+            control=None if explicit_report is not None and owner is not None and owner.question_settlement else control,
             text=assistant_text(last_message) if last_message is not None else "",
             child_session_path=child_path,
             child_instance_id=child_loop.agent_instance_id or "unknown",
@@ -278,6 +285,8 @@ async def consume_child(
         )
         if limited_result is not None:
             return limited_result
+        if owner is not None and owner.finish_waits_for_answer:
+            return terminal_result(state="idle", text="waiting for parent answer", status="running")
         if explicit_report is not None:
             report_status = explicit_report["status"]
             summary = explicit_report["summary"]

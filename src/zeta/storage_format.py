@@ -24,8 +24,9 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, open_created, shape_lock
 
-WRITER_EPOCH: Final = 13
+WRITER_EPOCH: Final = 14
 P06_FEATURE_EPOCH: Final = 6
+CHILD_QUESTION_STATES: Final = frozenset({"pending", "answered", "withdrawn"})
 
 
 class StorageFeature(StrEnum):
@@ -41,6 +42,7 @@ class StorageFeature(StrEnum):
     INBOX_DURABLE_INTENT = "inbox_durable_intent"
     TRANSCRIPT_TAIL_EVIDENCE = "transcript_tail_evidence"
     CHILD_RECOVERY = "child_recovery"
+    CHILD_QUESTION_HOLD = "child_question_hold"
 
 
 FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
@@ -54,6 +56,7 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.SESSION_RETENTION_ACTIVATION: 11,
     StorageFeature.TRANSCRIPT_TAIL_EVIDENCE: 12,
     StorageFeature.CHILD_RECOVERY: 13,
+    StorageFeature.CHILD_QUESTION_HOLD: 14,
     # APPROVAL_RESTART_REASON and INBOX_DURABLE_INTENT must be fixed int literals
     # (test_storage_feature_epochs forbids referencing WRITER_EPOCH here).
     # Recheck main+1 at the final merge.
@@ -122,6 +125,10 @@ GATED_HOME_PATHS: Final[tuple[tuple[str, str], ...]] = (
 # Persisted mappings that reject unknown keys.  Names are wire-shape names, not
 # Python type names, so a conditional variant can be compared independently.
 ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
+    "child_question_state": frozenset({
+        "question_id", "state", "question", "options", "held_at_turn_limit",
+        "ancestor_target_ids", "settlement_turn",
+    }),
     "child_recovered_notification": frozenset({
         "kind", "origin", "logical_id", "child_instance_id", "child_session_path", "description", "episode", "text", "display_only",
     }),
@@ -272,6 +279,7 @@ BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
 }
 
 CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "child_question_state.state": CHILD_QUESTION_STATES,
     "notification.child_recovered": frozenset({"child_recovered"}),
     "child_lifecycle.state": frozenset({"running", "idle", "finishing", "completed", "canceled", "failed", "suspended"}),
     "child_lifecycle.resume_mode": frozenset({"idle", "active"}),

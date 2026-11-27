@@ -973,6 +973,8 @@ class AgentLoop(
                     steering = self.store.pending_client_steering()
                     notification_context = system_message if notification_turn else None
                     self._set_pre_dispatch_step("admitting request")
+                    if (owner := getattr(self, "_child_run_owner", None)) is not None:
+                        await owner.repair_before_replay()
                     prepared_delivery = await watchdog.wait(
                         "request admission", "admitting request",
                         partial(
@@ -1394,7 +1396,8 @@ class AgentLoop(
             finally:
                 await dispatch.aclose()
                 await self._background_owner.wait_for_store_closes()
-            if self._explicit_finish_report is not None:
+            owner = getattr(self, "_child_run_owner", None)
+            if self._explicit_finish_report is not None or (owner is not None and owner.finish_waits_for_answer):
                 if self.child_turn_control is not None:
                     self.child_turn_control.finish_completion()
                 yield StreamEvent(

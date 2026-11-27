@@ -472,6 +472,10 @@ class AgentStateMixin:
     def child_recovery_enabled(self) -> bool:
         return feature_enabled(self._storage_lease.observed_epoch, StorageFeature.CHILD_RECOVERY)
 
+    @property
+    def child_question_hold_enabled(self) -> bool:
+        return feature_enabled(self._storage_lease.observed_epoch, StorageFeature.CHILD_QUESTION_HOLD)
+
     def select_child_accounts(self, marker_key: str, pins: dict[str, str]) -> None:
         with self._append_lock():
             self._load_session_state()
@@ -722,7 +726,7 @@ class AgentStateMixin:
         ):
             post_child_progress(self, self._agent_lifecycle)
 
-    def persist_child_activity(self, *, state: str | None, turns: int | None) -> None:
+    def persist_child_activity(self, *, state: str | None, turns: int | None, current_step: str | None = None) -> None:
         live = live_agent_lifecycle(self.agent_lifecycle_path)
         with self._append_lock():
             self._load_session_state()
@@ -732,7 +736,7 @@ class AgentStateMixin:
                 self._agent_lifecycle.update(live)
             self.update_agent_lifecycle(
                 state=state, turns_used=turns,
-                current_step={"idle": "idle, waiting for follow-up", "running": "running follow-up"}.get(state),
+                current_step=current_step or {"idle": "idle, waiting for follow-up", "running": "running follow-up"}.get(state),
                 idle_since=_now() if state == "idle" else None,
             )
             self._write_agent_lifecycle()
