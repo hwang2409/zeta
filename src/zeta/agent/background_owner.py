@@ -457,7 +457,8 @@ class BackgroundAgentOwner:
         owned_setups = set(self._watchers.values())
         for setup in self._setup_tasks - owned_setups:
             setup.cancel()
-        remaining = set(self._watchers)
+        current = asyncio.current_task()
+        remaining = {child for child, watcher in self._watchers.items() if watcher is not current}
         while remaining:
             leaves = remaining - {self._parent_ids.get(child) for child in remaining}
             assert leaves, "child ownership cycle"
@@ -468,7 +469,7 @@ class BackgroundAgentOwner:
                     await owner.suspend()
                 else:
                     self._request_cancellation(child)
-                if watcher is not None:
+                if watcher is not None and watcher is not current:
                     await asyncio.gather(asyncio.shield(watcher), return_exceptions=True)
             remaining -= leaves
         await self.wait()

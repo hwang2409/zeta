@@ -43,7 +43,7 @@ _IDLE_NUDGE_PROMPT = (
 
 
 async def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
-    if child_loop._child_run_owner is not None and child_loop._child_run_owner.recoverable:
+    if getattr(getattr(child_loop, "_child_run_owner", None), "recoverable", False):
         await child_store._commit_storage_command(_ChildActivityCommand(state="running"))
     elif getattr(child_loop, "explicit_finish", False):
         child_store.update_agent_lifecycle(
@@ -182,7 +182,7 @@ async def consume_run(
         if not callable(child_turns):
             return {}
         idle = state == "idle"
-        if idle and not child_store.child_recovery_enabled:
+        if idle and not getattr(getattr(child_loop, "_child_run_owner", None), "recoverable", False):
             _transition_idle(child_store)
         return agent_stats(
             child_store.agent_lifecycle(),
@@ -269,10 +269,10 @@ async def consume_run(
                 )
                 continue
             if idle:
-                owner = child_loop._child_run_owner
-                if owner is not None and owner.recoverable:
+                if getattr(getattr(child_loop, "_child_run_owner", None), "recoverable", False):
                     await child_store._commit_storage_command(_ChildActivityCommand(state="idle"))
-                _transition_idle(child_store)
+                else:
+                    _transition_idle(child_store)
                 content = result.get("content")
                 text = "child is idle"
                 if (

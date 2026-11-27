@@ -3788,6 +3788,8 @@ async def test_close_cancels_adopted_grandchild_after_child_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     backend = FinishGateBackend("handoff", background_child=True)
+    # This test exercises cancel-on-close before the recovery epoch.
+    (tmp_path / "storage-format.json").write_text('{"writer_epoch":12}\n')
     store = ConversationStore(tmp_path)
     loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
     owner = loop._background_owner
@@ -18507,7 +18509,7 @@ async def test_cancel_or_accepted_finish_racing_reminder_admission(
             loop, "work", child_store=store, idle_wait=wait_idle
         )
     )
-    await asyncio.wait_for(admission_reached.wait(), 2)
+    await await_or_fail(admission_reached.wait(), what="idle nudge admission")
     if terminal_action == "cancel":
         assert await loop._child_run_owner.cancel() is True
         accepted_report = None
