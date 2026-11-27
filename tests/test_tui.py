@@ -10094,6 +10094,70 @@ def _test_tui_app(store: ConversationStore, output: StringIO) -> TUIApp:
     )
 
 
+async def test_provider_suspension_notice_tracks_retry_progress(tmp_path: Path) -> None:
+    from zeta.core.store._async_writes import _ChildSuspensionCommand
+
+    store = ConversationStore(tmp_path / "sessions")
+    app = _test_tui_app(store, StringIO())
+    run_id = f"{store.session_id}:1"
+    first = "2026-11-27T08:11:48+00:00"
+    later = "2026-11-27T08:12:18+00:00"
+    deadline = "2026-11-27T09:11:43+00:00"
+    retry = {
+        "retry_started_at": "2026-11-27T08:11:43+00:00",
+        "retry_deadline_at": deadline,
+        "retry_state": "retrying",
+        "retry_step": 0,
+        "retry_probe_at": first,
+        "next_retry_at": first,
+    }
+    with create_pipe_input() as pipe:
+        task = asyncio.create_task(app.run(_display_session(app, pipe, True)))
+        try:
+            await wait_until(lambda: app._full_screen_active() and app.interaction_ready())
+            with ConversationStore(
+                store.session_dir / "agents", session_id="1", _storage_lease=store._storage_lease
+            ) as child:
+                child.start_agent_lifecycle(
+                    handle=run_id, started_at=retry["retry_started_at"], depth=1,
+                    agent_type="general", description="worker",
+                )
+                await child._commit_storage_command(_ChildSuspensionCommand(provider_retry=retry))
+                notice, _ = store.append_child_recovered(
+                    run_id, 1, path=str(child.session_dir), description="worker",
+                    suspension={
+                        "code": "server_error", "text": "suspended: provider unavailable, retrying",
+                        "next_retry_at": first,
+                    },
+                )
+                app._handle_background_event(
+                    StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=notice.data)
+                )
+                assert first in app._transcript.render(120)
+
+                await child._commit_storage_command(_ChildSuspensionCommand(provider_retry={
+                    **retry, "retry_step": 1, "retry_probe_at": later, "next_retry_at": later,
+                }))
+                display = app._transcript.render(120)
+                assert later in display, "the rendered suspension notice must show the updated retry time"
+                assert first not in display
+
+                retry.pop("next_retry_at")
+                await child._commit_storage_command(_ChildSuspensionCommand(provider_retry={
+                    **retry, "retry_step": 2, "retry_probe_at": deadline, "retry_state": "stopped",
+                }))
+                display = app._transcript.render(120)
+                assert display.count("suspended: provider unavailable") == 1
+                assert "retrying" not in display
+                assert later not in display
+        finally:
+            pipe.send_text("\x04")
+            try:
+                await await_or_fail(task, what="close the TUI prompt")
+            finally:
+                await close_owned_app(app)
+
+
 async def _run_reopened_session(store: ConversationStore, full_screen: bool) -> str:
     reopened = ConversationStore(store.root_dir, session_id=store.session_id)
     output = StringIO()

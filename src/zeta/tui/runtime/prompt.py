@@ -142,6 +142,10 @@ class PromptRuntimeMixin:
             session_id=self.loop.store.session_id,
         )
         try:
+            if self._stop_provider_retry_watch is None:
+                self._stop_provider_retry_watch = self._presenter.watch_provider_retries(
+                    self.loop.store.session_id, self._invalidate_background_prompt
+                )
             if not resume_ui:
                 self._begin_startup_replay()
             observer_host = getattr(self, "observer_host", None)

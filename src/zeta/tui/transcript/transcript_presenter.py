@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from rich.console import Console, Group, RenderableType
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.live import Live
 from rich.padding import Padding
 from rich.text import Text
 
+from ...core.agent_progress import register_child_run_sink
 from ...protocol.types import StreamEvent, StreamEventType
 from .. import theme
 from ..cards.agent_message import AgentIdentityIndex
@@ -31,6 +33,16 @@ from .transcript import (
 class ToolEventPresentation:
     visible_output: bool = False
     stop_after_tool: bool = False
+
+
+@dataclass
+class _SuspensionNotice:
+    event: StreamEvent
+    card: RenderableType
+    revision: int = 0
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        yield self.card
 
 
 class TranscriptPresenter:
@@ -63,6 +75,8 @@ class TranscriptPresenter:
         self._assistant_unit: _TranscriptUnit | None = None
         self._assistant_message_units: list[_TranscriptUnit] = []
         self._assistant_message_region: list[_TranscriptUnit] = []
+        self._suspension_notices: dict[str, _SuspensionNotice] = {}
+        self._provider_retries: dict[str, str | None] = {}
 
     @property
     def tool_region(self) -> Live | None:
@@ -328,9 +342,80 @@ class TranscriptPresenter:
         self._thinking_stream = None
         self.reset_assistant_unit()
 
+    def watch_provider_retries(
+        self, session_id: str, invalidate: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Consume the same projected lifecycle rows as serve, on the UI loop."""
+        loop = asyncio.get_running_loop()
+        watching = True
+
+        def apply(run_id: str, suspended: bool, next_at: str | None) -> None:
+            if not watching:
+                return
+            if suspended:
+                self._provider_retries[run_id] = next_at
+            else:
+                self._provider_retries.pop(run_id, None)
+                self._suspension_notices.pop(run_id, None)
+                return
+            notice = self._suspension_notices.get(run_id)
+            if notice is not None and notice.event.data.get("next_retry_at") != next_at:
+                notice.event = self._with_retry_time(notice.event, next_at)
+                notice.card = render_event(notice.event, self._agent_identities)
+                notice.revision += 1
+                self.transcript.touch_renderable(notice)
+                invalidate()
+
+        def sink(
+            kind: str, run_id: str, row: dict[str, object], _number: int, _store: object
+        ) -> None:
+            if kind == "started" or row.get("session_id") != session_id:
+                return
+            suspended = (
+                row.get("status") == "suspended"
+                and row.get("suspension_reason") == "provider_unavailable"
+            )
+            next_at = row.get("next_retry_at")
+            loop.call_soon_threadsafe(
+                apply, run_id, suspended, next_at if isinstance(next_at, str) else None
+            )
+
+        unregister = register_child_run_sink(sink)
+
+        def stop() -> None:
+            nonlocal watching
+            watching = False
+            unregister()
+            self._provider_retries.clear()
+            self._suspension_notices.clear()
+
+        return stop
+
+    @staticmethod
+    def _with_retry_time(event: StreamEvent, next_at: str | None) -> StreamEvent:
+        data = dict(event.data)
+        if next_at is None:
+            data.pop("next_retry_at", None)
+        else:
+            data["next_retry_at"] = next_at
+        return replace(event, data=data)
+
     def render_event(self, event: StreamEvent) -> RenderableType | None:
         self._agent_identities.observe(event)
-        return render_event(event, self._agent_identities)
+        run_id = (
+            event.data.get("child_instance_id")
+            if event.type is StreamEventType.AGENT_NOTIFICATION
+            and event.data.get("kind") == "child_suspended"
+            else None
+        )
+        if isinstance(run_id, str) and run_id in self._provider_retries:
+            event = self._with_retry_time(event, self._provider_retries[run_id])
+        rendered = render_event(event, self._agent_identities)
+        if isinstance(run_id, str) and rendered is not None:
+            notice = _SuspensionNotice(event, rendered)
+            self._suspension_notices[run_id] = notice
+            return notice
+        return rendered
 
     def update_tool_region(self, event: StreamEvent) -> bool:
         rendered = self.render_event(event)
