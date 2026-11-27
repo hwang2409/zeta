@@ -21,7 +21,7 @@ from .availability import AccountDisplay
 from .exhaustion import classify_subscription_limit, recovery_alternatives
 from .status import AccountStatus, account_status
 from .store import AccountError, AccountId, AccountStore
-from .usage import read_usage, record_subscription_limit
+from .usage import read_usage, record_usage_snapshot
 
 if TYPE_CHECKING:
     from ..core.session import SessionManager, SessionMetadata
@@ -699,7 +699,7 @@ class SessionAccountContext:
         now = datetime.now(UTC)
         state = limit.usage_state(now)
         assert state.snapshot is not None
-        record_subscription_limit(self.store, account, state.snapshot, now)
+        record_usage_snapshot(self.store, account, state.snapshot, now)
         states = {
             item: read_usage(self.store, item, now=now)
             for item in self.store.list()

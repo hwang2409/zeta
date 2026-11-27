@@ -8,8 +8,14 @@ from datetime import UTC, datetime
 from enum import Enum, auto
 
 from ..accounts.store import AccountCredentials
-from ..accounts.usage import AccountUsage, UsageState, normalize_usage
+from ..accounts.usage import (
+    AccountUsage,
+    UsageState,
+    normalize_usage,
+    record_usage_snapshot,
+)
 from ..protocol.types import Message, MessageRole, StreamEventType, TextContent
+from ..runtime.offload import await_joined_offload
 from .anthropic import AnthropicApiKeyCredential
 from .completion import retryable_provider_error
 
@@ -42,6 +48,7 @@ async def _exhausted(backend, credentials: AccountCredentials) -> bool:
         snapshot = normalize_usage(credentials.account.provider, response.json(), now)
     except (TypeError, ValueError):
         return False
+    await await_joined_offload(record_usage_snapshot, credentials.store, credentials.account, snapshot, now)
     return UsageState(snapshot, "now").known_exhausted(now)
 
 

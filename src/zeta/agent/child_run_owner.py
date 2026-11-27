@@ -50,6 +50,7 @@ class ChildRunTransitionOwner:
         self.quiescing = False
         self._shutdown_suspended = False
         self._provider_phase = "active"
+        self._provider_activation_requested = False
         self._retry_window: dict[str, str] = {}
         self._retry_schedule: RecoverySchedule | None = None
         self._provider_ready: asyncio.Event | None = None
@@ -154,7 +155,9 @@ class ChildRunTransitionOwner:
                 raise LookupError(self.run_id)
             await enqueue()
             await self.reconcile_questions()
-            if self._provider_phase == "provider_suspended":
+            if self._provider_phase == "provider_suspending":
+                self._provider_activation_requested = True
+            elif self._provider_phase == "provider_suspended":
                 await self._activate_provider(self._provider_episode)
 
     @property
@@ -230,30 +233,38 @@ class ChildRunTransitionOwner:
                 "text": state["current_step"], "code": code,
                 **({"next_retry_at": next_at} if next_at is not None else {}),
             })
-            if self.quiescing or self._cancellation is not None:
+        # Let sends queued behind the durable write register intent before arming the timer.
+        async with self._lock:
+            if self.quiescing or self._cancellation is not None or self._winner is not None:
                 raise asyncio.CancelledError
             self._provider_phase = "provider_suspended"
             ready = self._provider_ready = asyncio.Event()
-
-            async def activate(next_schedule):
-                async with self._lock:
-                    if self._provider_can_activate(episode):
-                        self._retry_schedule = next_schedule
-                        await self._activate_provider(episode)
-
-            async def update(next_schedule, stop):
-                async with self._lock:
-                    if self._provider_can_activate(episode):
-                        await self._persist_provider_wait(next_schedule, stopped=stop)
-
-            if not stopped:
-                self._recovery.subscribe(
-                    self._provider_account, self.run_id, self._provider_backend, deadline=deadline,
-                    schedule=schedule, activate=activate, update=update,
-                )
+            activate_now = self._provider_activation_requested
+            self._provider_activation_requested = False
+            if activate_now:
+                await self._activate_provider(episode)
+            elif not stopped:
+                self._subscribe_provider(episode, deadline, schedule)
         await ready.wait()
         if self.quiescing or self._cancellation is not None:
             raise asyncio.CancelledError
+
+    def _subscribe_provider(self, episode: int, deadline: str, schedule: RecoverySchedule) -> None:
+        async def activate(next_schedule):
+            async with self._lock:
+                if self._provider_can_activate(episode):
+                    self._retry_schedule = next_schedule
+                    await self._activate_provider(episode)
+
+        async def update(next_schedule, stop):
+            async with self._lock:
+                if self._provider_can_activate(episode):
+                    await self._persist_provider_wait(next_schedule, stopped=stop)
+
+        self._recovery.subscribe(
+            self._provider_account, self.run_id, self._provider_backend, deadline=deadline,
+            schedule=schedule, activate=activate, update=update,
+        )
 
     def _provider_can_activate(self, episode: int) -> bool:
         return (

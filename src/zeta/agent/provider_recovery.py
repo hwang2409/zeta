@@ -105,11 +105,7 @@ class ProviderRecoveryCoordinator:
             if edge > self.clock.now():
                 await self.clock.wait_until(edge)
             now = self.clock.now()
-            waiting = tuple(run for run in state.runs.values() if run.waiting)
-            for run in waiting:
-                if run.deadline <= now:
-                    run.waiting = False
-                    await run.update(self._schedule(state), True)
+            await self._expire(state, now)
             ready = tuple(run for run in state.runs.values() if run.waiting)
             if not ready or now < state.next_at:
                 continue
@@ -122,18 +118,27 @@ class ProviderRecoveryCoordinator:
             now = self.clock.now()
             state.step = min(state.step + 1, len(_BACKOFF) - 1)
             state.next_at = now + _BACKOFF[state.step]
-            schedule = self._schedule(state)
-            for run in tuple(state.runs.values()):
-                if not run.waiting:
-                    continue
-                if result is Readiness.STOP or run.deadline <= now:
-                    run.waiting = False
-                    await run.update(schedule, True)
-                elif result is Readiness.READY:
-                    run.waiting = False
-                    await run.activate(schedule)
-                else:
-                    await run.update(schedule, False)
+            await self._fan_out(state, result, now)
+
+    async def _expire(self, state: _Account, now: float) -> None:
+        for run in tuple(state.runs.values()):
+            if run.waiting and run.deadline <= now:
+                run.waiting = False
+                await run.update(self._schedule(state), True)
+
+    async def _fan_out(self, state: _Account, result: Readiness, now: float) -> None:
+        schedule = self._schedule(state)
+        for run in tuple(state.runs.values()):
+            if not run.waiting:
+                continue
+            if result is Readiness.STOP or run.deadline <= now:
+                run.waiting = False
+                await run.update(schedule, True)
+            elif result is Readiness.READY:
+                run.waiting = False
+                await run.activate(schedule)
+            else:
+                await run.update(schedule, False)
 
     async def close(self) -> None:
         self._closed = True

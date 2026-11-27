@@ -752,6 +752,19 @@ class AgentLoop(
         return self._finalize_tool_results([tool_call], [None])[0]
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
         return self.store.tool_result(tool_call_id)
+    @staticmethod
+    def _can_recover_provider(owner, budget: CompletionRetryBudget | None) -> bool:
+        return (
+            owner is not None and owner.provider_recovery_enabled and budget is not None
+            and budget.exhausted and budget.first_failure_retryable and not budget.committed
+        )
+
+    @staticmethod
+    async def _suspend_for_provider(owner, budget: CompletionRetryBudget, *, reset: bool) -> AsyncIterator[StreamEvent]:
+        if reset:
+            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
+        await owner.provider_suspend(budget.first_failure_code, budget.failure_elapsed)
+
     async def _run_turn_impl(
         self,
         user_text: str,
@@ -1195,17 +1208,14 @@ class AgentLoop(
                         step_delivery
                     ):
                         yield publication
-                if (
-                    owner is not None and owner.provider_recovery_enabled
-                    and provider_retry_budget is not None and provider_retry_budget.exhausted
-                    and provider_retry_budget.first_failure_retryable and not provider_retry_budget.committed
-                ):
+                if self._can_recover_provider(owner, provider_retry_budget):
                     delivery_published |= provider_started and has_active_delivery
-                    if partial_blocks or assistant_message is not None:
-                        yield StreamEvent(StreamEventType.ASSISTANT_RESET)
+                    async for recovery_event in self._suspend_for_provider(
+                        owner, provider_retry_budget, reset=bool(partial_blocks or assistant_message is not None),
+                    ):
+                        yield recovery_event
                     partial_blocks = []
                     assistant_message = None
-                    await owner.provider_suspend(provider_retry_budget.first_failure_code, provider_retry_budget.failure_elapsed)
                     provider_retry_budget = None
                     redispatch = "provider"
                     continue

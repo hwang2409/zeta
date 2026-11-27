@@ -69,6 +69,40 @@ class BrokenAgentLifecycle:
 AgentLifecycleRead = MissingAgentLifecycle | LoadedAgentLifecycle | BrokenAgentLifecycle
 
 
+def _validate_provider_retry(lifecycle: dict[str, Any]) -> None:
+    retrying = lifecycle.get("retry_state")
+    if lifecycle.get("suspension_reason") == "provider_unavailable" and retrying not in {"retrying", "stopped"}:
+        raise ValueError("invalid provider retry state")
+    if retrying is not None and (lifecycle["state"] != "suspended" or lifecycle.get("suspension_reason") != "provider_unavailable"):
+        raise ValueError("provider retry state outside provider suspension")
+    if ("next_retry_at" in lifecycle) != (retrying == "retrying"):
+        raise ValueError("invalid provider retry time")
+    if retrying is not None or "retry_started_at" in lifecycle or "retry_deadline_at" in lifecycle:
+        for key in ("retry_started_at", "retry_deadline_at", "retry_probe_at", *(("next_retry_at",) if retrying == "retrying" else ())):
+            timestamp = lifecycle.get(key)
+            if type(timestamp) is not str or len(timestamp) > 40 or datetime.fromisoformat(timestamp).utcoffset() != timedelta(0):
+                raise ValueError("invalid UTC provider retry timestamp")
+        step = lifecycle.get("retry_step")
+        if type(step) is not int or not 0 <= step <= 6:
+            raise ValueError("invalid provider retry step")
+
+
+def _apply_provider_retry(lifecycle: dict[str, Any], retry: dict[str, str | int] | None) -> None:
+    if retry is None:
+        for key in ("retry_started_at", "retry_deadline_at", "retry_probe_at", "retry_step"):
+            lifecycle.pop(key, None)
+        return
+    if "retry_started_at" not in lifecycle:
+        lifecycle["suspension_episode"] = lifecycle.get("suspension_episode", 0) + 1
+    lifecycle.update(retry)
+    lifecycle.update(state="suspended", suspended_at=_now(), suspension_reason="provider_unavailable", resume_mode="active")
+    if "next_retry_at" not in retry:
+        lifecycle.pop("next_retry_at", None)
+    lifecycle["current_step"] = "suspended: provider unavailable"
+    if lifecycle["retry_state"] == "retrying":
+        lifecycle["current_step"] += ", retrying"
+
+
 def _validate_status_lifecycle(value: object) -> dict[str, Any]:
     if type(value) is not dict:
         raise ValueError("lifecycle data is not an object")
@@ -100,21 +134,7 @@ def _validate_status_lifecycle(value: object) -> dict[str, Any]:
         ):
             raise ValueError("invalid child suspension")
         datetime.fromisoformat(suspended_at)
-    retrying = lifecycle.get("retry_state")
-    if lifecycle.get("suspension_reason") == "provider_unavailable" and retrying not in {"retrying", "stopped"}:
-        raise ValueError("invalid provider retry state")
-    if retrying is not None and (state != "suspended" or lifecycle.get("suspension_reason") != "provider_unavailable"):
-        raise ValueError("provider retry state outside provider suspension")
-    if ("next_retry_at" in lifecycle) != (retrying == "retrying"):
-        raise ValueError("invalid provider retry time")
-    if retrying is not None or "retry_started_at" in lifecycle or "retry_deadline_at" in lifecycle:
-        for key in ("retry_started_at", "retry_deadline_at", "retry_probe_at", *(("next_retry_at",) if retrying == "retrying" else ())):
-            timestamp = lifecycle.get(key)
-            if type(timestamp) is not str or len(timestamp) > 40 or datetime.fromisoformat(timestamp).utcoffset() != timedelta(0):
-                raise ValueError("invalid UTC provider retry timestamp")
-        step = lifecycle.get("retry_step")
-        if type(step) is not int or not 0 <= step <= 6:
-            raise ValueError("invalid provider retry step")
+    _validate_provider_retry(lifecycle)
     blocked = lifecycle.get("recovery_blocked")
     if "recovery_blocked" in lifecycle and (state != "suspended" or type(blocked) is not str or not 0 < len(blocked) <= 160):
         raise ValueError("invalid child recovery reason")
@@ -778,25 +798,12 @@ class AgentStateMixin:
             lifecycle = self._agent_lifecycle
             if lifecycle is None or lifecycle.get("finished_at") is not None:
                 return None
-            if (provider_retry is not None or retry_progress) and not self.provider_recovery_enabled:
-                raise ValueError("provider recovery is unavailable at this epoch")
-            if retry_progress:
+            if provider_retry is not None or retry_progress:
+                if not self.provider_recovery_enabled:
+                    raise ValueError("provider recovery is unavailable at this epoch")
                 if live is not None:
                     lifecycle.update(live)
-                for key in ("retry_started_at", "retry_deadline_at", "retry_probe_at", "retry_step"):
-                    lifecycle.pop(key, None)
-            elif provider_retry is not None:
-                if live is not None:
-                    lifecycle.update(live)
-                if "retry_started_at" not in lifecycle:
-                    lifecycle["suspension_episode"] = lifecycle.get("suspension_episode", 0) + 1
-                lifecycle.update(provider_retry)
-                lifecycle.update(state="suspended", suspended_at=_now(), suspension_reason="provider_unavailable", resume_mode="active")
-                if "next_retry_at" not in provider_retry:
-                    lifecycle.pop("next_retry_at", None)
-                lifecycle["current_step"] = "suspended: provider unavailable"
-                if lifecycle["retry_state"] == "retrying":
-                    lifecycle["current_step"] += ", retrying"
+                _apply_provider_retry(lifecycle, None if retry_progress else provider_retry)
             elif reason is not None and lifecycle["state"] != "suspended":
                 if live is not None:
                     lifecycle.update(live)

@@ -97,13 +97,14 @@ class _RecoveryBackend(_AttemptBackend):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["false-positive", "send", "cancel", "cancel-suspension", "cancel-activation", "restart"])
+@pytest.mark.parametrize("scenario", ["false-positive", "send", "cancel", "cancel-suspension", "send-suspension", "cancel-activation", "restart"])
 async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, scenario):
     from datetime import UTC, datetime, timedelta
     from io import StringIO
 
     from rich.console import Console
 
+    from zeta.agent.child_run_owner import ChildRunTransitionOwner
     from zeta.agent.pending_delivery import send_to_run
     from zeta.agent.recovery_lease import activate_agent_children
     from zeta.core.store._async_writes import (
@@ -128,6 +129,8 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
 
     commit_entered = asyncio.Event()
     commit_release = asyncio.Event()
+    send_entered = asyncio.Event()
+    subscribed = asyncio.Event()
     probe_entered = asyncio.Event()
     probe_release = asyncio.Event()
     unregister = register_child_run_sink(observe)
@@ -135,11 +138,11 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
 
     async def publish_commit(store, command):
         if isinstance(command, _ChildSuspensionCommand) and (
-            scenario == "cancel-suspension" and command.provider_retry is not None
+            scenario in {"cancel-suspension", "send-suspension"} and command.provider_retry is not None
             or scenario == "cancel-activation" and command.activate is not None
         ):
             commit_entered.set()
-            if scenario == "cancel-suspension":
+            if scenario in {"cancel-suspension", "send-suspension"}:
                 notices.put_nowait(("suspending", None))
             await await_or_fail(commit_release.wait(), what="release the child lifecycle write")
         result = await commit(store, command)
@@ -149,6 +152,15 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
 
     # test-contract: seam gate the durable write to control cancellation order.
     monkeypatch.setattr(ConversationStore, "_commit_storage_command", publish_commit)
+
+    if scenario == "send-suspension":
+        send = ChildRunTransitionOwner.send
+
+        async def observe_send(owner, enqueue):
+            send_entered.set()
+            await send(owner, enqueue)
+
+        monkeypatch.setattr(ChildRunTransitionOwner, "send", observe_send)
 
     async def suspended():
         kind, row = await await_or_fail(notices.get(), what="durable suspend notice or terminal receipt")
@@ -179,8 +191,38 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
                 recovery.clock = clock
                 recovery.wall = lambda: epoch + timedelta(seconds=clock.now())
                 recovery._probe = probe
+                if scenario == "send-suspension":
+                    subscribe = recovery.subscribe
+
+                    def observe_subscription(*args, **kwargs):
+                        subscribed.set()
+                        return subscribe(*args, **kwargs)
+
+                    monkeypatch.setattr(recovery, "subscribe", observe_subscription)
             try:
                 run_id = await await_or_fail(runner.spawn_child(loop, agent_type="general", task="work", cwd=None), what="spawn retained child")
+                if scenario == "send-suspension":
+                    kind, _ = await await_or_fail(notices.get(), what="suspension write begins")
+                    assert kind == "suspending"
+                    backend.offline = False
+                    sending = asyncio.create_task(send_to_run(store, run_id, "queued", owner=tree, channel=tree.conversation_channel))
+                    try:
+                        await await_or_fail(send_entered.wait(), what="send reaches transition owner during write")
+                        commit_release.set()
+                        assert await await_or_fail(sending, what="send accepted") is None
+                    finally:
+                        commit_release.set()
+                        sending.cancel()
+                        await await_or_fail(asyncio.gather(sending, return_exceptions=True), what="join send")
+                    _, terminal = await await_or_fail(ended.get(), what="explicit send replays without a probe")
+                    assert not subscribed.is_set(), "send during suspension must activate instead of subscribing"
+                    assert not probe_entered.is_set()
+                    assert terminal["status"] == "completed"
+                    assert terminal["turns_used"] == 2
+                    assert len(backend.requests) == 7
+                    assert backend.requests[0] == backend.requests[5]
+                    assert ended.empty()
+                    return
                 if scenario == "cancel-suspension":
                     kind, _ = await await_or_fail(notices.get(), what="suspension or terminal write")
                     assert kind == "suspending", "cancel must be possible during a nonterminal suspension write"
@@ -327,6 +369,7 @@ async def test_provider_readiness_uses_context_free_generation(tmp_path, provide
     import httpx
 
     from tests.test_codex import message_stream, sse, store_for
+    from zeta.accounts.usage import read_usage
     from zeta.providers import recovery_probe
     from zeta.providers.anthropic import AnthropicApiKeyCredential, AnthropicBackend
     from zeta.providers.codex import CodexBackend
@@ -364,9 +407,13 @@ async def test_provider_readiness_uses_context_free_generation(tmp_path, provide
             if provider == "codex":
                 assert await recovery_probe.probe_readiness(backend) is recovery_probe.Readiness.RETRY
                 assert [request.method for request in requests] == ["GET"]
+                credentials = backend.token_store
+                assert read_usage(credentials.store, credentials.account).known_exhausted()
                 exhausted = False
             assert await recovery_probe.probe_readiness(backend) is recovery_probe.Readiness.READY
             assert [request.method for request in requests] == (["GET", "GET", "POST"] if provider == "codex" else ["POST"])
+            if provider == "codex":
+                assert not read_usage(credentials.store, credentials.account).known_exhausted()
             payload = json.loads(requests[-1].content)
             assert payload["model"] == backend.model
             assert not payload.get("tools") and not payload.get("system")
