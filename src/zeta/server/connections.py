@@ -1161,11 +1161,11 @@ class ConnectionRegistry(ReplayOutput):
                 fidelity="session_history_fidelity" in features,
                 approval_origin="tool_approval_origin" in features,
             )
-            from ..core.agent_progress import read_agent_lifecycle
-            from ..core.child_runs import project_child_run_row
+            from ..core.agent_state import LoadedAgentLifecycle
+            from ..core.child_runs import project_child_run_row, read_child_lifecycle
             reader = self._child_reader_for(target[1], params["run_id"])
-            lifecycle = read_agent_lifecycle(reader.session_dir / "agent_lifecycle.json")
-            item = lifecycle if isinstance(lifecycle, dict) else None
+            lifecycle, _ = read_child_lifecycle(target[1], reader.session_dir.absolute())
+            item = lifecycle.value if isinstance(lifecycle, LoadedAgentLifecycle) else None
             if item is not None:
                 item = {"handle": item.get("handle"), "description": item.get("description", ""), "agent_type": item.get("agent_type", "general"), "state": item.get("state", "running"), "turns_used": item.get("turns_used", 0), "tool_calls": item.get("tool_calls", 0), "current_step": item.get("current_step", ""), "started_at": item.get("started_at"), "finished_at": item.get("finished_at"), "elapsed": item.get("elapsed", 0.0), "account_status": item.get("account_status")}
             row = None

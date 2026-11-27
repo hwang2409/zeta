@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.agent_progress import live_agent_lifecycle, publish_child_ended
+from ..core.child_runs import marker_supports_recovery
 from ..core.store import ConversationEntry, ConversationStore
 from ..protocol.types import (
     Message,
@@ -216,7 +217,7 @@ def _settle_recovered_child_from_receipt(
 def _recoverable_marker(
     marker: dict[str, Any], child_store: ConversationStore | None, parent: ConversationStore,
 ) -> bool:
-    if not (parent.child_recovery_enabled and marker.get("background") and "resume" in marker):
+    if not (parent.child_recovery_enabled and marker_supports_recovery(marker)):
         return False
     if child_store is None:
         return True

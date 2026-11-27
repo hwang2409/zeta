@@ -14,12 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ...core.agent_progress import read_agent_lifecycle
+from ...core.agent_state import LoadedAgentLifecycle
 from ...core.checkpoints import (
     ConversationEntry,
     ConversationIntegrityError,
     load_session_json,
 )
+from ...core.child_runs import read_child_lifecycle
 from ...core.session_files import (
     SessionError,
     SessionFileReplaced,
@@ -110,12 +111,18 @@ def agent_tree_signature(
 
 
 def _read_agent_lifecycle(path: Path) -> dict[str, object] | None:
-    lifecycle_path = path / "agent_lifecycle.json"
+    root = path.absolute()
+    while root.parent.name == "agents":
+        root = root.parent.parent
+    if root == path.absolute():
+        return None
     try:
-        lifecycle = read_agent_lifecycle(lifecycle_path)
+        with ConversationStore(root.parent, session_id=root.name, _read_only=True, _must_exist=True) as parent:
+            lifecycle, _ = read_child_lifecycle(parent, path.absolute())
     except (ConversationIntegrityError, OSError, ValueError):
         return None
-    return lifecycle if type(lifecycle) is dict else None
+    return lifecycle.value if isinstance(lifecycle, LoadedAgentLifecycle) else None
+
 
 
 class TodoStateNotWritten(Exception):

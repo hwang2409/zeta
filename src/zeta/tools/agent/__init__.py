@@ -49,7 +49,7 @@ from ...core.checkpoints import (
     load_session_json,
 )
 from ...core.child_lifecycle import select_legacy_child_lifecycle
-from ...core.session_execution import execution_owner_state
+from ...core.child_runs import read_child_lifecycle
 from ...core.session_files import (
     child_directory,
     open_session_file,
@@ -326,18 +326,7 @@ def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> b
 def _read_child_lifecycle(
     store: ConversationStore, child_path: Path
 ) -> tuple[object, str | None]:
-    with ExitStack() as cleanup:
-        directory_fd = store.directory_fd
-        for component in child_path.relative_to(store.session_dir.absolute()).parts:
-            directory_fd = cleanup.enter_context(
-                child_directory(directory_fd, component)
-            )
-        return (
-            read_agent_lifecycle_state(
-                directory_fd, child_path / "agent_lifecycle.json"
-            ),
-            execution_owner_state(directory_fd),
-        )
+    return read_child_lifecycle(store, child_path, read_state=read_agent_lifecycle_state)
 
 
 def _read_agent_transcript(
