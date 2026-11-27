@@ -97,14 +97,13 @@ class _RecoveryBackend(_AttemptBackend):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["false-positive", "send", "cancel", "cancel-suspension", "send-suspension", "cancel-activation", "restart"])
+@pytest.mark.parametrize("scenario", ["false-positive", "send", "restart", "shutdown-suspension"])
 async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, scenario):
     from datetime import UTC, datetime, timedelta
     from io import StringIO
 
     from rich.console import Console
 
-    from zeta.agent.child_run_owner import ChildRunTransitionOwner
     from zeta.agent.pending_delivery import send_to_run
     from zeta.agent.recovery_lease import activate_agent_children
     from zeta.core.store._async_writes import (
@@ -127,23 +126,17 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
             event_loop.call_soon_threadsafe(ended.put_nowait, (run_id, row))
             event_loop.call_soon_threadsafe(notices.put_nowait, ("ended", row))
 
-    commit_entered = asyncio.Event()
     commit_release = asyncio.Event()
-    send_entered = asyncio.Event()
-    subscribed = asyncio.Event()
+    quiesced = asyncio.Event()
+    close_release = asyncio.Event()
     probe_entered = asyncio.Event()
     probe_release = asyncio.Event()
     unregister = register_child_run_sink(observe)
     commit = ConversationStore._commit_storage_command
 
     async def publish_commit(store, command):
-        if isinstance(command, _ChildSuspensionCommand) and (
-            scenario in {"cancel-suspension", "send-suspension"} and command.provider_retry is not None
-            or scenario == "cancel-activation" and command.activate is not None
-        ):
-            commit_entered.set()
-            if scenario in {"cancel-suspension", "send-suspension"}:
-                notices.put_nowait(("suspending", None))
+        if scenario == "shutdown-suspension" and isinstance(command, _ChildSuspensionCommand) and command.provider_retry is not None:
+            notices.put_nowait(("suspending", None))
             await await_or_fail(commit_release.wait(), what="release the child lifecycle write")
         result = await commit(store, command)
         if isinstance(command, _AppendChildRecoveredCommand) and getattr(command, "suspension", None) is not None:
@@ -152,15 +145,6 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
 
     # test-contract: seam gate the durable write to control cancellation order.
     monkeypatch.setattr(ConversationStore, "_commit_storage_command", publish_commit)
-
-    if scenario == "send-suspension":
-        send = ChildRunTransitionOwner.send
-
-        async def observe_send(owner, enqueue):
-            send_entered.set()
-            await send(owner, enqueue)
-
-        monkeypatch.setattr(ChildRunTransitionOwner, "send", observe_send)
 
     async def suspended():
         kind, row = await await_or_fail(notices.get(), what="durable suspend notice or terminal receipt")
@@ -191,101 +175,72 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
                 recovery.clock = clock
                 recovery.wall = lambda: epoch + timedelta(seconds=clock.now())
                 recovery._probe = probe
-                if scenario == "send-suspension":
-                    subscribe = recovery.subscribe
+                if scenario == "shutdown-suspension":
+                    close_recovery = recovery.close
 
-                    def observe_subscription(*args, **kwargs):
-                        subscribed.set()
-                        return subscribe(*args, **kwargs)
+                    async def gate_close():
+                        quiesced.set()
+                        await await_or_fail(close_release.wait(), what="release coordinator shutdown")
+                        await close_recovery()
 
-                    monkeypatch.setattr(recovery, "subscribe", observe_subscription)
+                    monkeypatch.setattr(recovery, "close", gate_close)
             try:
                 run_id = await await_or_fail(runner.spawn_child(loop, agent_type="general", task="work", cwd=None), what="spawn retained child")
-                if scenario == "send-suspension":
-                    kind, _ = await await_or_fail(notices.get(), what="suspension write begins")
-                    assert kind == "suspending"
-                    backend.offline = False
-                    sending = asyncio.create_task(send_to_run(store, run_id, "queued", owner=tree, channel=tree.conversation_channel))
+                if scenario == "shutdown-suspension":
+                    kind, _ = await await_or_fail(notices.get(), what="suspension write or terminal receipt")
+                    assert kind == "suspending", "shutdown must be possible during suspension"
+                    closing = asyncio.create_task(loop.close())
                     try:
-                        await await_or_fail(send_entered.wait(), what="send reaches transition owner during write")
+                        await await_or_fail(quiesced.wait(), what="tree closed admission")
                         commit_release.set()
-                        assert await await_or_fail(sending, what="send accepted") is None
+                        await await_or_fail(tree.wait(), what="child settles while coordinator is closing")
+                        assert ended.empty(), "normal shutdown must not publish a terminal receipt"
+                        state = lifecycle(store, run_id)
+                        assert state["state"] == "suspended"
+                        deadline = state["retry_deadline_at"]
                     finally:
                         commit_release.set()
-                        sending.cancel()
-                        await await_or_fail(asyncio.gather(sending, return_exceptions=True), what="join send")
-                    _, terminal = await await_or_fail(ended.get(), what="explicit send replays without a probe")
-                    assert not subscribed.is_set(), "send during suspension must activate instead of subscribing"
-                    assert not probe_entered.is_set()
-                    assert terminal["status"] == "completed"
-                    assert terminal["turns_used"] == 2
-                    assert len(backend.requests) == 7
-                    assert backend.requests[0] == backend.requests[5]
-                    assert ended.empty()
-                    return
-                if scenario == "cancel-suspension":
-                    kind, _ = await await_or_fail(notices.get(), what="suspension or terminal write")
-                    assert kind == "suspending", "cancel must be possible during a nonterminal suspension write"
-                    transition = tree.run_transition(run_id)
-                    assert transition is not None
-                    request = transition.request_cancel()
-                    commit_release.set()
-                    assert await await_or_fail(request.confirmation, what="cancel during suspension")
-                    _, row = await await_or_fail(ended.get(), what="cancel writes one terminal receipt")
-                    assert row["status"] == "canceled"
-                    assert len(backend.requests) == 5
-                    assert ended.empty()
-                    return
-                notice = await suspended()
-                state = lifecycle(store, run_id)
-                assert state["turns_used"] == 0
-                assert state["next_retry_at"] == (epoch + timedelta(seconds=5)).isoformat()
-                deadline = state["retry_deadline_at"]
-                output = StringIO()
-                Console(file=output, width=120).print(render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=notice)))
-                assert "suspended: provider unavailable, retrying" in output.getvalue()
-                assert state["next_retry_at"] in output.getvalue()
-                if scenario != "restart":
-                    clock.advance(5)
-                    await await_or_fail(probe_entered.wait(), what="one account probe begins")
-                    transition = tree.run_transition(run_id)
-                    assert transition is not None
-                    if scenario == "false-positive":
-                        probe_release.set()
-                        await suspended()
-                        second = lifecycle(store, run_id)
-                        assert second["retry_deadline_at"] == deadline
-                        assert second["next_retry_at"] == (epoch + timedelta(seconds=15)).isoformat()
-                        assert second["suspension_episode"] == state["suspension_episode"]
-                        assert second["turns_used"] == 0
-                        assert len(backend.requests) == 10
-                        assert backend.requests[0] == backend.requests[5]
-                        assert len([row for row in store.agent_notifications(pending_only=False) if row.data.get("kind") == "child_suspended"]) == 1
-                    else:
-                        if scenario == "send":
+                        close_release.set()
+                        await await_or_fail(closing, what="finish closing tree")
+                else:
+                    notice = await suspended()
+                    state = lifecycle(store, run_id)
+                    assert state["turns_used"] == 0
+                    assert state["next_retry_at"] == (epoch + timedelta(seconds=5)).isoformat()
+                    deadline = state["retry_deadline_at"]
+                    output = StringIO()
+                    Console(file=output, width=120).print(render_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=notice)))
+                    assert "suspended: provider unavailable, retrying" in output.getvalue()
+                    assert state["next_retry_at"] in output.getvalue()
+                    if scenario != "restart":
+                        clock.advance(5)
+                        await await_or_fail(probe_entered.wait(), what="one account probe begins")
+                        if scenario == "false-positive":
+                            probe_release.set()
+                            await suspended()
+                            second = lifecycle(store, run_id)
+                            assert second["retry_deadline_at"] == deadline
+                            assert second["next_retry_at"] == (epoch + timedelta(seconds=15)).isoformat()
+                            assert second["suspension_episode"] == state["suspension_episode"]
+                            assert second["turns_used"] == 0
+                            assert len(backend.requests) == 10
+                            assert backend.requests[0] == backend.requests[5]
+                            assert len([row for row in store.agent_notifications(pending_only=False) if row.data.get("kind") == "child_suspended"]) == 1
+                        else:
                             backend.offline = False
                             assert await send_to_run(store, run_id, "queued", owner=tree, channel=tree.conversation_channel) is None
                             probe_release.set()
-                        else:
-                            if scenario == "cancel-activation":
-                                probe_release.set()
-                                await await_or_fail(commit_entered.wait(), what="enter durable activation")
-                            request = transition.request_cancel()
-                            commit_release.set()
-                            probe_release.set()
-                            assert await await_or_fail(request.confirmation, what="cancel wins")
-                        _, terminal = await await_or_fail(ended.get(), what="one terminal child fact")
-                        assert terminal["status"] == ("completed" if scenario == "send" else "canceled")
-                        assert len(backend.requests) == (7 if scenario == "send" else 5)
-                        if scenario == "send":
+                            _, terminal = await await_or_fail(ended.get(), what="one terminal child fact")
+                            assert terminal["status"] == "completed"
+                            assert terminal["turns_used"] == 2
+                            assert len(backend.requests) == 7
                             assert backend.requests[0] == backend.requests[5]
-                            assert terminal["turns_used"] == (2 if scenario == "send" else 1)
-                        assert ended.empty()
+                            assert ended.empty()
             finally:
                 commit_release.set()
                 probe_release.set()
                 await await_or_fail(loop.close(), what="close suspended or resumed tree")
-        if scenario == "restart":
+        if scenario in {"restart", "shutdown-suspension"}:
             backend.offline = False
             with ConversationStore(root, session_id=session_id, cwd=tmp_path) as store:
                 loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty())
@@ -293,13 +248,210 @@ async def test_retained_provider_episode_controls_replay(tmp_path, monkeypatch, 
                     assert lifecycle(store, run_id)["retry_deadline_at"] == deadline
                     await await_or_fail(activate_agent_children(loop), what="explicit parent resume")
                     _, terminal = await await_or_fail(ended.get(), what="restored child completes")
-                    assert terminal["turns_used"] == (2 if scenario == "send" else 1)
+                    assert terminal["turns_used"] == 1
                     assert lifecycle(store, run_id)["suspension_episode"] == state["suspension_episode"]
                     assert "retry_deadline_at" not in lifecycle(store, run_id)
                 finally:
                     await await_or_fail(loop.close(), what="close restored tree")
     finally:
         unregister()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase,write", [
+    ("running", None),
+    ("provider_suspending", "suspend-state"),
+    ("provider_suspending", "suspend-notice"),
+    ("provider_suspended", None),
+    ("activating", "activate-notice"),
+    ("activating", "activate-state"),
+])
+@pytest.mark.parametrize("event", ["send", "cancel", "shutdown", "probe_success", "probe_failure", "deadline", "finish"])
+async def test_provider_owner_transition_table(tmp_path, monkeypatch, phase, write, event):
+    from datetime import UTC, datetime
+
+    from zeta.agent.background_lifecycle import finish_background_child
+    from zeta.agent.child_run_owner import ChildRunTransitionOwner
+    from zeta.agent.pending_delivery import StepDeliveryFlow
+    from zeta.agent.provider_recovery import RecoverySchedule
+    from zeta.core.store._async_writes import (
+        _AppendChildRecoveredCommand,
+        _ChildSuspensionCommand,
+    )
+    from zeta.protocol.types import ToolResult
+
+    backend = _RecoveryBackend(_ManualClock())
+    entered, release = asyncio.Event(), asyncio.Event()
+    subscribed, replayed, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    invoked, finish_reached = asyncio.Event(), asyncio.Event()
+    enqueued, activations, receipts = [], [], []
+    tasks = []
+
+    def start(coro):
+        task = asyncio.create_task(coro)
+        tasks.append(task)
+        return task
+
+    async def noop(*_args):
+        return ()
+
+    def result(text, error, _status):
+        return {"content": [{"text": text}], "isError": error}
+
+    async def execute():
+        await await_or_fail(finish.wait(), what="execution completes")
+        return result("done", False, "completed")
+
+    with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as parent:
+        loop = AgentLoop(backend, parent, skill_catalog=SkillCatalog.empty())
+        tree = loop._background_owner
+        recovery = tree.provider_recovery
+        recovery.clock = _ManualClock()
+        now = datetime(2026, 11, 27, tzinfo=UTC)
+        recovery.wall = lambda: now
+        schedule = RecoverySchedule("2026-11-27T00:00:15+00:00", 1)
+        retry = RecoverySchedule("2026-11-27T00:00:35+00:00", 2)
+
+        def subscribe(*_args, **_kwargs):
+            subscribed.set()
+
+        # test-contract: stop the external scheduler; deliver probe events through the owner.
+        monkeypatch.setattr(recovery, "subscribe", subscribe)
+        with ConversationStore(parent.session_dir / "agents", session_id="1", cwd=tmp_path) as child:
+            run_id = f"{parent.session_id}:1"
+            flow = StepDeliveryFlow(child)
+            tree.conversation_channel.register_delivery_flow(run_id, flow)
+            owner = ChildRunTransitionOwner(child, "tool", background=True)
+            owner.run_id = run_id
+            owner.bind_provider_recovery(loop, backend, "work")
+            owner.attach_setup(tree, start(noop()), noop)
+            execution = start(execute())
+            owner.attach_runtime(execution, execution.cancel, noop)
+            commit = ConversationStore._commit_storage_command
+
+            async def gate(store, command):
+                edge = None
+                if isinstance(command, _AppendChildRecoveredCommand):
+                    edge = "suspend-notice" if command.suspension is not None else "activate-notice"
+                elif isinstance(command, _ChildSuspensionCommand):
+                    if command.activate is not None:
+                        edge = "activate-state"
+                    elif command.provider_retry is not None:
+                        edge = "suspend-state"
+                if edge is not None and edge == write and not entered.is_set():
+                    entered.set()
+                    await await_or_fail(release.wait(), what=f"release {edge}")
+                value = await commit(store, command)
+                if edge == "activate-state":
+                    activations.append(value)
+                return value
+
+            # test-contract: seam gate real lifecycle and notice writes on both sides of each handoff.
+            monkeypatch.setattr(ConversationStore, "_commit_storage_command", gate)
+
+            async def suspend_for_provider():
+                await owner.provider_suspend("server_error", 0)
+                replayed.set()
+
+            async def enqueue():
+                enqueued.append("message")
+
+            async def dispatch():
+                invoked.set()
+                if event == "send":
+                    await owner.send(enqueue)
+                elif event == "cancel":
+                    request = owner.request_cancel()
+                    assert await await_or_fail(request.confirmation, what="cancel wins")
+                elif event == "shutdown":
+                    owner.quiesce()
+                    if phase == "provider_suspending":
+                        # Let the child observe admission closed before suspend can acquire the lock.
+                        await await_or_fail(asyncio.gather(waiting, return_exceptions=True), what="suspension exits")
+                        execution.cancel()
+                        await await_or_fail(finalizer, what="shutdown settles before suspension join")
+                    await owner.suspend()
+                elif event == "finish":
+                    finish.set()
+                    await await_or_fail(asyncio.shield(execution), what="execution reaches terminal finish")
+                    finish_reached.set()
+                    await await_or_fail(finalizer, what="terminal finish joins the current write")
+                else:
+                    await owner.provider_probe_result(1, event, retry)
+
+            try:
+                await owner.start(lambda: child.start_agent_lifecycle(
+                    handle=run_id, started_at=now.isoformat(), depth=1, agent_type="general", description="work",
+                ))
+                finalizer = start(finish_background_child(
+                    child_task=execution, child_store=child, parent_store=parent, tool_call=ToolCall("tool", "agent", {}),
+                    child_instance_id=run_id, child_path=str(child.session_dir), description="work", child_turns=lambda: 0,
+                    build_result=result, validate_result=lambda row, key: ToolResult(key, row["content"][0]["text"], row["isError"]),
+                    publish_event=receipts.append, cleanup=noop, close_child=noop, error_message=str, background_owner=tree,
+                    run_owner=owner,
+                ))
+                waiting = start(suspend_for_provider()) if phase != "running" else None
+                if phase in {"provider_suspended", "activating"}:
+                    await await_or_fail(subscribed.wait(), what="durable suspension subscribed")
+                activating = start(owner.provider_probe_result(1, "probe_success", schedule)) if phase == "activating" else None
+                if write is not None:
+                    await await_or_fail(entered.wait(), what=f"enter {write}")
+                dispatched = start(dispatch())
+                await await_or_fail(invoked.wait(), what=f"admit {event}")
+                if event == "finish":
+                    await await_or_fail(finish_reached.wait(), what="finish reaches the gated phase")
+                release.set()
+                await await_or_fail(dispatched, what=f"settle {event}")
+                if activating is not None:
+                    await await_or_fail(activating, what="join initial activation")
+
+                if event not in {"shutdown", "cancel", "finish"}:
+                    should_replay = (
+                        phase == "activating" or phase == "provider_suspended" and event in {"send", "probe_success"}
+                        or phase == "provider_suspending" and event == "send"
+                    )
+                    if should_replay:
+                        await await_or_fail(replayed.wait(), what="activation wakes the child")
+                        assert len(activations) == 1
+                    else:
+                        assert not replayed.is_set()
+                        assert not activations
+                    assert bool(enqueued) == (event == "send")
+                    state = child.agent_lifecycle()
+                    assert state is not None
+                    if phase == "provider_suspended" and event == "deadline":
+                        assert state["retry_state"] == "stopped"
+                        assert "next_retry_at" not in state
+                    elif phase == "provider_suspended" and event == "probe_failure":
+                        assert state["next_retry_at"] == retry.probe_at
+                    if phase == "provider_suspending" and event == "send":
+                        assert not subscribed.is_set()
+                    assert not receipts
+                    finish.set()
+
+                await await_or_fail(finalizer, what="join terminal publication or restart preservation")
+                state = child.agent_lifecycle()
+                assert state is not None
+                if event == "shutdown":
+                    assert state["state"] == "suspended"
+                    assert state.get("finished_at") is None
+                    assert not receipts, "normal shutdown must not publish a terminal receipt"
+                    assert not replayed.is_set()
+                else:
+                    assert state["state"] == ("canceled" if event == "cancel" else "completed")
+                    assert len(receipts) == 1
+                    assert not await owner.cancel(), "a second terminal transition must lose"
+                    if event in {"cancel", "finish"}:
+                        assert not replayed.is_set()
+            finally:
+                release.set()
+                finish.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await await_or_fail(asyncio.gather(*tasks, return_exceptions=True), what="join matrix tasks")
+                await tree.conversation_channel.unregister_delivery_flow(run_id)
+                await await_or_fail(loop.close(), what="close parent")
 
 
 @pytest.mark.asyncio
