@@ -9,10 +9,10 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..core.store import ConversationStore
+from ..providers.recovery_schedule import ProviderRecoveryCoordinator
 from .child_run_owner import ChildRunTransitionOwner
 from .conversation_channel import ConversationChannel
 from .finish_gate import CausalEpisodeRegistry
-from .provider_recovery import ProviderRecoveryCoordinator
 
 _AGENT_CANCEL_CONFIRM_TIMEOUT = 1.0
 _CHILD_REGISTRATION_SHUTDOWN_TIMEOUT = 5.0

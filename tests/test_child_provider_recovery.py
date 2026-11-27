@@ -273,12 +273,12 @@ async def test_provider_owner_transition_table(tmp_path, monkeypatch, phase, wri
     from zeta.agent.background_lifecycle import finish_background_child
     from zeta.agent.child_run_owner import ChildRunTransitionOwner
     from zeta.agent.pending_delivery import StepDeliveryFlow
-    from zeta.agent.provider_recovery import RecoverySchedule
     from zeta.core.store._async_writes import (
         _AppendChildRecoveredCommand,
         _ChildSuspensionCommand,
     )
     from zeta.protocol.types import ToolResult
+    from zeta.providers.recovery_schedule import RecoverySchedule
 
     backend = _RecoveryBackend(_ManualClock())
     entered, release = asyncio.Event(), asyncio.Event()

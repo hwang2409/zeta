@@ -18,8 +18,8 @@ from ..core.store._async_writes import (
 from ..core.store._child_runs import child_run_segments
 from ..protocol.types import StreamEvent, StreamEventType
 from ..providers.recovery_probe import recovery_account
+from ..providers.recovery_schedule import RecoverySchedule
 from ..runtime.offload import await_joined_offload
-from .provider_recovery import RecoverySchedule
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop

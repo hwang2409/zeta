@@ -8,8 +8,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from ..providers.must_complete_close import DeadlineClock, MonotonicDeadlineClock
-from ..providers.recovery_probe import Readiness, probe_readiness
+from .must_complete_close import DeadlineClock, MonotonicDeadlineClock
+from .recovery_probe import Readiness, probe_readiness
 
 _LOG = logging.getLogger(__name__)
 _BACKOFF = (5, 10, 20, 40, 80, 160, 300)
