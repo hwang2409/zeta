@@ -755,8 +755,9 @@ the swap is the same as without the feature.
   event's `session_id` is the parked session; `data` is its
   `status.parked_sessions` row plus `last_turn_outcome` (`{turn_id, reason}`
   or `null`, the same object as in `status`). A session whose turn ends sends
-  `state: "idle"` with the turn's outcome, then `state: "closed"` once it holds
-  no work. A parked session reports `running` for its whole turn; `tool` is
+  `state: "idle"` with the turn's outcome, then `state: "closed"` after the
+  resident record is removed and no longer counts toward the resident limit.
+  A parked session reports `running` for its whole turn; `tool` is
   not sent while a turn runs. `resume` of a parked session sends no
   `parked_session_changed` event. Observers do not get this event. After a
   reconnect, read `status.parked_sessions`; events only report changes after

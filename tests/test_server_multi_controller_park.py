@@ -93,6 +93,68 @@ async def test_multi_park_without_reconnect(tmp_path: Path, transport: Transport
 
 
 @pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.parametrize("close_fails", (False, True))
+@pytest.mark.asyncio
+async def test_multi_park_closed_releases_resident_slot(
+    tmp_path: Path, transport: Transport, close_fails: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The sessionless record, the parked session, and the attached session fill the server.
+    monkeypatch.setattr("zeta.server.session_controllers.MAX_RESIDENT_RECORDS", 3)
+    backend = GatedBackend([HELD])
+    server = replay_server(tmp_path, transport, lambda *_: (backend, "offline"))
+    closing, release = asyncio.Event(), asyncio.Event()
+    owner = record = None
+    try:
+        await await_or_fail(server.start(), what="start resident server")
+        owner = await connect_replay(server, transport)
+        assert "result" in await negotiate(owner, replay=False, extra=PARK)
+        parked = await _hold(owner, backend, 2, 0)
+        assert "result" in await owner.request(4, "new_session", SETTINGS)
+        record = server.parking.get(parked)
+        assert record is not None
+        close = record.runtime.close
+
+        async def held_close() -> None:
+            closing.set()
+            await await_or_fail(release.wait(), what="release parked runtime close")
+            await close()
+            if close_fails:
+                raise RuntimeError("injected close failure")
+
+        # test-contract: seam hold cleanup so premature notification cannot race slot release.
+        monkeypatch.setattr(record.runtime, "close", held_close)
+        backend.open_all()
+        await await_or_fail(closing.wait(), what="parked runtime starts closing")
+        refused = await owner.request(5, "new_session", SETTINGS)
+        assert refused.get("error", {}).get("data") == {"reason": "resident_limit"}, refused
+
+        # The response fences notifications queued before the held close. If a
+        # closed event already arrived, react while cleanup is still held.
+        if not any(
+            frame.get("params", {}).get("event") == "parked_session_changed"
+            and frame["params"].get("session_id") == parked
+            and frame["params"].get("data", {}).get("state") == "closed"
+            for frame in owner.buffered
+        ):
+            release.set()
+        await await_or_fail(
+            owner.event("parked_session_changed", {"session_id": parked, "data.state": "closed"}),
+            what="parked session closes",
+        )
+        opened = await owner.request(6, "new_session", SETTINGS)
+        assert "result" in opened, f"closed must free a resident slot: {opened}"
+    finally:
+        release.set()
+        backend.open_all()
+        if record is not None and record.close_task is not None:
+            # Let the server report the retire failure, not shutdown re-raise it.
+            await await_or_fail(asyncio.wait((record.close_task,)), what="drain parked close")
+        if owner is not None:
+            await owner.close()
+        await await_or_fail(server.close(), what="close resident server")
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
 @pytest.mark.asyncio
 async def test_multi_park_outlives_grace_while_connected(
     tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
