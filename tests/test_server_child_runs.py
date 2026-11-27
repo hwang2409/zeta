@@ -409,7 +409,7 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
         notice, _ = await root._commit_storage_command(_AppendChildRecoveredCommand(
             run_id=run_id, episode=1, path=path, description="work",
         ))
-        await control._event(StreamEvent(StreamEventType.AGENT_NOTIFICATION,
+        await control.control._event(StreamEvent(StreamEventType.AGENT_NOTIFICATION,
             data={"notification_id": notice.id, **notice.data}, row_seq=notice.seq,
         ), session_id=session_id, background=True)
         frame = await await_or_fail(client.event("child_recovered"), what="serve recovery notification")
