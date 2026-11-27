@@ -272,8 +272,7 @@ async def consume_run(
                 owner = child_loop._child_run_owner
                 if owner is not None and owner.recoverable:
                     await child_store._commit_storage_command(_ChildActivityCommand(state="idle"))
-                else:
-                    _transition_idle(child_store)
+                _transition_idle(child_store)
                 content = result.get("content")
                 text = "child is idle"
                 if (
