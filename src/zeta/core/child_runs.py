@@ -362,8 +362,9 @@ def read_agent_status(
     return sorted(children, key=lambda child: str(child["started_at"]))
 
 
-def child_run_for_features(row: dict, *, child_recovery: bool) -> dict:
-    if not child_recovery and row.get("status") == "suspended" and "run_id" in row:
+def child_run_for_features(row: dict[str, Any], *, child_recovery: bool) -> dict[str, Any]:
+    """Project a child run row, not its event or history envelope."""
+    if not child_recovery and row.get("status") == "suspended":
         return {**row, "status": "running"}
     return row
 

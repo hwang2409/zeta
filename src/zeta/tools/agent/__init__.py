@@ -85,7 +85,8 @@ _TERMINAL_AGENT_STATES = frozenset(
     {"completed", "failed", "canceled", "turn_limit"}
 )
 _DURABLE_TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
-_NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing", "suspended"})
+_AGENT_STATES_REQUIRING_OWNER = frozenset({"running", "idle", "finishing"})
+_NONTERMINAL_AGENT_STATES = _AGENT_STATES_REQUIRING_OWNER | {"suspended"}
 _VALID_AGENT_STATES = _NONTERMINAL_AGENT_STATES | _DURABLE_TERMINAL_AGENT_STATES
 _STATUS_REASON_FALLBACK = "child status unavailable"
 _STATUS_REASON_MAX_BYTES = MAX_AGENT_RESULT_BYTES
@@ -839,7 +840,7 @@ def _read_agent_status(
                     running_handles is not None
                     and handle not in running_handles
                     and owner_state in {None, "recovery"}
-                    and item["state"] in _NONTERMINAL_AGENT_STATES
+                    and item["state"] in _AGENT_STATES_REQUIRING_OWNER
                 ):
                     item = _lost_agent_status(
                         item, requested=requested_handle is not None

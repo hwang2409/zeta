@@ -465,7 +465,11 @@ class ConnectionRegistry(ReplayOutput):
         from ..core.child_runs import child_run_for_features
 
         if event in {EventDescriptor.CHILD_STARTED, EventDescriptor.CHILD_PROGRESS, EventDescriptor.CHILD_ENDED}:
-            fields = child_run_for_features(fields, child_recovery="child_recovery" in features)
+            child = fields.get("child")
+            if isinstance(child, dict):
+                row = child_run_for_features(child, child_recovery="child_recovery" in features)
+                if row is not child:
+                    fields = {**fields, "child": row}
         if event is EventDescriptor.TOOL_START and "tool_approval_origin" not in features:
             tool_call = fields.get("tool_call")
             if isinstance(tool_call, dict) and "approval_origin" in tool_call:
@@ -1073,7 +1077,7 @@ class ConnectionRegistry(ReplayOutput):
                 ),
                 selected,
             )
-        return self._strip_restart_reason(connection, result)
+        return self._shape_history_for_features(connection, result)
 
     async def read_content(
         self, connection: Any, params: dict[str, Any], controller: SessionUse
@@ -1138,7 +1142,7 @@ class ConnectionRegistry(ReplayOutput):
                 ),
                 selected,
             )
-        return self._strip_restart_reason(connection, result)
+        return self._shape_history_for_features(connection, result)
 
     async def read_child_run_events(
         self, connection: Any, params: dict[str, Any], controller: SessionUse
@@ -1172,9 +1176,7 @@ class ConnectionRegistry(ReplayOutput):
                 raise ProtocolError(ErrorDescriptor.CHILD_RUN_NOT_FOUND, "child run was not found")
             return result, row
         result = await self.run_read(connection, read, controller)
-        from ..core.child_runs import child_run_for_features
-
-        return result[0], 0, child_run_for_features(result[1], child_recovery="child_recovery" in features)
+        return result[0], 0, result[1]
 
     def _child_reader_for(
         self, root_store: ConversationStore, run_id: str, *, allow_stale: bool = False

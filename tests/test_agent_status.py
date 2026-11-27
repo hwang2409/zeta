@@ -553,6 +553,22 @@ async def test_agent_status_projects_running_lifecycle_after_owner_is_killed(
 
 
 @pytest.mark.asyncio
+async def test_agent_status_keeps_an_unowned_suspended_child_visible(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path) as store:
+        child, handle = _new_live_child(store, 1)
+        with child:
+            _persist_finished_receipt(store, child, "agent-1", handle)
+            child.transition_agent_suspension(reason="normal_exit")
+        loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+        try:
+            result = await _status(loop, handle)
+            [item] = result["structuredContent"]["children"]
+            assert item["state"] == "suspended", "suspension does not require a live owner"
+        finally:
+            await loop.close()
+
+
+@pytest.mark.asyncio
 async def test_broken_durable_lifecycle_is_terminal_despite_live_projection(
     tmp_path: Path,
 ) -> None:

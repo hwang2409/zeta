@@ -376,6 +376,8 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
 
 @pytest.mark.asyncio
 async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: Path) -> None:
+    from zeta.agent.turn_limit import append_child_start
+    from zeta.core.agent_progress import post_child_progress
     from zeta.protocol.types import StreamEvent, StreamEventType
 
     server = ZetaServer(
@@ -385,14 +387,15 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
     )
     client = await _start_client(server)
     observer = None
+    features = ["child_runs", "child_run_history", "child_run_events", "session_replay_seq"]
     try:
         await client.request("hello", "hello", {
-            "protocol_version": "1.2", "features": ["child_runs", "child_recovery"],
+            "protocol_version": "1.2", "features": [*features, "child_recovery"],
         })
         reader, writer = await await_or_fail(asyncio.open_unix_connection(str(server.socket_path)), what="observer connect")
         observer = ServeClient(reader=reader, writer=writer)
         await observer.request("hello", "hello", {
-            "protocol_version": "1.2", "role": "observer", "features": ["serve_observers", "child_runs"],
+            "protocol_version": "1.2", "role": "observer", "features": [*features, "serve_observers"],
         })
         created = await client.request("new", "new_session", {"provider": "codex"})
         session_id = created["result"]["session"]["session_id"]
@@ -417,9 +420,27 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
             child_session_path=path, child_instance_id=run_id, description="work", background=True,
             agent_type="general", accepts_follow_ups=False, explicit_finish=False, turns_used=0,
         ))
-        for peer, expected in [(client, "suspended"), (observer, "running")]:
+        await append_child_start(root, run_id, None, "general", "work", accepts_follow_ups=False)
+        peers = [(observer, "running"), (client, "suspended")]
+        for peer, expected in peers:
             listed = await peer.request("list", "child_run_list", {"session_id": session_id})
             assert [row["status"] for row in listed["result"]["runs"]] == [expected]
+            history = await peer.request("history", "child_run_events", {"session_id": session_id, "run_id": run_id})
+            assert history["result"]["child"]["status"] == expected, "child history snapshot"
+            joined = await peer.request("baseline", "session_history_and_subscribe", {"session_id": session_id})
+            [progress] = [row["child"] for row in joined["result"]["messages"] if row.get("event") == "child_progress"]
+            assert progress["status"] == expected, "session history baseline"
+
+        def publish_progress():
+            with ConversationStore(root.session_dir / "agents", session_id="1", _storage_lease=root._storage_lease) as child:
+                lifecycle = child.agent_lifecycle()
+                assert lifecycle is not None
+                post_child_progress(child, lifecycle)
+
+        await asyncio.to_thread(publish_progress)
+        for peer, expected in peers:
+            progress = await await_or_fail(peer.event("child_progress"), what="live suspended child progress")
+            assert progress["child"]["status"] == expected, "live child progress"
         notice, _ = await root._commit_storage_command(_AppendChildRecoveredCommand(
             run_id=run_id, episode=1, path=path, description="work",
         ))

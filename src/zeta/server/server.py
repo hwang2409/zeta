@@ -940,7 +940,7 @@ class _Client:
         else:
             if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
                 baseline_builder = (
-                    lambda result: self.connections._strip_restart_reason(self, self.connections.child_runs.with_baseline(result))
+                    lambda result: self.connections._shape_history_for_features(self, self.connections.child_runs.with_baseline(result))
                     if request["method"] in {"session_history_and_subscribe", "child_run_events"}
                     else None
                 )

@@ -598,15 +598,13 @@ class ReplayOutput:
         result = await self.run_read(connection, read, controller, fence=False)
         assert isinstance(result, tuple)
         history, *rest = result
-        shaped = self._strip_restart_reason(connection, history)
+        shaped = self._shape_history_for_features(connection, history)
         if shaped is history:
             return result
         return (shaped, *rest)
 
-    def _strip_restart_reason(self, connection: Any, history: object) -> object:
-        """Strip ``server_restarted`` from projected approval rows for a legacy
-        connection (no ``approval_restart_reason`` feature). One output seam for
-        every history page; returns the same object when nothing is stripped."""
+    def _shape_history_for_features(self, connection: Any, history: object) -> object:
+        """Apply negotiated projections to each history page and join baseline."""
         from ...core.child_runs import child_run_for_features
 
         features = self._connections[connection].features
@@ -618,10 +616,16 @@ class ReplayOutput:
         shaped = event_contract.shape_approval_history_rows(
             rows, include_restart_reason="approval_restart_reason" in features,
         )
-        if "child_recovery" not in features:
-            projected = [child_run_for_features(row, child_recovery=False) if isinstance(row, dict) else row for row in shaped]
-            if any(a is not b for a, b in zip(shaped, projected, strict=True)):
-                shaped = projected
+        def project_child(envelope: Any) -> Any:
+            if not isinstance(envelope, dict) or not isinstance(child := envelope.get("child"), dict):
+                return envelope
+            row = child_run_for_features(child, child_recovery="child_recovery" in features)
+            return envelope if row is child else {**envelope, "child": row}
+
+        projected = [project_child(row) for row in shaped]
+        if any(a is not b for a, b in zip(shaped, projected, strict=True)):
+            shaped = projected
+        projected_history = project_child(history)
         if shaped is rows:
-            return history
-        return {**history, "messages": shaped}
+            return projected_history
+        return {**projected_history, "messages": shaped}
