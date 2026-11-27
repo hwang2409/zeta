@@ -8,6 +8,7 @@ import os
 import shutil
 import threading
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 from itertools import product
 from pathlib import Path
@@ -23,6 +24,8 @@ from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend
 from tests.support.owned import await_or_fail
 from zeta.agent.pending_delivery import StepDeliveryFlow
+from zeta.core import agent_progress
+from zeta.core.agent_progress import remove_live_agent_lifecycle
 from zeta.core.approval import ApprovalPolicy, ApprovalRequest
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
@@ -926,6 +929,81 @@ def _list_lines(navigation: AgentNavigation, width: int = 80) -> list[str]:
         text = "".join(fragment for _, fragment in fragments)
         console.print(Text(text))
     return output.getvalue().splitlines()
+
+
+def test_agent_list_refresh_shows_live_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 100.0
+    # test-contract: seam advances list debounce without sleeping
+    monkeypatch.setattr(agent_card, "_monotonic", lambda: now)
+    with (
+        ConversationStore(tmp_path / "sessions", session_id="root") as root,
+        ConversationStore(root.session_dir / "agents", session_id="1") as child,
+    ):
+        try:
+            child.start_agent_lifecycle(
+                handle="root:1", started_at="2026-11-19T00:00:00+00:00",
+                depth=1, agent_type="worker", description="test child",
+            )
+            navigation = AgentNavigation(root)
+            assert any("test child · worker · running" in line for line in _list_lines(navigation))
+            for state in ("idle", "finishing"):
+                child.update_agent_lifecycle(state=state)
+                now += 2
+                assert any(f"test child · worker · {state}" in line for line in _list_lines(navigation))
+        finally:
+            remove_live_agent_lifecycle(child.agent_lifecycle_path)
+
+
+def test_agent_list_refresh_does_not_wait_for_progress_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 100.0
+    # test-contract: seam advance the refresh debounce without sleeping
+    monkeypatch.setattr(agent_card, "_monotonic", lambda: now)
+    with (
+        ConversationStore(tmp_path / "sessions", session_id="root") as root,
+        ConversationStore(root.session_dir / "agents", session_id="1") as child,
+    ):
+        try:
+            child.start_agent_lifecycle(
+                handle="root:1", started_at="2026-11-19T00:00:00+00:00",
+                depth=1, agent_type="worker", description="test child",
+            )
+            navigation = AgentNavigation(root)
+            assert any("test child · worker · running" in line for line in _list_lines(navigation))
+            child.update_agent_lifecycle(state="idle")
+            now += 2
+
+            resolved: list[Path] = []
+            original_resolve = Path.resolve
+
+            def record_resolve(path: Path, *args, **kwargs) -> Path:
+                resolved.append(path)
+                return original_resolve(path, *args, **kwargs)
+
+            locked = threading.Event()
+            refreshed = threading.Event()
+
+            def hold_progress_lock() -> bool:
+                # test-contract: seam hold the publication lock across the real render
+                with agent_progress._lock:
+                    locked.set()
+                    return refreshed.wait(10)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                publisher = pool.submit(hold_progress_lock)
+                try:
+                    assert locked.wait(10), "publisher did not acquire the lock"
+                    with monkeypatch.context() as patch:
+                        patch.setattr(Path, "resolve", record_resolve)
+                        lines = _list_lines(navigation)
+                finally:
+                    refreshed.set()
+                assert publisher.result(timeout=10), "TUI refresh waited for the progress lock"
+            assert not resolved, "TUI refresh called Path.resolve"
+            assert any("test child · worker · idle" in line for line in lines)
+        finally:
+            remove_live_agent_lifecycle(child.agent_lifecycle_path)
 
 
 def _list_fragments(

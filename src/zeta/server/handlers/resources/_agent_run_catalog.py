@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .... import storage_format
+from ....core.agent_progress import live_agent_lifecycle, overlay_agent_progress
 from ....core.agent_state import _validate_status_lifecycle
 from ....core.checkpoints import load_session_json
 from ....core.child_runs import (
@@ -76,16 +77,18 @@ def _marker(fd: int, run_id: str) -> dict[str, Any]:
 
 def _row(fd: int, parent_fd: int, run_id: str, state: str | None, child_recovery: bool, home: Path) -> dict[str, Any] | None:
     try:
+        root, *segments = run_id.split(":")
+        path = home / "sessions" / root
+        for segment in segments:
+            path = path / "agents" / segment
+        live = live_agent_lifecycle(path / "agent_lifecycle.json")
         lifecycle = _validate_status_lifecycle(_metadata(fd, "agent_lifecycle.json"))
         if state in TERMINAL_AGENT_STATES and lifecycle["state"] != state:
             return None
         if lifecycle["state"] in TERMINAL_AGENT_STATES and state is not None and lifecycle["state"] != state:
             return None
+        lifecycle = overlay_agent_progress(lifecycle, live)
         marker = _marker(parent_fd, run_id)
-        root, *segments = run_id.split(":")
-        path = home / "sessions" / root
-        for segment in segments:
-            path = path / "agents" / segment
         lifecycle = project_orphaned_lifecycle(lifecycle, execution_owner_state(fd), marker, child_path=path)
         item = project_agent_status(lifecycle, run_id, notifications=())
         session_id, parent_run_id = run_row_identity(run_id)
@@ -163,10 +166,11 @@ def read_page(
     rows = []
     keys = []
     scanned = after
+    sessions = home / "sessions"
     try:
         with (
             storage_format.open_reader(home),
-            session_root(home / "sessions") as fd,
+            session_root(sessions) as fd,
             closing(_candidates(fd, root_id, after)) as candidates,
         ):
             for index, (key, child_fd, parent_fd) in enumerate(candidates):

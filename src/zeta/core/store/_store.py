@@ -162,7 +162,8 @@ class ConversationStore(
         _history_index: HistoryIndex | None = None,
     ) -> None:
         default_home = Path(os.environ.get("ZETA_HOME", Path.home() / ".zeta"))
-        self.root_dir = Path(session_dir or default_home / "sessions")
+        # Descendant lifecycle lookups reuse this absolute root without querying cwd.
+        self.root_dir = Path(session_dir or default_home / "sessions").absolute()
         home = self.root_dir
         while home.name != "sessions" and home != home.parent:
             home = home.parent
