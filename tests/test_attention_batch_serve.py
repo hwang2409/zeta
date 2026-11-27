@@ -3,13 +3,23 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from tests.support.owned import await_or_fail
+from tests.support.owned import await_or_fail, owned_app
 from tests.support.serve_close import close_serve
+from tests.test_attention_batch_ui import (
+    _make_app,
+    _press,
+    _rendered_text,
+    _session,
+    _wait_for_records,
+)
+from tests.test_attention_batch_ui import _request as _seed_attention
 from tests.test_server import (
+    _connect,
     _ready_extensions,
     _request,
     _seed_slash_fixtures,
@@ -17,8 +27,13 @@ from tests.test_server import (
 from zeta.attention_records import AttentionStore
 from zeta.attention_replies import AttentionReplies
 from zeta.project_inbox import ProjectInbox
+from zeta.project_registry import ProjectRegistry
+from zeta.runtime.loop import AgentLoop
 from zeta.server import ZetaServer
 from zeta.server.slash_commands import ServerSlashSession
+from zeta.skills import SkillCatalog
+from zeta.tools.list_attention import register as register_list_attention
+from zeta.tools.registry import ToolRegistry
 
 
 def _start_publication_watcher(loop, *, turn_active: bool = False) -> asyncio.Task[None]:
@@ -37,13 +52,16 @@ async def _stop_publication_watcher(watcher: asyncio.Task[None]) -> None:
         await asyncio.wait_for(watcher, 10)
 
 
-async def _await_inbox_notice(store, *, what: str) -> list:
-    """Wait for the supervisor to deliver at least one durable inbox notice."""
+async def _await_inbox_notice(store, *, what: str, message_id: str | None = None) -> list:
+    """Wait for the supervisor to deliver a matching durable inbox notice."""
     async with asyncio.timeout(10):
-        while not store.agent_notifications():
+        while not (notices := [
+            notice for notice in store.agent_notifications()
+            if message_id is None or message_id in notice.data.get("message_ids", ())
+        ]):
             # test-contract: latency poll the delivered durable inbox notice
             await asyncio.sleep(0.02)
-    return store.agent_notifications()
+    return notices
 
 
 def _seed_inbox(registry, tmp_path: Path, project_id: str, session_id: str) -> str:
@@ -58,6 +76,89 @@ def _seed_inbox(registry, tmp_path: Path, project_id: str, session_id: str) -> s
         title="seeded",
         body="deliver on the next poll",
     )
+
+
+@pytest.mark.asyncio
+async def test_project_attention_queue_matches_across_surfaces(tmp_path: Path) -> None:
+    project = _seed_slash_fixtures(tmp_path)
+    home = tmp_path / "home"
+    server = ZetaServer(home=home, cwd=project, port=0, provider="codex")
+    reader, writer = await _connect(server)
+    predecessors = []
+    tools = None
+    try:
+        async def rpc(method, params):
+            response = (await _request(reader, writer, method, method, params))[-1]
+            assert "result" in response, response
+            return response["result"]
+
+        await rpc("hello", {"protocol_version": "1.0", "client_version": "1.1", "features": ["state_read_v1"]})
+        runtime = server.controllers.attached().runtime
+        await asyncio.to_thread(runtime.manager.project_registry.create_project, "local", "test", project)
+        session_id = (await rpc("new_session", {"provider": "codex"}))["session"]["session_id"]
+        opened = runtime.opened
+        project_id = opened.metadata.project_id
+        foreign = await asyncio.to_thread(runtime.manager.project_registry.create_project, "foreign", "test")
+        for owner_project in (project_id, foreign.project_id):
+            predecessors.append(await asyncio.to_thread(_session, home, owner_project))
+        dead, other = predecessors
+        rows = []
+        for owner, kind, title, expected in (
+            (opened, "decision", "Pick a database", "action"),
+            (dead, "deferred", "Revisit the budget", "action"),
+            (dead, "answer", "Build finished", "fyi"),
+            (dead, "decided", "Use the blue theme", "fyi"),
+            (dead, "decided", "Already dismissed", None),
+            (other, "decision", "Foreign project choice", None),
+        ):
+            record = await asyncio.to_thread(_seed_attention, owner, owner.metadata.project_id, title, kind=kind)
+            rows.append((record, expected))
+            if title == "Already dismissed":
+                store = AttentionStore(owner.store.session_dir, writer_epoch=5)
+                await asyncio.to_thread(store.replace, replace(record, status="resolved", resolved_at=record.created_at))
+        dead.store.close()
+        tools = ToolRegistry(project, session_store=opened.store, skill_catalog=SkillCatalog.empty(), project_id=project_id)
+        register_list_attention(tools)
+        listing = tools.definitions_by_name["list_attention"].handler
+        app = await _make_app(home, opened, session_id)
+        async with owned_app(app):
+            rendered = _rendered_text(app)
+            assert "● 2 attention items" in rendered, rendered
+            for view in ("action", "fyi"):
+                if view == "fyi":
+                    _press(app, "f")
+                rendered = _rendered_text(app)
+                slash = (await rpc("slash_run", {"session_id": session_id, "text": f"/decisions {view}"}))["text"]
+                page = await rpc("state_attention", {"project_id": project_id, "list": view})
+                result = (await listing({"list": view}))["structuredContent"]
+                expected_ids = {record.id for record, expected in rows if expected == view}
+                assert {row["attention_id"] for row in page["items"]} == expected_ids
+                assert {row["id"] for row in result["items"]} == expected_ids
+                assert (result["action_required_total"], result["info_total"]) == (2, 2)
+                for record, expected in rows:
+                    assert (record.title in rendered) == (expected == view), rendered
+                    assert (record.title in slash) == (expected == view), slash
+            assert "● 2 attention items" in rendered
+            selected = app._decisions_panel.selected.record
+            _press(app, "d")
+            await await_or_fail(
+                asyncio.to_thread(_wait_for_records, home, dead.store.session_id, {selected.id}),
+                what="dismiss FYI from a dead predecessor in the TUI",
+            )
+            await app._decisions_tick()
+            assert selected.title not in _rendered_text(app)
+            page = await rpc("state_attention", {"project_id": project_id, "status": "open", "list": "fyi"})
+            remaining = next(record for record, expected in rows if expected == "fyi" and record.id != selected.id)
+            assert [row["attention_id"] for row in page["items"]] == [remaining.id]
+            await rpc("slash_run", {"session_id": session_id, "text": f"/decisions dismiss {remaining.id}"})
+            result = (await listing({"list": "fyi"}))["structuredContent"]
+            assert result["items"] == [] and result["action_required_total"] == 2
+    finally:
+        if tools is not None:
+            await tools.close()
+        for predecessor in predecessors:
+            predecessor.store.close()
+        await close_serve(server, writer)
 
 
 @pytest.mark.asyncio
@@ -99,8 +200,18 @@ async def test_serve_decisions_lists_broken_record_without_body(tmp_path: Path) 
 async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    async def defer_inbox_activation(_loop):
+        pass
+
+    # test-contract: seam start the real supervisor only at the dismiss below, not for the earlier batch.
+    monkeypatch.setattr(AgentLoop, "_activate_project_inbox", defer_inbox_activation)
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    registry = ProjectRegistry(tmp_path / "home" / "projects")
+    try:
+        await asyncio.to_thread(registry.create_project, "serve attention", "test", project)
+    finally:
+        registry._storage_lease.close()
     reader, writer, session_id = await _ready_extensions(server)
     watcher = None
     try:
@@ -108,9 +219,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
         assert opened is not None
         registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
-        project_id = (
-            await asyncio.to_thread(registry.create_project, "serve attention", "test")
-        ).project_id
+        project_id = opened.metadata.project_id
         store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         records = await await_or_fail(
             asyncio.gather(
@@ -291,7 +400,7 @@ async def test_serve_decisions_batch_is_one_message_and_rejects_conflicts(
         # the dismiss publishes in-process, waking the owner's supervisor to
         # deliver the pending inbox message as one durable notification.
         notices = await _await_inbox_notice(
-            opened.store, what="serve owner inbox delivery"
+            opened.store, what="serve owner inbox delivery", message_id=seeded
         )
         assert any(seeded in notice.data["message_ids"] for notice in notices)
     finally:
@@ -435,6 +544,11 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
 ) -> None:
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    registry = ProjectRegistry(tmp_path / "home" / "projects")
+    try:
+        await asyncio.to_thread(registry.create_project, "operation error", "test", project)
+    finally:
+        registry._storage_lease.close()
     reader, writer, session_id = await _ready_extensions(server)
     watcher = None
     try:
@@ -442,9 +556,7 @@ async def test_serve_checks_recovery_outcome_before_unexpected_operation_error(
         assert opened is not None
         registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
-        project_id = (
-            await asyncio.to_thread(registry.create_project, "operation error", "test")
-        ).project_id
+        project_id = opened.metadata.project_id
         store = AttentionStore(opened.store.session_dir, writer_epoch=5)
         sealed = await _seed_attention_record(store, session_id, project_id, "sealed")
         target = await _seed_attention_record(store, session_id, project_id, "target")

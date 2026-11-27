@@ -151,7 +151,8 @@ class AttentionRecord:
 
         return {
             "attention_id": self.id, "project_id": self.project_id, "session_id": self.session_id,
-            "kind": self.kind, "status": "open" if self.status == "open" else "done",
+            "kind": self.kind, "requires_action": self.requires_action,
+            "status": "open" if self.status == "open" else "done",
             "title": self.title, "created_ns": timestamp_ns(self.created_at),
             "updated_ns": timestamp_ns(self.resolved_at or self.created_at),
         }
@@ -488,16 +489,21 @@ def _is_attention_id(value: str) -> bool:
     return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 
 
-def state_attention_home_generation(sessions_dir: Path) -> object:
+def state_attention_home_generation(sessions_dir: Path, *, include_owner: bool = False) -> object:
     from .state_snapshot import stamps
 
-    return stamps([sessions_dir]), tuple(state_attention_generation(path) for path in _attention_sessions(sessions_dir))
+    sessions = _attention_sessions(sessions_dir)
+    owner_paths = (path / "meta.json" for path in sessions) if include_owner else ()
+    return stamps((sessions_dir, *owner_paths)), tuple(state_attention_generation(path) for path in sessions)
 
 
-def state_attention_home_rows(sessions_dir: Path, epoch: int, project_id: str | None, status: str | None):
+def state_attention_home_rows(
+    sessions_dir: Path, epoch: int, project_id: str | None, status: str | None,
+):
     return [
         row for path in _attention_sessions(sessions_dir) for row in state_attention_rows(path, epoch)
-        if (project_id is None or row["project_id"] == project_id) and (status is None or row["status"] == status)
+        if (project_id is None or row["project_id"] == project_id)
+        and (status is None or row["status"] == status)
     ]
 
 

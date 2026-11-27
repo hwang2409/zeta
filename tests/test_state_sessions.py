@@ -215,6 +215,7 @@ async def test_session_state_websocket(tmp_path, monkeypatch, case):
                 assert reply["items"][0] == {
                     "attention_id": attention[0], "project_id": None, "session_id": sid, "kind": "decision",
                     "status": "done", "title": "synthetic attention", "created_ns": 1794096000000000000,
+                    "requires_action": True,
                     "updated_ns": 1794096060000000000,
                 }
                 assert all(row["session_id"] == sid and row["status"] == "open" for row in reply["items"][1:])
