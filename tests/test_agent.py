@@ -21386,7 +21386,10 @@ async def test_refused_finish_keeps_idle_parent_live_for_every_delivery_path(
         assert len(questions) == 1
         assert questions[0].data.get("routing_note") is None
         question_data = questions[0].data
-        await _send_follow_up(loop, question_data["child_instance_id"], f"Re {question_data['question_id']}: continue")
+        assert await send_to_run(
+            lead_store, worker_handle, f"Re {question_data['question_id']}: continue",
+            owner=loop._background_owner, channel=loop._background_owner.conversation_channel,
+        ) is None
         await asyncio.wait_for(backend.lead_completion_seen.wait(), 10)
         assert not any(
             entry.type == "notification" and entry.data.get("kind") == "child_question"
@@ -23707,10 +23710,10 @@ async def test_child_run_owner_serializes_finish_and_cancel(
         method = "accept_explicit_finish" if first == "finish" else "mark_agent_canceled_async"
         original = getattr(store, method)
 
-        async def hold_write(*args):
+        async def hold_write(*args, **kwargs):
             write_entered.set()
             await await_or_fail(release_write.wait(), what="release terminal write")
-            return await original(*args)
+            return await original(*args, **kwargs)
 
         monkeypatch.setattr(store, method, hold_write)
         async def finish():
