@@ -8,7 +8,7 @@ import pytest
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
-from zeta.agent import runner
+from zeta.agent import run_consumer, runner
 from zeta.agent.pending_delivery import send_to_run
 from zeta.agent.recovery_lease import activate_agent_children
 from zeta.core.agent_progress import register_child_run_sink
@@ -80,8 +80,9 @@ async def _answer(loop, run_id, card):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("restart", [False, True], ids=["late-answer", "last-turn-restart"])
-async def test_pending_question_precedes_finish(tmp_path, monkeypatch, restart, observe):
+@pytest.mark.parametrize("mode", ["late-answer", "last-turn-restart", "charged-restart"])
+async def test_pending_question_precedes_finish(tmp_path, monkeypatch, mode, observe):
+    restart = mode != "late-answer"
     root = tmp_path / "sessions"
     first = ScriptedTurn(tool_calls=[ASK, _finish("early")])
     idle = ScriptedTurn([TextContent("waiting for the answer")])
@@ -119,19 +120,52 @@ async def test_pending_question_precedes_finish(tmp_path, monkeypatch, restart, 
             await await_or_fail(activate_agent_children(loop), what="resume held child")
             assert not loop.backend.calls
             card, = _cards(store)
-            assert await _answer(loop, run_id, card) is None
-            await await_or_fail(loop._background_owner.wait(), what="settlement ends same run")
-            assert len(loop.backend.calls) == len(ended) == 1
-            state, _ = read_child_lifecycle(store, path)
-            assert isinstance(state, LoadedAgentLifecycle)
-            assert state.value["turns_used"] == 2
-            assert not _cards(store)
+            if mode == "charged-restart":
+                charged = asyncio.Event()
+
+                async def stop_before_dispatch(*args):
+                    charged.set()
+                    await await_or_fail(asyncio.Event().wait(), what="crash before settlement dispatch")
+
+                # test-contract: stop after the durable charge but before provider dispatch.
+                with monkeypatch.context() as cut:
+                    # test-contract: durability interrupt the charged attempt before dispatch.
+                    cut.setattr(run_consumer, "_transition_running", stop_before_dispatch)
+                    # test-contract: seam send through the resident child delivery flow.
+                    assert await _answer(loop, run_id, card) is None
+                    await await_or_fail(charged.wait(), what="charge before dispatch")
+                    await await_or_fail(loop.close(), what="release charged child without dispatch")
+                assert not loop.backend.calls
+            else:
+                assert await _answer(loop, run_id, card) is None
+                await await_or_fail(loop._background_owner.wait(), what="settlement ends same run")
+                assert len(loop.backend.calls) == len(ended) == 1
+                state, _ = read_child_lifecycle(store, path)
+                assert isinstance(state, LoadedAgentLifecycle)
+                assert state.value["turns_used"] == 2
+                assert not _cards(store)
         finally:
             await await_or_fail(loop.close(), what="close resumed parent")
+    if mode == "charged-restart":
+        with ConversationStore(root, session_id=session_id, cwd=tmp_path) as store:
+            loop = _loop(store, monkeypatch, [done], limit=1)
+            try:
+                await await_or_fail(activate_agent_children(loop), what="recover charged settlement")
+                await await_or_fail(loop._background_owner.wait(), what="exhausted handoff without replay")
+                assert not loop.backend.calls, "a charged settlement must not dispatch again"
+                assert len(ended) == 1
+                state, _ = read_child_lifecycle(store, path)
+                assert isinstance(state, LoadedAgentLifecycle)
+                assert state.value["turns_used"] == 2
+                assert (path / "turn-limit-handoff.md").is_file()
+                assert not _cards(store)
+            finally:
+                await await_or_fail(loop.close(), what="close parent after exhausted handoff")
 
 
 @pytest.mark.asyncio
-async def test_restart_repairs_answer_before_provider_replay(tmp_path, monkeypatch, observe):
+@pytest.mark.parametrize("mode", ["answer-restart", "answer-resident", "withdraw-restart"])
+async def test_reconciles_question_before_replay(tmp_path, monkeypatch, observe, mode):
     root = tmp_path / "sessions"
     idle = ScriptedTurn([TextContent("waiting for the answer")])
     with ConversationStore(root, cwd=tmp_path) as store:
@@ -147,15 +181,31 @@ async def test_restart_repairs_answer_before_provider_replay(tmp_path, monkeypat
             route = channel.produce_to_live_parent
 
             async def interrupt(child_id, build):
-                if build(store).kind == "question_answer_ack":
+                if build(store).kind == ("child_question_close" if mode == "withdraw-restart" else "question_answer_ack"):
                     raise InterruptedError("ancestor answer commit interrupted")
                 return await route(child_id, build)
 
             # test-contract: cut the answer across two real stores.
             with monkeypatch.context() as cut:
                 cut.setattr(channel, "produce_to_live_parent", interrupt)
-                with pytest.raises(InterruptedError, match="ancestor answer commit interrupted"):
-                    await _answer(loop, run_id, card)
+                if mode == "withdraw-restart":
+                    channel_owner = loop._background_owner
+                    transition = getattr(channel_owner, "run_transition", lambda _: None)(run_id)
+                    if transition is not None:
+                        with pytest.raises(InterruptedError, match="ancestor answer commit interrupted"):
+                            await transition.withdraw_questions()
+                else:
+                    with pytest.raises(InterruptedError, match="ancestor answer commit interrupted"):
+                        await _answer(loop, run_id, card)
+            if mode == "answer-resident":
+                transition = getattr(loop._background_owner, "run_transition", lambda _: None)(run_id)
+                if transition is not None:
+                    await transition.repair_before_replay()
+                assert not _cards(store), "resident repair must remove the stale ancestor card"
+                rows = store.active_branch_head_sequence()
+                await transition.repair_before_replay()
+                assert store.active_branch_head_sequence() == rows, "resident repair must not append a second ack"
+                return
         finally:
             await await_or_fail(loop.close(), what="release original owner")
 
@@ -164,6 +214,10 @@ async def test_restart_repairs_answer_before_provider_replay(tmp_path, monkeypat
         try:
             await await_or_fail(activate_agent_children(loop), what="reconcile answered question on restart")
             assert not _cards(store), "restart must settle the ancestor card before replay"
+            if mode == "withdraw-restart":
+                assert not loop.backend.calls
+                assert any(row.data.get("kind") == "child_question_withdrawn" for row in store.agent_notifications())
+                return
             await await_or_fail(loop._background_owner.wait(), what="replay accepted answer")
             assert len(loop.backend.calls) == 1
         finally:
