@@ -302,6 +302,7 @@ def project_agent_status(
         "turns_used": turns_used,
         "tool_calls": tool_calls,
         "current_step": current_step,
+        **_provider_retry_fields(lifecycle),
         "depth": depth,
         "agent_type": agent_type,
         "description": description,
@@ -395,10 +396,23 @@ def read_agent_status(
     return sorted(children, key=lambda child: str(child["started_at"]))
 
 
+_PROVIDER_RETRY_FIELDS = ("suspension_reason", "retry_state", "retry_started_at", "retry_deadline_at", "next_retry_at")
+
+
+def _provider_retry_fields(lifecycle: dict) -> dict:
+    if lifecycle.get("suspension_reason") != "provider_unavailable":
+        return {}
+    return {key: lifecycle[key] for key in _PROVIDER_RETRY_FIELDS if key in lifecycle}
+
+
 def child_run_for_features(row: dict[str, Any], *, child_recovery: bool) -> dict[str, Any]:
     """Project a child run row, not its event or history envelope."""
     if not child_recovery and row.get("status") == "suspended":
-        return {**row, "status": "running"}
+        legacy = {key: value for key, value in row.items() if key not in _PROVIDER_RETRY_FIELDS}
+        legacy["status"] = "running"
+        if row.get("suspension_reason") == "provider_unavailable":
+            legacy["current_step"] = "thinking"
+        return legacy
     return row
 
 
@@ -425,6 +439,7 @@ def project_child_run_row(
         "turns_used": item["turns_used"],
         "tool_count": item["tool_calls"],
         "current_step": _bounded_text(item["current_step"], 3_998),
+        **_provider_retry_fields(item),
         "started_at": _bounded_text(item["started_at"], 3_998),
         "finished_at": (
             _bounded_text(item["finished_at"], 3_998)

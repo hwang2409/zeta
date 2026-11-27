@@ -579,10 +579,11 @@ class AnthropicBackend(CompletionBackend):
         tool_schemas: Sequence[ToolSchema],
         *,
         token: str | None = None,
+        probe: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         async with self._lease.borrow("anthropic completion") as client:
             events = self._complete_once_with_client(
-                client, messages, tool_schemas, token=token
+                client, messages, tool_schemas, token=token, probe=probe
             )
             try:
                 async for event in events:
@@ -597,6 +598,7 @@ class AnthropicBackend(CompletionBackend):
         tool_schemas: Sequence[ToolSchema],
         *,
         token: str | None = None,
+        probe: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         stream_context = None
         entered = False
@@ -608,8 +610,8 @@ class AnthropicBackend(CompletionBackend):
                 messages,
                 tool_schemas,
                 model=self.model,
-                max_tokens=self.max_tokens,
-                thinking_budget=self.thinking_budget,
+                max_tokens=1 if probe else self.max_tokens,
+                thinking_budget=0 if probe else self.thinking_budget,
             )
             oauth_compat = _oauth_compat_enabled(
                 self.token_store, setting_enabled=self.oauth_compat_setting

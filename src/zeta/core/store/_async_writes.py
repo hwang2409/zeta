@@ -441,8 +441,14 @@ class _ChildSuspensionCommand(_StoreMutationCommand):
     activate: int | None = None
     blocked: str | None = None
 
+    provider_retry: dict[str, str] | None = None
+    retry_progress: bool = False
+
     def apply(self, store: Any) -> Any:
-        return store.transition_agent_suspension(reason=self.reason, activate=self.activate, blocked=self.blocked)
+        return store.transition_agent_suspension(
+            reason=self.reason, activate=self.activate, blocked=self.blocked,
+            provider_retry=self.provider_retry, retry_progress=self.retry_progress,
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -482,8 +488,10 @@ class _AppendChildRecoveredCommand(_StoreMutationCommand):
     path: str
     description: str
 
+    suspension: dict | None = None
+
     def apply(self, store: Any) -> Any:
-        return store.append_child_recovered(self.run_id, self.episode, path=self.path, description=self.description)
+        return store.append_child_recovered(self.run_id, self.episode, path=self.path, description=self.description, suspension=self.suspension)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

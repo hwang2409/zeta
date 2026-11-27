@@ -1591,6 +1591,13 @@ exposed. If `child_recovery` is negotiated with `child_runs`, a suspended run
 has `status: "suspended"`; clients without it receive `status: "running"`.
 The negotiated `child_recovered` event carries a durable display-only notification
 with `child_instance_id`, `episode`, and `logical_id` (`child-recovered:<run_id>:<episode>`).
+A provider-suspended row includes `suspension_reason: "provider_unavailable"`,
+`retry_state` (`retrying` or `stopped`), `retry_started_at`, `retry_deadline_at`,
+and `next_retry_at` while retrying (all UTC timestamps). These fields are present
+on negotiated baseline, history, and live progress rows. A `child_suspended`
+display-only notice identifies the run and episode and includes the initial
+next retry time if available. Clients without the feature do not receive the
+notice or any retry fields.
 
 A live row can also include `account_status` when a snapshot is available. It
 contains `account` (the child's pinned `provider:account` ID), `held` (boolean,
@@ -2845,6 +2852,7 @@ Event fields are:
 | `project_inbox_health` (protocol 1.2 only) | `event`, `data: object` | `session_id` |
 | `child_question` | `event`, `data: object` | `session_id` |
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
+| `child_suspended` | `event`, `data: object` | `session_id` |
 | `child_recovered` | `event`, `data: object` | `session_id` |
 | `child_idle` | `event`, `data: object` | `session_id` |
 | `child_hold` | `event`, `data: object` | `session_id` |

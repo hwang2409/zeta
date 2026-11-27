@@ -239,7 +239,7 @@ class DeliveryFold:
     def _apply_notification(self, entry: ConversationEntry) -> None:
         handle = entry.data.get("child_instance_id")
         child_path = entry.data.get("child_session_path")
-        if entry.data.get("kind") == "child_recovered":
+        if entry.data.get("kind") in {"child_recovered", "child_suspended"}:
             self.recoveries_by_id.setdefault(entry.data["logical_id"], entry)
         elif type(handle) is str and handle and type(child_path) is str and child_path:
             self.agent_receipts.append((handle, child_path))

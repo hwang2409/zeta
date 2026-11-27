@@ -366,17 +366,23 @@ class NotificationStateMixin:
 
     def append_child_recovered(
         self: ConversationStore, run_id: str, episode: int, *, path: str, description: str,
+        suspension: dict | None = None,
     ) -> tuple[ConversationEntry, bool]:
         from ._validation import validate_child_recovered
 
         if not self.child_recovery_enabled:
             raise ValueError("child recovery is unavailable at this epoch")
-        logical_id = f"child-recovered:{run_id}:{episode}"
+        if suspension is not None and not self.provider_recovery_enabled:
+            raise ValueError("provider recovery is unavailable at this epoch")
+        kind = "child_suspended" if suspension is not None else "child_recovered"
+        logical_id = f"{kind.replace('_', '-')}:{run_id}:{episode}"
         data = {
-            "kind": "child_recovered", "origin": MessageOrigin.NOTIFICATION.value, "logical_id": logical_id,
+            "kind": kind, "origin": MessageOrigin.NOTIFICATION.value, "logical_id": logical_id,
             "child_instance_id": run_id, "episode": episode, "child_session_path": path,
             "description": description[:4096], "text": "child recovered", "display_only": True,
         }
+        if suspension is not None:
+            data.update(suspension)
         validate_child_recovered(data)
         with self._append_lock():
             self._load()

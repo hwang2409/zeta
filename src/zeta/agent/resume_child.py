@@ -150,7 +150,12 @@ async def _resume_child(
         parent._agent_child_stores[tool_call.id] = store
         parent._agent_child_turns[tool_call.id] = turns
         parent._agent_child_types[tool_call.id] = preset.name
-        was = "suspended" if state["suspension_reason"] == "normal_exit" else "interrupted because the parent crashed"
+        owner.restore_provider_window(state)
+        was = {
+            "normal_exit": "suspended",
+            "owner_lost": "interrupted because the parent crashed",
+            "provider_unavailable": "suspended because the provider was unavailable",
+        }[state["suspension_reason"]]
         held = control is not None and control.exhausted and (await owner.hold_at_limit() or owner.settlement_due())
         await _run_installed_child(
             parent, child, store, owner, tool_call,

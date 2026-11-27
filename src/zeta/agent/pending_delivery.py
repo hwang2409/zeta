@@ -818,7 +818,8 @@ async def send_to_run(
     marker = parent_store.agent_children().get(child_instance_id)
     if marker is None:
         return no_live_run
-    if not has_follow_up_loop(
+    transition = owner.run_transition(child_instance_id)
+    if not (transition is not None and transition.provider_suspended) and not has_follow_up_loop(
         accepts_follow_ups=marker.get("accepts_follow_ups") is True,
         background=marker.get("background") is True,
     ):
@@ -832,7 +833,6 @@ async def send_to_run(
             f"agent_send rejected for {agent_type} child {child_instance_id!r}: "
             f"{reason}"
         )
-    transition = owner.run_transition(child_instance_id)
     match = QUESTION_ANSWER_PATTERN.match(message)
     question_id = match.group(1) if match is not None else None
 
@@ -850,8 +850,7 @@ async def send_to_run(
 
     durable = transition is not None and transition.durable_questions and bool(transition.questions())
     try:
-        if durable:
-            assert transition is not None
+        if transition is not None and (durable or transition.provider_recovery_enabled):
             await transition.send(enqueue)
         else:
             await enqueue()

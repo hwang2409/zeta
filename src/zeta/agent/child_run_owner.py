@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from ..core.agent_state import LoadedAgentLifecycle, MissingAgentLifecycle
@@ -15,6 +16,8 @@ from ..core.store._async_writes import (
     _ReserveQuestionSettlementCommand,
 )
 from ..core.store._child_runs import child_run_segments
+from ..protocol.types import StreamEvent, StreamEventType
+from ..providers.recovery_probe import recovery_account
 from ..runtime.offload import await_joined_offload
 
 if TYPE_CHECKING:
@@ -44,6 +47,10 @@ class ChildRunTransitionOwner:
         self._cancellation: CancellationRequest | None = None
         self._winner: str | None = None
         self.quiescing = False
+        self._shutdown_suspended = False
+        self._provider_phase = "active"
+        self._retry_window: dict[str, str] = {}
+        self._provider_ready: asyncio.Event | None = None
         self._close_admission: Callable[[], None] | None = None
         self._setup_task: asyncio.Task | None = None
         self._execution: asyncio.Task | None = None
@@ -145,6 +152,132 @@ class ChildRunTransitionOwner:
                 raise LookupError(self.run_id)
             await enqueue()
             await self.reconcile_questions()
+            if self._provider_phase == "provider_suspended":
+                await self._activate_provider(self._provider_episode)
+
+    @property
+    def provider_recovery_enabled(self) -> bool:
+        return self._background and self._store.provider_recovery_enabled
+
+    def bind_provider_recovery(self, parent: AgentLoop, backend, description: str) -> None:
+        self._provider_backend = backend
+        self._provider_account = recovery_account(backend)
+        self._provider_parent = parent
+        self._provider_description = description
+
+    @property
+    def provider_suspended(self) -> bool:
+        return self._provider_phase in {"provider_suspending", "provider_suspended", "activating"}
+
+    @property
+    def _recovery(self):
+        assert self._tree is not None
+        return self._tree.provider_recovery
+
+    def _provider_unsubscribe(self) -> None:
+        if hasattr(self, "_provider_account"):
+            self._recovery.unsubscribe(self._provider_account, self.run_id)
+
+    async def _provider_notice(self, suspension=None) -> None:
+        from ..core.store._async_writes import _AppendChildRecoveredCommand
+
+        parent = self._provider_parent
+        notice, created = await parent.store._commit_storage_command(_AppendChildRecoveredCommand(
+            run_id=self.run_id, episode=self._provider_episode, path=str(self._store.session_dir),
+            description=self._provider_description, suspension=suspension,
+        ))
+        if created:
+            parent._publish_background_event(StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION, data={"notification_id": notice.id, **notice.data}, row_seq=notice.seq,
+            ))
+
+    def restore_provider_window(self, state: dict) -> None:
+        self._retry_window = {key: state[key] for key in ("retry_started_at", "retry_deadline_at") if key in state}
+
+    async def _persist_provider_wait(self, next_at: str | None) -> dict:
+        from ..core.store._async_writes import _ChildSuspensionCommand
+
+        return await self._store._commit_storage_command(_ChildSuspensionCommand(provider_retry={
+            **self._retry_window, "retry_state": "retrying" if next_at is not None else "stopped",
+            **({"next_retry_at": next_at} if next_at is not None else {}),
+        }))
+
+    async def provider_suspend(self, code: str, elapsed: float) -> None:
+        self._provider_phase = "provider_suspending"
+        async with self._lock:
+            if self.quiescing or self._cancellation is not None or self._winner is not None:
+                raise asyncio.CancelledError
+            if not self._retry_window:
+                started = self._recovery.wall() - timedelta(seconds=elapsed)
+                self._retry_window = {
+                    "retry_started_at": started.isoformat(),
+                    "retry_deadline_at": (started + timedelta(hours=1)).isoformat(),
+                }
+            deadline = self._retry_window["retry_deadline_at"]
+            next_at = self._recovery.next_retry(self._provider_account, deadline)
+            state = await self._persist_provider_wait(next_at)
+            self._provider_episode = episode = state["suspension_episode"]
+            await self._provider_notice({
+                "text": state["current_step"], "code": code,
+                **({"next_retry_at": next_at} if next_at is not None else {}),
+            })
+            if self.quiescing or self._cancellation is not None:
+                raise asyncio.CancelledError
+            self._provider_phase = "provider_suspended"
+            ready = self._provider_ready = asyncio.Event()
+
+            async def activate():
+                async with self._lock:
+                    await self._activate_provider(episode)
+
+            async def update(next_at):
+                async with self._lock:
+                    if self._provider_can_activate(episode):
+                        await self._persist_provider_wait(next_at)
+
+            self._recovery.subscribe(
+                self._provider_account, self.run_id, self._provider_backend,
+                started=self._retry_window["retry_started_at"], deadline=deadline,
+                next_at=next_at, activate=activate, update=update,
+            )
+        await ready.wait()
+        if self.quiescing or self._cancellation is not None:
+            raise asyncio.CancelledError
+
+    def _provider_can_activate(self, episode: int) -> bool:
+        return (
+            self._provider_phase == "provider_suspended" and episode == self._provider_episode
+            and not self.quiescing and self._cancellation is None and self._winner is None
+        )
+
+    async def _activate_provider(self, episode: int) -> None:
+        from ..core.store._async_writes import _ChildSuspensionCommand
+
+        if not self._provider_can_activate(episode):
+            return
+        self._provider_phase = "activating"
+        try:
+            await self._provider_notice()
+            if self._cancellation is not None or self.quiescing:
+                return
+            await self._store._commit_storage_command(_ChildSuspensionCommand(activate=episode))
+            if self._cancellation is not None or self.quiescing:
+                return
+            self._recovery.replaying(self._provider_account, self.run_id)
+            self._provider_phase = "active"
+            assert self._provider_ready is not None
+            self._provider_ready.set()
+        finally:
+            if self._provider_phase == "activating":
+                self._provider_phase = "provider_suspended"
+
+    async def provider_replay_progress(self) -> None:
+        from ..core.store._async_writes import _ChildSuspensionCommand
+
+        if self._retry_window:
+            await self._store._commit_storage_command(_ChildSuspensionCommand(retry_progress=True))
+            self._retry_window = {}
+            self._recovery.replay_progress(self._provider_account, self.run_id)
 
     async def hold_at_limit(self) -> bool:
         async with self._lock:
@@ -180,7 +313,7 @@ class ChildRunTransitionOwner:
 
     @property
     def suspending(self) -> bool:
-        return self._winner == "suspend"
+        return self._shutdown_suspended and self._winner is None
 
     def quiesce(self) -> None:
         self.quiescing = True
@@ -196,7 +329,8 @@ class ChildRunTransitionOwner:
             if self._explicit_finish and await self._store.explicit_finish_report() is not None:
                 self._winner = "finish"
                 return
-            self._winner = "suspend"
+            self._shutdown_suspended = True
+            self._provider_unsubscribe()
             if self._abort_runtime is not None:
                 self._abort_runtime()
             task = self._execution if self._execution is not None else self._setup_task
@@ -267,6 +401,7 @@ class ChildRunTransitionOwner:
         )
         if not duplicate:
             self._cancellation = request
+            self._provider_unsubscribe()
         return request
 
     async def cancel_and_join(self) -> None:
@@ -318,7 +453,7 @@ class ChildRunTransitionOwner:
         """Confirm cancellation before interrupting runtime execution."""
         async with self._lock:
             if self._winner is not None or (
-                self._background and self._execution is not None and self._execution.done()
+                self._background and self._execution is not None and self._execution.done() and not self.provider_suspended
             ):
                 return False
             if (
@@ -340,7 +475,7 @@ class ChildRunTransitionOwner:
         self, state: str, text: str, turns_used: int, *, canonical: bool = False,
     ) -> None:
         async with self._lock:
-            if self._winner in {"cancel", "suspend"}:
+            if self._winner == "cancel" or self.suspending:
                 raise asyncio.CancelledError
             if self._winner is None:
                 await self._store._commit_storage_command(_FinishAgentLifecycleCommand(
@@ -361,7 +496,8 @@ class ChildRunTransitionOwner:
                     and await self._store.terminal_transition() == "cancel"
                 ):
                     self._winner = "cancel"
-            if self._winner is None:
+            self._provider_unsubscribe()
+            if self._winner is None and not self.suspending:
                 self._winner = "finish" if report is not None else "complete"
             canceled = self._winner == "cancel"
             request = self._cancellation

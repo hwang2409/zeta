@@ -257,10 +257,11 @@ class CodexBackend(CompletionBackend):
         tool_schemas: Sequence[ToolSchema],
         *,
         token: str | None = None,
+        probe: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         async with self._lease.borrow("codex completion") as client:
             events = self._complete_once_with_client(
-                client, messages, tool_schemas, token=token
+                client, messages, tool_schemas, token=token, probe=probe
             )
             try:
                 async for event in events:
@@ -275,6 +276,7 @@ class CodexBackend(CompletionBackend):
         tool_schemas: Sequence[ToolSchema],
         *,
         token: str | None = None,
+        probe: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         stream_context: Any = None
         entered = False
@@ -291,6 +293,12 @@ class CodexBackend(CompletionBackend):
                 tool_schemas,
                 model=self.model,
             )
+            if probe:
+                # ChatGPT-plan OAuth rejects max_output_tokens. Keep the request
+                # context-free and close the stream at the first generated output.
+                payload["instructions"] = "Reply with one character."
+                payload["reasoning"] = {"effort": "low"}
+                payload.pop("include", None)
             static_json = _cache_affinity_json(payload, messages, self.model)
             cache_key = str(uuid.uuid5(uuid.NAMESPACE_OID, static_json))
             # ponytail: pre-5.6 key routes one prefix; shard above ~15 requests/min.
