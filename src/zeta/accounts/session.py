@@ -280,12 +280,24 @@ class SessionAccountContext:
         )
 
     def restore_child_snapshot(self, provider: str, pins: dict[str, str]) -> SessionAccountContext:
+        canonical = account_provider(provider)
         context = SessionAccountContext(
             self.home, self.store, None, self.metadata,
-            {name: AccountId(*value.split(":", 1)) for name, value in pins.items()},
-            _frozen=True, _active_provider=account_provider(provider),
+            _frozen=True, _active_provider=canonical,
         )
-        context._validate_pins()
+        if canonical is not None and canonical in pins:
+            context._pins[canonical] = AccountId(*pins[canonical].split(":", 1))
+            context._validate_pins()
+        # Auxiliary accounts are useful but must not prevent the saved model from running.
+        for name, value in pins.items():
+            if name == canonical:
+                continue
+            try:
+                account = AccountId(*value.split(":", 1))
+                if self.store.contains(account):
+                    context._pins[name] = account
+            except (AccountError, OSError, ValueError):
+                continue
         return context
 
     async def switch_active(

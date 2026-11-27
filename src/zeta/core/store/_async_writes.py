@@ -329,9 +329,10 @@ class _ResolveApprovalCommand(_StoreMutationCommand):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _MarkAgentCanceledCommand(_StoreMutationCommand):
     tool_call_id: str
+    current_step: str | None = None
 
     def apply(self, store: Any) -> None:
-        store.mark_agent_canceled(self.tool_call_id)
+        store.mark_agent_canceled(self.tool_call_id, current_step=self.current_step)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -521,6 +522,7 @@ class _FinishAgentLifecycleCommand(_StoreMutationCommand):
     killed_task_count: int | None
     killed_task_ids_truncated: bool | None
     canonical_receipt: bool
+    current_step: str | None = None
 
     def apply(self, store: Any) -> None:
         store.finish_agent_lifecycle(
@@ -531,6 +533,7 @@ class _FinishAgentLifecycleCommand(_StoreMutationCommand):
             killed_task_count=self.killed_task_count,
             killed_task_ids_truncated=self.killed_task_ids_truncated,
             canonical_receipt=self.canonical_receipt,
+            current_step=self.current_step,
         )
 
 
@@ -1203,10 +1206,10 @@ class AsyncDurableWritesMixin:
         return await self._commit_storage_command(_TerminalTransitionCommand())
 
     async def mark_agent_canceled_async(
-        self: ConversationStore, parent_tool_call_id: str
+        self: ConversationStore, parent_tool_call_id: str, *, current_step: str
     ) -> None:
         await self._commit_storage_command(
-            _MarkAgentCanceledCommand(tool_call_id=parent_tool_call_id)
+            _MarkAgentCanceledCommand(tool_call_id=parent_tool_call_id, current_step=current_step)
         )
 
     async def idle_nudge_eligible(

@@ -553,7 +553,7 @@ class ChildRunTransitionOwner:
                 return False
             if self._prepare_cancel is not None:
                 await self._prepare_cancel()
-            await self._store.mark_agent_canceled_async(self._tool_call_id)
+            await self._store.mark_agent_canceled_async(self._tool_call_id, current_step="canceled")
             self._winner = "cancel"
             if self._abort_runtime is not None:
                 self._abort_runtime()
@@ -569,7 +569,7 @@ class ChildRunTransitionOwner:
                 await self._store._commit_storage_command(_FinishAgentLifecycleCommand(
                     state=state, final_result=text, turns_used=turns_used,
                     killed_task_ids=None, killed_task_count=None,
-                    killed_task_ids_truncated=None, canonical_receipt=canonical,
+                    killed_task_ids_truncated=None, canonical_receipt=canonical, current_step=state,
                 ))
                 self._winner = "complete"
 
@@ -608,10 +608,10 @@ class ChildRunTransitionOwner:
             await asyncio.shield(request.cleanup)
         return canceled, report
 
-    async def publish_background[Result](self, publish: Callable[[], Awaitable[Result]]) -> Result:
+    async def publish_background[Result](self, state: str, publish: Callable[[str], Awaitable[Result]]) -> Result:
         async with self._lock:
             await self.withdraw_questions()
-            return await publish()
+            return await publish(state)
 
     def recovered_report(self) -> dict[str, object] | None:
         return self._store.pending_prompt_queue.explicit_finish_report_snapshot()
@@ -621,12 +621,12 @@ class ChildRunTransitionOwner:
         lifecycle = self._store.agent_lifecycle()
         running = lifecycle is not None and lifecycle.get("finished_at") is None
         if status == "canceled" and (lifecycle is None or running):
-            self._store.mark_agent_canceled(self._tool_call_id)
+            self._store.mark_agent_canceled(self._tool_call_id, current_step="canceled")
             return
         if running:
+            state = "failed" if status == "error" else "completed"
             self._store.finish_agent_lifecycle(
-                "failed" if status == "error" else "completed",
-                final_result=text or "child completed",
+                state, final_result=text or "child completed", current_step=state,
             )
         self._store.finish_agent_parent()
 

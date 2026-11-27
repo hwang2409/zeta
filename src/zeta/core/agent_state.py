@@ -88,6 +88,13 @@ def _validate_provider_retry(lifecycle: dict[str, Any]) -> None:
             raise ValueError("invalid provider retry step")
 
 
+def _clear_terminal_suspension(lifecycle: dict[str, Any], replacement_step: str | None) -> None:
+    if replacement_step is not None and lifecycle.get("suspension_reason") == "provider_unavailable":
+        lifecycle["current_step"] = replacement_step
+    for key in _SUSPENSION_FIELDS:
+        lifecycle.pop(key, None)
+
+
 def _apply_provider_retry(lifecycle: dict[str, Any], retry: dict[str, str | int] | None) -> None:
     if retry is None:
         for key in ("retry_started_at", "retry_deadline_at", "retry_probe_at", "retry_step"):
@@ -609,7 +616,7 @@ class AgentStateMixin:
                 self._agent_parent = None
             self._write_session_state(self.bash_cwd, self._todo_items)
 
-    def mark_agent_canceled(self, parent_tool_call_id: str) -> None:
+    def mark_agent_canceled(self, parent_tool_call_id: str, *, current_step: str | None = None) -> None:
         """Persist a child cancellation and its terminal lifecycle."""
 
         if not parent_tool_call_id:
@@ -634,8 +641,7 @@ class AgentStateMixin:
                 and self._agent_lifecycle.get("finished_at") is None
             )
             if lifecycle_was_running:
-                for key in _SUSPENSION_FIELDS:
-                    self._agent_lifecycle.pop(key, None)
+                _clear_terminal_suspension(self._agent_lifecycle, current_step)
                 self._agent_lifecycle["state"] = "canceled"
                 self._agent_lifecycle["finished_at"] = _now()
                 self._agent_lifecycle["final_result"] = "tool execution canceled"
@@ -857,6 +863,7 @@ class AgentStateMixin:
         killed_task_count: int | None = None,
         killed_task_ids_truncated: bool | None = None,
         canonical_receipt: bool = False,
+        current_step: str | None = None,
     ) -> None:
         """Persist a terminal child state and its final result text."""
 
@@ -897,8 +904,7 @@ class AgentStateMixin:
                 raise ValueError("invalid killed task fields")
             resolved_finished_at = finished_at or _now()
             self._agent_lifecycle["state"] = state
-            for key in _SUSPENSION_FIELDS:
-                self._agent_lifecycle.pop(key, None)
+            _clear_terminal_suspension(self._agent_lifecycle, current_step)
             self._agent_lifecycle["finished_at"] = resolved_finished_at
             self._agent_lifecycle["final_result"] = final_result
             if canonical_receipt:
@@ -998,6 +1004,7 @@ class AgentStateMixin:
         killed_task_count: int | None,
         killed_task_ids_truncated: bool,
         canceled_tool_call_id: str | None = None,
+        current_step: str | None = None,
     ) -> tuple[str, ...]:
         """Transfer direct markers and durably publish one terminal lifecycle."""
 
@@ -1012,7 +1019,7 @@ class AgentStateMixin:
         transferred: list[str] = []
         if canceled_tool_call_id is not None:
             await self._commit_storage_command(
-                _MarkAgentCanceledCommand(tool_call_id=canceled_tool_call_id)
+                _MarkAgentCanceledCommand(tool_call_id=canceled_tool_call_id, current_step=current_step)
             )
         else:
             for marker_key, marker in self.agent_children().items():
@@ -1040,6 +1047,7 @@ class AgentStateMixin:
                 killed_task_count=killed_task_count,
                 killed_task_ids_truncated=killed_task_ids_truncated,
                 canonical_receipt=True,
+                current_step=current_step,
             )
         )
         return tuple(transferred)

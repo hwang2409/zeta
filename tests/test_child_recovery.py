@@ -159,19 +159,23 @@ async def test_recovery_preserves_activated_episode_across_notice_interruption(t
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("phase", ["pending", "selected", "unavailable"])
+@pytest.mark.parametrize("phase", ["pending", "selected", "unavailable", "auxiliary-missing", "active-missing"])
 async def test_resume_reconstructs_saved_model_accounts_and_lifetime_budget(tmp_path, monkeypatch, phase):
     from types import SimpleNamespace
 
+    from zeta.accounts.session import SessionAccountContext
+    from zeta.accounts.store import AccountStore
     from zeta.agent.presets import GENERAL_PRESET
     from zeta.agent.resume_descriptor import preset_snapshot
+    from zeta.core.session_metadata import SessionMetadata
     from zeta.protocol.types import ToolCall
 
     accounts = {"codex": "codex:saved"}
     restarts = []
     entered = asyncio.Event()
     release = asyncio.Event()
-    model = "gpt-5.6-luna"
+    provider = "ollama" if phase == "auxiliary-missing" else "codex"
+    model = "qwen3:4b" if provider == "ollama" else "gpt-5.6-luna"
 
     class Accounts:
         def child_snapshot(self, provider):
@@ -184,7 +188,7 @@ async def test_resume_reconstructs_saved_model_accounts_and_lifetime_budget(tmp_
 
     def resolve(loop, requested, *, pinned_context):
         assert requested == model
-        assert pinned_context.snapshot() == accounts
+        assert pinned_context.snapshot() == ({} if phase == "auxiliary-missing" else accounts)
         if phase == "unavailable":
             return None, "model unavailable"
         return loop.backend, None
@@ -210,7 +214,7 @@ async def test_resume_reconstructs_saved_model_accounts_and_lifetime_budget(tmp_
             background=True, agent_type="general", turns_used=3,
             resume={
                 "preset": preset_snapshot(GENERAL_PRESET), "requested_model": model,
-                "model": model, "provider": "codex", "requested_max_turns": 4,
+                "model": model, "provider": provider, "requested_max_turns": 4,
                 "effective_max_turns": 4, "depth": 1, "cwd": str(tmp_path),
                 "description": "saved work", "background": True, "follow_up": False,
                 "explicit_finish": False, "account_pins": "pending" if phase == "pending" else "selected",
@@ -220,26 +224,36 @@ async def test_resume_reconstructs_saved_model_accounts_and_lifetime_budget(tmp_
 
     with ConversationStore(root, session_id=session_id, cwd=tmp_path) as store:
         loop = _loop(store)
-        loop.account_context = Accounts()
+        loop.backend.provider = provider
+        date = "2026-11-08T00:00:00+00:00"
+        metadata = SessionMetadata(1, session_id, date, date, provider, model, str(tmp_path), 8, 200_000)
+        loop.account_context = (
+            SessionAccountContext(tmp_path, AccountStore(tmp_path / "accounts-home"), None, metadata)
+            if phase in {"auxiliary-missing", "active-missing"} else Accounts()
+        )
         try:
             before, _ = read_child_lifecycle(store, path)
             assert isinstance(before, LoadedAgentLifecycle)
             assert before.value["state"] == "suspended"
             await await_or_fail(activate_agent_children(loop), what="resume saved descriptor")
-            assert restarts[0] == (("select", "codex") if phase == "pending" else ("restore", "codex", accounts))
+            if phase not in {"auxiliary-missing", "active-missing"}:
+                assert restarts.pop(0) == (("select", "codex") if phase == "pending" else ("restore", "codex", accounts))
             descriptor = store.agent_children()[run_id]["resume"]
             assert (descriptor["account_pins"], descriptor["selected_accounts"]) == ("selected", accounts)
-            if phase == "unavailable":
+            if phase in {"unavailable", "active-missing"}:
                 blocked, _ = read_child_lifecycle(store, path)
                 assert isinstance(blocked, LoadedAgentLifecycle)
                 assert blocked.value["state"] == "suspended"
-                assert "unavailable" in blocked.value["recovery_blocked"]
+                assert blocked.value["recovery_blocked"] == "saved model or account is unavailable"
                 assert not entered.is_set()
                 assert not store.agent_notifications(pending_only=False)
             else:
+                resumed, _ = read_child_lifecycle(store, path)
+                assert isinstance(resumed, LoadedAgentLifecycle)
+                assert "recovery_blocked" not in resumed.value
                 await await_or_fail(entered.wait(), what="resumed child executes")
-                assert restarts[1][:3] == ("execute", 3, 4)
-                assert "parent crashed" in restarts[1][3]
+                assert restarts[0][:3] == ("execute", 3, 4)
+                assert "parent crashed" in restarts[0][3]
         finally:
             await await_or_fail(loop.close(), what="close reconstructed runtime")
             release.set()

@@ -443,6 +443,7 @@ async def test_provider_owner_transition_table(tmp_path, monkeypatch, phase, wri
                     if should_replay:
                         await await_or_fail(replayed.wait(), what="activation wakes the child")
                         assert len(activations) == 1
+                        assert activations[0]["current_step"] == "recovering interrupted work"
                     else:
                         assert not replayed.is_set()
                         assert not activations
@@ -474,6 +475,7 @@ async def test_provider_owner_transition_table(tmp_path, monkeypatch, phase, wri
                     assert not replayed.is_set()
                 else:
                     assert state["state"] == ("canceled" if event == "cancel" else "completed")
+                    assert "retrying" not in state["current_step"]
                     assert len(receipts) == 1
                     assert not await owner.cancel(), "a second terminal transition must lose"
                     if event in {"cancel", "finish"}:
