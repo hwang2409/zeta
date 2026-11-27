@@ -14,19 +14,13 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ..core.abort import AbortSignal as ToolAbortSignal
-from ..core.agent_state import (
-    LoadedAgentLifecycle,
-    MissingAgentLifecycle,
-    _lifecycle_elapsed,
-)
+from ..core.agent_state import _lifecycle_elapsed
 from ..core.checkpoints.mutation import AppendConversationRows, ConversationRow
-from ..core.child_runs import TERMINAL_AGENT_STATES, read_child_lifecycle
 from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..core.store._async_writes import (
     _RegisterAgentChildCommand,
     _SelectChildAccountsCommand,
 )
-from ..core.store._child_runs import child_run_segments
 from ..media.image_policy import image_policy_for_provider
 from ..path_identity import same_physical_path
 from ..project_registry import ProjectRegistryError
@@ -75,6 +69,7 @@ from .child_context import (
     consume_run,
     resolve_child_backend,
 )
+from .child_control import ChildControlError
 from .child_run_owner import ChildRunTransitionOwner
 from .conversation_channel import NO_HOLD_WAKE, HoldWake, has_follow_up_loop
 from .explicit_finish import eligible as explicit_finish_eligible
@@ -599,13 +594,6 @@ async def run_agent_tool(
     return result
 
 
-class ChildControlError(Exception):
-    def __init__(self, code: str, *, detail: str | None = None) -> None:
-        super().__init__(code)
-        self.code = code
-        self.detail = detail
-
-
 async def spawn_child(
     loop: AgentLoop, *, agent_type: str, task: str, cwd: str | None,
 ) -> str:
@@ -625,48 +613,6 @@ async def spawn_child(
     result = launch.result()
     assert isinstance(result, str)
     return result
-
-
-async def cancel_child_run(loop: AgentLoop, run_id: str) -> str:
-    store = loop.store
-    try:
-        segments = child_run_segments(store.session_id, run_id)
-    except ValueError:
-        raise ChildControlError("child_run_not_found") from None
-    path = store.session_dir.absolute()
-    for segment in segments:
-        path = path / "agents" / str(segment)
-
-    def state() -> str:
-        try:
-            lifecycle, _ = read_child_lifecycle(store, path)
-        except FileNotFoundError:
-            raise ChildControlError("child_run_not_found") from None
-        if isinstance(lifecycle, MissingAgentLifecycle):
-            raise ChildControlError("child_run_not_found")
-        if not isinstance(lifecycle, LoadedAgentLifecycle):
-            raise ChildControlError("state_unavailable")
-        if lifecycle.value.get("handle") != run_id:
-            raise ChildControlError("child_run_not_found")
-        return lifecycle.value["state"]
-
-    try:
-        current = await await_joined_offload(state)
-    except asyncio.CancelledError:
-        # An interrupted reply must not withdraw cancellation of a live child.
-        loop._background_owner.cancel(run_id)
-        raise
-    if current in TERMINAL_AGENT_STATES:
-        return current
-    outcome = await loop._background_owner.cancel_and_wait(run_id)
-    if outcome.status == "confirmed":
-        return "cancelling"
-    current = await await_joined_offload(state)
-    if current in TERMINAL_AGENT_STATES:
-        return current
-    if outcome.status == "failed" or not loop._background_owner.owns_running(run_id):
-        raise ChildControlError("state_unavailable")
-    raise ChildControlError("operation_busy")
 
 
 async def _run_child(

@@ -90,6 +90,7 @@ def test_nested_recovery_uses_indexed_tool_result_lookup() -> None:
 
     class Store:
         session_id = "parent"
+        child_recovery_enabled = False
 
         def __init__(self) -> None:
             self.messages_calls = 0

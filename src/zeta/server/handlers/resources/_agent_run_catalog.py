@@ -82,10 +82,13 @@ def _row(fd: int, parent_fd: int, run_id: str, state: str | None, child_recovery
         session_id, parent_run_id = run_row_identity(run_id)
         row = project_child_run_row(
             item, session_id=session_id, parent_run_id=parent_run_id,
-            accepts_follow_ups=_follow_ups(parent_fd, run_id),
+            accepts_follow_ups=False,
         )
         row = child_run_for_features(row, child_recovery=child_recovery)
-        return row if state is None or row["status"] == state else None
+        if state is not None and row["status"] != state:
+            return None
+        row["accepts_follow_ups"] = _follow_ups(parent_fd, run_id)
+        return row
     except (OSError, ValueError, TypeError, OverflowError, RecursionError):
         return None
 

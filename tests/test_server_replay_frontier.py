@@ -57,6 +57,7 @@ CONTROLLER_FEATURES = (
     "child_runs",
     "child_run_history",
     "child_run_events",
+    "child_recovery",
 )
 Route = tuple[EventDescriptor, str]
 
@@ -436,6 +437,9 @@ async def _background(
 NOTIFICATIONS: dict[EventDescriptor, Callable[[Any], None]] = {
     EventDescriptor.SUB_AGENT_RECEIPT: lambda store: store.append_agent_notification(
         "child-done", child_session_path="/tmp/child", description="child", status="completed", text="done"
+    ),
+    EventDescriptor.CHILD_RECOVERED: lambda store: store.append_child_recovered(
+        f"{store.session_id}:1", 1, path="/tmp/child", description="child"
     ),
     EventDescriptor.CHILD_IDLE: lambda store: store.append_child_idle_notification(
         "child-idle", child_session_path="/tmp/child", description="child", text="idle"
