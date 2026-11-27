@@ -9341,14 +9341,18 @@ async def test_serve_slash_decisions_lists_and_resolves_attention_kinds(
 ) -> None:
     project = _seed_slash_fixtures(tmp_path)
     server = ZetaServer(home=tmp_path / "home", cwd=project, port=0, provider="codex")
+    registry = ProjectRegistry(tmp_path / "home" / "projects")
+    try:
+        await asyncio.to_thread(registry.create_project, "serve attention", "test", project)
+    finally:
+        registry._storage_lease.close()
     reader, writer, session_id = await _ready_extensions(server)
     try:
         opened = server.controllers.attached().runtime.opened
         assert opened is not None
         registry = server.controllers.attached().runtime.manager.project_registry
         assert registry is not None
-        project_record = await asyncio.to_thread(registry.create_project, "serve attention", "test")
-        project_id = project_record.project_id
+        project_id = opened.metadata.project_id
         store = await asyncio.to_thread(
             AttentionStore, opened.store.session_dir, writer_epoch=5
         )

@@ -302,9 +302,9 @@ _EXPECTED_PROVIDER_TOOL_CONTRACTS = {
             },
         ),
         "list_attention": (
-            "offset=integer",
+            "list=string offset=integer",
             "",
-            {"offset.minimum": 0},
+            {"list.enum": ["action", "fyi"], "offset.minimum": 0},
         ),
         "mcp_discover": (
             "action=string names=array names[]=string query=string server=string uri=string",

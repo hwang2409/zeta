@@ -349,7 +349,7 @@ def test_list_attention_pages_and_keeps_broken_timestamps_visible(tmp_path: Path
             why="The predecessor stopped.",
             kind={4: "answer", 6: "deferred", 100: "decided"}.get(index, "decision"),
         )
-        for index in range(101)
+        for index in range(103)
     ]
     for record, created_at in zip(records[:3], (None, "not-a-time", "2026-01-01T00:00:00"), strict=True):
         path = attention.directory / f"{record.id}.json"
@@ -367,6 +367,7 @@ def test_list_attention_pages_and_keeps_broken_timestamps_visible(tmp_path: Path
 
     try:
         first = asyncio.run(registry.definitions_by_name["list_attention"].handler({}))
+        fyi = asyncio.run(registry.definitions_by_name["list_attention"].handler({"list": "fyi"}))
         second = asyncio.run(
             registry.definitions_by_name["list_attention"].handler({"offset": 100})
         )
@@ -378,7 +379,7 @@ def test_list_attention_pages_and_keeps_broken_timestamps_visible(tmp_path: Path
     # mutation: omit Broken rows from _list_attention_sync(); the visibility assertion fails.
     assert all(item["broken"] is True for item in first_items[:3])
     # mutation: change the list page size from 100 to 101; the paging assertions fail.
-    assert first["structuredContent"]["total"] == 101
+    assert first["structuredContent"]["total"] == 103
     assert first["structuredContent"]["next_offset"] == 100
     assert len(first_items) == 100 and len(second_items) == 1
     assert [item["id"] for item in first_items[:3]] == sorted(
@@ -386,13 +387,14 @@ def test_list_attention_pages_and_keeps_broken_timestamps_visible(tmp_path: Path
     )
     assert "next_offset" not in second["structuredContent"]
     rendered, wire = _render_receipt(ToolCall("list-page", "list_attention", {}), first)
-    assert "96 require action · 2 FYI · 3 broken" in rendered
+    assert "98 require action · 2 FYI · 3 broken" in rendered
     for page in (wire["structured_content"], second["structuredContent"]):
-        assert page["action_required_total"] == 96
+        assert page["action_required_total"] == 98
         assert page["info_total"] == 2
         for item in page["items"]:
             assert item["requires_action"] is (item["kind"] in {"decision", "deferred"})
-    assert "[FYI, answer," in rendered
+    assert "[FYI, answer," not in rendered
+    assert [item["kind"] for item in fyi["structuredContent"]["items"]] == ["answer", "decided"]
 
 
 def test_list_attention_omits_nonopen_and_out_of_scope_owners(tmp_path: Path) -> None:

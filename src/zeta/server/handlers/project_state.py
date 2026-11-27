@@ -6,6 +6,8 @@ from time import time_ns
 from typing import Any
 
 from ... import attention_records, storage_format
+from ...attention_decisions import open_attention_items
+from ...attention_records import AttentionRecord
 from ...memory.transaction import STATE_MEMORY_KINDS
 from ...project_inbox import ProjectInbox
 from ...project_inbox import is_message_id as _valid_message_id
@@ -52,10 +54,18 @@ def request(collection: str, params: dict[str, Any]) -> tuple[tuple, Resume | No
         value = params.get(field)
         if value is not None and value not in variants:
             raise InvalidParams("invalid filter")
+    attention_list = None
+    if collection == "attention":
+        allowed.add("list")
+        attention_list = params.get("list")
+        if attention_list is not None and (attention_list not in ("action", "fyi") or value == "done"):
+            raise InvalidParams("invalid attention list")
     limit = params.get("limit", 50)
     if params.keys() - allowed - {"limit", "cursor"} or type(limit) is not int or not 1 <= limit <= 200:
         raise InvalidParams("invalid page params")
     scope = (collection, project_id, value)
+    if attention_list is not None:
+        scope += (attention_list,)
     return scope, resume(params.get("cursor"), scope, (), _order(collection)), limit
 
 
@@ -77,11 +87,12 @@ def page(collection, snapshot, start, limit, fits):
 
 
 def snapshot(home: Path, scope: tuple, stable: Callable) -> Any:
-    collection, project_id, selector = scope
+    collection, project_id, selector, *attention_list = scope
     resource = collection.removesuffix("_detail")
     manifest = home / "storage-format.json"
 
     sessions = home / "sessions"
+    open_queue = collection == "attention" and (selector == "open" or bool(attention_list))
 
     def owners(epoch):
         registry = ProjectRegistry.for_state_read(home / "projects", epoch)
@@ -98,7 +109,7 @@ def snapshot(home: Path, scope: tuple, stable: Callable) -> Any:
                     tuple((memory.state_generation(p.name), inbox.state_generation(p.name)) for p in projects),
                 )
             elif collection == "attention":
-                state = attention_records.state_attention_home_generation(sessions)
+                state = attention_records.state_attention_home_generation(sessions, include_owner=open_queue)
             else:
                 owner = memory if collection.startswith("memory") else inbox
                 state = owner.state_generation(project_id)
@@ -118,6 +129,13 @@ def snapshot(home: Path, scope: tuple, stable: Callable) -> Any:
                 return inbox.state_rows(project_id, status=selector)
             if collection == "inbox_detail":
                 return inbox.state_rows(project_id, message_id=selector)
+            if open_queue:
+                return [
+                    item.record.state_row()
+                    for item in open_attention_items(home, project_id, epoch=epoch)
+                    if isinstance(item.record, AttentionRecord)
+                    and (not attention_list or item.is_fyi == (attention_list[0] == "fyi"))
+                ]
             return attention_records.state_attention_home_rows(sessions, epoch, project_id, selector)
 
     try:

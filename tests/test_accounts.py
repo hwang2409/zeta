@@ -11,10 +11,14 @@ import os
 import signal
 import socket
 import stat
+import subprocess
+import sys
 import threading
-from contextlib import contextmanager
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, contextmanager
 from io import StringIO
 from pathlib import Path
+from tempfile import TemporaryFile
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -40,6 +44,7 @@ from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.login import isolated_logins, reject_provider_token_exchange
 from tests.support.owned import await_or_fail
+from tests.support.processes import child_handshake, reap_process
 from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import (
     AccountCredentialLockTimeoutError,
@@ -97,15 +102,52 @@ def _hold_lifecycle_lock(
         release.wait()
 
 
-def _hold_registry_lock(
-    home: str,
-    ready: multiprocessing.synchronize.Event,
-    release: multiprocessing.synchronize.Event,
-) -> None:
-    store = AccountStore(home)
-    with store._home() as home_fd, store._registry_guard(home_fd):
-        ready.set()
-        release.wait()
+@asynccontextmanager
+async def _registry_lock_holder(home: Path) -> AsyncIterator[None]:
+    child = """\
+import os
+import sys
+from zeta.accounts import AccountStore
+
+store = AccountStore(sys.argv[1])
+with store._home() as home_fd, store._registry_guard(home_fd):
+    with os.fdopen(int(os.environ['ZETA_TEST_READY_FD']), 'wb') as ready:
+        ready.write(b'ZETA_TEST_READY\\n')
+    sys.stdin.buffer.read()  # EOF releases the lock, even if the parent dies.
+"""
+    with (
+        child_handshake() as handshake,
+        TemporaryFile() as stderr,
+        subprocess.Popen(  # noqa: ASYNC220 - the handshake and reap wait off-loop
+            [sys.executable, "-c", child, str(home)],
+            env={**os.environ, **handshake.child_env()},
+            pass_fds=handshake.pass_fds,
+            stdin=subprocess.PIPE,
+            stderr=stderr,
+        ) as holder,
+    ):
+        assert holder.stdin is not None
+        startup_error = None
+        try:
+            try:
+                await await_or_fail(
+                    handshake.wait(process=holder),
+                    timeout=40,
+                    what="registry lock holder ready",
+                )
+            except AssertionError as error:
+                startup_error = error
+                raise
+            yield
+        finally:
+            holder.stdin.close()
+            exitcode = await asyncio.to_thread(reap_process, holder, timeout=10)
+            if startup_error is not None:
+                stderr.seek(0)
+                startup_error.add_note(
+                    f"registry lock holder exitcode: {exitcode}; stderr:\n"
+                    f"{stderr.read().decode(errors='replace')}"
+                )
 
 
 def _refresh_account_token(
@@ -737,75 +779,57 @@ async def test_access_token_times_out_when_another_process_holds_registry_lock(
     # test-contract: seam parks the worker-thread registry lock boundary until
     # the loop runs, then lets the real bounded guard time out.
     monkeypatch.setattr(account_store, "_bounded_guard", observe_lock_wait)
-    context = multiprocessing.get_context("spawn")
-    ready = context.Event()
-    release = context.Event()
-    holder = context.Process(
-        target=_hold_registry_lock,
-        args=(str(tmp_path), ready, release),
-    )
-    holder.start()
-    operation: asyncio.Task[str] | None = None
-    progress_future: asyncio.Future[None] | None = None
-    try:
-        await await_or_fail(
-            asyncio.to_thread(ready.wait), timeout=60, what="registry lock holder ready"
-        )
-        async with httpx.AsyncClient() as client:
-            operation = asyncio.create_task(credential.access_token(client))
-            assert await await_or_fail(
-                asyncio.to_thread(lock_waiting.wait, 10),
-                what="registry lock-wait signal",
-            )
-            loop = asyncio.get_running_loop()
-            progress_future = loop.create_future()
+    async with _registry_lock_holder(tmp_path):
+        operation: asyncio.Task[str] | None = None
+        progress_future: asyncio.Future[None] | None = None
+        try:
+            async with httpx.AsyncClient() as client:
+                operation = asyncio.create_task(credential.access_token(client))
+                assert await await_or_fail(
+                    asyncio.to_thread(lock_waiting.wait, 10),
+                    what="registry lock-wait signal",
+                )
+                loop = asyncio.get_running_loop()
+                progress_future = loop.create_future()
 
-            def mark_progress() -> None:
-                if (
-                    operation is not None
-                    and not operation.done()
-                    and not progress_future.done()
-                ):
-                    progress_future.set_result(None)
-                # release the parked worker thread even if the operation has
-                # already finished, so no thread stays blocked.
-                progress_seen.set()
+                def mark_progress() -> None:
+                    if (
+                        operation is not None
+                        and not operation.done()
+                        and not progress_future.done()
+                    ):
+                        progress_future.set_result(None)
+                    # release the parked worker thread even if the operation has
+                    # already finished, so no thread stays blocked.
+                    progress_seen.set()
 
-            loop.call_soon(mark_progress)
-            done, _ = await await_or_fail(
-                asyncio.wait(
-                    (progress_future, operation),
-                    timeout=10,
-                    return_when=asyncio.FIRST_COMPLETED,
-                ),
-                what="event-loop progress during registry lock wait",
-            )
-            assert progress_future in done, (
-                "registry lock wait completed without event-loop progress"
-            )
-            assert not operation.done()
-            with pytest.raises(AccountCredentialLockTimeoutError):
-                await await_or_fail(operation, what="access token")
-    finally:
-        # Unblock the readiness thread even if the holder never signaled.
-        ready.set()
-        # unpark the worker thread before draining, so cancel/drain cannot hang.
-        progress_seen.set()
-        if progress_future is not None and not progress_future.done():
-            progress_future.cancel()
-        if operation is not None and not operation.done():
-            operation.cancel()
-        if operation is not None:
-            await await_or_fail(
-                asyncio.gather(operation, return_exceptions=True),
-                what="access token operation",
-            )
-        release.set()
-        holder.join(timeout=5)
-        if holder.is_alive():
-            holder.kill()
-            holder.join(timeout=5)
-        holder.close()
+                loop.call_soon(mark_progress)
+                done, _ = await await_or_fail(
+                    asyncio.wait(
+                        (progress_future, operation),
+                        timeout=10,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    ),
+                    what="event-loop progress during registry lock wait",
+                )
+                assert progress_future in done, (
+                    "registry lock wait completed without event-loop progress"
+                )
+                assert not operation.done()
+                with pytest.raises(AccountCredentialLockTimeoutError):
+                    await await_or_fail(operation, what="access token")
+        finally:
+            # unpark the worker thread before draining, so cancel/drain cannot hang.
+            progress_seen.set()
+            if progress_future is not None and not progress_future.done():
+                progress_future.cancel()
+            if operation is not None and not operation.done():
+                operation.cancel()
+            if operation is not None:
+                await await_or_fail(
+                    asyncio.gather(operation, return_exceptions=True),
+                    what="access token operation",
+                )
 
 
 @pytest.mark.asyncio
@@ -843,37 +867,23 @@ async def test_registry_lock_timeout_reaches_tui_turn_error_card(
     )
     rendered: list[object] = []
     app._print = rendered.append
-    context = multiprocessing.get_context("spawn")
-    ready = context.Event()
-    release = context.Event()
-    holder = context.Process(
-        target=_hold_registry_lock,
-        args=(str(tmp_path), ready, release),
-    )
-    holder.start()
     try:
-        assert ready.wait(timeout=5)
-        await await_or_fail(
-            app._consume_turn("hello"), what="TUI account-lock timeout turn"
-        )
-        output = StringIO()
-        console = Console(file=output, force_terminal=False, width=100)
-        for item in rendered:
-            console.print(item)
-        plain = Text.from_ansi(output.getvalue()).plain
-        assert len(waits) == MAX_ACCOUNT_LOCK_ATTEMPTS - 1
-        assert plain.count("waiting for account lock") == len(waits)
-        assert plain.index("waiting for account lock") < plain.index(
-            "account busy · account_lock_timeout"
-        )
-        assert "retry: ctrl+y" in plain
+        async with _registry_lock_holder(tmp_path):
+            await await_or_fail(
+                app._consume_turn("hello"), what="TUI account-lock timeout turn"
+            )
+            output = StringIO()
+            console = Console(file=output, force_terminal=False, width=100)
+            for item in rendered:
+                console.print(item)
+            plain = Text.from_ansi(output.getvalue()).plain
+            assert len(waits) == MAX_ACCOUNT_LOCK_ATTEMPTS - 1
+            assert plain.count("waiting for account lock") == len(waits)
+            assert plain.index("waiting for account lock") < plain.index(
+                "account busy · account_lock_timeout"
+            )
+            assert "retry: ctrl+y" in plain
     finally:
-        release.set()
-        holder.join(timeout=5)
-        if holder.is_alive():
-            holder.kill()
-            holder.join(timeout=5)
-        holder.close()
         store.close()
 
 
