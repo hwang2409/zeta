@@ -416,6 +416,7 @@ async def _build_child_loop(
     child_turn_control: ChildTurnControl | None = None,
     recovered_explicit_finish: bool | None = None,
 ) -> tuple[AgentLoop, ChildApprovalPolicy | None]:
+    """Build the child under current policy for both spawn and recovery."""
     child_registry: ToolRegistry | None = None
     child_policy: ChildApprovalPolicy | None = None
     child_loop: AgentLoop | None = None
@@ -429,16 +430,16 @@ async def _build_child_loop(
             await child_registry.close(background_task_cause=background_task_cause)
 
     try:
-        explicit_finish = explicit_finish_eligible(
-            global_enabled=loop.explicit_finish,
-            preset=preset,
-            background=follow_up_loop,
-        )
         recovering = recovered_explicit_finish is not None
-        if recovering:
-            if recovered_explicit_finish and not explicit_finish:
-                raise ChildRecoveryPolicyError("saved explicit finish is disabled by current settings")
-            explicit_finish = recovered_explicit_finish
+        explicit_finish = (
+            explicit_finish_eligible(
+                global_enabled=loop.explicit_finish,
+                preset=preset,
+                background=follow_up_loop,
+            )
+            if recovered_explicit_finish is None
+            else recovered_explicit_finish
+        )
         runtime_tool_names = {"ask_parent"} if follow_up_loop else set()
         if explicit_finish:
             runtime_tool_names.update(("finish", "agent_handoff"))
@@ -447,13 +448,6 @@ async def _build_child_loop(
             for name in runtime_tool_names
             if loop.tool_registry.tool_is_allowed_by_policy(name)
         )
-        if recovering and explicit_finish:
-            missing_finish_tools = {"finish", "agent_handoff"} - policy_allowed_runtime_names
-            if missing_finish_tools:
-                raise ChildRecoveryPolicyError(
-                    "current policy blocks required explicit-finish tools: "
-                    + ", ".join(sorted(missing_finish_tools))
-                )
         try:
             excluded_names, profile_tool_allow = resolve_child_profile_tools(
                 preset=preset,
@@ -580,6 +574,11 @@ async def _build_child_loop(
         if child_loop.explicit_finish:
             register_finish(child_registry, child_loop=child_loop)
             register_handoff(child_loop)
+            # Only finish is required to complete the saved contract.
+            if recovering and "finish" not in child_registry.registered_names:
+                raise ChildRecoveryPolicyError(
+                    "current policy blocks required explicit-finish tools: finish"
+                )
         loop._background_owner.conversation_channel.register_loop(child_instance_id)
         await child_loop._ensure_step_delivery()
         if loop.plan_mode:
