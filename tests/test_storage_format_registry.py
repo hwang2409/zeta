@@ -486,6 +486,8 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
         "child_instance_id": "root:1", "episode": 1, "child_session_path": "/tmp/agents/1",
         "description": "work", "text": "child recovered", "display_only": True,
     }
+    suspended = {**recovered, "kind": "child_suspended", "logical_id": "child-suspended:root:1:1",
+                 "code": "server_error", "next_retry_at": "2026-11-08T00:00:05+00:00"}
     question = {
         "question_id": "q", "state": "answered", "question": "continue?", "options": [],
         "held_at_turn_limit": True, "ancestor_target_ids": [None], "settlement_turn": 2,
@@ -496,6 +498,7 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
         ShapeCase("child_resume", validate_child_resume, resume, frozenset(resume)),
         ShapeCase("child_resume_preset", lambda data: validate_child_resume({**resume, "preset": data}), preset, frozenset(preset)),
         ShapeCase("child_recovered_notification", validate_child_recovered, recovered, frozenset(recovered)),
+        ShapeCase("child_suspended_notification", validate_child_recovered, suspended, frozenset(suspended) - {"code", "next_retry_at"}),
         ShapeCase("hook_config", hook_root, {"hook": []}, frozenset()),
         ShapeCase(
             "hook_record",

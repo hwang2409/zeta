@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 _AGENT_STATES = CLOSED_VARIANTS["child_lifecycle.state"]
 _SUSPENSION_FIELDS = (
-    "retry_state", "retry_started_at", "retry_deadline_at", "next_retry_at", "suspended_at", "suspension_reason", "resume_mode", "recovery_blocked",
+    "retry_state", "retry_started_at", "retry_deadline_at", "retry_probe_at", "retry_step", "next_retry_at", "suspended_at", "suspension_reason", "resume_mode", "recovery_blocked",
 )
 _TERMINAL_AGENT_STATES = {"completed", "canceled", "failed"}
 
@@ -108,10 +108,13 @@ def _validate_status_lifecycle(value: object) -> dict[str, Any]:
     if ("next_retry_at" in lifecycle) != (retrying == "retrying"):
         raise ValueError("invalid provider retry time")
     if retrying is not None or "retry_started_at" in lifecycle or "retry_deadline_at" in lifecycle:
-        for key in ("retry_started_at", "retry_deadline_at", *(("next_retry_at",) if retrying == "retrying" else ())):
+        for key in ("retry_started_at", "retry_deadline_at", "retry_probe_at", *(("next_retry_at",) if retrying == "retrying" else ())):
             timestamp = lifecycle.get(key)
             if type(timestamp) is not str or len(timestamp) > 40 or datetime.fromisoformat(timestamp).utcoffset() != timedelta(0):
                 raise ValueError("invalid UTC provider retry timestamp")
+        step = lifecycle.get("retry_step")
+        if type(step) is not int or not 0 <= step <= 6:
+            raise ValueError("invalid provider retry step")
     blocked = lifecycle.get("recovery_blocked")
     if "recovery_blocked" in lifecycle and (state != "suspended" or type(blocked) is not str or not 0 < len(blocked) <= 160):
         raise ValueError("invalid child recovery reason")
@@ -764,7 +767,8 @@ class AgentStateMixin:
 
     def transition_agent_suspension(
         self, *, reason: str | None = None, activate: int | None = None, blocked: str | None = None,
-        provider_retry: dict[str, str] | None = None, retry_progress: bool = False,
+        provider_retry: dict[str, str | int] | None = None, retry_progress: bool = False,
+        retry_schedule: tuple[str, int] | None = None,
     ) -> dict[str, Any] | None:
         if not self.child_recovery_enabled:
             raise ValueError("child recovery is unavailable at this epoch")
@@ -777,7 +781,9 @@ class AgentStateMixin:
             if (provider_retry is not None or retry_progress) and not self.provider_recovery_enabled:
                 raise ValueError("provider recovery is unavailable at this epoch")
             if retry_progress:
-                for key in ("retry_started_at", "retry_deadline_at"):
+                if live is not None:
+                    lifecycle.update(live)
+                for key in ("retry_started_at", "retry_deadline_at", "retry_probe_at", "retry_step"):
                     lifecycle.pop(key, None)
             elif provider_retry is not None:
                 if live is not None:
@@ -802,6 +808,8 @@ class AgentStateMixin:
             elif lifecycle["state"] == "suspended" and activate == lifecycle["suspension_episode"]:
                 lifecycle["state"] = "idle" if lifecycle["resume_mode"] == "idle" else "running"
                 lifecycle["current_step"] = "idle, waiting for follow-up" if lifecycle["state"] == "idle" else "recovering interrupted work"
+                if retry_schedule is not None:
+                    lifecycle["retry_probe_at"], lifecycle["retry_step"] = retry_schedule
                 for key in ("recovery_blocked", "suspended_at", "suspension_reason", "resume_mode", "retry_state", "next_retry_at"):
                     lifecycle.pop(key, None)
             elif lifecycle["state"] == "suspended" and blocked is not None:
@@ -1036,6 +1044,6 @@ class AgentStateMixin:
         self._storage_lease.publish_json(
             self.directory_fd,
             "agent_lifecycle.json",
-            mapping_mutations(value),
+            mapping_mutations(value, delete=(key for key in _SUSPENSION_FIELDS if key not in value)),
             write_session_file,
         )

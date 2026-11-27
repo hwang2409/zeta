@@ -16,11 +16,17 @@ _BACKOFF = (5, 10, 20, 40, 80, 160, 300)
 
 
 @dataclass(slots=True)
+class RecoverySchedule:
+    probe_at: str
+    step: int
+
+
+@dataclass(slots=True)
 class _Subscriber:
     backend: object
     deadline: float
-    activate: Callable[[], Awaitable[None]]
-    update: Callable[[str | None], Awaitable[None]]
+    activate: Callable[[RecoverySchedule], Awaitable[None]]
+    update: Callable[[RecoverySchedule, bool], Awaitable[None]]
     waiting: bool = True
 
 
@@ -41,28 +47,29 @@ class ProviderRecoveryCoordinator:
         self._tasks: set[asyncio.Task[None]] = set()
         self._closed = False
 
-    def next_retry(self, account, deadline: str) -> str | None:
-        wall = self.wall()
-        limit = datetime.fromisoformat(deadline)
-        if self._closed or wall >= limit:
-            return None
-        state = self._accounts.get(account)
-        seconds = _BACKOFF[0] if state is None else max(0, state.next_at - self.clock.now())
-        return min(wall + timedelta(seconds=seconds), limit).isoformat()
+    def schedule(self, account, previous: RecoverySchedule | None) -> RecoverySchedule:
+        if (state := self._accounts.get(account)) is not None:
+            return self._schedule(state)
+        if previous is not None:
+            return previous
+        return RecoverySchedule((self.wall() + timedelta(seconds=_BACKOFF[0])).isoformat(), 0)
 
-    def subscribe(self, account, run_id: str, backend, *, started: str, deadline: str,
-                  next_at: str | None, activate, update) -> None:
-        if self._closed or next_at is None:
+    def _schedule(self, state: _Account) -> RecoverySchedule:
+        remaining = max(0, state.next_at - self.clock.now())
+        return RecoverySchedule((self.wall() + timedelta(seconds=remaining)).isoformat(), state.step)
+
+    def subscribe(self, account, run_id: str, backend, *, deadline: str,
+                  schedule: RecoverySchedule, activate, update) -> None:
+        if self._closed:
             return
         wall, now = self.wall(), self.clock.now()
-        to_mono = lambda stamp: now + (datetime.fromisoformat(stamp) - wall).total_seconds()
+
+        def to_mono(stamp: str) -> float:
+            return now + (datetime.fromisoformat(stamp) - wall).total_seconds()
+
         state = self._accounts.get(account)
         if state is None:
-            elapsed = (datetime.fromisoformat(next_at) - datetime.fromisoformat(started)).total_seconds()
-            step = 0
-            while step < len(_BACKOFF) - 1 and elapsed > sum(_BACKOFF[:step + 1]):
-                step += 1
-            state = self._accounts[account] = _Account(to_mono(next_at), step)
+            state = self._accounts[account] = _Account(to_mono(schedule.probe_at), schedule.step)
         state.runs[run_id] = _Subscriber(backend, to_mono(deadline), activate, update)
         if state.task is None or state.task.done():
             state.task = asyncio.create_task(self._run(state))
@@ -102,7 +109,7 @@ class ProviderRecoveryCoordinator:
             for run in waiting:
                 if run.deadline <= now:
                     run.waiting = False
-                    await run.update(None)
+                    await run.update(self._schedule(state), True)
             ready = tuple(run for run in state.runs.values() if run.waiting)
             if not ready or now < state.next_at:
                 continue
@@ -115,18 +122,18 @@ class ProviderRecoveryCoordinator:
             now = self.clock.now()
             state.step = min(state.step + 1, len(_BACKOFF) - 1)
             state.next_at = now + _BACKOFF[state.step]
+            schedule = self._schedule(state)
             for run in tuple(state.runs.values()):
                 if not run.waiting:
                     continue
                 if result is Readiness.STOP or run.deadline <= now:
                     run.waiting = False
-                    await run.update(None)
+                    await run.update(schedule, True)
                 elif result is Readiness.READY:
                     run.waiting = False
-                    await run.activate()
+                    await run.activate(schedule)
                 else:
-                    delay = min(state.next_at, run.deadline) - now
-                    await run.update((self.wall() + timedelta(seconds=delay)).isoformat())
+                    await run.update(schedule, False)
 
     async def close(self) -> None:
         self._closed = True

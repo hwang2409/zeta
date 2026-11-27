@@ -461,11 +461,13 @@ NOTIFICATIONS: dict[EventDescriptor, Callable[[Any], None]] = {
 
 def _notification(event: EventDescriptor) -> Callable[[Serve, Any], Awaitable[None]]:
     async def run(serve: Serve, backend: Any) -> None:
-        if event is EventDescriptor.CHILD_RECOVERED:
+        if event in {EventDescriptor.CHILD_RECOVERED, EventDescriptor.CHILD_SUSPENDED}:
             # Recovery publishes immediately, not as part of the next model turn.
             store = serve.store
             notice, _ = store.append_child_recovered(
-                f"{store.session_id}:1", 1, path="/tmp/child", description="child"
+                f"{store.session_id}:1", 1, path="/tmp/child", description="child",
+                suspension={"code": "server_error", "text": "suspended: provider unavailable"}
+                if event is EventDescriptor.CHILD_SUSPENDED else None
             )
             await serve.server.controllers.attached().control._event(
                 StreamEvent(StreamEventType.AGENT_NOTIFICATION,
@@ -547,7 +549,7 @@ SCENARIOS = {
             lambda tmp: _text_backend("ok"),
             _notification(event),
         )
-        for event in (*NOTIFICATIONS, EventDescriptor.CHILD_RECOVERED)
+        for event in (*NOTIFICATIONS, EventDescriptor.CHILD_RECOVERED, EventDescriptor.CHILD_SUSPENDED)
     },
 }
 
@@ -566,7 +568,7 @@ PREMISE_SCENARIOS: dict[Route, tuple[str, ...]] = {
     (EventDescriptor.CHILD_STARTED, ""): ("background_child",),
     (EventDescriptor.CHILD_ENDED, ""): ("background_child",),
     **{(event, "durable"): (f"notification_{event.value}",)
-       for event in (*NOTIFICATIONS, EventDescriptor.CHILD_RECOVERED)},
+       for event in (*NOTIFICATIONS, EventDescriptor.CHILD_RECOVERED, EventDescriptor.CHILD_SUSPENDED)},
 }
 ROW_BACKED = [
     route for route, source in rows.ROUTES.items() if source is not rows.LIVE

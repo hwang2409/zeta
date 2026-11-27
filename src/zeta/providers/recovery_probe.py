@@ -26,7 +26,7 @@ def recovery_account(backend):
         return credentials.account
     if isinstance(credentials, AnthropicApiKeyCredential):
         return "anthropic", hashlib.sha256(credentials.api_key.encode()).digest()
-    return backend.provider, getattr(backend, "base_url", None)
+    return getattr(backend, "provider", None), getattr(backend, "base_url", None)
 
 
 async def _exhausted(backend, credentials: AccountCredentials) -> bool:

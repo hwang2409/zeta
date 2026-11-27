@@ -242,7 +242,10 @@ def validate_child_recovered(data: Mapping[str, Any]) -> None:
 
     kind = data.get("kind")
     suspended = kind == "child_suspended"
-    reject_unknown_keys(data, "child_suspended_notification" if suspended else "child_recovered_notification")
+    if suspended:
+        reject_unknown_keys(data, "child_suspended_notification")
+    else:
+        reject_unknown_keys(data, "child_recovered_notification")
     if (
         data.get("origin") != "notification" or kind not in ("child_recovered", "child_suspended")
         or data.get("display_only") is not True

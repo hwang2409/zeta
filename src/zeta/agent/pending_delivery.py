@@ -850,7 +850,7 @@ async def send_to_run(
 
     durable = transition is not None and transition.durable_questions and bool(transition.questions())
     try:
-        if transition is not None and (durable or transition.provider_recovery_enabled):
+        if transition is not None and (durable or transition.provider_suspended):
             await transition.send(enqueue)
         else:
             await enqueue()

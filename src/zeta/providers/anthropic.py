@@ -606,12 +606,15 @@ class AnthropicBackend(CompletionBackend):
         primary_exception: BaseException | None = None
         try:
             token = token if token is not None else await self.token_store.access_token(client)
-            payload = build_request_payload(
+            payload = {
+                "model": self.model, "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 1, "stream": True,
+            } if probe else build_request_payload(
                 messages,
                 tool_schemas,
                 model=self.model,
-                max_tokens=1 if probe else self.max_tokens,
-                thinking_budget=0 if probe else self.thinking_budget,
+                max_tokens=self.max_tokens,
+                thinking_budget=self.thinking_budget,
             )
             oauth_compat = _oauth_compat_enabled(
                 self.token_store, setting_enabled=self.oauth_compat_setting

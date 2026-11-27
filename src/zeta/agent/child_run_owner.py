@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from ..core.agent_state import LoadedAgentLifecycle, MissingAgentLifecycle
@@ -19,6 +19,7 @@ from ..core.store._child_runs import child_run_segments
 from ..protocol.types import StreamEvent, StreamEventType
 from ..providers.recovery_probe import recovery_account
 from ..runtime.offload import await_joined_offload
+from .provider_recovery import RecoverySchedule
 
 if TYPE_CHECKING:
     from ..runtime.loop import AgentLoop
@@ -50,6 +51,7 @@ class ChildRunTransitionOwner:
         self._shutdown_suspended = False
         self._provider_phase = "active"
         self._retry_window: dict[str, str] = {}
+        self._retry_schedule: RecoverySchedule | None = None
         self._provider_ready: asyncio.Event | None = None
         self._close_admission: Callable[[], None] | None = None
         self._setup_task: asyncio.Task | None = None
@@ -193,13 +195,18 @@ class ChildRunTransitionOwner:
 
     def restore_provider_window(self, state: dict) -> None:
         self._retry_window = {key: state[key] for key in ("retry_started_at", "retry_deadline_at") if key in state}
+        if "retry_probe_at" in state:
+            self._retry_schedule = RecoverySchedule(state["retry_probe_at"], state["retry_step"])
 
-    async def _persist_provider_wait(self, next_at: str | None) -> dict:
+    async def _persist_provider_wait(self, schedule: RecoverySchedule, *, stopped: bool) -> dict:
         from ..core.store._async_writes import _ChildSuspensionCommand
 
+        self._retry_schedule = schedule
+        next_at = min(datetime.fromisoformat(schedule.probe_at), datetime.fromisoformat(self._retry_window["retry_deadline_at"]))
         return await self._store._commit_storage_command(_ChildSuspensionCommand(provider_retry={
-            **self._retry_window, "retry_state": "retrying" if next_at is not None else "stopped",
-            **({"next_retry_at": next_at} if next_at is not None else {}),
+            **self._retry_window, "retry_state": "stopped" if stopped else "retrying",
+            "retry_probe_at": schedule.probe_at, "retry_step": schedule.step,
+            **({} if stopped else {"next_retry_at": next_at.isoformat()}),
         }))
 
     async def provider_suspend(self, code: str, elapsed: float) -> None:
@@ -214,8 +221,10 @@ class ChildRunTransitionOwner:
                     "retry_deadline_at": (started + timedelta(hours=1)).isoformat(),
                 }
             deadline = self._retry_window["retry_deadline_at"]
-            next_at = self._recovery.next_retry(self._provider_account, deadline)
-            state = await self._persist_provider_wait(next_at)
+            schedule = self._recovery.schedule(self._provider_account, self._retry_schedule)
+            stopped = self._recovery.wall() >= datetime.fromisoformat(deadline)
+            state = await self._persist_provider_wait(schedule, stopped=stopped)
+            next_at = state.get("next_retry_at")
             self._provider_episode = episode = state["suspension_episode"]
             await self._provider_notice({
                 "text": state["current_step"], "code": code,
@@ -226,20 +235,22 @@ class ChildRunTransitionOwner:
             self._provider_phase = "provider_suspended"
             ready = self._provider_ready = asyncio.Event()
 
-            async def activate():
-                async with self._lock:
-                    await self._activate_provider(episode)
-
-            async def update(next_at):
+            async def activate(next_schedule):
                 async with self._lock:
                     if self._provider_can_activate(episode):
-                        await self._persist_provider_wait(next_at)
+                        self._retry_schedule = next_schedule
+                        await self._activate_provider(episode)
 
-            self._recovery.subscribe(
-                self._provider_account, self.run_id, self._provider_backend,
-                started=self._retry_window["retry_started_at"], deadline=deadline,
-                next_at=next_at, activate=activate, update=update,
-            )
+            async def update(next_schedule, stop):
+                async with self._lock:
+                    if self._provider_can_activate(episode):
+                        await self._persist_provider_wait(next_schedule, stopped=stop)
+
+            if not stopped:
+                self._recovery.subscribe(
+                    self._provider_account, self.run_id, self._provider_backend, deadline=deadline,
+                    schedule=schedule, activate=activate, update=update,
+                )
         await ready.wait()
         if self.quiescing or self._cancellation is not None:
             raise asyncio.CancelledError
@@ -260,7 +271,11 @@ class ChildRunTransitionOwner:
             await self._provider_notice()
             if self._cancellation is not None or self.quiescing:
                 return
-            await self._store._commit_storage_command(_ChildSuspensionCommand(activate=episode))
+            schedule = self._retry_schedule
+            assert schedule is not None
+            await self._store._commit_storage_command(_ChildSuspensionCommand(
+                activate=episode, retry_schedule=(schedule.probe_at, schedule.step),
+            ))
             if self._cancellation is not None or self.quiescing:
                 return
             self._recovery.replaying(self._provider_account, self.run_id)
@@ -277,6 +292,7 @@ class ChildRunTransitionOwner:
         if self._retry_window:
             await self._store._commit_storage_command(_ChildSuspensionCommand(retry_progress=True))
             self._retry_window = {}
+            self._retry_schedule = None
             self._recovery.replay_progress(self._provider_account, self.run_id)
 
     async def hold_at_limit(self) -> bool:
@@ -487,6 +503,9 @@ class ChildRunTransitionOwner:
 
     async def background_outcome(self) -> tuple[bool, dict[str, object] | None]:
         """Read the winning outcome after execution settles, before publication."""
+        request = self._cancellation
+        if request is not None and not request.confirmation.done():
+            await asyncio.gather(asyncio.shield(request.confirmation), return_exceptions=True)
         async with self._lock:
             report = None
             if self._explicit_finish:

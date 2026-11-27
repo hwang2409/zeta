@@ -298,7 +298,8 @@ class CodexBackend(CompletionBackend):
                 # context-free and close the stream at the first generated output.
                 payload["instructions"] = "Reply with one character."
                 payload["reasoning"] = {"effort": "low"}
-                payload.pop("include", None)
+                for key in ("include", "tool_choice", "parallel_tool_calls"):
+                    payload.pop(key, None)
             static_json = _cache_affinity_json(payload, messages, self.model)
             cache_key = str(uuid.uuid5(uuid.NAMESPACE_OID, static_json))
             # ponytail: pre-5.6 key routes one prefix; shard above ~15 requests/min.
