@@ -41,7 +41,7 @@ def raise_if_out_of_files(exc: BaseException, what: str) -> None:
     if isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE):
         soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
         message = f"too many open files (soft limit {soft}); {what} was not read"
-        raise CredentialReadError(exc.errno, message) from exc
+        raise CredentialReadError(exc.errno, message, exc.filename) from exc
 
 
 def raise_if_unreadable(exc: BaseException, what: str) -> None:
@@ -61,7 +61,7 @@ def raise_if_unreadable(exc: BaseException, what: str) -> None:
     raise_if_out_of_files(exc, what)
     name = errno.errorcode.get(exc.errno or 0, "unknown error")
     message = f"{what} could not be read ({name}: {exc.strerror})"
-    raise CredentialReadError(exc.errno, message) from exc
+    raise CredentialReadError(exc.errno, message, exc.filename) from exc
 
 
 class OAuthRefreshFailure(Enum):

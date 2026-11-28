@@ -35,7 +35,6 @@ from ..core.session_files import (
 from ..oauth import (
     ACCOUNT_LOCK_TURN_WAIT_SECONDS,
     OAUTH_REFRESH_TIMEOUT_SECONDS,
-    CredentialReadError,
     OAuthRefreshFailure,
     OAuthTokens,
     classify_oauth_refresh_failure,
@@ -571,7 +570,7 @@ class AccountStore(_AccountRegistry):
             ):
                 return ()
             with self._lock_at(home_fd, ".accounts-migration.lock"):
-                with self._registry_guard(home_fd):
+                with self._keeping_unreadable(warnings), self._registry_guard(home_fd):
                     state, value = self._load_registry(home_fd)
                     if state is _Registry.LOADED:
                         self._sweep_orphan_directories(
@@ -589,17 +588,8 @@ class AccountStore(_AccountRegistry):
                     if state is _Registry.MISSING and warnings:
                         logger.warning("%s", warnings[-1])
                 for provider in ("anthropic", "codex"):
-                    try:
+                    with self._keeping_unreadable(warnings):
                         self._migrate_provider(home_fd, provider, warnings)
-                    except CredentialReadError as exc:
-                        if exc.errno in (errno.EMFILE, errno.ENFILE):
-                            raise
-                        path = self.credential_path(AccountId(provider, "default"))
-                        warnings.append(
-                            f"kept {path}: {exc.strerror}; "
-                            "fix its permissions, then restart zeta"
-                        )
-                        logger.warning("%s", warnings[-1])
         return tuple(warnings)
 
     def refuse_orphaning_registration(self, account: AccountId) -> None:
@@ -607,6 +597,28 @@ class AccountStore(_AccountRegistry):
 
         with self._home() as home_fd:
             self._refuse_orphaning_registration(home_fd, account)
+
+    @contextmanager
+    def _keeping_unreadable(self, warnings: list[str]) -> Iterator[None]:
+        """The one owner of a failed read at startup: warn, keep every file, go on."""
+
+        try:
+            yield
+        except OSError as exc:
+            if exc.errno in (errno.EMFILE, errno.ENFILE):
+                raise
+            code = errno.errorcode.get(exc.errno or 0, "unknown error")
+            reason = f"{code}: {os.strerror(exc.errno)}" if exc.errno else code
+            warning = (
+                f"kept every account file: account migration failed ({reason}); "
+                "fix it, then restart zeta"
+                if exc.filename is None  # e.g. ENOSPC from os.write: no path to name
+                else f"kept {_failed_path(self.home, exc.filename)}: could not be read "
+                f"or written ({reason}); fix its permissions, then restart zeta"
+            )
+            if warning not in warnings:  # each later step trips on the same path
+                warnings.append(warning)
+                logger.warning("%s", warning)
 
     def _migrate_provider(
         self, home_fd: int, provider: str, warnings: list[str]
@@ -644,9 +656,10 @@ class AccountStore(_AccountRegistry):
                 )
                 logger.warning("%s", warnings[-1])
                 return
+            # read before creating the account directory: a failed read leaves no trace
+            tokens = _read_tokens(home_fd, legacy_name) if keep is _Keep.LEGACY else None
             with _account_directory(home_fd, account) as account_fd:
-                if keep is _Keep.LEGACY:
-                    tokens = _read_tokens(home_fd, legacy_name)
+                if tokens is not None:
                     self._stage_account_tokens(account_fd, account, tokens)
                 if str(account) not in self._read_registry(home_fd)["accounts"]:
                     self._register_account(home_fd, account)
@@ -1178,8 +1191,36 @@ def _read_optional_tokens(directory_fd: int) -> OAuthTokens | None:
         credential = _read_optional_bytes(directory_fd, "oauth.json")
     except OSError as exc:
         raise_if_unreadable(exc, "OAuth credentials file")
+        if exc.errno == errno.ELOOP:  # a symlinked login is a bad login, as in _read_tokens
+            raise AccountError("OAuth credentials are invalid; login required") from exc
         raise
     return None if credential is None else _tokens_from_bytes(credential)
+
+
+def _children(directory: Path) -> list[Path]:
+    try:
+        return [] if directory.is_symlink() else list(directory.iterdir())
+    except OSError:  # missing, unreadable, or a file
+        return []
+
+
+def _failed_path(home: Path, name: str) -> Path:
+    """Reads go through dir_fd, so an error names only the last component; find it."""
+
+    roots = [home / "accounts", home / "account-locks"]
+    providers = [root / provider for root in roots for provider in _PROVIDERS]
+    accounts = [path for provider in providers for path in _children(provider)]
+    files = [path for account in accounts for path in _children(account)]
+    matches = [
+        path
+        for path in (home / name, *roots, *providers, *accounts, *files)
+        if path.name == name and os.path.lexists(path)
+    ]
+    # the same name can sit in several trees: the unreadable one failed
+    return next(
+        (path for path in matches if not os.access(path, os.R_OK)),
+        matches[0] if matches else home / name,
+    )
 
 
 def _tokens_from_bytes(credential: bytes) -> OAuthTokens:
