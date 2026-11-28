@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ...agent.pending_delivery import send_to_run
+from ...agent.pending_delivery import send_rejection, send_to_run
 from ...core.child_runs import child_run_rows
 from ...protocol.types import MessageOrigin
 from ..protocol import ErrorDescriptor, ProtocolError
@@ -47,7 +47,16 @@ async def list_runs(client: Any, params: dict[str, Any], controller) -> dict[str
         )
     from ...core.child_runs import child_run_for_features
 
-    page = [child_run_for_features(row, child_recovery="child_recovery" in client.features) for row in rows[offset : offset + limit]]
+    # Owner state is live and loop-bound, so read it here rather than off-loop.
+    markers = store.agent_children()
+    page = [
+        {
+            **child_run_for_features(row, child_recovery="child_recovery" in client.features),
+            "accepts_send": loop is not None
+            and send_rejection(store, row["run_id"], markers, owner=loop._background_owner) is None,
+        }
+        for row in rows[offset : offset + limit]
+    ]
     result: dict[str, object] = {"runs": page}
     next_offset = offset + len(page)
     if next_offset < len(rows):
