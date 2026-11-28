@@ -348,6 +348,7 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
         assert before["session_id"] == session_id
         assert before["parent_run_id"] is None
         assert before["accepts_follow_ups"] is True
+        assert before.get("accepts_send") is True, before
         assert "handle" not in before
         assert before.get("account_status") == account_status, "child_run_list must expose the held account"
 
@@ -367,6 +368,9 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
         assert after["run_id"] == run_id
         assert after["turns_used"] > before["turns_used"]
         assert after["tool_count"] >= before["tool_count"]
+        owner = server.controllers.attached().runtime.loop._background_owner
+        await await_or_fail(owner.wait(), what="follow-up child finishes")
+        await _send_agrees_with_row(client, session_id, run_id, False, "finished-follow-up")
     finally:
         backend.release_children.set()
         await observer.close()
@@ -489,3 +493,194 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
             await observer.close()
         await client.close()
         await server.close()
+
+
+async def _send_agrees_with_row(
+    client: ServeClient, session_id: str, run_id: str, expected: bool, tag: str
+) -> None:
+    """accepts_send on the row must predict exactly what child_run_send does."""
+    listed = await client.request(f"{tag}-list", "child_run_list", {"session_id": session_id})
+    [row] = [item for item in listed["result"]["runs"] if item["run_id"] == run_id]
+    assert row.get("accepts_send") is expected, f"{tag}: row {row}"
+    sent = await client.request(
+        f"{tag}-send", "child_run_send", {"session_id": session_id, "run_id": run_id, "text": f"follow-up {tag}"}
+    )
+    assert ("result" in sent) is expected, f"{tag}: accepts_send={expected} but child_run_send returned {sent}"
+
+
+class _GatedChild:
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    @owned_completion
+    async def complete(self, messages, tool_schemas):
+        self.started.set()
+        await await_or_fail(self.release.wait(), what="release child completion")
+        async for event in FakeBackend.complete.__wrapped__(
+            FakeBackend([ScriptedTurn([TextContent("done")])]), messages, tool_schemas
+        ):
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_accepts_send_is_false_for_running_profile_without_follow_ups_and_canceled_run(
+    tmp_path: Path,
+) -> None:
+    backend = _GatedChild()
+    server = ZetaServer(
+        provider="codex", home=tmp_path / "home", cwd=tmp_path, socket_path=short_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (backend, model or "offline"),
+    )
+    client = await _start_client(server)
+    try:
+        await client.request("hello", "hello", {
+            "protocol_version": "1.2", "features": ["child_runs", "child_run_control_v1"],
+        })
+        created = await client.request("new", "new_session", {"provider": "codex"})
+        session_id = created["result"]["session"]["session_id"]
+        spawned = await client.request("spawn", "child_run_spawn", {
+            "session_id": session_id, "agent_type": "explore", "task": "inspect", "cwd": str(tmp_path),
+        })
+        run_id = spawned["result"]["data"]["run_id"]
+        await await_or_fail(backend.started.wait(), what="child enters model call")
+        await _send_agrees_with_row(client, session_id, run_id, False, "running-explore")
+
+        cancelled = await client.request("cancel", "child_run_cancel", {
+            "session_id": session_id, "run_id": run_id, "reason": "user_cancelled",
+        })
+        assert "result" in cancelled, cancelled
+        owner = server.controllers.attached().runtime.loop._background_owner
+        await await_or_fail(owner.wait(), what="canceled child settles")
+        await _send_agrees_with_row(client, session_id, run_id, False, "canceled")
+    finally:
+        backend.release.set()
+        await client.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_accepts_send_is_true_for_provider_suspended_run_with_live_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent import runner
+    from zeta.core.agent_progress import register_child_run_sink
+    from tests.test_child_provider_recovery import _ManualClock, _RecoveryBackend
+
+    clock = _ManualClock()
+    child_backend = _RecoveryBackend(clock)
+    # test-contract: inject a provider that is offline; the owners and recovery stay real.
+    monkeypatch.setattr(runner, "resolve_child_backend", lambda *_a, **_kw: (child_backend, None))
+    event_loop = asyncio.get_running_loop()
+    suspended = asyncio.Event()
+
+    def observe(kind, run_id, row, revision, child_store):
+        if kind == "progress" and row["status"] == "suspended":
+            event_loop.call_soon_threadsafe(suspended.set)
+
+    unregister = register_child_run_sink(observe)
+    server = ZetaServer(
+        provider="codex", home=tmp_path / "home", cwd=tmp_path, socket_path=short_socket_path(tmp_path),
+        backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
+    )
+    client = await _start_client(server)
+    try:
+        await client.request("hello", "hello", {
+            "protocol_version": "1.2", "features": ["child_runs", "child_run_control_v1", "child_recovery"],
+        })
+        created = await client.request("new", "new_session", {"provider": "codex"})
+        session_id = created["result"]["session"]["session_id"]
+        owner = server.controllers.attached().runtime.loop._background_owner
+        recovery = owner.provider_recovery
+        # test-contract: hold the retry clock so the run stays provider-suspended.
+        recovery.clock = clock
+        spawned = await client.request("spawn", "child_run_spawn", {
+            "session_id": session_id, "agent_type": "explore", "task": "inspect", "cwd": str(tmp_path),
+        })
+        run_id = spawned["result"]["data"]["run_id"]
+        await await_or_fail(suspended.wait(), what="child is provider-suspended")
+        # explore does not accept follow-ups; provider suspension still takes a send.
+        child_backend.offline = False
+        await _send_agrees_with_row(client, session_id, run_id, True, "provider-suspended")
+        await await_or_fail(owner.wait(), what="activated child finishes")
+        await _send_agrees_with_row(client, session_id, run_id, False, "finished")
+    finally:
+        unregister()
+        await client.close()
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_accepts_send_is_false_for_restart_suspended_run_with_blocked_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from zeta.agent.presets import GENERAL_PRESET
+    from zeta.agent.resume_descriptor import preset_snapshot
+    from zeta.core.child_runs import LoadedAgentLifecycle, read_child_lifecycle
+
+    def make_server() -> ZetaServer:
+        return ZetaServer(
+            provider="codex", home=tmp_path / "home", cwd=tmp_path, socket_path=short_socket_path(tmp_path),
+            backend_factory=lambda provider, model, home: (FakeBackend([]), model or "offline"),
+        )
+
+    first = make_server()
+    client = await _start_client(first)
+    try:
+        await client.request("hello", "hello", {"protocol_version": "1.2", "features": ["child_runs"]})
+        created = await client.request("new", "new_session", {"provider": "codex"})
+        session_id = created["result"]["session"]["session_id"]
+        root = first.controllers.attached().runtime.opened.store
+        root_dir = root.root_dir
+    finally:
+        await client.close()
+        await first.close()
+
+    run_id = f"{session_id}:1"
+    model = "gpt-5.6-luna"
+
+    def seed() -> Path:
+        with ConversationStore(root_dir, session_id=session_id, cwd=tmp_path) as store:
+            with ConversationStore(store.session_dir / "agents", session_id="1") as child:
+                child.start_agent_lifecycle(
+                    handle=run_id, started_at="2026-11-08T00:00:00+00:00", depth=1,
+                    agent_type="general", description="saved work",
+                )
+                path = child.session_dir
+            store.register_agent_child(
+                ToolCall("saved-call", "agent", {"model": model, "max_turns": 4}),
+                child_session_path=str(path), child_instance_id=run_id, description="saved work",
+                background=True, agent_type="general", accepts_follow_ups=True, turns_used=0,
+                resume={
+                    "preset": preset_snapshot(GENERAL_PRESET), "requested_model": model,
+                    "model": model, "provider": "codex", "requested_max_turns": 4,
+                    "effective_max_turns": 4, "depth": 1, "cwd": str(tmp_path),
+                    "description": "saved work", "background": True, "follow_up": True,
+                    "explicit_finish": False, "account_pins": "selected", "selected_accounts": {},
+                },
+            )
+            return path
+
+    path = await asyncio.to_thread(seed)
+    # test-contract: the saved model cannot be resolved, so restart recovery blocks.
+    monkeypatch.setattr(
+        "zeta.agent.resume_child.resolve_child_backend", lambda *_a, **_kw: (None, "model unavailable")
+    )
+    second = make_server()
+    client = await _start_client(second)
+    try:
+        await client.request("hello", "hello", {
+            "protocol_version": "1.2", "features": ["child_runs", "child_recovery"],
+        })
+        resumed = await client.request("resume", "resume", {"session_id": session_id})
+        assert "result" in resumed, resumed
+        loop = second.controllers.attached().runtime.loop
+        await await_or_fail(loop._background_owner.wait(), what="blocked recovery settles")
+        blocked, _ = read_child_lifecycle(loop.store, path)
+        assert isinstance(blocked, LoadedAgentLifecycle)
+        assert blocked.value["state"] == "suspended"
+        assert blocked.value["recovery_blocked"] == "saved model or account is unavailable"
+        await _send_agrees_with_row(client, session_id, run_id, False, "restart-blocked")
+    finally:
+        await client.close()
+        await second.close()
