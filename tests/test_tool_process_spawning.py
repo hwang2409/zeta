@@ -362,3 +362,31 @@ async def test_launcher_exit_before_failure_preserves_spawn_error(
     assert Process.ready.closed
     assert Transport.instance.closed
     assert Transport.instance.waited
+
+
+@pytest.mark.asyncio
+async def test_launcher_runs_nothing_when_zeta_dies_before_its_go_byte(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "ran"
+
+    async def die_after_ready(*, process) -> None:
+        # zeta reads the ready byte and dies before it sends the go byte.
+        loop = asyncio.get_running_loop()
+        assert await asyncio.wait_for(
+            loop.run_in_executor(None, os.read, process.ready.fileno(), 1), 10
+        ) == b"1"
+        process.ready.close()
+
+    # test-contract: seam zeta dies between the launcher's ready byte and its go byte.
+    monkeypatch.setattr(tool_spawn, "_wait_for_launcher", die_after_ready)
+    process = await asyncio.wait_for(
+        create_tool_subprocess_shell(f"echo ran > {shlex.quote(str(marker))}"), 10
+    )
+    try:
+        assert await asyncio.wait_for(process.wait(), 10) == 1
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await asyncio.wait_for(process.wait(), 10)
+    assert not marker.exists(), "the launcher ran the command without zeta's go byte"
