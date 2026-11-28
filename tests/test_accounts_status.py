@@ -652,6 +652,45 @@ def test_accounts_status_corrupt_login_keeps_json_valid_and_reports_other_accoun
     assert "secret-file-content" not in captured.out + captured.err
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+def test_accounts_status_unreadable_login_is_unknown_not_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    credential_path = _save_account(tmp_path)
+    os.chmod(credential_path, 0)
+    try:
+        with pytest.raises(OSError, match=r"could not be read \(EACCES") as caught:
+            named_account_credentials(tmp_path, "codex", "default").read()
+        assert "login" not in str(caught.value)
+
+        assert _run_json(tmp_path, monkeypatch, "--refresh") == 1
+        assert json.loads(capsys.readouterr().out) == [
+            {
+                "provider": "codex",
+                "account": "default",
+                "is_default": True,
+                "logged_in": None,
+                "access_token_expires_at": None,
+                "error": "unreadable_credentials",
+                "retryable": False,
+                "refresh": {
+                    "ok": False,
+                    "code": "unreadable_credentials",
+                    "retryable": False,
+                },
+            }
+        ]
+        assert cli_main.main(["accounts", "status"]) == 1
+        assert capsys.readouterr().out.strip() == (
+            "codex:default  login unknown (unreadable_credentials)"
+            "  expires unknown  default"
+        )
+    finally:
+        os.chmod(credential_path, 0o600)
+
+
 def test_accounts_status_corrupt_login_human_output_has_one_line_per_account(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

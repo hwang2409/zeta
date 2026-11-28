@@ -32,12 +32,31 @@ class ProviderLoginRequiredError(RuntimeError):
     """Raised when a provider cannot run until the operator logs in."""
 
 
-def raise_if_out_of_files(exc: BaseException) -> None:
-    """Re-raise descriptor exhaustion honestly: it is not a bad or missing login."""
-    if isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE):
+class CredentialReadError(OSError):
+    """A credential or account file exists but could not be read; the login is unknown."""
+
+
+def raise_if_unreadable(exc: BaseException, what: str) -> None:
+    """Re-raise a failed read honestly: it is not a bad or missing login.
+
+    A missing file is left to the caller, which knows whether it means logged out.
+    ELOOP is left too: O_NOFOLLOW refusing a symlinked file is a bad file, not a failed read.
+    """
+    if isinstance(exc, CredentialReadError):
+        raise exc
+    if (
+        not isinstance(exc, OSError)
+        or isinstance(exc, FileNotFoundError)
+        or exc.errno == errno.ELOOP
+    ):
+        return
+    if exc.errno in (errno.EMFILE, errno.ENFILE):
         soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-        message = f"too many open files (soft limit {soft}); credentials were not read"
-        raise OSError(exc.errno, message) from exc
+        message = f"too many open files (soft limit {soft}); {what} was not read"
+        raise CredentialReadError(exc.errno, message) from exc
+    name = errno.errorcode.get(exc.errno or 0, "unknown error")
+    message = f"{what} could not be read ({name}: {exc.strerror})"
+    raise CredentialReadError(exc.errno, message) from exc
 
 
 class OAuthRefreshFailure(Enum):

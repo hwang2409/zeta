@@ -615,13 +615,13 @@ async def _read_safe_account_status(
             "error": "invalid_credentials",
         }
     except OSError as exc:
-        if exc.errno not in (errno.EMFILE, errno.ENFILE):
-            raise
+        # the file could not be read, so the login state is unknown, not bad
+        exhausted = exc.errno in (errno.EMFILE, errno.ENFILE)
         return None, {
             "logged_in": None,
             "access_token_expires_at": None,
-            "error": "too_many_open_files",
-            "retryable": True,
+            "error": "too_many_open_files" if exhausted else "unreadable_credentials",
+            "retryable": exhausted,
         }
     try:
         expiry = _expiry_iso(tokens.expires_at) if tokens is not None else None
@@ -661,12 +661,16 @@ async def _account_status(
         "is_default": default == account,
         **safe_status,
     }
-    if (unknown := safe_status.get("error")) in {"lock_timeout", "too_many_open_files"}:
+    if (unknown := safe_status.get("error")) in {
+        "lock_timeout",
+        "too_many_open_files",
+        "unreadable_credentials",
+    }:
         if refresh:
             status["refresh"] = {
                 "ok": False,
                 "code": unknown,
-                "retryable": True,
+                "retryable": safe_status["retryable"],
             }
         return status, False
     if not refresh:

@@ -13,7 +13,7 @@ from enum import Enum
 from typing import Any, cast
 
 from ..core.session_files import SessionFileReplaced, child_directory
-from ..oauth import raise_if_out_of_files
+from ..oauth import raise_if_unreadable
 from ..storage_format import (
     CLOSED_VARIANTS,
     reject_unknown_keys,
@@ -343,5 +343,5 @@ class _AccountRegistry:
                     raise ValueError
             return _Registry.LOADED, normalized
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise_if_out_of_files(exc)
+            raise_if_unreadable(exc, "account registry")
             return _Registry.BROKEN, empty

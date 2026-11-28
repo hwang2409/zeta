@@ -24,7 +24,7 @@ from .oauth import (
     OAuthTokens,
     ProviderLoginRequiredError,
     classify_oauth_refresh_failure,
-    raise_if_out_of_files,
+    raise_if_unreadable,
 )
 
 
@@ -241,7 +241,7 @@ class CodexCredentialDriver:
             with auth_path.open() as handle:
                 return _extract_codex_tokens(json.load(handle))
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise_if_out_of_files(exc)
+            raise_if_unreadable(exc, "Codex auth file")
             raise CodexAuthError("Codex credentials could not be read") from exc
 
     async def refresh(

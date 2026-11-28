@@ -227,36 +227,44 @@ has this closed schema:
 - `provider`: `"anthropic"` or `"codex"`.
 - `account`: the account label.
 - `is_default`: boolean.
-- `logged_in`: boolean, or `null` when a lock timeout or pending migration makes
-  the state unknown.
+- `logged_in`: boolean, or `null` when a lock timeout, pending migration, or an
+  unreadable credential file makes the state unknown.
 - `access_token_expires_at`: an RFC 3339 UTC string, or `null` when missing or
   unknown.
 - `error`, when present: `"invalid_credentials"` for malformed credentials or
-  a non-renderable expiry, `"lock_timeout"`, or `"migration_pending"` when a
-  legacy login must be migrated by another account command.
-- `retryable`, present with `error: "lock_timeout"` or `"migration_pending"`:
-  `true` for a lock timeout and `false` for pending migration.
+  a non-renderable expiry, `"lock_timeout"`, `"migration_pending"` when a
+  legacy login must be migrated by another account command,
+  `"too_many_open_files"` when the process ran out of file descriptors, or
+  `"unreadable_credentials"` when the credential file exists but cannot be read
+  (for example permission denied or an I/O error).
+- `retryable`, present with every `error` except `"invalid_credentials"`:
+  `true` for a lock timeout or too many open files, and `false` for pending
+  migration or unreadable credentials.
 - `refresh`, present with `--refresh`: an object with boolean `ok`, `code`, and
   `retryable`. `code` is `null` on success, `"auth_error"` for a rejected or
   missing login, `"http_error"` for other HTTP failures, `"lock_timeout"`
-  when the credential lock prevents a refresh attempt, or `"migration_pending"`
-  when migration is required. `retryable` is `true` for `"lock_timeout"`, a
-  boolean for `"http_error"`, `false` for `"migration_pending"`, and `null`
-  otherwise.
+  when the credential lock prevents a refresh attempt, `"migration_pending"`
+  when migration is required, or `"too_many_open_files"` or
+  `"unreadable_credentials"` when the credentials could not be read.
+  `retryable` is `true` for `"lock_timeout"` and `"too_many_open_files"`, a
+  boolean for `"http_error"`, `false` for `"migration_pending"` and
+  `"unreadable_credentials"`, and `null` otherwise.
 
 The exhaustive safe failure values across `error` and `refresh.code` are
-`invalid_credentials`, `lock_timeout`, `migration_pending`, `auth_error`, and
+`invalid_credentials`, `lock_timeout`, `migration_pending`,
+`too_many_open_files`, `unreadable_credentials`, `auth_error`, and
 `http_error`. no exception message or credential content is included. a lock
-timeout or pending migration leaves `logged_in` unknown instead of claiming
-that the account is logged out. a legacy file produces `migration_pending` only
-when that provider has no migrated catalog account; migrated accounts remain
-visible. `status` never performs migration or waits on migration, registry, or
+timeout, pending migration, or unreadable credential file leaves `logged_in`
+unknown instead of claiming that the account is logged out. a legacy file
+produces `migration_pending` only when that provider has no migrated catalog
+account; migrated accounts remain visible. `status` never performs migration or waits on migration, registry, or
 unbounded lifecycle locks.
 
 Exit status `0` means every selected account is logged in and every requested
 refresh succeeded. exit status `1` means there are no selected accounts, a login
-is missing or invalid, a credential lock timed out, or a refresh failed. parse
-errors reported by argparse retain exit status `2`.
+is missing or invalid, a credential lock timed out, credentials could not be
+read, or a refresh failed. parse errors reported by argparse retain exit status
+`2`.
 
 `default` changes the global default, which a session uses only when it has no
 saved selection at load (see the session-load rule above). `switch` is reserved for
