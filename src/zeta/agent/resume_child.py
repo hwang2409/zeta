@@ -55,10 +55,10 @@ _ENDED_NOTE = (
 )
 
 
-def _stop_orphans(store: ConversationStore) -> dict[str, str]:
+def _stop_orphans(session_dir: Path, call_ids: list[str]) -> dict[str, str]:
     notes = {}
-    for call_id in store.unresolved_tool_call_ids():
-        outcome = tool_process_record.stop_orphan(store.session_dir, call_id)
+    for call_id in call_ids:
+        outcome = tool_process_record.stop_orphan(session_dir, call_id)
         groups = ", ".join(map(str, outcome.groups)) or "unknown"
         if outcome.kind == "unstoppable":
             raise OrphanedToolProcessError(
@@ -74,7 +74,7 @@ def _stop_orphans(store: ConversationStore) -> dict[str, str]:
 
 async def repair_interrupted_child(root: ConversationStore, store: ConversationStore, run_id: str) -> None:
     # Stop leftover tool processes first, so a restart at any point here kills again or finds them gone.
-    notes = await asyncio.to_thread(_stop_orphans, store)
+    notes = await asyncio.to_thread(_stop_orphans, store.session_dir, store.unresolved_tool_call_ids())
     await store._commit_storage_command(_RepairChildInterruptionCommand(notes=notes))
     await asyncio.to_thread(tool_process_record.sweep, store.session_dir)
     for wire_id, tool_call in root.delegated_unmatched_requests(run_id):

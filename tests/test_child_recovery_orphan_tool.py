@@ -62,7 +62,8 @@ def _parent_with_running_bash(root: str, cwd: str, command: str, pipe) -> None:
         loop = AgentLoop(_backend([]), store, skill_catalog=SkillCatalog.empty())
         await runner.spawn_child(loop, agent_type="general", task="work", cwd=None)
         pipe.send(store.session_id)
-        await asyncio.sleep(300)  # the test kills this process with SIGKILL
+        # The test kills this process with SIGKILL; the deadline only ends a forgotten helper.
+        await asyncio.wait_for(asyncio.Event().wait(), 300)
 
     asyncio.run(main())
 

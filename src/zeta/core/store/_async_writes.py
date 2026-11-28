@@ -6,7 +6,8 @@ import asyncio
 import copy
 import threading
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from ...agent.receipt import encode_json
@@ -451,7 +452,7 @@ class _ChildSuspensionCommand(_StoreMutationCommand):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _RepairChildInterruptionCommand(_StoreMutationCommand):
     # A call id maps to a longer canceled text that says what recovery did with its process.
-    notes: Mapping[str, str] = field(default_factory=dict)
+    notes: Mapping[str, str] = dataclass_field(default_factory=dict)
 
     def apply(self, store: Any) -> None:
         from ...protocol.types import Message, MessageRole, TextContent

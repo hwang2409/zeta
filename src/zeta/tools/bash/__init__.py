@@ -15,6 +15,7 @@ from ...core.abort import AbortSignal
 from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
 from .._results import _spill_preview
+from .._shared import tool_process_record
 from .._shared.background_spawn import _kill_and_reap
 from .._shared.log_open import create_log_off_loop, open_log_off_loop
 from .._shared.process import (
@@ -23,7 +24,6 @@ from .._shared.process import (
     tool_subprocess_env,
 )
 from .._shared.shell_cwd import bind_shell_cwd_async
-from .._shared import tool_process_record
 from .._shared.tool_spawn import create_tool_subprocess_shell
 from ..registry import (
     ToolExecutionContext,
