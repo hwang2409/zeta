@@ -21740,7 +21740,8 @@ class FinishDraftBackend(CompletionBackend):
 
     report = "long report " * 40
 
-    def __init__(self) -> None:
+    def __init__(self, retry_summary: str = "") -> None:
+        self.retry_summary = retry_summary
         self.child_paused = asyncio.Event()
         self.release_finish = asyncio.Event()
         self.child_turns = 0
@@ -21779,9 +21780,9 @@ class FinishDraftBackend(CompletionBackend):
                     ToolUseContent(ToolCall("finish-2", "finish", dict(args))),
                 ]
             else:
-                # A third turn means the empty-summary finish was refused; end
-                # with a different report so the run stays bounded.
-                summary = "" if self.child_turns == 2 else "fallback"
+                # A third turn means the retry was refused; end with a
+                # different report so the run stays bounded.
+                summary = self.retry_summary if self.child_turns == 2 else "fallback"
                 blocks = [
                     ToolUseContent(
                         ToolCall(
@@ -21800,10 +21801,11 @@ class FinishDraftBackend(CompletionBackend):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("retry_summary", ["", "NOT READY: macos run failed"])
 async def test_finish_refusal_shows_notice_and_keeps_draft_report(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retry_summary: str
 ) -> None:
-    backend = FinishDraftBackend()
+    backend = FinishDraftBackend(retry_summary)
     monkeypatch.setitem(
         AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
     )
@@ -21839,8 +21841,12 @@ async def test_finish_refusal_shows_notice_and_keeps_draft_report(
             child_store.pending_prompt_queue.explicit_finish_report
         )
         assert report is not None
-        assert report["summary"] == backend.report.strip()
-        assert report["verdict"] == "pass"
+        if retry_summary:
+            # A new summary uses only its own fields, not the refused draft's.
+            assert report == {"status": "done", "summary": retry_summary}, report
+        else:
+            assert report["summary"] == backend.report.strip()
+            assert report["verdict"] == "pass"
     finally:
         await loop.close()
         if child_store is not None:

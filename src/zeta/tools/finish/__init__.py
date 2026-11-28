@@ -9,6 +9,8 @@ from ..registry import AbortSignal, ToolExecutionContext, ToolRegistry, text_blo
 
 _STATUSES = {"done", "blocked", "failed"}
 _VERDICTS = {"pass", "fail", "inconclusive"}
+# Refusals that end the run; no retry follows, so no draft is kept.
+_ENDING_REFUSALS = {"child is canceled", "child is finishing"}
 
 
 def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
@@ -50,21 +52,20 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         _execution_context: ToolExecutionContext | None = None,
     ) -> dict[str, object]:
         status = arguments.get("status")
-        summary = arguments.get("summary")
         if status not in _STATUSES:
             return _error("status must be done, blocked, or failed")
-        if draft and (summary is None or summary == ""):
-            summary = draft["summary"]
+        fields = _report_fields(arguments, draft)
+        summary = fields.get("summary")
         if type(summary) is not str or not summary.strip() or len(summary) > 8_000:
             return _error("summary must be a nonempty string of at most 8000 characters")
-        head_sha = arguments.get("head_sha", draft.get("head_sha"))
+        head_sha = fields.get("head_sha")
         if head_sha is not None and (
             type(head_sha) is not str
             or not 7 <= len(head_sha) <= 64
             or any(char not in "0123456789abcdef" for char in head_sha)
         ):
             return _error("head_sha must be 7 to 64 lowercase hexadecimal characters")
-        verdict = arguments.get("verdict", draft.get("verdict"))
+        verdict = fields.get("verdict")
         if verdict is not None and verdict not in _VERDICTS:
             return _error("verdict must be pass, fail, or inconclusive")
         if child_loop._explicit_finish_report is not None:
@@ -85,6 +86,8 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         if refusal is None:
             refusal = await owner.accept_finish(report)
         if refusal is not None:
+            if refusal in _ENDING_REFUSALS:
+                return _error("finish refused; " + refusal)
             draft.clear()
             draft.update(report)
             if (
@@ -129,6 +132,18 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         requires_approval=False,
         parallel_safe=False,
     )
+
+
+def _report_fields(
+    arguments: dict[str, Any], draft: dict[str, object]
+) -> dict[str, object]:
+    """Return the call's report fields, or the whole draft for an empty-summary resend."""
+    if draft and arguments.get("summary") in (None, ""):
+        return {
+            **draft,
+            **{k: arguments[k] for k in ("head_sha", "verdict") if k in arguments},
+        }
+    return arguments
 
 
 def _error(message: str) -> dict[str, object]:
