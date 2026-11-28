@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import math
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import nullcontext
@@ -14,13 +16,15 @@ if TYPE_CHECKING:
     from ..core.store import ConversationStore
     from ..runtime.loop import AgentLoop
 
-from ..core.agent_progress import publish_child_started
+from ..core.agent_progress import live_agent_lifecycle, publish_child_started
 from ..core.checkpoints import _now
 from ..core.store._async_writes import _EnsureTurnLimitHandoffCommand
 from ..project_inbox_sent.notifications import project_inbox_notification
 from ..protocol.types import Message, StreamEvent, StreamEventType, harness_notice
 from .presets import valid_max_turns
 from .receipt import _without_agent_receipt_suffix, has_agent_receipt_suffix
+
+_LOGGER = logging.getLogger(__name__)
 
 HANDOFF_NAME = "turn-limit-handoff.md"
 _MARKER_PREFIX = "[zeta:turn-limit:v1] "
@@ -368,6 +372,9 @@ def make_publish_child_lifecycle(
     return publish_child_lifecycle
 
 
+_PROGRESS_SAVE_SECONDS = 10.0
+
+
 def make_child_progress_callbacks(
     *,
     loop: Any,
@@ -375,7 +382,7 @@ def make_child_progress_callbacks(
     child_marker_key: str,
     child_tool_call_id: str,
     recoverable: bool,
-) -> tuple[Callable[[int], Awaitable[None] | None], Callable[[], None]]:
+) -> tuple[Callable[[int], Awaitable[None] | None], Callable[[], None], Callable[[], Awaitable[None]]]:
     from ..core.store._async_writes import _ChildActivityCommand, _ChildTurnsCommand
 
     async def persist_turns(turns: int) -> None:
@@ -394,7 +401,30 @@ def make_child_progress_callbacks(
     def record_tool_call() -> None:
         child_store.update_agent_lifecycle(tool_calls=1)
 
-    return update_turns, record_tool_call
+    async def save_progress_while_running() -> None:
+        # A crash inside one long step otherwise loses its elapsed time and started tool calls.
+        live = live_agent_lifecycle(child_store.agent_lifecycle_path)
+        last_turns = live.get("turns_used") if live is not None else None
+        while True:
+            await asyncio.sleep(_PROGRESS_SAVE_SECONDS)
+            live = live_agent_lifecycle(child_store.agent_lifecycle_path)
+            if live is None or live.get("state") != "running":
+                continue
+            if live.get("turns_used") != last_turns:
+                last_turns = live.get("turns_used")
+                continue  # the turn-end write just saved progress
+            try:
+                await child_store._commit_storage_command(_ChildActivityCommand())
+            except Exception:
+                _LOGGER.warning("child progress save failed; retrying next interval", exc_info=True)
+            finally:
+                # The save publishes live progress from a worker thread; republish this loop's copy so
+                # a tool call counted while the save ran is not replaced by the older snapshot, also
+                # when the saver is canceled while the save is in flight.
+                if live_agent_lifecycle(child_store.agent_lifecycle_path) is not None:
+                    child_store.update_agent_lifecycle()
+
+    return update_turns, record_tool_call, save_progress_while_running
 
 
 def fallback_handoff(
