@@ -9,6 +9,8 @@ from ..registry import AbortSignal, ToolExecutionContext, ToolRegistry, text_blo
 
 _STATUSES = {"done", "blocked", "failed"}
 _VERDICTS = {"pass", "fail", "inconclusive"}
+# Refusals that end the run; no retry follows, so no draft is kept.
+_ENDING_REFUSALS = {"child is canceled", "child is finishing"}
 
 
 def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
@@ -39,6 +41,9 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         )
     )
 
+    # The last refused report, so a retry after reading the notice can omit it.
+    draft: dict[str, object] = {}
+
     async def finish(
         _registry: ToolRegistry,
         arguments: dict[str, Any],
@@ -47,19 +52,20 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         _execution_context: ToolExecutionContext | None = None,
     ) -> dict[str, object]:
         status = arguments.get("status")
-        summary = arguments.get("summary")
         if status not in _STATUSES:
             return _error("status must be done, blocked, or failed")
+        fields = _report_fields(arguments, draft)
+        summary = fields.get("summary")
         if type(summary) is not str or not summary.strip() or len(summary) > 8_000:
             return _error("summary must be a nonempty string of at most 8000 characters")
-        head_sha = arguments.get("head_sha")
+        head_sha = fields.get("head_sha")
         if head_sha is not None and (
             type(head_sha) is not str
             or not 7 <= len(head_sha) <= 64
             or any(char not in "0123456789abcdef" for char in head_sha)
         ):
             return _error("head_sha must be 7 to 64 lowercase hexadecimal characters")
-        verdict = arguments.get("verdict")
+        verdict = fields.get("verdict")
         if verdict is not None and verdict not in _VERDICTS:
             return _error("verdict must be pass, fail, or inconclusive")
         if child_loop._explicit_finish_report is not None:
@@ -69,14 +75,33 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
             report["head_sha"] = head_sha
         if verdict is not None:
             report["verdict"] = verdict
-        if refusal := owner.owned_work_refusal():
-            return _error("finish refused; " + refusal)
+        refusal = owner.owned_work_refusal()
         flow = child_loop.step_delivery
-        if flow is not None and (await flow.admit_terminal("finish")).pending:
-            return _error("finish refused; pending notification must be read first")
-        refusal = await owner.accept_finish(report)
+        if (
+            refusal is None
+            and flow is not None
+            and (await flow.admit_terminal("finish")).pending
+        ):
+            refusal = "pending notification must be read first"
+        if refusal is None:
+            refusal = await owner.accept_finish(report)
         if refusal is not None:
-            return _error("finish refused; " + refusal)
+            if refusal in _ENDING_REFUSALS:
+                return _error("finish refused; " + refusal)
+            draft.clear()
+            draft.update(report)
+            if (
+                "must be read" in refusal
+                and flow is not None
+                and (preview := flow.pending_preview())
+            ):
+                refusal += ":\n" + preview
+            return _error(
+                "finish refused; "
+                + refusal
+                + "\nyour report is kept; after this, call finish with an empty "
+                "summary to send it unchanged"
+            )
         child_loop._explicit_finish_report = report
         return {
             "content": [text_block("finish accepted; no more work or prose is needed")],
@@ -90,13 +115,14 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         binding="loop",
         description=(
             "Call finish to end this run and report the contract result with status "
-            "and summary; include verdict and head_sha when they apply."
+            "and summary; include verdict and head_sha when they apply. After a "
+            "refused finish, an empty summary resends the refused report."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "status": {"enum": sorted(_STATUSES)},
-                "summary": {"type": "string", "minLength": 1, "maxLength": 8_000},
+                "summary": {"type": "string", "maxLength": 8_000},
                 "head_sha": {"type": "string", "pattern": "^[0-9a-f]{7,64}$"},
                 "verdict": {"enum": sorted(_VERDICTS)},
             },
@@ -106,6 +132,18 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         requires_approval=False,
         parallel_safe=False,
     )
+
+
+def _report_fields(
+    arguments: dict[str, Any], draft: dict[str, object]
+) -> dict[str, object]:
+    """Return the call's report fields, or the whole draft for an empty-summary resend."""
+    if draft and arguments.get("summary") in (None, ""):
+        return {
+            **draft,
+            **{k: arguments[k] for k in ("head_sha", "verdict") if k in arguments},
+        }
+    return arguments
 
 
 def _error(message: str) -> dict[str, object]:
