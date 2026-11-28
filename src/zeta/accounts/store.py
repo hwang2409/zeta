@@ -162,19 +162,25 @@ class AccountStore(_AccountRegistry):
     def _lifecycle_guard(
         self, home_fd: int, account: AccountId, *, wait: bool = True
     ) -> Iterator[None]:
-        with (
-            _account_lock_directory(home_fd, account) as lock_fd,
-            self._lock_at(lock_fd, "lifecycle.lock", wait=wait),
-        ):
+        with self._account_lock(home_fd, account, "lifecycle.lock", wait=wait):
             yield
 
     @contextmanager
     def usage_guard(self, account: AccountId) -> Iterator[None]:
         with (
             self._home() as home_fd,
-            _account_lock_directory(home_fd, account) as lock_fd,
-            self._lock_at(lock_fd, "usage.lock"),
+            self._account_lock(home_fd, account, "usage.lock"),
         ):
+            yield
+
+    @contextmanager
+    def _account_lock(
+        self, home_fd: int, account: AccountId, name: str, *, wait: bool = True
+    ) -> Iterator[None]:
+        with ExitStack() as stack:
+            with unreadable_account_directory(account):  # e.g. a root-owned lock dir
+                lock_fd = stack.enter_context(_account_lock_directory(home_fd, account))
+                stack.enter_context(self._lock_at(lock_fd, name, wait=wait))
             yield
 
     def _read_usage_bytes(self, account: AccountId) -> bytes | None:
@@ -1048,27 +1054,43 @@ def _account_lock_directory(home_fd: int, account: AccountId) -> Iterator[int]:
 
 
 @contextmanager
+def unreadable_account_directory(account: AccountId) -> Iterator[None]:
+    """The one owner of a failed open of one account's directory: a read error naming it.
+
+    A missing directory and descriptor exhaustion keep their meaning (see raise_if_unreadable).
+    """
+    try:
+        yield
+    except OSError as exc:
+        raise_if_unreadable(exc, f"account {account} directory")
+        raise
+
+
+@contextmanager
 def _account_directory(home_fd: int, account: AccountId) -> Iterator[int]:
     with ExitStack() as stack:
-        accounts_fd = stack.enter_context(
-            _owned_fd(_mkdir_child_durable(home_fd, "accounts"))
-        )
-        provider_fd = stack.enter_context(
-            _owned_fd(_mkdir_child_durable(accounts_fd, account.provider))
-        )
-        account_fd = stack.enter_context(
-            _owned_fd(_mkdir_child_durable(provider_fd, account.name))
-        )
+        with unreadable_account_directory(account):
+            accounts_fd = stack.enter_context(
+                _owned_fd(_mkdir_child_durable(home_fd, "accounts"))
+            )
+            provider_fd = stack.enter_context(
+                _owned_fd(_mkdir_child_durable(accounts_fd, account.provider))
+            )
+            account_fd = stack.enter_context(
+                _owned_fd(_mkdir_child_durable(provider_fd, account.name))
+            )
         yield account_fd
 
 
 @contextmanager
 def _open_account_directory(home_fd: int, account: AccountId) -> Iterator[int]:
-    with (
-        child_directory(home_fd, "accounts") as accounts_fd,
-        child_directory(accounts_fd, account.provider) as provider_fd,
-        child_directory(provider_fd, account.name) as account_fd,
-    ):
+    with ExitStack() as stack:
+        with unreadable_account_directory(account):
+            accounts_fd = stack.enter_context(child_directory(home_fd, "accounts"))
+            provider_fd = stack.enter_context(
+                child_directory(accounts_fd, account.provider)
+            )
+            account_fd = stack.enter_context(child_directory(provider_fd, account.name))
         yield account_fd
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -13,9 +14,13 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from ..oauth import CredentialReadError
+
 if TYPE_CHECKING:
     from .store import AccountId, AccountStore
 
+# the closed set read_usage accepts has no "unreadable"; a new string is a format change
+_UNREADABLE_ERROR = "internal refresh error; retry or restart zeta"
 FRESH_FOR = timedelta(minutes=15)
 REFRESH_COOLDOWN = timedelta(seconds=60)
 REQUEST_TIMEOUT_SECONDS = 15.0
@@ -248,6 +253,12 @@ class AccountUsage:
                         "account busy; retry after the other account operation finishes",
                         now,
                     )
+                except CredentialReadError as exc:  # its usage lock could not be opened
+                    if exc.errno in (errno.EMFILE, errno.ENFILE):
+                        raise
+                    result = UsageState(
+                        state.snapshot, state.freshness, _UNREADABLE_ERROR, now
+                    )
                 if result is not None:
                     results[account] = result
         return results
@@ -268,9 +279,9 @@ class AccountUsage:
                 and now - state.last_attempt_at < REFRESH_COOLDOWN
             ):
                 return None
-            self._write(account, state.snapshot, now, None, "in_flight")
             error: str | None = None
             try:
+                self._write(account, state.snapshot, now, None, "in_flight")
                 response = await asyncio.wait_for(
                     self._request(account, client), REQUEST_TIMEOUT_SECONDS
                 )
@@ -285,19 +296,16 @@ class AccountUsage:
                     self._write(account, snapshot, now, None, "succeeded", finished=now)
                     return UsageState(snapshot, "now", None, now)
             except asyncio.CancelledError:
-                self._write(
-                    account,
-                    state.snapshot,
-                    now,
-                    "refresh canceled; retry",
-                    "failed",
-                    finished=now,
-                )
+                self._write_failed(account, state, now, "refresh canceled; retry")
                 raise
             except (httpx.HTTPError, TimeoutError):
                 error = "network error; check your connection and retry"
             except AccountCredentialLockTimeoutError:
                 raise
+            except CredentialReadError as exc:
+                if exc.errno in (errno.EMFILE, errno.ENFILE):
+                    raise  # nothing was read; the next account would fail the same way
+                error = _UNREADABLE_ERROR
             except RuntimeError as exc:
                 from ..codex import CodexAuthError
                 from ..providers.anthropic_errors import AnthropicAuthError
@@ -309,7 +317,7 @@ class AccountUsage:
                 )
             except (TypeError, ValueError, json.JSONDecodeError):
                 error = "invalid usage response; retry later"
-            self._write(account, state.snapshot, now, error, "failed", finished=now)
+            self._write_failed(account, state, now, error)
             return UsageState(state.snapshot, usage_freshness(state.snapshot, now), error, now)
 
     async def _request(
@@ -342,6 +350,16 @@ class AccountUsage:
             headers["user-agent"] = "codex-cli"
             endpoint = "https://chatgpt.com/backend-api/wham/usage"
         return await client.get(endpoint, headers=headers)
+
+    def _write_failed(
+        self, account: AccountId, state: UsageState, now: datetime, error: str | None
+    ) -> None:
+        try:
+            self._write(account, state.snapshot, now, error, "failed", finished=now)
+        except CredentialReadError as exc:
+            if exc.errno in (errno.EMFILE, errno.ENFILE):
+                raise
+            # the account directory is unreadable, so it cannot hold the failed row
 
     def _write(
         self,
