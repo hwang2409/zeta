@@ -87,6 +87,7 @@ from zeta.accounts import (
     SessionAccountContext,
 )
 from zeta.accounts.usage import UsageSnapshot, UsageState, UsageWindow
+from zeta.agent.child_run_owner import ChildRunTransitionOwner
 from zeta.attention_decisions import DecisionItem
 from zeta.attention_records import AttentionRecord
 from zeta.core.approval import ApprovalPolicy
@@ -1706,7 +1707,7 @@ def test_every_durable_notification_kind_has_non_error_rendering() -> None:
         event = StreamEvent(StreamEventType.AGENT_NOTIFICATION, data=payloads[kind])
         rendered = render_agent_notification(event)
         assert rendered is not None, kind
-        assert "unavailable" not in renderable_plain(rendered).lower(), kind
+        assert rendered.style != theme.ERROR, kind
         assert render_event(event) is not None, kind
 
 
@@ -1816,6 +1817,7 @@ async def test_every_session_mode_tool_renders_start_and_end(tmp_path: Path) -> 
         agent_instance_id="root:2",
         _explicit_finish_report=None,
     )
+    child_loop._child_run_owner = ChildRunTransitionOwner(stores[3], "test-call", explicit_finish=True)
     register_finish(explicit_child, child_loop=child_loop)
     register_handoff(child_loop)
     attention_fork = ToolRegistry(
@@ -10090,6 +10092,83 @@ def _test_tui_app(store: ConversationStore, output: StringIO) -> TUIApp:
             color_system="truecolor",
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "states",
+    [
+        (("running", "provider recovered"), ("completed", "· completed")),
+        (("stopped", "suspended: provider unavailable, retry stopped"),),
+        (("failed", "· failed"),),
+        (("canceled", "· canceled"),),
+        (("running", "provider recovered"), ("normal_exit", "suspended for restart")),
+        (("idle", "provider recovered"), ("finishing", "provider recovered")),
+    ],
+    ids=["completed", "retry-cap", "failed", "canceled", "restart", "active"],
+)
+async def test_provider_suspension_notice_tracks_lifecycle(
+    tmp_path: Path, states: tuple[tuple[str, str], ...]
+) -> None:
+    from zeta.core.agent_progress import post_child_progress, publish_child_ended
+
+    store = ConversationStore(tmp_path / "sessions")
+    app = _test_tui_app(store, StringIO())
+    run_id = f"{store.session_id}:1"
+    first = "2026-11-27T08:11:48+00:00"
+    later = "2026-11-27T08:12:18+00:00"
+    retrying = "suspended: provider unavailable, retrying (next retry: {})"
+    lifecycle = {
+        "handle": run_id, "description": "worker", "agent_type": "general",
+        "turns_used": 0, "tool_calls": 0, "current_step": "thinking",
+        "started_at": first, "finished_at": None, "elapsed": 0.0,
+    }
+    with create_pipe_input() as pipe:
+        task = asyncio.create_task(app.run(_display_session(app, pipe, True)))
+        try:
+            await wait_until(lambda: app._full_screen_active() and app.interaction_ready())
+            post_child_progress(store, {
+                **lifecycle, "state": "suspended", "suspension_reason": "provider_unavailable",
+                "retry_state": "retrying", "next_retry_at": first,
+            })
+            await asyncio.sleep(0)  # Drain the already queued lifecycle callback.
+            app._handle_background_event(StreamEvent(StreamEventType.AGENT_NOTIFICATION, data={
+                "kind": "child_suspended", "child_instance_id": run_id,
+                "description": "worker", "next_retry_at": first,
+            }))
+            assert retrying.format(first) in app._transcript.render(120)
+
+            post_child_progress(store, {
+                **lifecycle, "state": "suspended", "suspension_reason": "provider_unavailable",
+                "retry_state": "retrying", "next_retry_at": later,
+            })
+            await asyncio.sleep(0)
+            display = Text.from_ansi(app._transcript.render(120)).plain
+            assert retrying.format(later) in display
+            assert first not in display
+
+            mismatches = []
+            for state, expected in states:
+                row = {**lifecycle, "state": state}
+                if state in {"completed", "failed", "canceled"}:
+                    publish_child_ended(run_id, 1, {**row, "finished_at": later})
+                else:
+                    if state == "stopped":
+                        row.update(state="suspended", suspension_reason="provider_unavailable", retry_state="stopped")
+                    elif state == "normal_exit":
+                        row.update(state="suspended", suspension_reason="normal_exit")
+                    post_child_progress(store, row)
+                await asyncio.sleep(0)
+                display = Text.from_ansi(app._transcript.render(120)).plain
+                if expected not in display or "retrying" in display or later in display:
+                    lines = [line.strip(" │") for line in display.splitlines() if "│" in line]
+                    mismatches.append((state, expected, lines))
+            assert not mismatches, "the same card must replace the retry text at each lifecycle transition"
+        finally:
+            pipe.send_text("\x04")
+            try:
+                await await_or_fail(task, what="close the TUI prompt")
+            finally:
+                await close_owned_app(app)
 
 
 async def _run_reopened_session(store: ConversationStore, full_screen: bool) -> str:

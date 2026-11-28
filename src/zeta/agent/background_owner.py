@@ -9,10 +9,13 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..core.store import ConversationStore
+from ..providers.recovery_schedule import ProviderRecoveryCoordinator
+from .child_run_owner import ChildRunTransitionOwner
 from .conversation_channel import ConversationChannel
 from .finish_gate import CausalEpisodeRegistry
 
 _AGENT_CANCEL_CONFIRM_TIMEOUT = 1.0
+_CHILD_REGISTRATION_SHUTDOWN_TIMEOUT = 5.0
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,8 @@ class BackgroundAgentOwner:
         ):
             raise ValueError("finish_gate_task_timeout must be positive")
         self.notification_store = notification_store
+        self.provider_recovery = ProviderRecoveryCoordinator()
+        self._child_recovery_enabled = notification_store.child_recovery_enabled
         self.finish_gate_max_turns = finish_gate_max_turns
         self.finish_gate_timeout = float(finish_gate_timeout)
         # This internal bound lets tasks outlive a turn but stops abandoned tasks
@@ -77,6 +82,8 @@ class BackgroundAgentOwner:
         self._observed_close_failures: set[asyncio.Task[Any]] = set()
         self._setup_tasks: set[asyncio.Task[Any]] = set()
         self._setup_closed = False
+        self._registrations: set[asyncio.Task[Any]] = set()
+        self._runs: dict[str, ChildRunTransitionOwner] = {}
         self._cancellation_tasks: set[asyncio.Task[Any]] = set()
         self._cancellers: dict[
             str, Callable[[], CancellationRequest | asyncio.Task[None] | None]
@@ -121,10 +128,19 @@ class BackgroundAgentOwner:
         task.add_done_callback(self._setup_tasks.discard)
         return task
 
-    def finish_child_setup(self) -> None:
-        task = asyncio.current_task()
-        if task is not None:
-            self._setup_tasks.discard(task)
+    def register_child_setup(
+        self, registration: Callable[[], Coroutine[Any, Any, ChildRunTransitionOwner]],
+    ) -> asyncio.Task[ChildRunTransitionOwner]:
+        if self._setup_closed:
+            raise asyncio.CancelledError
+        task = asyncio.create_task(registration())
+        self._registrations.add(task)
+
+        def finished(task: asyncio.Task[Any]) -> None:
+            self._registrations.discard(task)
+
+        task.add_done_callback(finished)
+        return task
 
     def create_cancellation_task[TaskResult](
         self, awaitable: Awaitable[TaskResult]
@@ -226,9 +242,11 @@ class BackgroundAgentOwner:
         return _CancellationConfirmation(instance_id, confirmation)
 
     def cancel_subtree(
-        self, instance_id: str
+        self, instance_id: str, *, include_self: bool = True,
     ) -> tuple[_CancellationConfirmation, ...]:
         selected = self._subtree_ids(instance_id)
+        if not include_self:
+            selected.discard(instance_id)
         return tuple(
             confirmation
             for child in tuple(self._cancellers)
@@ -314,6 +332,44 @@ class BackgroundAgentOwner:
             self._store_close_tasks.add(close_task)
             self._store_close_stores[close_task] = store
 
+    def run_transition(self, run_id: str) -> ChildRunTransitionOwner | None:
+        return self._runs.get(run_id)
+
+    def begin_run(
+        self,
+        instance_id: str,
+        store: ConversationStore,
+        tool_call_id: str,
+        setup_task: asyncio.Task[Any],
+        prepare_cancel: Callable[[], Awaitable[None]],
+        *,
+        parent_store: ConversationStore,
+        parent_instance_id: str | None,
+        description: str | None,
+        explicit_finish: bool,
+        background: bool,
+    ) -> ChildRunTransitionOwner:
+        owner = ChildRunTransitionOwner(
+            store, tool_call_id, explicit_finish=explicit_finish, background=background,
+        )
+        owner.attach_setup(self, setup_task, prepare_cancel)
+        owner.run_id = instance_id
+        self.register(
+            instance_id, owner.request_cancel, setup_task,
+            parent_store=parent_store, parent_instance_id=parent_instance_id,
+            active_store=store, description=description,
+        )
+        self._runs[instance_id] = owner
+        if self._setup_closed and owner.recoverable:
+            owner.quiesce()
+        return owner
+
+    def finish_child_setup(self, task: asyncio.Task[Any]) -> None:
+        self._setup_tasks.discard(task)
+
+    def attach_run_watcher(self, instance_id: str, watcher: asyncio.Task[Any]) -> None:
+        self._watchers[instance_id] = watcher
+
     def register(
         self,
         instance_id: str,
@@ -344,6 +400,7 @@ class BackgroundAgentOwner:
             self._request_cancellation(instance_id)
 
     def unregister(self, instance_id: str) -> None:
+        self._runs.pop(instance_id, None)
         self._cancellers.pop(instance_id, None)
         self._watchers.pop(instance_id, None)
         self._parent_stores.pop(instance_id, None)
@@ -390,7 +447,40 @@ class BackgroundAgentOwner:
     async def close_children(self) -> None:
         """Stop admission and cancel and join the whole child tree."""
         self._setup_closed = True
-        self.cancel_all()
+        if not self._child_recovery_enabled:
+            self.cancel_all()
+            await self.wait()
+            return
+        for owner in self._runs.values():
+            owner.quiesce()
+        await self.provider_recovery.close()
+        # asyncio.wait never propagates shutdown cancellation into a marker commit.
+        if self._registrations:
+            _, pending = await asyncio.wait(
+                tuple(self._registrations), timeout=_CHILD_REGISTRATION_SHUTDOWN_TIMEOUT,
+            )
+            if pending:
+                raise TimeoutError("child registration did not settle at shutdown")
+        owned_setups = set(self._watchers.values())
+        for setup in self._setup_tasks - owned_setups:
+            setup.cancel()
+        current = asyncio.current_task()
+        remaining = {child for child, watcher in self._watchers.items() if watcher is not current}
+        while remaining:
+            leaves = remaining - {self._parent_ids.get(child) for child in remaining}
+            assert leaves, "child ownership cycle"
+            for child in leaves:
+                if child not in self._watchers:
+                    continue  # it finished and unregistered while an earlier leaf was joined
+                watcher = self._watchers.get(child)
+                owner = self._runs.get(child)
+                if owner is not None and owner.recoverable:
+                    await owner.suspend()
+                else:
+                    self._request_cancellation(child)
+                if watcher is not None and watcher is not current:
+                    await asyncio.gather(asyncio.shield(watcher), return_exceptions=True)
+            remaining -= leaves
         await self.wait()
 
     def cancel_all(self) -> None:

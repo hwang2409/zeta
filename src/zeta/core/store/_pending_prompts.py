@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import weakref
 from collections.abc import Iterator
@@ -15,6 +16,7 @@ from ..checkpoints import ConversationEntry
 if TYPE_CHECKING:
     from ._store import ConversationStore
 
+QUESTION_ANSWER_PATTERN = re.compile(r"^Re ([^:\s]+):(?:\s|$)")
 MAX_PENDING_PROMPT_TEXT = 16_000
 PENDING_PROMPT_ID_METADATA = "zeta.pending_prompt_id"
 
@@ -60,11 +62,13 @@ class PendingPromptStoreMixin:
         report: dict[str, object],
         persisted_notification_ids: frozenset[str],
         delivering_prompt_id: str | None,
+        question_settlement: bool = False,
     ) -> str | None:
         return self.pending_prompt_queue.accept_explicit_finish(
             report,
             persisted_notification_ids=persisted_notification_ids,
             delivering_prompt_id=delivering_prompt_id,
+            question_settlement=question_settlement,
         )
 
     def _cancel_explicit_child(self) -> bool:
@@ -125,6 +129,7 @@ class PendingPromptQueue:
         origin: MessageOrigin = MessageOrigin.UNKNOWN,
         deadline: float | None = None,
         starts_new_episode: bool = False,
+        answer_question_id: str | None = None,
     ) -> ConversationEntry:
         if type(text) is not str or not text.strip():
             raise ValueError("pending prompt text must be a nonempty string")
@@ -146,11 +151,15 @@ class PendingPromptQueue:
                 not starts_new_episode or self._terminal_transition_unlocked() is not None
             ):
                 raise PendingPromptsClosedError("pending prompt queue is closed")
-            entry = self._store._append_row_unlocked(
-                "pending_prompt",
-                {"text": text, "origin": origin.value},
-                deadline=deadline,
-            )
+            data = {"text": text, "origin": origin.value}
+            question = self._store._delivery_fold.child_questions.get(answer_question_id)
+            if self._store.child_question_hold_enabled and question is not None and question.data["state"] == "pending":
+                entry, _ = self._store._append_many_unlocked([
+                    ("pending_prompt", data),
+                    ("child_question_state", {**question.data, "state": "answered"}),
+                ])
+            else:
+                entry = self._store._append_row_unlocked("pending_prompt", data, deadline=deadline)
             return self._store._snapshot_entry(entry)
 
     def pending(self) -> list[ConversationEntry]:
@@ -194,6 +203,7 @@ class PendingPromptQueue:
         *,
         persisted_notification_ids: frozenset[str] = frozenset(),
         delivering_prompt_id: str | None = None,
+        question_settlement: bool = False,
     ) -> str | None:
         """Atomically close admission and persist one accepted finish report."""
         with self._lock():
@@ -204,9 +214,8 @@ class PendingPromptQueue:
                     if transition.data["action"] == "finish"
                     else "child is canceled"
                 )
-            if any(
-                entry.id != delivering_prompt_id for entry in self._pending_unlocked()
-            ):
+            pending = self._pending_unlocked()
+            if not question_settlement and any(entry.id != delivering_prompt_id for entry in pending):
                 return "pending follow-up must be read before finish"
             pending_notifications = [
                 entry
@@ -218,6 +227,7 @@ class PendingPromptQueue:
                 return "pending notification must be read before finish"
             self._store._append_many_unlocked(
                 [
+                    *([("pending_prompt_ack", {"prompt_id": entry.id}) for entry in pending] if question_settlement else []),
                     ("pending_queue_closed", {}),
                     ("terminal_transition", {"action": "finish", "report": report}),
                 ]

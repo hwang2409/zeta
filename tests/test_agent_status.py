@@ -19,9 +19,9 @@ from tests.support.agent_lifecycle import wait_background_owner
 from tests.support.branch_reads import branch_messages
 from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
+from zeta.agent.child_run_owner import ChildRunTransitionOwner
 from zeta.agent.presets import AGENT_PRESETS
 from zeta.agent.receipt import encode_json
-from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.agent.tool_results import validated_tool_result
 from zeta.core.abort import AbortGenerationRegistry
 from zeta.core.agent_progress import (
@@ -207,19 +207,19 @@ async def test_agent_status_reports_child_while_finish_is_being_published(
 ) -> None:
     finish_accepted = asyncio.Event()
     release_finish = asyncio.Event()
-    original_accept_finish = TerminalTransitionFence.accept_finish
+    original_accept_finish = ChildRunTransitionOwner.accept_finish
 
     async def accept_finish_and_hold(
-        fence: TerminalTransitionFence, report: dict[str, object]
+        owner: ChildRunTransitionOwner, report: dict[str, object]
     ) -> str | None:
-        reason = await original_accept_finish(fence, report)
+        reason = await original_accept_finish(owner, report)
         if reason is None:
             finish_accepted.set()
             await asyncio.wait_for(release_finish.wait(), timeout=10)
         return reason
 
     monkeypatch.setattr(
-        TerminalTransitionFence, "accept_finish", accept_finish_and_hold
+        ChildRunTransitionOwner, "accept_finish", accept_finish_and_hold
     )
     monkeypatch.setitem(
         AGENT_PRESETS,
@@ -550,6 +550,22 @@ async def test_agent_status_projects_running_lifecycle_after_owner_is_killed(
         _kill_and_drain_child_owner(owner)
         await loop.close()
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_status_keeps_an_unowned_suspended_child_visible(tmp_path: Path) -> None:
+    with ConversationStore(tmp_path) as store:
+        child, handle = _new_live_child(store, 1)
+        with child:
+            _persist_finished_receipt(store, child, "agent-1", handle)
+            child.transition_agent_suspension(reason="normal_exit")
+        loop = AgentLoop(FakeBackend([]), store, skill_catalog=SkillCatalog.empty())
+        try:
+            result = await _status(loop, handle)
+            [item] = result["structuredContent"]["children"]
+            assert item["state"] == "suspended", "suspension does not require a live owner"
+        finally:
+            await loop.close()
 
 
 @pytest.mark.asyncio

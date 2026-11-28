@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from rich.console import Console, Group, RenderableType
+from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.live import Live
 from rich.padding import Padding
 from rich.text import Text
 
+from ...core.agent_progress import register_child_run_sink
 from ...protocol.types import StreamEvent, StreamEventType
 from .. import theme
-from ..cards.agent_message import AgentIdentityIndex
+from ..cards.agent_message import (
+    AgentIdentityIndex,
+    ChildSuspensionPresentation,
+    child_suspension_presentation,
+    render_child_suspension_message,
+)
 from ..cards.agent_sync import refresh_agent_cards
 from ..cards.base import compact_tool_card
 from ..layout import CONTENT_MARGIN
@@ -31,6 +38,16 @@ from .transcript import (
 class ToolEventPresentation:
     visible_output: bool = False
     stop_after_tool: bool = False
+
+
+@dataclass
+class _SuspensionNotice:
+    event: StreamEvent
+    card: RenderableType
+    revision: int = 0
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        yield self.card
 
 
 class TranscriptPresenter:
@@ -63,6 +80,8 @@ class TranscriptPresenter:
         self._assistant_unit: _TranscriptUnit | None = None
         self._assistant_message_units: list[_TranscriptUnit] = []
         self._assistant_message_region: list[_TranscriptUnit] = []
+        self._suspension_notices: dict[str, list[_SuspensionNotice]] = {}
+        self._suspension_presentations: dict[str, ChildSuspensionPresentation] = {}
 
     @property
     def tool_region(self) -> Live | None:
@@ -328,9 +347,74 @@ class TranscriptPresenter:
         self._thinking_stream = None
         self.reset_assistant_unit()
 
+    def watch_provider_retries(
+        self, session_id: str, invalidate: Callable[[], None]
+    ) -> Callable[[], None]:
+        """Consume the same projected lifecycle rows as serve, on the UI loop."""
+        loop = asyncio.get_running_loop()
+        watching = True
+
+        def apply(run_id: str, row: dict[str, object]) -> None:
+            if not watching:
+                return
+            notices = self._suspension_notices.get(run_id)
+            previous = self._suspension_presentations.get(run_id)
+            if previous is None and not notices and not (
+                row.get("status") == "suspended"
+                and row.get("suspension_reason") == "provider_unavailable"
+            ):
+                return
+            presentation = child_suspension_presentation(row)
+            if presentation == previous:
+                return
+            # Keep the latest copy even if delivery of the suspension notice trails recovery.
+            self._suspension_presentations[run_id] = presentation
+            if notices:
+                for notice in notices:
+                    notice.card = render_child_suspension_message(
+                        notice.event, self._agent_identities, presentation
+                    )
+                    notice.revision += 1
+                    self.transcript.touch_renderable(notice)
+                invalidate()
+
+        def sink(
+            kind: str, run_id: str, row: dict[str, object], _number: int, _store: object
+        ) -> None:
+            if kind != "started" and row.get("session_id") == session_id:
+                loop.call_soon_threadsafe(apply, run_id, row)
+
+        unregister = register_child_run_sink(sink)
+
+        def stop() -> None:
+            nonlocal watching
+            watching = False
+            unregister()
+            self._suspension_presentations.clear()
+            self._suspension_notices.clear()
+
+        return stop
+
     def render_event(self, event: StreamEvent) -> RenderableType | None:
         self._agent_identities.observe(event)
-        return render_event(event, self._agent_identities)
+        run_id = (
+            event.data.get("child_instance_id")
+            if event.type is StreamEventType.AGENT_NOTIFICATION
+            and event.data.get("kind") == "child_suspended"
+            else None
+        )
+        presentation = (
+            self._suspension_presentations.get(run_id) if isinstance(run_id, str) else None
+        )
+        rendered = (
+            render_child_suspension_message(event, self._agent_identities, presentation)
+            if presentation is not None else render_event(event, self._agent_identities)
+        )
+        if isinstance(run_id, str) and rendered is not None:
+            notice = _SuspensionNotice(event, rendered)
+            self._suspension_notices.setdefault(run_id, []).append(notice)
+            return notice
+        return rendered
 
     def update_tool_region(self, event: StreamEvent) -> bool:
         rendered = self.render_event(event)

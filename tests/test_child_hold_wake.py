@@ -23,7 +23,7 @@ from tests.test_accounts_exhaustion import _account_context
 from tests.test_rate_limit_hold import _collect
 from zeta.accounts.exhaustion import classify_subscription_limit
 from zeta.accounts.store import AccountId
-from zeta.accounts.usage import UsageSnapshot, UsageWindow, record_subscription_limit
+from zeta.accounts.usage import UsageSnapshot, UsageWindow, record_usage_snapshot
 from zeta.agent.conversation_channel import HoldWake
 from zeta.core.store import ConversationStore
 from zeta.core.store._step_delivery import NotificationInput
@@ -215,7 +215,7 @@ async def test_long_rate_limit_hold_wakes_parent_once_across_reprobes(
     def seed_usage() -> None:
         now = datetime.now(UTC)
         for name, percent in (("first", 85.0), ("second", 10.0)):
-            record_subscription_limit(
+            record_usage_snapshot(
                 tree.context.store,
                 AccountId("codex", name),
                 UsageSnapshot(now, "usage_endpoint", (

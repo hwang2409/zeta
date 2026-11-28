@@ -13,6 +13,7 @@ from unittest import mock
 import pytest
 
 from zeta.accounts.store import _read_publication_pending
+from zeta.agent.resume_descriptor import validate_child_resume
 from zeta.attention_forks import read_attention_fork
 from zeta.attention_records import AttentionRecord
 from zeta.context_eviction._fact_floor import validate_fact_floor
@@ -31,6 +32,7 @@ from zeta.core.store._client_delivery import validate_client_delivery_data
 from zeta.core.store._row_history import validate_turn_end_data
 from zeta.core.store._validation import (
     validate_child_idle_notification_data,
+    validate_child_recovered,
     validate_terminal_transition_data,
 )
 from zeta.core.store.prompt_composition import parse_prompt_recipe
@@ -468,7 +470,35 @@ def test_strict_production_validators_are_bound_to_registry(tmp_path: Path) -> N
         "created_at": "2026-01-01T00:00:00.000000Z",
     }
 
+    preset = {
+        "name": "general", "source": "builtin", "preamble": "", "prompt_suffix": "",
+        "allow_delegation": True, "accepts_follow_ups": True, "explicit_finish": False,
+        "tool_names": None, "max_turns": None, "max_child_depth": None,
+    }
+    resume = {
+        "preset": preset, "model": "model", "requested_model": "model", "provider": "codex",
+        "requested_max_turns": None, "effective_max_turns": 5, "depth": 1, "cwd": "/tmp",
+        "description": "work", "background": True, "follow_up": True, "explicit_finish": False,
+        "account_pins": "selected", "selected_accounts": {},
+    }
+    recovered = {
+        "kind": "child_recovered", "origin": "notification", "logical_id": "child-recovered:root:1:1",
+        "child_instance_id": "root:1", "episode": 1, "child_session_path": "/tmp/agents/1",
+        "description": "work", "text": "child recovered", "display_only": True,
+    }
+    suspended = {**recovered, "kind": "child_suspended", "logical_id": "child-suspended:root:1:1",
+                 "code": "server_error", "next_retry_at": "2026-11-08T00:00:05+00:00"}
+    question = {
+        "question_id": "q", "state": "answered", "question": "continue?", "options": [],
+        "held_at_turn_limit": True, "ancestor_target_ids": [None], "settlement_turn": 2,
+    }
     cases = [
+        ShapeCase("child_question_state", store_entry("child_question_state"), question,
+                  frozenset(question) - {"settlement_turn"}),
+        ShapeCase("child_resume", validate_child_resume, resume, frozenset(resume)),
+        ShapeCase("child_resume_preset", lambda data: validate_child_resume({**resume, "preset": data}), preset, frozenset(preset)),
+        ShapeCase("child_recovered_notification", validate_child_recovered, recovered, frozenset(recovered)),
+        ShapeCase("child_suspended_notification", validate_child_recovered, suspended, frozenset(suspended) - {"code", "next_retry_at"}),
         ShapeCase("hook_config", hook_root, {"hook": []}, frozenset()),
         ShapeCase(
             "hook_record",

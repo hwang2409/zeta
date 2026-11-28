@@ -1593,7 +1593,17 @@ Each row contains `run_id`, the top-level `session_id`, nullable
 child run, cumulative across its follow-up segments, and never decreases. The
 public `run_id` is the existing child
 instance id. Child-local store ids and the agent tool's `handle` name are not
-exposed.
+exposed. If `child_recovery` is negotiated with `child_runs`, a suspended run
+has `status: "suspended"`; clients without it receive `status: "running"`.
+The negotiated `child_recovered` event carries a durable display-only notification
+with `child_instance_id`, `episode`, and `logical_id` (`child-recovered:<run_id>:<episode>`).
+A provider-suspended row includes `suspension_reason: "provider_unavailable"`,
+`retry_state` (`retrying` or `stopped`), `retry_started_at`, `retry_deadline_at`,
+and `next_retry_at` while retrying (all UTC timestamps). These fields are present
+on negotiated baseline, history, and live progress rows. A `child_suspended`
+display-only notice identifies the run and episode and includes the initial
+next retry time if available. Clients without the feature do not receive the
+notice or any retry fields.
 
 A live row can also include `account_status` when a snapshot is available. It
 contains `account` (the child's pinned `provider:account` ID), `held` (boolean,
@@ -2848,6 +2858,8 @@ Event fields are:
 | `project_inbox_health` (protocol 1.2 only) | `event`, `data: object` | `session_id` |
 | `child_question` | `event`, `data: object` | `session_id` |
 | `child_question_withdrawn` | `event`, `data: object` | `session_id` |
+| `child_suspended` | `event`, `data: object` | `session_id` |
+| `child_recovered` | `event`, `data: object` | `session_id` |
 | `child_idle` | `event`, `data: object` | `session_id` |
 | `child_hold` | `event`, `data: object` | `session_id` |
 | `child_message_delivered` | `event`, `data: object` | `session_id` |
@@ -3514,6 +3526,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `telemetry_read_v1` | enables the read-only `telemetry_status`, `telemetry_sessions`, `telemetry_trace`, `telemetry_overview`, `telemetry_models`, `telemetry_tools`, `telemetry_errors`, `telemetry_series`, and `telemetry_agent_tree` methods |
 | `state_read_v1` | enables `state_catalog`, `state_projects`, `state_memory`, `state_memory_detail`, `state_inbox`, `state_inbox_detail`, `state_attention`, `state_sessions`, `state_session`, `state_agents`, `state_background_tasks`, `state_settings`, `state_accounts`, `state_storage`, and `state_retention` |
 | `session_replay_seq` | enables the atomic `session_history_and_subscribe` join; its result includes `replay.stream_id` and `replay.history_seq`, visible live events include `stream_id` and `seq`, an ended stream gets one `replay_stream_ended` event, and it implies `session_history_fidelity`, `session_history_backward`, and `user_message_event` (so a replay client receives the live `user_message` echo its history already includes) |
+| `child_recovery` | exposes suspended status and the child recovery notice; requires `child_runs` |
 | `child_run_history` | enables read-only paging of a selected child run's backward transcript history |
 | `child_run_events` | enables the atomic newest-page and live child lifecycle join; the server advertises the feature and request only when the client also requests `session_replay_seq`, `child_run_history`, and `child_runs` |
 | `served_turn_end` | includes one durable whole-turn outcome as `served_turn_end` in `session_history`; distinct from provider-segment `turn_end` |

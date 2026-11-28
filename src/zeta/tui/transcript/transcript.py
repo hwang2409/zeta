@@ -368,6 +368,12 @@ class TranscriptWidget(TranscriptVirtualMixin, TranscriptFinderMixin, UIControl)
         self._bump_revision()
         self._prime_search_unit(unit)
 
+    def touch_renderable(self, renderable: RenderableType) -> None:
+        for unit in reversed(self._units):
+            if unit is not None and unit.value is renderable:
+                self.touch(unit)
+                return
+
     def remove(self, unit: _TranscriptUnit, *, leading_blank: bool = False) -> None:
         if unit not in self._unit_set:
             return
