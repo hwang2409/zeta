@@ -630,3 +630,76 @@ async def test_tool_call_counted_while_progress_saves_is_kept(tmp_path, monkeypa
             await await_or_fail(asyncio.gather(saver, return_exceptions=True), what="join the progress saver")
         saved = json.loads(store.agent_lifecycle_path.read_text())
         assert (saved["state"], saved["tool_calls"]) == ("running", 1), "a save must not drop a tool call counted meanwhile"
+
+
+@pytest.mark.asyncio
+async def test_canceled_progress_save_keeps_tool_call_counted_meanwhile(tmp_path, monkeypatch):
+    _fast_progress_saves(monkeypatch)
+    reached, release = threading.Event(), threading.Event()
+    live = agent_state.live_agent_lifecycle
+
+    def held(path):
+        value = live(path)
+        if threading.current_thread() is not threading.main_thread() and not release.is_set():
+            reached.set()
+            release.wait(10)
+        return value
+
+    # test-contract: seam hold the save's worker thread after it read live progress (the bad order).
+    monkeypatch.setattr(agent_state, "live_agent_lifecycle", held)
+    with ConversationStore(tmp_path / "child") as store:
+        store.start_agent_lifecycle(
+            handle="child-1", started_at="2026-01-01T00:00:00+00:00", depth=1, agent_type="worker", description="work",
+        )
+        *_, save_progress = turn_limit.make_child_progress_callbacks(
+            loop=None, child_store=store, child_marker_key="child-1", child_tool_call_id="call", recoverable=True,
+        )
+        saver = asyncio.create_task(save_progress())
+        try:
+            assert await await_or_fail(asyncio.to_thread(reached.wait, 10), what="a save reads live progress")
+            store.update_agent_lifecycle(tool_calls=1)  # the runner counts a tool call while the save runs
+            saver.cancel()  # the run ends while the save is in flight
+            await asyncio.sleep(0)
+            release.set()
+            await await_or_fail(asyncio.gather(saver, return_exceptions=True), what="join the progress saver")
+        finally:
+            release.set()
+            saver.cancel()
+            await await_or_fail(asyncio.gather(saver, return_exceptions=True), what="join the progress saver")
+        assert saver.cancelled()
+        current = agent_progress.live_agent_lifecycle(store.agent_lifecycle_path)
+        assert current["tool_calls"] == 1, "a canceled save must not leave its older snapshot published"
+
+
+@pytest.mark.asyncio
+async def test_failed_progress_save_logs_and_next_interval_saves(tmp_path, monkeypatch, caplog):
+    _fast_progress_saves(monkeypatch)
+    with ConversationStore(tmp_path / "child") as store:
+        store.start_agent_lifecycle(
+            handle="child-1", started_at="2026-01-01T00:00:00+00:00", depth=1, agent_type="worker", description="work",
+        )
+        commit, saved = store._commit_storage_command, asyncio.Event()
+        calls = []
+
+        async def flaky(command):
+            calls.append(command)
+            if len(calls) == 1:
+                raise OSError("disk full")
+            result = await commit(command)
+            saved.set()
+            return result
+
+        # test-contract: seam fail the first progress save, then save normally.
+        monkeypatch.setattr(store, "_commit_storage_command", flaky)
+        *_, save_progress = turn_limit.make_child_progress_callbacks(
+            loop=None, child_store=store, child_marker_key="child-1", child_tool_call_id="call", recoverable=True,
+        )
+        saver = asyncio.create_task(save_progress())
+        try:
+            with caplog.at_level("WARNING", logger="zeta.agent.turn_limit"):
+                await await_or_fail(saved.wait(), what="a later interval saves after a failed save")
+        finally:
+            saver.cancel()
+            await await_or_fail(asyncio.gather(saver, return_exceptions=True), what="join the progress saver")
+        (record,) = [r for r in caplog.records if r.name == "zeta.agent.turn_limit"]
+        assert record.levelname == "WARNING" and "disk full" in str(record.exc_info[1]), record

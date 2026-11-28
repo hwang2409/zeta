@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import nullcontext
@@ -22,6 +23,8 @@ from ..project_inbox_sent.notifications import project_inbox_notification
 from ..protocol.types import Message, StreamEvent, StreamEventType, harness_notice
 from .presets import valid_max_turns
 from .receipt import _without_agent_receipt_suffix, has_agent_receipt_suffix
+
+_LOGGER = logging.getLogger(__name__)
 
 HANDOFF_NAME = "turn-limit-handoff.md"
 _MARKER_PREFIX = "[zeta:turn-limit:v1] "
@@ -410,11 +413,16 @@ def make_child_progress_callbacks(
             if live.get("turns_used") != last_turns:
                 last_turns = live.get("turns_used")
                 continue  # the turn-end write just saved progress
-            await child_store._commit_storage_command(_ChildActivityCommand())
-            # The save publishes live progress from a worker thread; republish this loop's copy so
-            # a tool call counted while the save ran is not replaced by the older snapshot.
-            if live_agent_lifecycle(child_store.agent_lifecycle_path) is not None:
-                child_store.update_agent_lifecycle()
+            try:
+                await child_store._commit_storage_command(_ChildActivityCommand())
+            except Exception:
+                _LOGGER.warning("child progress save failed; retrying next interval", exc_info=True)
+            finally:
+                # The save publishes live progress from a worker thread; republish this loop's copy so
+                # a tool call counted while the save ran is not replaced by the older snapshot, also
+                # when the saver is canceled while the save is in flight.
+                if live_agent_lifecycle(child_store.agent_lifecycle_path) is not None:
+                    child_store.update_agent_lifecycle()
 
     return update_turns, record_tool_call, save_progress_while_running
 
