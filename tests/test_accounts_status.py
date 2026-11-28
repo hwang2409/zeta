@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -21,6 +22,7 @@ from tests.support.credentials import named_account_credentials
 from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountError, AccountId, AccountStore
 from zeta.accounts.session import SessionAccountContext
+from zeta.accounts.usage import AccountUsage
 from zeta.core.session import SessionManager
 from zeta.core.session_files import SessionFileReplaced
 from zeta.oauth import OAuthTokens
@@ -983,6 +985,127 @@ def test_unreadable_default_account_ends_cli_start_with_a_message(
     err = capsys.readouterr().err
     assert err.startswith("zeta: ") and message in err
     assert "Traceback" not in err
+
+
+def _outcome(call: Callable[[], object]) -> object:
+    """Return the result, or the escaped error, so a crash fails at an assertion."""
+    try:
+        return call()
+    except Exception as exc:  # noqa: BLE001 - the table asserts on what escaped
+        return exc
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+@pytest.mark.parametrize(
+    "row",
+    [
+        "usage refresh",
+        "usage out-of-files",
+        "accounts refresh",
+        "cli start",
+        "logout",
+        "lock dir accounts refresh",
+        "lock dir cli start",
+        "lock dir logout",
+        "out-of-files",
+    ],
+)
+def test_one_unreadable_account_fails_alone_with_a_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    row: str,
+) -> None:
+    work = AccountId("codex", "work")
+    credential = _save_account(tmp_path, name="work")
+    store = AccountStore(tmp_path)
+    assert store.migrate() == ()
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    monkeypatch.delenv("ZETA_ACCOUNT_HOME", raising=False)
+    start = ["--provider", "codex", "--no-session", "--print", "hi"]
+    if row.startswith("usage"):
+        good = AccountId("anthropic", "default")
+        broken = AccountId("anthropic", "aaa")  # listed first, so it runs first
+        _save_account(tmp_path, "anthropic")
+        path = _save_account(tmp_path, "anthropic", "aaa")
+        fixture = Path(__file__).parent / "fixtures/usage/anthropic_oauth_usage.json"
+        reply = json.loads(fixture.read_text())["response"]
+        transport = httpx.MockTransport(lambda _: httpx.Response(200, json=reply))
+        usage = AccountUsage(store, transport=transport)
+        if row == "usage out-of-files":
+
+            def exhausted_read(directory_fd: int, name: str) -> bytes | None:
+                if name == "oauth.json":
+                    raise OSError(errno.EMFILE, "Too many open files", name)
+                return read_bytes(directory_fd, name)
+
+            read_bytes = account_store_module._read_optional_bytes
+            # test-contract: seam real EMFILE needs the whole process out of descriptors
+            monkeypatch.setattr(
+                account_store_module, "_read_optional_bytes", exhausted_read
+            )
+            raised = _outcome(lambda: asyncio.run(usage.refresh_stale()))
+            assert isinstance(raised, OSError) and raised.errno == errno.EMFILE, raised
+            # nothing was read, so no failed row is claimed for it
+            saved = json.loads((path.parent / "usage.json").read_text())
+            assert saved["outcome"] == "in_flight", saved
+            return
+        os.chmod(path, 0)
+        try:
+            results = _outcome(lambda: asyncio.run(usage.refresh_stale()))
+        finally:
+            os.chmod(path, 0o600)
+        assert isinstance(results, dict), results
+        assert results[good].error is None and results[good].freshness == "now"
+        failed = "internal refresh error; retry or restart zeta"
+        assert results[broken].error == failed
+        saved = json.loads((path.parent / "usage.json").read_text())
+        assert (saved["outcome"], saved["last_error"]) == ("failed", failed)
+        return
+    if row == "out-of-files":
+        open_directory = account_store_module.child_directory
+
+        def exhausted(parent_fd: int, name: str, **kwargs: bool):
+            if name == work.name:
+                raise OSError(errno.EMFILE, "Too many open files", name)
+            return open_directory(parent_fd, name, **kwargs)
+
+        # test-contract: seam real EMFILE needs the whole process out of descriptors
+        monkeypatch.setattr(account_store_module, "child_directory", exhausted)
+        assert _outcome(lambda: cli_main.main(start)) == 2
+        err = capsys.readouterr().err
+        assert err.startswith("zeta: ") and "Traceback" not in err
+        assert f"account {work} directory was not read" in err
+        return
+    action = row.removeprefix("lock dir ")
+    argv = {
+        "accounts refresh": ["accounts", "refresh"],
+        "cli start": start,
+        "logout": ["accounts", "logout", str(work)],
+    }[action]
+    # a root-owned `sudo zeta login` leaves the lock directory unreadable too
+    locks = tmp_path / "account-locks/codex/work"
+    unreadable = locks if row.startswith("lock dir") else credential.parent
+    assert unreadable.is_dir()
+    files = {item: item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    os.chmod(unreadable, 0)
+    try:
+        code = _outcome(lambda: cli_main.main(argv))
+    finally:
+        os.chmod(unreadable, 0o700)
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    if action == "accounts refresh":
+        assert code == 0, code
+        assert f"{work}" in captured.out
+    else:
+        assert code == 2, code
+        message = f"zeta: [Errno 13] account {work} directory could not be read"
+        assert message in captured.err
+    assert {item: item.read_bytes() for item in files if item.name != "usage.json"} == {
+        item: data for item, data in files.items() if item.name != "usage.json"
+    }
+    assert str(work) in json.loads((tmp_path / "accounts.json").read_text())["accounts"]
 
 
 def test_startup_with_a_symlinked_login_is_a_bad_login_not_a_read_error(

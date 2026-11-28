@@ -6,7 +6,7 @@ import os
 import stat
 
 from ..core.session_files import child_directory
-from .store import AccountError, AccountId
+from .store import AccountError, AccountId, unreadable_account_directory
 
 
 def _fsync_directory(directory_fd: int) -> None:
@@ -37,6 +37,7 @@ def validate_account_directory(
 ) -> None:
     try:
         with (
+            unreadable_account_directory(account),
             child_directory(home_fd, root) as root_fd,
             child_directory(root_fd, account.provider) as provider_fd,
             child_directory(provider_fd, account.name) as account_fd,
