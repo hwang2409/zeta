@@ -1639,24 +1639,39 @@ Observers can call `child_run_list`, but `child_run_send` returns the existing
 
 An accepted message is written to the child's own transcript as a pending
 prompt before the response, so it survives a restart. The child reads queued
-messages one at a time, oldest first, at its next model request. A
-`"suspended"` row with `suspension_reason: "provider_unavailable"` belongs to a
-live run that waits for its provider. A send to it is accepted even if its
+messages one at a time, oldest first, at its next model request.
+
+A send to a `"suspended"` row is accepted only while this server owns the run.
+The row has no field that says so directly, so clients use this rule: a
+suspended row accepts a send when `suspension_reason` is
+`"provider_unavailable"` and `current_step` does not start with `recovery
+blocked:`. Such a run waits for its provider. The send is accepted even if its
 profile does not accept follow-ups or its retry is `stopped`: the server queues
 the message and wakes the child at once, without waiting for the next probe.
-Any other `"suspended"` row has no live owner in this server (recovery after a
-restart did not finish, for example `current_step` starts with `recovery
-blocked:`). Such a send is refused and nothing is queued. Homes below storage
-epoch 13 never suspend a child; a restart cancels it instead. The server
-applies these rules with or without `child_recovery`; that feature changes
-only the reported `status`.
+
+A row whose `current_step` starts with `recovery blocked:` has no owner, with
+any reason, including `"provider_unavailable"`: after a parent restart a
+provider reason stays on the row, and a blocked recovery keeps it and its retry
+fields. A `normal_exit` or `owner_lost` row has no owner once recovery is done.
+A send to these rows returns `-32005` and nothing is queued. While a restarted
+server resumes a child, there is a short window in which a `normal_exit` or
+`owner_lost` row still reads `"suspended"` but a send to a profile that accepts
+follow-ups is accepted. The rule is a hint: treat `-32005` as "not now" and
+call `child_run_list` again.
+
+Homes below storage epoch 13 never suspend a child; a restart cancels it
+instead. The server applies these send rules with or without `child_recovery`.
+Without that feature, a suspended row reads as `"running"`, its retry fields
+are removed, and a provider row's `current_step` reads `thinking`, so the
+client cannot target the suspended case.
 
 | child state | `child_run_send` result |
 | --- | --- |
 | `running` or `idle`, profile accepts follow-ups | accepted; delivered at the next safe point |
 | `running`, profile does not accept follow-ups, or foreground child | `-32005` |
-| `suspended`, `provider_unavailable` (retrying or stopped) | accepted; the child wakes now and reads it |
-| `suspended`, other reason, no live owner (recovery blocked or not done) | `-32005`; nothing queued |
+| `suspended`, `provider_unavailable` (retrying or stopped), not recovery blocked | accepted; the child wakes now and reads it |
+| `suspended`, any reason, `current_step` starts with `recovery blocked:` | `-32005`; nothing queued |
+| `suspended`, `normal_exit` or `owner_lost`, recovery done or not running | `-32005`; nothing queued |
 | `completed`, `failed`, `canceled`, or unknown `run_id` | `-32005` |
 | `text` over 16,000 characters | `-32602` |
 

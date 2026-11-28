@@ -445,7 +445,7 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
             joined = await peer.request("baseline", "session_history_and_subscribe", {"session_id": session_id})
             [progress] = [row["child"] for row in joined["result"]["messages"] if row.get("event") == "child_progress"]
             check_row(progress, expected)
-        # A suspended run with no live owner here (restart-suspended or recovery blocked) refuses the message.
+        # This provider_unavailable row has no live owner in this server (like a blocked recovery), so the send is refused.
         refused = await client.request("send-suspended", "child_run_send", {"session_id": session_id, "run_id": run_id, "text": "wake"})
         assert refused["error"]["code"] == -32005, refused
 
