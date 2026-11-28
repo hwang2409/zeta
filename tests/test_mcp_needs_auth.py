@@ -20,7 +20,7 @@ from tests.support.storage_homes import initialize_storage_home
 from zeta.mcp import StreamableHTTPMCPClient, load_mcp_config
 from zeta.mcp import mount as mount_module
 from zeta.mcp import oauth_store as oauth_store_module
-from zeta.mcp.client import MCPAuthRequiredError
+from zeta.mcp.client import MCPHTTPError
 from zeta.mcp.config import MCPServerConfig
 from zeta.mcp.management import MCPManagementService
 from zeta.mcp.mount import mount_mcp_servers
@@ -228,7 +228,7 @@ async def test_needs_auth_write_waits_for_the_store_lock_off_the_event_loop(
     client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
     release = asyncio.create_task(release_when_contended())
     try:
-        with pytest.raises(MCPAuthRequiredError):
+        with pytest.raises(MCPHTTPError, match="/mcp auth slack"):
             await await_or_fail(client.connect(), what="connect")
         await await_or_fail(release, what="lock release")
         assert waiting_threads, "the needs-auth write never waited for the lock"
