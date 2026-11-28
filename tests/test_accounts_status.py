@@ -997,7 +997,18 @@ def _outcome(call: Callable[[], object]) -> object:
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
 @pytest.mark.parametrize(
-    "row", ["usage refresh", "accounts refresh", "cli start", "logout", "out-of-files"]
+    "row",
+    [
+        "usage refresh",
+        "usage out-of-files",
+        "accounts refresh",
+        "cli start",
+        "logout",
+        "lock dir accounts refresh",
+        "lock dir cli start",
+        "lock dir logout",
+        "out-of-files",
+    ],
 )
 def test_one_unreadable_account_fails_alone_with_a_message(
     tmp_path: Path,
@@ -1012,7 +1023,7 @@ def test_one_unreadable_account_fails_alone_with_a_message(
     monkeypatch.setenv("ZETA_HOME", str(tmp_path))
     monkeypatch.delenv("ZETA_ACCOUNT_HOME", raising=False)
     start = ["--provider", "codex", "--no-session", "--print", "hi"]
-    if row == "usage refresh":
+    if row.startswith("usage"):
         good = AccountId("anthropic", "default")
         broken = AccountId("anthropic", "aaa")  # listed first, so it runs first
         _save_account(tmp_path, "anthropic")
@@ -1021,6 +1032,24 @@ def test_one_unreadable_account_fails_alone_with_a_message(
         reply = json.loads(fixture.read_text())["response"]
         transport = httpx.MockTransport(lambda _: httpx.Response(200, json=reply))
         usage = AccountUsage(store, transport=transport)
+        if row == "usage out-of-files":
+
+            def exhausted_read(directory_fd: int, name: str) -> bytes | None:
+                if name == "oauth.json":
+                    raise OSError(errno.EMFILE, "Too many open files", name)
+                return read_bytes(directory_fd, name)
+
+            read_bytes = account_store_module._read_optional_bytes
+            # test-contract: seam real EMFILE needs the whole process out of descriptors
+            monkeypatch.setattr(
+                account_store_module, "_read_optional_bytes", exhausted_read
+            )
+            raised = _outcome(lambda: asyncio.run(usage.refresh_stale()))
+            assert isinstance(raised, OSError) and raised.errno == errno.EMFILE, raised
+            # nothing was read, so no failed row is claimed for it
+            saved = json.loads((path.parent / "usage.json").read_text())
+            assert saved["outcome"] == "in_flight", saved
+            return
         os.chmod(path, 0)
         try:
             results = _outcome(lambda: asyncio.run(usage.refresh_stale()))
@@ -1048,20 +1077,25 @@ def test_one_unreadable_account_fails_alone_with_a_message(
         assert err.startswith("zeta: ") and "Traceback" not in err
         assert f"account {work} directory was not read" in err
         return
+    action = row.removeprefix("lock dir ")
     argv = {
         "accounts refresh": ["accounts", "refresh"],
         "cli start": start,
         "logout": ["accounts", "logout", str(work)],
-    }[row]
+    }[action]
+    # a root-owned `sudo zeta login` leaves the lock directory unreadable too
+    locks = tmp_path / "account-locks/codex/work"
+    unreadable = locks if row.startswith("lock dir") else credential.parent
+    assert unreadable.is_dir()
     files = {item: item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
-    os.chmod(credential.parent, 0)
+    os.chmod(unreadable, 0)
     try:
         code = _outcome(lambda: cli_main.main(argv))
     finally:
-        os.chmod(credential.parent, 0o700)
+        os.chmod(unreadable, 0o700)
     captured = capsys.readouterr()
     assert "Traceback" not in captured.err
-    if row == "accounts refresh":
+    if action == "accounts refresh":
         assert code == 0, code
         assert f"{work}" in captured.out
     else:
