@@ -527,6 +527,9 @@ def _handle_login(args: argparse.Namespace) -> int:
     return 0
 
 
+_NO_ACCOUNTS = "no accounts; run zeta login <provider> --account <name>"
+
+
 def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
     from ..accounts.usage import format_usage_lines, usage_json
 
@@ -565,7 +568,7 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
             + marker
         )
         lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
-    print("\n".join(lines))
+    print("\n".join(lines) or _NO_ACCOUNTS)
 
 
 def _expiry_iso(expires_at: float) -> str:
@@ -757,6 +760,10 @@ def _print_account_statuses(
 ) -> None:
     if as_json:
         print(json.dumps(statuses))
+        return
+    if not statuses:
+        # status exits 1 here, so the hint goes to stderr like other failures.
+        print(_NO_ACCOUNTS, file=sys.stderr)
         return
     lines = []
     for status in statuses:
