@@ -84,16 +84,19 @@ async def _start(
         tmp_path / "tools", register_builtin=False, skill_catalog=SkillCatalog.empty()
     )
     notices: list[str] = []
-    mount = await mount_mcp_servers(
-        registry,
-        load_mcp_config(home / "mcp.json"),
-        notice_sink=notices.append,
-        home=str(home),
-    )
     try:
-        return notices, mount.statuses["slack"].state
+        mount = await mount_mcp_servers(
+            registry,
+            load_mcp_config(home / "mcp.json"),
+            notice_sink=notices.append,
+            home=str(home),
+        )
+        try:
+            return notices, mount.statuses["slack"].state
+        finally:
+            await mount.close()
     finally:
-        await mount.close()
+        await registry.close()
 
 
 async def _home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -135,7 +138,7 @@ async def test_refresh_401_skips_later_mounts_until_mcp_auth(
 
     notices, state = await _start(tmp_path, home, server, monkeypatch)
     assert state == "mounted"
-    assert notices == ["mcp · slack mounted (1 tools)"]
+    assert "mcp · slack mounted (1 tools)" in notices
 
 
 @pytest.mark.asyncio

@@ -65,6 +65,14 @@ class MCPHTTPError(MCPTransportError):
         self.status_code = status_code
 
 
+class MCPAuthRequiredError(MCPHTTPError):
+    """Raised when an OAuth server needs `/mcp auth` before any request can succeed."""
+
+    def __init__(self, detail: str, *, reauthorize: bool) -> None:
+        super().__init__(401, detail)
+        self.reauthorize = reauthorize
+
+
 class MCPCanceled(MCPError):
     """Raised when an MCP request is aborted by the caller."""
 
@@ -543,6 +551,7 @@ __all__ = [
     "MCPCanceled",
     "MCPClient",
     "MCPError",
+    "MCPAuthRequiredError",
     "MCPHTTPError",
     "MCPPrompt",
     "MCPPromptArgument",

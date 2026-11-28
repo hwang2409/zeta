@@ -1386,7 +1386,7 @@ async def test_http_client_reports_refresh_failure_shape(
     assert "run /mcp auth live" in text
     persisted = (await MCPCredentialStore(home=home).load("live")).token
     assert persisted is not None
-    assert persisted.refresh_error is None
+    assert persisted.refresh_error == "MCP OAuth: token endpoint returned HTTP 400"
     await client.close()
 
 
@@ -2635,7 +2635,8 @@ async def test_logout_wins_failed_refresh_reload_windows(
         if replace_during_failure:
             changed = replace(original, access_token="changed-token")
             await MCPCredentialStore(home=home).save_login("live", changed)
-        race.connection.send((400, {"error": "invalid_grant"}))
+        # a transient failure; a login-required one persists needs-auth instead
+        race.connection.send((503, {"error": "temporarily_unavailable"}))
         await race.gate()
         await manager.logout("live", scope="user")
         race.release()
