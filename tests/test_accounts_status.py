@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import select
@@ -817,22 +818,57 @@ def test_startup_with_unreadable_registry_warns_and_keeps_running(
     assert registry.read_bytes() == original
 
 
+def _unreadable_row(home: Path, row: str) -> tuple[Path, str]:
+    """Build one startup home whose `row` path cannot be read; return it and the warning."""
+    if row == "legacy":
+        initialize_storage_home(home)
+        path = home / "codex-oauth.json"
+        path.write_text(json.dumps(OAuthTokens("a", "r", 1).to_dict()))
+    else:
+        credential = _save_account(home)
+        path = {
+            "account-dir": credential.parent,
+            "oauth": credential,
+            "pending": credential.with_name("publish-pending.json"),
+            "registry": home / "accounts.json",
+        }[row]
+        if row == "pending":
+            path.write_text("{}")
+    if row == "registry":
+        return path, "accounts.json is unreadable; kept it and every account directory"
+    reason = "could not be read (EACCES: Permission denied)"
+    return path, f"kept {path}: {reason}; fix its permissions, then restart zeta"
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
-def test_startup_migration_with_unreadable_login_warns_and_keeps_running(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "row", ["account-dir", "oauth", "legacy", "pending", "registry"]
+)
+def test_startup_with_an_unreadable_account_path_warns_and_keeps_every_file(
+    tmp_path: Path, row: str
 ) -> None:
-    credential_path = _save_account(tmp_path)
-    original = credential_path.read_bytes()
-    os.chmod(credential_path, 0)
+    path, warning = _unreadable_row(tmp_path, row)
+    files = {item: item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    mode = path.stat().st_mode
+    os.chmod(path, 0)
     try:
-        warnings = asyncio.run(server_accounts.migrate(tmp_path))
-        assert warnings == (
-            (
-                f"kept {credential_path}: OAuth credentials file could not be read "
-                "(EACCES: Permission denied); fix its permissions, then restart zeta"
-            ),
-        )
-        assert AccountStore(tmp_path).migrate() == warnings
+        assert AccountStore(tmp_path).migrate() == (warning,)
+        assert asyncio.run(server_accounts.migrate(tmp_path)) == (warning,)
     finally:
-        os.chmod(credential_path, 0o600)
-    assert credential_path.read_bytes() == original
+        os.chmod(path, mode)
+    assert {item: item.read_bytes() for item in files} == files
+
+
+def test_startup_out_of_files_is_not_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _save_account(tmp_path)
+
+    def exhausted(*_args: object) -> None:
+        raise OSError(errno.EMFILE, "Too many open files", "default")
+
+    # test-contract: seam real EMFILE needs the whole process out of descriptors
+    monkeypatch.setattr(account_store_module, "_open_account_directory", exhausted)
+    with pytest.raises(OSError) as caught:
+        AccountStore(tmp_path).migrate()
+    assert caught.value.errno == errno.EMFILE

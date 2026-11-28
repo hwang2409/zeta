@@ -35,7 +35,6 @@ from ..core.session_files import (
 from ..oauth import (
     ACCOUNT_LOCK_TURN_WAIT_SECONDS,
     OAUTH_REFRESH_TIMEOUT_SECONDS,
-    CredentialReadError,
     OAuthRefreshFailure,
     OAuthTokens,
     classify_oauth_refresh_failure,
@@ -589,17 +588,7 @@ class AccountStore(_AccountRegistry):
                     if state is _Registry.MISSING and warnings:
                         logger.warning("%s", warnings[-1])
                 for provider in ("anthropic", "codex"):
-                    try:
-                        self._migrate_provider(home_fd, provider, warnings)
-                    except CredentialReadError as exc:
-                        if exc.errno in (errno.EMFILE, errno.ENFILE):
-                            raise
-                        path = self.credential_path(AccountId(provider, "default"))
-                        warnings.append(
-                            f"kept {path}: {exc.strerror}; "
-                            "fix its permissions, then restart zeta"
-                        )
-                        logger.warning("%s", warnings[-1])
+                    self._migrate_provider(home_fd, provider, warnings)
         return tuple(warnings)
 
     def refuse_orphaning_registration(self, account: AccountId) -> None:
@@ -609,6 +598,40 @@ class AccountStore(_AccountRegistry):
             self._refuse_orphaning_registration(home_fd, account)
 
     def _migrate_provider(
+        self, home_fd: int, provider: str, warnings: list[str]
+    ) -> None:
+        """The one owner of a failed read at startup: warn, keep every file, go on."""
+
+        try:
+            self._migrate_provider_files(home_fd, provider, warnings)
+        except OSError as exc:
+            if exc.errno in (errno.EMFILE, errno.ENFILE):
+                raise
+            directory = self.accounts / provider / "default"
+            # reads go through dir_fd, so the error names only the last component
+            path = next(
+                (
+                    candidate
+                    for candidate in (
+                        self.home / f"{provider}-oauth.json",
+                        self.accounts,
+                        self.accounts / provider,
+                        directory / "oauth.json",
+                        directory / "publish-pending.json",
+                    )
+                    if candidate.name == exc.filename
+                ),
+                directory,
+            )
+            code = errno.errorcode.get(exc.errno or 0, "unknown error")
+            reason = f"{code}: {os.strerror(exc.errno)}" if exc.errno else code
+            warnings.append(
+                f"kept {path}: could not be read ({reason}); "
+                "fix its permissions, then restart zeta"
+            )
+            logger.warning("%s", warnings[-1])
+
+    def _migrate_provider_files(
         self, home_fd: int, provider: str, warnings: list[str]
     ) -> None:
         account = AccountId(provider, "default")
@@ -644,9 +667,10 @@ class AccountStore(_AccountRegistry):
                 )
                 logger.warning("%s", warnings[-1])
                 return
+            # read before creating the account directory: a failed read leaves no trace
+            tokens = _read_tokens(home_fd, legacy_name) if keep is _Keep.LEGACY else None
             with _account_directory(home_fd, account) as account_fd:
-                if keep is _Keep.LEGACY:
-                    tokens = _read_tokens(home_fd, legacy_name)
+                if tokens is not None:
                     self._stage_account_tokens(account_fd, account, tokens)
                 if str(account) not in self._read_registry(home_fd)["accounts"]:
                     self._register_account(home_fd, account)
