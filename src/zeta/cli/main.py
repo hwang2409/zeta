@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import copy
+import errno
 import json
 import os
 import sys
@@ -613,6 +614,15 @@ async def _read_safe_account_status(
             "access_token_expires_at": None,
             "error": "invalid_credentials",
         }
+    except OSError as exc:
+        if exc.errno not in (errno.EMFILE, errno.ENFILE):
+            raise
+        return None, {
+            "logged_in": None,
+            "access_token_expires_at": None,
+            "error": "too_many_open_files",
+            "retryable": True,
+        }
     try:
         expiry = _expiry_iso(tokens.expires_at) if tokens is not None else None
     except (OSError, OverflowError, ValueError):
@@ -651,11 +661,11 @@ async def _account_status(
         "is_default": default == account,
         **safe_status,
     }
-    if safe_status.get("error") == "lock_timeout":
+    if (unknown := safe_status.get("error")) in {"lock_timeout", "too_many_open_files"}:
         if refresh:
             status["refresh"] = {
                 "ok": False,
-                "code": "lock_timeout",
+                "code": unknown,
                 "retryable": True,
             }
         return status, False
@@ -757,7 +767,9 @@ def _print_account_statuses(
     lines = []
     for status in statuses:
         if error := status.get("error"):
-            state = f"login invalid ({error})"
+            # logged_in None: the login could not be checked, not a bad login
+            known = status["logged_in"] is not None
+            state = f"login {'invalid' if known else 'unknown'} ({error})"
         else:
             state = "logged in" if status["logged_in"] else "login missing"
         default = "  default" if status["is_default"] else ""
@@ -1283,7 +1295,30 @@ def _main(argv: list[str] | None = None) -> int:
     return _run_tui_command(args, entrypoint, original_argv)
 
 
+# macOS OPEN_MAX: setrlimit refuses a higher RLIMIT_NOFILE even when the hard limit is unlimited.
+_OPEN_FILE_TARGET = 10240
+
+
+def _raise_open_file_limit() -> None:
+    """Lift the soft open-file limit (256 on macOS), which many live children exhaust."""
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    target = (
+        _OPEN_FILE_TARGET
+        if hard == resource.RLIM_INFINITY
+        else min(hard, _OPEN_FILE_TARGET)
+    )
+    if soft == resource.RLIM_INFINITY or soft >= target:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (OSError, ValueError):
+        pass  # kern.maxfilesperproc may be lower; keep the inherited limit
+
+
 def main(argv: list[str] | None = None) -> int:
+    _raise_open_file_limit()
     return _run_console(lambda: _main(argv))
 
 
