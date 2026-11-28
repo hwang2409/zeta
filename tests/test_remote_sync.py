@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import fcntl
 import hashlib
+import inspect
 import io
 import json
 import multiprocessing
@@ -17,6 +18,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,6 +28,7 @@ import pytest
 from tests.support.branch_reads import branch_entries
 from tests.support.storage_homes import initialize_storage_home
 from zeta import remote_sync as remote_sync_module
+from zeta import storage_format
 from zeta.cli.main import main as cli_main
 from zeta.core.session import SessionManager
 from zeta.core.session_files import (
@@ -70,7 +73,12 @@ from zeta.remote_sync.project_publish import (
 )
 from zeta.remote_sync.ssh import SshTransport
 from zeta.skills import SkillCatalog
-from zeta.storage_format import GATED_HOME_PATHS, StorageFormatError, open_writer
+from zeta.storage_format import (
+    GATED_HOME_PATHS,
+    StorageFormatError,
+    open_writer,
+    writer_epoch,
+)
 from zeta.tools import ToolRegistry
 from zeta.tools import session_push as session_push_tool
 from zeta.tools.session_push import register as register_session_push
@@ -2072,6 +2080,112 @@ def test_p06_3_generated_project_programs_refuse_manifestless_state_like_local(
     assert fetch.returncode == 53, "generated program wrote over gated state"
     assert not (remote_home / "storage-format.json").exists()
     assert not (local_home / "storage-format.json").exists()
+
+
+def test_concurrent_remote_first_opens_all_wait_for_one_bootstrap(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "remote-home"
+    # every program starts at one shared instant so their first opens collide
+    start = time.time() + 1.5
+    gate = f"import time; time.sleep(max(0.0, {start!r} - time.time()))\n"
+    programs = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                gate + ssh_module._PROJECT_FETCH_SCRIPT,
+                str(home),
+                "missing-project",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(12)
+    ]
+    results = []
+    try:
+        for program in programs:
+            _stdout, stderr = program.communicate(timeout=60)
+            results.append((program.returncode, stderr))
+    finally:
+        for program in programs:
+            if program.poll() is None:
+                program.kill()
+                program.communicate(timeout=10)
+
+    # 44 = project not found, reached only after the stored-format lease is held
+    failed = [(code, stderr) for code, stderr in results if code != 44]
+    assert failed == [], f"remote first opens refused: {failed}"
+    assert json.loads((home / "storage-format.json").read_text()) == {
+        "writer_epoch": writer_epoch()
+    }
+    assert sorted(path.name for path in home.glob("*storage-format.json*")) == [
+        "storage-format.json"
+    ]
+
+
+def test_remote_first_open_waits_for_a_held_bootstrap(tmp_path: Path) -> None:
+    home = tmp_path / "remote-home"
+    home.mkdir()
+    holder = os.open(home / ".storage-format.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        fetch = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                ssh_module._PROJECT_FETCH_SCRIPT,
+                str(home),
+                "missing-project",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            try:
+                fetch.wait(0.5)  # the other first open is still publishing
+            except subprocess.TimeoutExpired:
+                pass
+            (home / "storage-format.json").write_text(
+                json.dumps({"writer_epoch": writer_epoch()}) + "\n"
+            )
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+        _stdout, stderr = fetch.communicate(timeout=30)
+    finally:
+        os.close(holder)
+    assert fetch.returncode == 44, stderr
+    assert "initializing" not in stderr
+
+
+def test_remote_first_open_ships_the_local_bootstrap_owner() -> None:
+    # A second bootstrap (its own lock name, manifest publish, or exclusive lock)
+    # anywhere outside storage_format fails here.
+    root = Path(storage_format.__file__).parent
+    spelled = sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.py")
+        if path.name != "storage_format.py" and ".storage-format.lock" in path.read_text()
+    )
+    assert spelled == [], f"stored-format lock opened outside its owner: {spelled}"
+    program = ssh_module._REMOTE_WRITER_EPOCH
+    owners = [
+        storage_format._home_has_gated_state,
+        storage_format._wait_for_bootstrap,
+        storage_format._publish_manifest,
+        storage_format._lease_home,
+    ]
+    for owner in owners:
+        assert program.count(f"def {owner.__name__}(") == 1, owner.__name__
+        assert inspect.getsource(owner) in program, f"{owner.__name__} is not the shipped owner"
+    rest = program
+    for owner in owners:
+        rest = rest.replace(inspect.getsource(owner), "")
+    for primitive in ("LOCK_EX", "os.replace", "os.rename"):
+        assert primitive not in rest, f"remote program bootstraps outside the owner: {primitive}"
 
 
 def test_p06_3_generated_project_program_retains_stored_format_lease(
