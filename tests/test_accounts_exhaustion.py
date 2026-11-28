@@ -131,7 +131,7 @@ def test_unknown_429_and_changed_schema_are_not_exhaustion() -> None:
     )
 
 
-def test_anthropic_429_is_not_classified_without_fixture() -> None:
+def test_anthropic_429_with_codex_shape_is_not_exhaustion() -> None:
     assert (
         classify_subscription_limit(
             "anthropic",
