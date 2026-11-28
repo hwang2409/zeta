@@ -154,11 +154,11 @@ def _run_discovery_git(
         )
         return None, "timeout"
     except subprocess.CalledProcessError as exc:
+        if (exc.stderr or "").startswith("fatal: not a git repository ("):
+            return None, "non-repository"
         logging.getLogger(__name__).warning(
             "git project discovery failed for %s (exit %s)", directory, exc.returncode
         )
-        if (exc.stderr or "").startswith("fatal: not a git repository ("):
-            return None, "non-repository"
         return None, "git-error"
     except OSError as exc:
         logging.getLogger(__name__).warning(

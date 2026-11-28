@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import select
@@ -15,9 +16,12 @@ import pytest
 
 import zeta.accounts.store as account_store_module
 import zeta.cli.main as cli_main
+import zeta.server.accounts as server_accounts
 from tests.support.credentials import named_account_credentials
 from tests.support.storage_homes import initialize_storage_home
-from zeta.accounts import AccountId, AccountStore
+from zeta.accounts import AccountError, AccountId, AccountStore
+from zeta.accounts.session import SessionAccountContext
+from zeta.core.session import SessionManager
 from zeta.core.session_files import SessionFileReplaced
 from zeta.oauth import OAuthTokens
 
@@ -652,6 +656,45 @@ def test_accounts_status_corrupt_login_keeps_json_valid_and_reports_other_accoun
     assert "secret-file-content" not in captured.out + captured.err
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+def test_accounts_status_unreadable_login_is_unknown_not_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    credential_path = _save_account(tmp_path)
+    os.chmod(credential_path, 0)
+    try:
+        with pytest.raises(OSError, match=r"could not be read \(EACCES") as caught:
+            named_account_credentials(tmp_path, "codex", "default").read()
+        assert "login" not in str(caught.value)
+
+        assert _run_json(tmp_path, monkeypatch, "--refresh") == 1
+        assert json.loads(capsys.readouterr().out) == [
+            {
+                "provider": "codex",
+                "account": "default",
+                "is_default": True,
+                "logged_in": None,
+                "access_token_expires_at": None,
+                "error": "unreadable_credentials",
+                "retryable": False,
+                "refresh": {
+                    "ok": False,
+                    "code": "unreadable_credentials",
+                    "retryable": False,
+                },
+            }
+        ]
+        assert cli_main.main(["accounts", "status"]) == 1
+        assert capsys.readouterr().out.strip() == (
+            "codex:default  login unknown (unreadable_credentials)"
+            "  expires unknown  default"
+        )
+    finally:
+        os.chmod(credential_path, 0o600)
+
+
 def test_accounts_status_corrupt_login_human_output_has_one_line_per_account(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -747,6 +790,252 @@ def test_accounts_status_never_blocks_on_account_locks(
     if refresh:
         assert row["refresh"] == {"ok": True, "code": None, "retryable": None}
     assert blocking == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+def test_startup_with_unreadable_registry_warns_and_keeps_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _save_account(tmp_path)
+    registry = tmp_path / "accounts.json"
+    original = registry.read_bytes()
+    warning = (
+        f"accounts.json is unreadable: {registry}; kept it and every account directory; "
+        "move it aside to a backup, then run login again or restore it from a backup, "
+        "then restart zeta"
+    )
+    os.chmod(registry, 0)
+    try:
+        startup = ("accounts.json is unreadable; kept it and every account directory",)
+        assert AccountStore(tmp_path).migrate() == startup
+        assert asyncio.run(server_accounts.migrate(tmp_path)) == startup
+
+        monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+        assert cli_main.main(["accounts", "status"]) == 1
+        assert capsys.readouterr().err == warning + "\n"
+    finally:
+        os.chmod(registry, 0o600)
+    assert registry.read_bytes() == original
+
+
+def _unreadable_row(home: Path, row: str) -> tuple[Path, str]:
+    """Build one startup home whose `row` path cannot be read; return it and the warning."""
+    if row == "legacy":
+        initialize_storage_home(home)
+        path = home / "codex-oauth.json"
+        path.write_text(json.dumps(OAuthTokens("a", "r", 1).to_dict()))
+    else:
+        credential = _save_account(home)
+        path = {
+            "accounts-root": home / "accounts",
+            "provider-dir": credential.parent.parent,
+            "account-dir": credential.parent,
+            "orphan-dir": credential.parent.with_name("work"),
+            "locks-dir": home / "account-locks" / "codex",
+            "oauth": credential,
+            "pending": credential.with_name("publish-pending.json"),
+            "registry": home / "accounts.json",
+        }[row]
+        if row == "pending":
+            path.write_text("{}")
+        if row == "orphan-dir":
+            path.mkdir()
+    if row == "registry":
+        return path, "accounts.json is unreadable; kept it and every account directory"
+    reason = "could not be read or written (EACCES: Permission denied)"
+    return path, f"kept {path}: {reason}; fix its permissions, then restart zeta"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+@pytest.mark.parametrize(
+    "row",
+    [
+        "accounts-root",
+        "provider-dir",
+        "account-dir",
+        "orphan-dir",
+        "locks-dir",
+        "oauth",
+        "legacy",
+        "pending",
+        "registry",
+    ],
+)
+def test_startup_with_an_unreadable_account_path_warns_and_keeps_every_file(
+    tmp_path: Path, row: str
+) -> None:
+    path, warning = _unreadable_row(tmp_path, row)
+    files = {item: item.read_bytes() for item in tmp_path.rglob("*") if item.is_file()}
+    mode = path.stat().st_mode
+    os.chmod(path, 0)
+    try:
+        assert AccountStore(tmp_path).migrate() == (warning,)
+        assert asyncio.run(server_accounts.migrate(tmp_path)) == (warning,)
+    finally:
+        os.chmod(path, mode)
+    assert {item: item.read_bytes() for item in files} == files
+    assert path.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+@pytest.mark.parametrize("row", ["oauth", "account-dir", "out-of-files"])
+def test_one_unreadable_account_is_listed_unavailable_after_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str
+) -> None:
+    default = AccountId("codex", "default")
+    work = AccountId("codex", "work")
+    _save_account(tmp_path)
+    credential = _save_account(tmp_path, name="work")
+    store = AccountStore(tmp_path)
+    assert store.migrate() == ()
+    store.set_default(default)
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="codex", model="gpt-5.5", cwd=tmp_path)
+    try:
+        reads = {
+            "session start": lambda: SessionAccountContext.load(
+                tmp_path, manager, opened.metadata
+            ),
+            "account_list": store.catalog_snapshot,
+            "state accounts": store.state_rows,
+        }
+        if row == "out-of-files":
+            open_directory = account_store_module._open_account_directory
+
+            def exhausted(home_fd: int, account: AccountId):
+                if account == work:
+                    raise OSError(errno.EMFILE, "Too many open files", "work")
+                return open_directory(home_fd, account)
+
+            # test-contract: seam real EMFILE needs the whole process out of descriptors
+            monkeypatch.setattr(
+                account_store_module, "_open_account_directory", exhausted
+            )
+            for name, read in reads.items():
+                with pytest.raises(OSError) as caught:
+                    read()
+                assert caught.value.errno == errno.EMFILE, name
+            return
+        path = credential if row == "oauth" else credential.parent
+        mode = path.stat().st_mode
+        os.chmod(path, 0)
+        try:
+            context = reads["session start"]()
+            _, displays, _ = reads["account_list"]()
+            rows, warnings = reads["state accounts"]()
+        finally:
+            os.chmod(path, mode)
+        assert context.resolve("codex") == default
+        assert context.unavailable_accounts == (str(work),)
+        assert {item.account: item.available for item in displays} == {
+            default: True,
+            work: False,
+        }
+        assert {item["account_id"]: item["status"] for item in rows} == {
+            str(default): "selected",
+            str(work): "error",
+        }
+        assert f"{work}: credentials unavailable or expired" in warnings
+    finally:
+        opened.store.close()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        (
+            "unreadable",
+            "OAuth credentials file could not be read (EACCES: Permission denied)",
+        ),
+        ("out-of-files", "OAuth credentials file was not read"),
+    ],
+)
+def test_unreadable_default_account_ends_cli_start_with_a_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    row: str,
+    message: str,
+) -> None:
+    credential = _save_account(tmp_path)
+    assert AccountStore(tmp_path).migrate() == ()
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    monkeypatch.delenv("ZETA_ACCOUNT_HOME", raising=False)
+    argv = ["--provider", "codex", "--no-session", "--print", "hi"]
+    if row == "out-of-files":
+
+        def exhausted(*_args: object) -> None:
+            raise OSError(errno.EMFILE, "Too many open files", "oauth.json")
+
+        # test-contract: seam real EMFILE needs the whole process out of descriptors
+        monkeypatch.setattr(account_store_module, "_read_optional_bytes", exhausted)
+        assert cli_main.main(argv) == 2
+    else:
+        mode = credential.stat().st_mode
+        os.chmod(credential, 0)
+        try:
+            assert cli_main.main(argv) == 2
+        finally:
+            os.chmod(credential, mode)
+    err = capsys.readouterr().err
+    assert err.startswith("zeta: ") and message in err
+    assert "Traceback" not in err
+
+
+def test_startup_with_a_symlinked_login_is_a_bad_login_not_a_read_error(
+    tmp_path: Path,
+) -> None:
+    credential = _save_account(tmp_path)
+    target = tmp_path / "elsewhere-oauth.json"
+    credential.rename(target)
+    credential.symlink_to(target)
+    original = target.read_bytes()
+
+    for migrate in (
+        AccountStore(tmp_path).migrate,
+        lambda: asyncio.run(server_accounts.migrate(tmp_path)),
+    ):
+        with pytest.raises(AccountError, match="OAuth credentials are invalid; login required"):
+            migrate()
+    assert credential.is_symlink()
+    assert target.read_bytes() == original
+
+
+def test_startup_out_of_files_is_not_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _save_account(tmp_path)
+
+    def exhausted(*_args: object) -> None:
+        raise OSError(errno.EMFILE, "Too many open files", "default")
+
+    # test-contract: seam real EMFILE needs the whole process out of descriptors
+    monkeypatch.setattr(account_store_module, "_open_account_directory", exhausted)
+    with pytest.raises(OSError) as caught:
+        AccountStore(tmp_path).migrate()
+    assert caught.value.errno == errno.EMFILE
+
+
+def test_startup_failure_without_a_path_names_no_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credential = _save_account(tmp_path)
+    original = credential.read_bytes()
+
+    def full_disk(*_args: object) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    # test-contract: seam os.write/fsync ENOSPC carries no file name and needs a full disk
+    monkeypatch.setattr(account_store_module, "_open_account_directory", full_disk)
+    warning = (
+        "kept every account file: account migration failed "
+        "(ENOSPC: No space left on device); fix it, then restart zeta"
+    )
+    assert AccountStore(tmp_path).migrate() == (warning,)
+    assert credential.read_bytes() == original
 
 
 def test_accounts_commands_say_how_to_log_in_when_home_has_no_accounts(

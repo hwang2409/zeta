@@ -6,6 +6,8 @@ from zeta.skills import SkillCatalog
 
 import asyncio
 import base64
+import errno
+import os
 from collections.abc import AsyncIterator
 import json
 import subprocess
@@ -2246,6 +2248,31 @@ def test_claude_keychain_bootstrap_treats_timeout_as_missing(
     monkeypatch.setattr(anthropic_module.subprocess, "run", run)
 
     assert anthropic_credentials(tmp_path / "zeta.json").bootstrap() is None
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        (errno.EMFILE, "too many open files (soft limit"),
+        (errno.EIO, "macOS keychain could not be read (EIO"),
+    ],
+)
+def test_claude_keychain_bootstrap_surfaces_os_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int, message: str
+) -> None:
+    def run(*args: object, **kwargs: object) -> object:
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.delenv("ZETA_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(anthropic_module.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(anthropic_module.sys, "platform", "darwin")
+    monkeypatch.setattr(anthropic_module.subprocess, "run", run)
+
+    with pytest.raises(OSError) as caught:
+        anthropic_module.AnthropicCredentialDriver().bootstrap()
+    assert message in str(caught.value)
+    assert "login" not in str(caught.value)
 
 
 def test_claude_file_bootstrap_wins_over_keychain(

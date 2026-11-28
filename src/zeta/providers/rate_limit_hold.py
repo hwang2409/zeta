@@ -54,8 +54,8 @@ class ForegroundChildHeld(Exception):
     """A foreground child hit a hold too long to block its caller; its text is the receipt."""
 
 
-def foreground_hold_abandoned(data: Mapping[str, Any]) -> bool:
-    """A foreground child cannot block its caller on a hold this long; it stops instead."""
+def caller_outwaited(data: Mapping[str, Any]) -> bool:
+    """A hold too long for a caller to wait on: a foreground child stops, a background one wakes its parent."""
     return (
         data.get("limit") == "subscription"
         or float(data["retry_after"]) > LONG_HOLD_WAKE_SECONDS

@@ -17,7 +17,7 @@ from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..core.store._child_runs import child_run_segments
 from ..core.store._step_delivery import TerminalTargetSealedError
 from ..protocol.types import StreamEvent, StreamEventType
-from ..providers.rate_limit_hold import LONG_HOLD_WAKE_SECONDS
+from ..providers.rate_limit_hold import caller_outwaited
 from ..runtime.offload import await_joined_offload
 
 if TYPE_CHECKING:
@@ -110,6 +110,12 @@ def recover_completion_mirrors(
                 child_instance_id, parent_notification.seq, child_lifecycle
             )
     return root_notification
+
+
+def child_note_prefix(child_instance_id: str) -> str:
+    """Start of a note's ``child_idle`` text; the TUI reads it to label the card."""
+
+    return f"child {child_instance_id} notes (no reply needed; it keeps working): "
 
 
 @dataclass(slots=True)
@@ -212,11 +218,7 @@ class HoldWake:
         hold = event.data
         if self._status is None or not self._status["held"]:
             await self._update_status(held=True)
-        if (
-            self._channel is None
-            or self._woken
-            or hold["retry_after"] <= LONG_HOLD_WAKE_SECONDS
-        ):
+        if self._channel is None or self._woken or not caller_outwaited(hold):
             return True
         self._woken = True
         # a subscription hold names its account; a rate limit uses the child's pin
@@ -390,6 +392,18 @@ class ConversationChannel:
             child_instance_id, lambda _s: NotificationInput("child_idle", data)
         )
         return result.entries[0] if result.entries else None
+
+    async def publish_note(
+        self, *, child_instance_id: str, child_session_path: str, note: str
+    ) -> None:
+        """Send a no-reply child note as an idle notice; it never opens a question."""
+
+        await self.publish_idle(
+            child_instance_id=child_instance_id,
+            child_session_path=child_session_path,
+            description=self._owner.description(child_instance_id),
+            text=child_note_prefix(child_instance_id) + note,
+        )
 
     async def publish_hold(
         self,

@@ -18,6 +18,7 @@ from ..telemetry import Telemetry
 from .abandoned_closes import AbandonedCloses, live_abandoned_closes
 from .call_deadline import MCPCallDeadline, finish_call_cleanup
 from .client import (
+    MCPAuthRequiredError,
     MCPClient,
     MCPPrompt,
     MCPResourceContent,
@@ -646,7 +647,12 @@ class MCPServerActor(MCPDefinitionPublisher):
         except Exception as exc:  # noqa: BLE001 - isolate one server
             self._tool_refresh.abort_setup(client)
             reason = _error_text(exc)
-            logger.warning("failed to mount MCP server %s: %s", self.name, reason)
+            if isinstance(exc, MCPAuthRequiredError):
+                need = "reauthorization" if exc.reauthorize else "authorization"
+                notice = f"mcp · {self.name} needs {need}: /mcp auth {self.name}"
+            else:
+                logger.warning("failed to mount MCP server %s: %s", self.name, reason)
+                notice = f"mcp · {self.name} failed: {reason}"
             status = MCPServerStatus(
                 self.name,
                 config.transport,
@@ -654,7 +660,7 @@ class MCPServerActor(MCPDefinitionPublisher):
                 reason=reason,
                 stderr_log_path=str(mcp_log_path(self.name)),
             )
-            _notice(notice_sink, f"mcp · {self.name} failed: {reason}")
+            _notice(notice_sink, notice)
             return _SetupOutcome(status, client)
         status = MCPServerStatus(
             self.name,

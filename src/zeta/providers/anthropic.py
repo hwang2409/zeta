@@ -32,6 +32,7 @@ from ..oauth import (
     OAuthRefreshFailure,
     ProviderLoginRequiredError,
     classify_oauth_refresh_failure,
+    raise_if_unreadable,
 )
 from .anthropic_errors import (
     AnthropicAuthError,
@@ -228,7 +229,10 @@ def _keychain_claude_tokens() -> OAuthTokens | None:
             text=True,
             timeout=2,
         )
-    except (OSError, subprocess.SubprocessError):
+    except OSError as exc:
+        raise_if_unreadable(exc, "macOS keychain")
+        return None  # no `security` tool: no keychain to read
+    except subprocess.SubprocessError:
         return None
     if result.returncode != 0 or not isinstance(result.stdout, str) or not result.stdout.strip():
         return None
@@ -294,6 +298,7 @@ class AnthropicCredentialDriver:
             except self.auth_error_type:
                 raise
             except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise_if_unreadable(exc, "Claude credentials file")
                 raise self.auth_error_type(
                     f"{self.provider_label} credentials could not be read"
                 ) from exc
@@ -650,9 +655,12 @@ class AnthropicBackend(CompletionBackend):
             entered = True
             try:
                 if response.status_code >= 400:
+                    account = getattr(self.token_store, "account", None)
                     raise await build_response_error(
                         response,
-                        _http_error,
+                        lambda status, body, headers: _http_error(
+                            status, body, headers, account=account
+                        ),
                     )
                 async for event in _decode_response(
                     response,

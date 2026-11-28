@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -103,6 +104,25 @@ def resolve_child_backend(
         return None, f"agent error: could not start {provider} backend: {exc}"
     return backend, None
 
+
+async def refuse_held_child_backend(loop: AgentLoop, child_backend: object) -> str | None:
+    """Refusal text when the child's account has a long cached hold, read off-loop.
+
+    On refusal, a backend built only for this child is closed before returning.
+    """
+    accounts = getattr(loop, "account_context", None)
+    if accounts is None:
+        return None
+    refusal = await asyncio.to_thread(
+        accounts.spawn_hold_refusal, getattr(child_backend, "provider", None)
+    )
+    if (
+        refusal is not None
+        and child_backend is not loop.backend
+        and is_owned_completion_backend(child_backend)
+    ):
+        await loop.close_backend(child_backend, stage="child_construction")
+    return refusal
 
 def _load_child_project_context(
     loop: AgentLoop,

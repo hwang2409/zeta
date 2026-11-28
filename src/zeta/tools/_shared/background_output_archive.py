@@ -32,7 +32,8 @@ class _BackgroundOutputArchive:
     """
 
     def __init__(self, directory_fd: int) -> None:
-        self._directory_fd = os.dup(directory_fd)
+        # Borrow the owner's pinned directory; the owner closes this archive first.
+        self._directory_fd = directory_fd
         opened: list[int] = []
         try:
             self._archive_fd = open_session_file(
@@ -51,14 +52,12 @@ class _BackgroundOutputArchive:
         except BaseException:
             for fd in reversed(opened):
                 os.close(fd)
-            os.close(self._directory_fd)
             raise
         self._release_archive = weakref.finalize(self, os.close, self._archive_fd)
         self._release_journal = weakref.finalize(self, os.close, self._journal_fd)
         self._release_transaction = weakref.finalize(
             self, os.close, self._transaction_fd
         )
-        self._release_directory = weakref.finalize(self, os.close, self._directory_fd)
         self._lock = threading.RLock()
         self._closed = False
         self._committed_length = 0
@@ -152,7 +151,6 @@ class _BackgroundOutputArchive:
             self._release_archive()
             self._release_journal()
             self._release_transaction()
-            self._release_directory()
 
     def _append_locked(self, task_id: str, source_fd: int, length: int) -> None:
         existing = self._ranges.get(task_id)

@@ -3337,6 +3337,12 @@ error code and message. Provider status and origin remain internal.
   Controllers can call it before attaching a session. Observers retain the
   existing active-session requirement.
 - `session_settings`: returns `model`, `approval_mode`, and `plan_mode`. with the negotiated `otel` feature it also returns `telemetry` (`enabled`, `state`, and `reason`); endpoint and exporter details are never returned.
+  Controllers and observers must both pass `session_id`. A missing or empty
+  `session_id` returns `-32602` (`session_id must be a nonempty string`). A
+  `session_id` that is not the active session (for an observer, the session it
+  joined with `session_history_and_subscribe`) returns `-32003`
+  `NO_ACTIVE_SESSION` (`session is not active`, no `data`). Observer replies do
+  not include `plan_mode`.
 - `account_list` without `account_list_idle_v1`: takes `session_id` and
   returns every named subscription
   account with `account`, `label`, optional `detail`, `current`, `default`, and

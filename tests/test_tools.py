@@ -48,6 +48,12 @@ def _python_command(source: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
 
 
+def _expected_child_niceness(parent: int, increment: int) -> int:
+    # The launcher sets min(19, parent + increment). A parent already above 19
+    # (macOS allows 20) cannot lower its nice value without root, so it stays put.
+    return max(parent, min(19, parent + increment))
+
+
 def _niceness_command() -> str:
     return _python_command("import os; print(os.getpriority(os.PRIO_PROCESS, 0))")
 
@@ -196,6 +202,83 @@ async def test_registry_validates_arguments_before_running_handler(tmp_path: Pat
     assert result["isError"] is True
     assert "invalid arguments" in result["content"][0]["text"]
     assert not called
+
+
+@pytest.mark.asyncio
+async def test_registry_size_errors_state_the_limit_and_the_real_size(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    registry.register(
+        "sized",
+        lambda arguments: "ran",
+        parameters={
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "minLength": 2, "maxLength": 5},
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 2,
+                },
+            },
+            "additionalProperties": False,
+        },
+    )
+    try:
+        cases = {
+            "long": (
+                {"summary": "x" * 9},
+                "arguments.summary is too long (9 > 5 characters)",
+            ),
+            "short": (
+                {"summary": "x"},
+                "arguments.summary is too short (1 < 2 characters)",
+            ),
+            "items": (
+                {"options": ["a", "b", "c"]},
+                "arguments.options has too many items (3 > 2)",
+            ),
+        }
+        for call_id, (arguments, message) in cases.items():
+            result = await registry.execute(ToolCall(call_id, "sized", arguments))
+            assert result["isError"] is True
+            assert result["content"][0]["text"] == f"invalid arguments: {message}"
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_rejects_a_copied_context_placeholder_before_schema_checks(
+    tmp_path: Path,
+) -> None:
+    called = False
+
+    def handler(arguments: dict[str, object]) -> str:
+        nonlocal called
+        called = True
+        return "ran"
+
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    # an open schema: without the early check the placeholder would reach the handler
+    registry.register(
+        "open", handler, parameters={"type": "object"}, requires_approval=False
+    )
+    try:
+        result = await registry.execute(
+            ToolCall("copied", "open", {"eviction_receipt": {"source_seq": 649}})
+        )
+        assert result["content"][0]["text"] == (
+            "invalid arguments: you copied a context placeholder; send the real arguments"
+        )
+        assert result["isError"] is True
+        assert not called
+    finally:
+        await registry.close()
 
 
 def test_registry_rejects_unsupported_schema_constructs(tmp_path: Path) -> None:
@@ -347,10 +430,7 @@ async def test_bash_lowers_child_priority_without_changing_parent(tmp_path: Path
         ToolCall("bash-niceness", "bash", {"command": _niceness_command()})
     )
 
-    max_niceness = 20 if sys.platform == "darwin" else 19
-    assert int(result["structuredContent"]["stdout"]) == min(
-        max_niceness, parent_niceness + 10
-    )
+    assert int(result["structuredContent"]["stdout"]) == _expected_child_niceness(parent_niceness, 10)
     assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
 
 
@@ -1972,7 +2052,11 @@ async def test_bash_timeout_marker_is_not_output_capped(
     text = result["content"][0]["text"]
     assert result["isError"] is True
     assert text.startswith(marker + "\n")
-    assert len(text.encode()) <= len(marker.encode()) + 1 + max_output
+    # the hint line (F066) follows the capped output and is not counted
+    hint = "\nhint: pass a larger `timeout` (max 3600) or use run_background"
+    assert text.endswith(hint)
+    capped = text.removesuffix(hint)
+    assert len(capped.encode()) <= len(marker.encode()) + 1 + max_output
     assert result["structuredContent"]["timed_out"] is True
 
 
@@ -2861,10 +2945,7 @@ async def test_run_background_lowers_child_priority_without_changing_parent(
         ToolCall("bg-niceness-output", "task_output", {"task_id": task_id})
     )
 
-    max_niceness = 20 if sys.platform == "darwin" else 19
-    assert int(output["structuredContent"]["output"]) == min(
-        max_niceness, parent_niceness + 10
-    )
+    assert int(output["structuredContent"]["output"]) == _expected_child_niceness(parent_niceness, 10)
     assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
     await registry.close()
 

@@ -13,6 +13,7 @@ from enum import Enum
 from typing import Any, cast
 
 from ..core.session_files import SessionFileReplaced, child_directory
+from ..oauth import raise_if_out_of_files
 from ..storage_format import (
     CLOSED_VARIANTS,
     reject_unknown_keys,
@@ -341,5 +342,7 @@ class _AccountRegistry:
                 if key not in accounts or not key.startswith(f"{provider}:"):
                     raise ValueError
             return _Registry.LOADED, normalized
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            # any other failed read is BROKEN: startup warns and keeps the file
+            raise_if_out_of_files(exc, "account registry")
             return _Registry.BROKEN, empty
