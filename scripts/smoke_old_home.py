@@ -3,12 +3,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HINT = re.compile(r"zeta storage-format advance --expected-epoch 0 --target-epoch \d+")
@@ -51,6 +53,110 @@ def run(binary: Path, home: Path, *args: str) -> subprocess.CompletedProcess[str
     return subprocess.run(
         [str(binary), *args], env=env, text=True, capture_output=True, check=False
     )
+
+
+LOGIN = """
+import os
+from pathlib import Path
+from zeta.accounts import AccountCredentials, AccountId, AccountStore
+from zeta.oauth import OAuthTokens
+from zeta.providers.anthropic import AnthropicCredentialDriver
+AccountCredentials(
+    AccountStore(Path(os.environ["ZETA_HOME"])),
+    AccountId("anthropic", "default"),
+    AnthropicCredentialDriver(),
+).save(OAuthTokens("access", "refresh", 9_999_999_999))
+"""
+
+
+EPOCH = "from zeta.storage_format import WRITER_EPOCH; print(WRITER_EPOCH)"
+
+ALIGNED_START = """
+import sys, time
+from zeta.cli.main import main
+while time.time() < float(sys.argv[1]):
+    pass
+sys.exit(main(["session", "list"]))
+"""
+
+
+def start_fresh(binary: Path, home: Path, label: str) -> None:
+    started = run(binary, home, "session", "list")
+    if started.returncode != 0:
+        raise AssertionError(
+            f"{label}: first start failed:\n{started.stdout}\n{started.stderr}"
+        )
+    if not (home / "zeta" / "storage-format.json").is_file():
+        raise AssertionError(f"{label}: first start wrote no stored-format manifest")
+    print(f"passed: {label}")
+
+
+def smoke_fresh_homes(binary: Path, python: Path, root: Path) -> None:
+    """A new user's home must start with no manual storage-format step."""
+    empty = root / "empty"
+    (empty / "user").mkdir(parents=True)
+    (empty / "zeta").mkdir()
+    start_fresh(binary, empty, "empty home")
+
+    missing = root / "missing"
+    (missing / "user").mkdir(parents=True)
+    start_fresh(binary, missing, "missing home")
+
+    # cold starts spread over ~100 ms of imports and miss the one-fsync bootstrap window,
+    # so each start imports first and calls the real entry point at one shared instant
+    epoch = json.loads(
+        subprocess.run(
+            [str(python), "-c", EPOCH], text=True, capture_output=True, check=True
+        ).stdout
+    )
+    for index in range(10):
+        concurrent = root / f"concurrent-{index}"
+        (concurrent / "user").mkdir(parents=True)
+        env = {
+            "HOME": str(concurrent / "user"),
+            "ZETA_HOME": str(concurrent / "zeta"),
+            "PATH": os.environ["PATH"],
+        }
+        go = str(time.time() + 3)
+        starts = [
+            subprocess.Popen(
+                [str(python), "-c", ALIGNED_START, go],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(4)
+        ]
+        for started in starts:
+            stdout, stderr = started.communicate(timeout=120)
+            if started.returncode != 0:
+                raise AssertionError(
+                    f"concurrent first start failed:\n{stdout}\n{stderr}"
+                )
+        zeta_home = concurrent / "zeta"
+        manifests = sorted(
+            path.name for path in zeta_home.glob("*storage-format.json*")
+        )
+        if manifests != ["storage-format.json"]:
+            raise AssertionError(f"concurrent first starts left manifests {manifests}")
+        manifest = json.loads((zeta_home / "storage-format.json").read_text())
+        if manifest != {"writer_epoch": epoch}:
+            raise AssertionError(f"concurrent first starts wrote manifest {manifest}")
+    print("passed: concurrent first starts")
+
+    login = root / "login"
+    (login / "user").mkdir(parents=True)
+    logged_in = subprocess.run(
+        [str(python), "-c", LOGIN],
+        env={"HOME": str(login / "user"), "ZETA_HOME": str(login / "zeta")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if logged_in.returncode != 0:
+        raise AssertionError(f"login through zeta's store failed:\n{logged_in.stderr}")
+    start_fresh(binary, login, "login-only home")
 
 
 def main() -> int:
@@ -123,6 +229,7 @@ def main() -> int:
                 f"zeta imported outside virtual environment: {imported}"
             )
         binary = venv / "bin" / "zeta"
+        smoke_fresh_homes(binary, venv / "bin" / "python", temp_root / "fresh")
 
         zeta_home = home / "zeta"
         before = snapshot_home(zeta_home)
