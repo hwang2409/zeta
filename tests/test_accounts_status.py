@@ -895,7 +895,9 @@ def test_one_unreadable_account_is_listed_unavailable_after_startup(
     opened = manager.create(provider="codex", model="gpt-5.5", cwd=tmp_path)
     try:
         reads = {
-            "session start": lambda: SessionAccountContext.load(tmp_path, manager, opened.metadata),
+            "session start": lambda: SessionAccountContext.load(
+                tmp_path, manager, opened.metadata
+            ),
             "account_list": store.catalog_snapshot,
             "state accounts": store.state_rows,
         }
@@ -908,7 +910,9 @@ def test_one_unreadable_account_is_listed_unavailable_after_startup(
                 return open_directory(home_fd, account)
 
             # test-contract: seam real EMFILE needs the whole process out of descriptors
-            monkeypatch.setattr(account_store_module, "_open_account_directory", exhausted)
+            monkeypatch.setattr(
+                account_store_module, "_open_account_directory", exhausted
+            )
             for name, read in reads.items():
                 with pytest.raises(OSError) as caught:
                     read()
@@ -925,7 +929,10 @@ def test_one_unreadable_account_is_listed_unavailable_after_startup(
             os.chmod(path, mode)
         assert context.resolve("codex") == default
         assert context.unavailable_accounts == (str(work),)
-        assert {item.account: item.available for item in displays} == {default: True, work: False}
+        assert {item.account: item.available for item in displays} == {
+            default: True,
+            work: False,
+        }
         assert {item["account_id"]: item["status"] for item in rows} == {
             str(default): "selected",
             str(work): "error",
