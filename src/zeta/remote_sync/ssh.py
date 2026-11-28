@@ -110,6 +110,7 @@ _MANIFEST = {storage_format._MANIFEST!r}
 _BOOTSTRAP_WAIT_SECONDS = {storage_format._BOOTSTRAP_WAIT_SECONDS!r}
 _BOOTSTRAP_NOTICE_SECONDS = {storage_format._BOOTSTRAP_NOTICE_SECONDS!r}
 _LEASE = None
+NOTICE_SINK = None
 
 def _reject(reason): print(f"zeta-remote: {{reason}}", file=sys.stderr); sys.exit(46)
 

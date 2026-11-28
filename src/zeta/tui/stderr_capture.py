@@ -15,6 +15,7 @@ from typing import Any
 
 from prompt_toolkit.patch_stdout import patch_stdout
 
+from .. import storage_format
 from ..core.session import env_home
 
 _TUI_STDERR_MAX_BYTES = 50 * 1024 * 1024
@@ -170,11 +171,16 @@ def run_tui_session(
             if owner is not None:
                 await owner.stop()
 
-    with patch_stdout(raw=True):
-        # prompt_toolkit temporarily proxies stderr to the terminal; incidental
-        # diagnostics must keep using the already redirected descriptor.
-        sys.stderr = sys.__stderr__
-        return asyncio.run(run())
+    # a raw line would corrupt the screen the TUI owns: send notices to the log meanwhile
+    sink, storage_format.NOTICE_SINK = storage_format.NOTICE_SINK, None
+    try:
+        with patch_stdout(raw=True):
+            # prompt_toolkit temporarily proxies stderr to the terminal; incidental
+            # diagnostics must keep using the already redirected descriptor.
+            sys.stderr = sys.__stderr__
+            return asyncio.run(run())
+    finally:
+        storage_format.NOTICE_SINK = sink
 
 
 def run_tui_lifecycle(args: Any, lifecycle: Any) -> tuple[int, str | None]:
@@ -215,6 +221,7 @@ def _setup() -> None:
         _TERMINAL_FD = terminal_fd
         _LOCK_FD = log_fd
         _SETUP = True
+        storage_format.NOTICE_SINK = write_terminal
     except BaseException as exc:
         if log_fd is not None:
             os.close(log_fd)

@@ -694,3 +694,35 @@ def test_resume_override_rejection_reaches_the_terminal(tmp_path: Path, monkeypa
     assert b"session override rejected" in output, output
     assert b"'claude' (from --provider)" in output, output
     assert returncode == 1
+
+
+def test_bootstrap_wait_notice_reaches_the_terminal_until_the_tui_owns_it(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "zeta-home"
+    code = f"""
+import os
+from pathlib import Path
+from zeta import storage_format
+from zeta.tui.stderr_capture import run_tui_session, stderr_to_log
+lock = os.open({str(tmp_path / "lock")!r}, os.O_RDWR | os.O_CREAT, 0o600)
+with stderr_to_log():
+    storage_format._say_waiting(lock, Path('/before-paint'))
+
+    async def painted(_app, _args):
+        storage_format._say_waiting(lock, Path('/after-paint'))
+        return False, False
+
+    run_tui_session(None, None, painted)
+    storage_format._say_waiting(lock, Path('/after-exit'))
+"""
+    terminal, returncode = _run_pty_python(code, _capture_env(home))
+
+    assert returncode == 0, terminal
+    waiting = b"zeta: waiting for another zeta process to finish creating "
+    assert waiting + b"/before-paint" in terminal, terminal
+    assert waiting + b"/after-exit" in terminal, terminal
+    # once the TUI owns the screen a raw line would corrupt it: it goes to the log
+    assert b"/after-paint" not in terminal, terminal
+    (log,) = (home / "logs" / "tui-stderr").glob("*.log")
+    assert (waiting + b"/after-paint") in log.read_bytes()
