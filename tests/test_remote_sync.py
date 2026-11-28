@@ -97,7 +97,8 @@ def test_mirror_temporary_kind_keys_match_entry_store() -> None:
 
 def _git_repo(path: Path) -> None:
     path.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    # pin the branch: the session-push test asserts it, and init.defaultBranch varies
+    subprocess.run(["git", "init", "-q", "-b", "master"], cwd=path, check=True)
     subprocess.run(
         ["git", "config", "user.email", "test@example.com"], cwd=path, check=True
     )
@@ -2078,6 +2079,11 @@ def test_p06_3_generated_project_programs_refuse_manifestless_state_like_local(
     )
 
     assert fetch.returncode == 53, "generated program wrote over gated state"
+    advance = (
+        "run zeta storage-format advance --expected-epoch 0 "
+        f"--target-epoch {storage_format.writer_epoch()}"
+    )
+    assert advance in fetch.stderr.decode(), fetch.stderr
     assert not (remote_home / "storage-format.json").exists()
     assert not (local_home / "storage-format.json").exists()
 
@@ -2144,18 +2150,20 @@ def test_remote_first_open_waits_for_a_held_bootstrap(tmp_path: Path) -> None:
             stderr=subprocess.PIPE,
             text=True,
         )
+        first_line = ""
         try:
-            try:
-                # hold past the notice so the shipped program prints its waiting line
-                fetch.wait(storage_format._BOOTSTRAP_NOTICE_SECONDS + 0.5)
-            except subprocess.TimeoutExpired:
-                pass
+            # hold until the shipped program prints its waiting line (its notice
+            # clock starts after interpreter startup, not at Popen)
+            assert fetch.stderr is not None
+            if select.select([fetch.stderr], [], [], 30)[0]:
+                first_line = fetch.stderr.readline()
             (home / "storage-format.json").write_text(
                 json.dumps({"writer_epoch": writer_epoch()}) + "\n"
             )
         finally:
             fcntl.flock(holder, fcntl.LOCK_UN)
-        stdout, stderr = fetch.communicate(timeout=30)
+        stdout, rest = fetch.communicate(timeout=30)
+        stderr = first_line + rest
     finally:
         os.close(holder)
     assert "Traceback" not in stderr, stderr
@@ -2214,6 +2222,14 @@ def test_remote_first_open_ships_the_local_bootstrap_owner() -> None:
         rest = rest.replace(inspect.getsource(owner), "")
     for primitive in ("LOCK_EX", "os.replace", "os.rename"):
         assert primitive not in rest, f"remote program bootstraps outside the owner: {primitive}"
+
+
+def test_remote_manifest_refusal_ships_the_local_text() -> None:
+    builder = storage_format._missing_manifest_text
+    assert str(storage_format._missing_manifest_error(Path("/h"))) == builder(Path("/h"))
+    for name, program in _SHIPPED_PROGRAMS.items():
+        assert inspect.getsource(builder) in program, name
+        assert program.count("storage-format advance") == 1, f"{name} spells the hint twice"
 
 
 def test_shipped_remote_programs_parse_as_python_3_8() -> None:
