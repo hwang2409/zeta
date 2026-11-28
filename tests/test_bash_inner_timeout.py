@@ -33,12 +33,12 @@ async def _run(tmp_path: Path, arguments: dict[str, Any]) -> tuple[str, dict]:
                 registry.execute(ToolCall("inner", "bash", arguments))
             )
             try:
-                done, _ = await asyncio.wait({call}, timeout=5)
+                done, _ = await asyncio.wait({call}, timeout=10)
                 assert done, "bash kept the 30 s default instead of the inner timeout"
                 result = call.result()
             finally:
                 call.cancel()
-                await asyncio.gather(call, return_exceptions=True)
+                await asyncio.wait_for(asyncio.gather(call, return_exceptions=True), 10)
         finally:
             await registry.close()
     finally:
@@ -47,21 +47,19 @@ async def _run(tmp_path: Path, arguments: dict[str, Any]) -> tuple[str, dict]:
 
 
 @pytest.mark.asyncio
-async def test_inner_timeout_sets_the_tool_timeout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # margin 0 keeps the test short; the margin itself is checked below
-    monkeypatch.setattr(bash_tool, "_INNER_TIMEOUT_MARGIN_SECONDS", 0.0, raising=False)
+async def test_inner_timeout_sets_the_tool_timeout(tmp_path: Path) -> None:
+    # the tool kills at N plus the 5 s margin, far before the 30 s default
     _, result = await _run(tmp_path, {"command": _IGNORE_N + "timeout 0.3 sleep 30"})
 
     assert result["structuredContent"]["timed_out"] is True
-    assert result["structuredContent"]["timeout_seconds"] == 0.3
+    assert result["structuredContent"]["timeout_seconds"] == 5.3
 
 
 @pytest.mark.asyncio
 async def test_inner_timeout_longer_than_default_is_not_killed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # test-contract: seam the 30 s default cannot be waited out in a unit test
     monkeypatch.setattr(bash_tool, "_DEFAULT_TIMEOUT_SECONDS", 0.2, raising=False)
     text, result = await _run(
         tmp_path, {"command": _IGNORE_N + "timeout 2 sleep 0.5; echo done"}
