@@ -2150,18 +2150,20 @@ def test_remote_first_open_waits_for_a_held_bootstrap(tmp_path: Path) -> None:
             stderr=subprocess.PIPE,
             text=True,
         )
+        first_line = ""
         try:
-            try:
-                # hold past the notice so the shipped program prints its waiting line
-                fetch.wait(storage_format._BOOTSTRAP_NOTICE_SECONDS + 0.5)
-            except subprocess.TimeoutExpired:
-                pass
+            # hold until the shipped program prints its waiting line (its notice
+            # clock starts after interpreter startup, not at Popen)
+            assert fetch.stderr is not None
+            if select.select([fetch.stderr], [], [], 30)[0]:
+                first_line = fetch.stderr.readline()
             (home / "storage-format.json").write_text(
                 json.dumps({"writer_epoch": writer_epoch()}) + "\n"
             )
         finally:
             fcntl.flock(holder, fcntl.LOCK_UN)
-        stdout, stderr = fetch.communicate(timeout=30)
+        stdout, rest = fetch.communicate(timeout=30)
+        stderr = first_line + rest
     finally:
         os.close(holder)
     assert "Traceback" not in stderr, stderr
