@@ -43,7 +43,7 @@ from ..protocol.types import (
 )
 from ..providers.rate_limit_hold import (
     ForegroundChildHeld,
-    foreground_hold_abandoned,
+    caller_outwaited,
     foreground_hold_text,
     rate_limit_hold_text,
 )
@@ -184,7 +184,7 @@ async def consume_child(
         async for event in events:
             forward_nested_agent_start(child_loop, event)
             if await hold_wake.observe(event):
-                if not background and foreground_hold_abandoned(event.data):
+                if not background and caller_outwaited(event.data):
                     raise ForegroundChildHeld(foreground_hold_text(event.data))
                 account_text = hold_wake.held_account_text()
                 hold_text = rate_limit_hold_text(event.data, pinned=account_text is not None)

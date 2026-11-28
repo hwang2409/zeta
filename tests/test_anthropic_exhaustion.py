@@ -88,6 +88,19 @@ def test_short_retry_after_429_still_retries_inside_budget() -> None:
     assert plan.delay == 5.0
 
 
+@pytest.mark.parametrize("value", ["inf", "1e15", "Fri, 31 Dec 9999 23:59:59 GMT"])
+def test_absurd_retry_after_is_no_value(value: str) -> None:
+    status, _headers, body = RATE_LIMIT_429
+    try:
+        error = http_error(status, body, {"retry-after": value}, account=ACCOUNT)
+    except OverflowError:
+        error = None
+    assert error is not None, "an absurd Retry-After must not replace the HTTP error"
+    assert error.status_code == 429
+    assert error.retry_after is None
+    assert getattr(error, "subscription_limit", None) is None
+
+
 def test_other_anthropic_400_is_not_exhaustion() -> None:
     body = json.dumps(
         {"type": "error", "error": {"type": "invalid_request_error", "message": "bad"}}
