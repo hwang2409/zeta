@@ -729,7 +729,7 @@ class ConversationLogMixin:
                 os.close(fd)
 
         try:
-            entries, torn_at = self._parse_entry_lines(
+            entries, torn_at, ends = self._parse_entry_lines(
                 raw, first_row=len(self._resident_rows.rows) + 2
             )
         except ConversationIntegrityError:
@@ -745,7 +745,14 @@ class ConversationLogMixin:
             return
 
         try:
-            accepted = self._accept_incremental_entries(entries)
+            starts = [0, *ends[:-1]]
+            spans = [
+                (known_offset + start, end - start) for start, end in zip(starts, ends)
+            ]
+            if not self._read_only and not raw.endswith(b"\n") and spans:
+                # The row slot includes the terminator written below.
+                spans[-1] = (spans[-1][0], spans[-1][1] + 1)
+            accepted = self._accept_incremental_entries(entries, spans)
         except ConversationIntegrityError:
             self._load_full()
             return
@@ -1114,8 +1121,10 @@ class ConversationLogMixin:
 
     def _parse_entry_lines(
         self: ConversationStore, raw: bytes, *, first_row: int
-    ) -> tuple[list[ConversationEntry], int | None]:
+    ) -> tuple[list[ConversationEntry], int | None, list[int]]:
+        """Parse whole rows; also return the end offset of each parsed row."""
         entries: list[ConversationEntry] = []
+        ends: list[int] = []
         offset = 0
         index = 0
         while offset < len(raw):
@@ -1140,7 +1149,7 @@ class ConversationLogMixin:
                     raise ConversationIntegrityError(
                         f"invalid {kind}conversation row {first_row + index}: {self.path}"
                     ) from exc
-                return entries, offset
+                return entries, offset, ends
             if not isinstance(row, dict):
                 raise ConversationIntegrityError(
                     f"conversation row {first_row + index} is not an object: {self.path}"
@@ -1154,8 +1163,9 @@ class ConversationLogMixin:
                     f"invalid conversation entry: {self.path}"
                 ) from exc
             offset = line_end
+            ends.append(line_end)
             index += 1
-        return entries, None
+        return entries, None, ends
 
     @staticmethod
     def _read_fd(fd: int, length: int) -> bytes:

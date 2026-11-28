@@ -328,8 +328,10 @@ def _build_append_entries(
     rows: tuple[ConversationRow, ...],
     deterministic_ids: tuple[str, ...],
 ) -> list[ConversationEntry]:
-    prior_ids = set(store._entry_ids)
-    parent_id = store._resident_rows.rows[-1].id if store._resident_rows.rows else None
+    prior_ids = store._entry_ids
+    batch_ids: set[str] = set()
+    tip_id = store._resident_rows.rows[-1].id if store._resident_rows.rows else None
+    parent_id = tip_id
     next_seq = store._resident_rows.rows[-1].seq + 1 if store._resident_rows.rows else 1
     entries: list[ConversationEntry] = []
     for index, row in enumerate(rows):
@@ -346,7 +348,7 @@ def _build_append_entries(
         entry_id = (
             deterministic_ids[index] if deterministic_ids else os.urandom(16).hex()
         )
-        if entry_id in prior_ids:
+        if entry_id in prior_ids or entry_id in batch_ids:
             raise ConversationIntegrityError(f"duplicate conversation id: {entry_id}")
         entry = ConversationEntry(
             seq=next_seq + index,
@@ -359,8 +361,13 @@ def _build_append_entries(
         store._validate_notification_write(entry.type, entry.data)
         store._validate_entry_payload(entry)
         entries.append(entry)
-        prior_ids.add(entry_id)
+        batch_ids.add(entry_id)
         parent_id = entry_id
+    if entries[0].parent_id == tip_id:
+        # The branch up to the tip is already validated and this loop fixed the
+        # tail's seq, ids and parents, so only the tail's relations need checks.
+        store._validate_linear_tail(entries)
+        return entries
     store._resident_rows.extend(entries)
     try:
         store._validate_entries()
