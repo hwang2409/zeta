@@ -48,6 +48,12 @@ def _python_command(source: str) -> str:
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(source)}"
 
 
+def _expected_child_niceness(parent: int, increment: int) -> int:
+    # The launcher sets min(19, parent + increment). A parent already above 19
+    # (macOS allows 20) cannot lower its nice value without root, so it stays put.
+    return max(parent, min(19, parent + increment))
+
+
 def _niceness_command() -> str:
     return _python_command("import os; print(os.getpriority(os.PRIO_PROCESS, 0))")
 
@@ -424,10 +430,7 @@ async def test_bash_lowers_child_priority_without_changing_parent(tmp_path: Path
         ToolCall("bash-niceness", "bash", {"command": _niceness_command()})
     )
 
-    max_niceness = 20 if sys.platform == "darwin" else 19
-    assert int(result["structuredContent"]["stdout"]) == min(
-        max_niceness, parent_niceness + 10
-    )
+    assert int(result["structuredContent"]["stdout"]) == _expected_child_niceness(parent_niceness, 10)
     assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
 
 
@@ -2942,10 +2945,7 @@ async def test_run_background_lowers_child_priority_without_changing_parent(
         ToolCall("bg-niceness-output", "task_output", {"task_id": task_id})
     )
 
-    max_niceness = 20 if sys.platform == "darwin" else 19
-    assert int(output["structuredContent"]["output"]) == min(
-        max_niceness, parent_niceness + 10
-    )
+    assert int(output["structuredContent"]["output"]) == _expected_child_niceness(parent_niceness, 10)
     assert os.getpriority(os.PRIO_PROCESS, 0) == parent_niceness
     await registry.close()
 
