@@ -9,7 +9,7 @@ import subprocess
 import sys
 import warnings
 from asyncio import events, unix_events
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import IO, Any
 
@@ -139,8 +139,12 @@ async def create_tool_subprocess_shell(
     pass_fds: Sequence[int] = (),
     env: Mapping[str, str] | None = None,
     niceness: int = 0,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> asyncio.subprocess.Process:
-    """Start a session-owned shell after its stdio and inherited fds are installed."""
+    """Start a session-owned shell after its stdio and inherited fds are installed.
+
+    ``on_spawn`` gets the pid before the first await, so before the launcher can run the command.
+    """
 
     if cwd_fd is None:
         directory = os.fspath(cwd if cwd is not None else os.getcwd())
@@ -185,6 +189,8 @@ async def create_tool_subprocess_shell(
             raise
         proc = transport._proc
         try:
+            if on_spawn is not None:
+                on_spawn(proc.pid)
             await waiter
             await _wait_for_launcher(process=proc)
         except BaseException:

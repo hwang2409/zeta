@@ -49,10 +49,21 @@ def _backend(turns):
     return backend
 
 
-def _parent_with_running_bash(root: str, cwd: str, command: str, pipe) -> None:
+def _parent_with_running_bash(root: str, cwd: str, command: str, pipe, stall_after_spawn: bool = False) -> None:
     """Run in a spawned process: start a background child whose bash call never returns."""
 
     store = ConversationStore(Path(root), cwd=Path(cwd))
+    if stall_after_spawn:
+        bash_tool = importlib.import_module("zeta.tools.bash")
+        real_spawn = bash_tool.spawn_background
+
+        async def stalled_spawn(*args, **kwargs):
+            await real_spawn(*args, **kwargs)
+            # The command already runs; zeta is killed before it gets back from the spawn.
+            await asyncio.wait_for(asyncio.Event().wait(), 300)
+
+        # test-contract: seam zeta dies after the command started but before the spawn call returned.
+        bash_tool.spawn_background = stalled_spawn
 
     async def main() -> None:
         child = _backend([
@@ -111,14 +122,16 @@ def _call_results(backend: FakeBackend) -> list[str]:
     ]
 
 
-async def _crash_with_running_bash(tmp_path: Path, body: str, *, pid_files: tuple[str, ...]) -> tuple[str, list[int]]:
+async def _crash_with_running_bash(
+    tmp_path: Path, body: str, *, pid_files: tuple[str, ...], stall_after_spawn: bool = False,
+) -> tuple[str, list[int]]:
     """Kill a real parent with SIGKILL while its child's bash call runs; return session id and pids."""
 
     command = f"echo $$ > {shlex.quote(str(tmp_path / 'pid'))}; {body}"
     parent_pipe, child_pipe = multiprocessing.get_context("spawn").Pipe()
     process = multiprocessing.get_context("spawn").Process(
         target=_parent_with_running_bash,
-        args=(str(tmp_path / "sessions"), str(tmp_path), command, child_pipe),
+        args=(str(tmp_path / "sessions"), str(tmp_path), command, child_pipe, stall_after_spawn),
     )
     async with owned_child_process(process, endpoints=(parent_pipe, child_pipe)):
         process.start()
@@ -182,6 +195,18 @@ async def test_running_orphan_is_stopped_before_child_resumes(tmp_path, monkeypa
         assert result.startswith("tool execution canceled"), result
         assert "stopped its leftover processes" in result, result
         assert not _records(), "recovery left a record behind"
+
+
+@pytest.mark.asyncio
+async def test_orphan_of_a_crash_right_after_spawn_is_stopped(tmp_path, monkeypatch):
+    session_id, pids = await _crash_with_running_bash(
+        tmp_path, "exec sleep 120", pid_files=("pid",), stall_after_spawn=True,
+    )
+    with _owned_groups(pids):
+        assert _alive(pids[0]), "the orphan must outlive the killed parent"
+        _, lifecycle = await _resume(tmp_path, monkeypatch, session_id, pids, expect_call=False)
+        assert "recovery_blocked" not in lifecycle, lifecycle["recovery_blocked"]
+        assert not _alive(pids[0]), "recovery did not stop the orphan"
 
 
 @pytest.mark.asyncio
@@ -373,6 +398,35 @@ async def test_root_session_bash_removes_its_record(tmp_path):
     assert "timed out" in results[1].content, results[1].content
     assert ".lock" in listing.read_text(), "a root-session call must hold a record while it runs"
     assert not _records(), "a finished or timed-out root-session call left its record behind"
+
+
+@pytest.mark.asyncio
+async def test_bash_call_runs_when_its_record_cannot_be_written(tmp_path, monkeypatch):
+    module = importlib.import_module("zeta.tools._shared.tool_process_record")
+    real_write = module._write
+
+    def failing_pgid_write(fd, value):
+        if value["pgid"] is not None:
+            raise OSError("disk full")
+        real_write(fd, value)
+
+    # test-contract: seam the record write of the process group fails.
+    monkeypatch.setattr(module, "_write", failing_pgid_write)
+    backend = _backend([
+        ScriptedTurn(tool_calls=[ToolCall("root-echo", "bash", {"command": "echo ran"})]),
+        ScriptedTurn([TextContent("done")]),
+    ])
+    with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
+        loop = AgentLoop(backend, store, max_turns=2, skill_catalog=SkillCatalog.empty())
+        try:
+            async for _ in loop.run_turn("go", origin=MessageOrigin.USER):
+                pass
+        finally:
+            await await_or_fail(loop.close(), what="close root loop")
+    messages, _ = backend.calls[-1]
+    (result,) = [m.tool_result for m in messages if m.role is MessageRole.TOOL_RESULT]
+    assert "ran" in result.content, result.content
+    assert not _records()
 
 
 def test_holder_scan_finds_lsof_outside_path(tmp_path, monkeypatch):

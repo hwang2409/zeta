@@ -58,7 +58,11 @@ class ToolProcessRecord:
         self._call_id = call_id
 
     def set_pgid(self, pgid: int) -> None:
-        _write(self.fd, {"call_id": self._call_id, "pgid": pgid, "stopping": False})
+        try:
+            _write(self.fd, {"call_id": self._call_id, "pgid": pgid, "stopping": False})
+        except OSError:
+            # The call still runs; a record without a group makes recovery block instead of guessing.
+            pass
 
     def close_parent_fd(self) -> None:
         if self.fd >= 0:
