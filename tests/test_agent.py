@@ -21849,9 +21849,9 @@ async def test_finish_refusal_shows_notice_and_keeps_draft_report(
         ]
         for refusal in results[:2]:
             assert refusal.is_error
-            assert "notice: also check the macos run" in refusal.content, (
-                refusal.content
-            )
+            # The refusal names the pending input; its text arrives once, next turn.
+            assert "- 1 follow-up message(s)" in refusal.content, refusal.content
+            assert "also check the macos run" not in refusal.content, refusal.content
         assert [result.is_error for result in results] == [True, True, False], [
             result.content for result in results
         ]
@@ -21900,8 +21900,8 @@ async def test_finish_refusal_preview_lists_prompts_and_notifications(
         await asyncio.to_thread(store.pending_prompt_queue.append, "parent says stop")
         preview = pending_delivery_module.StepDeliveryFlow(store).pending_preview()
         assert preview.splitlines() == [
-            "- follow-up: parent says stop",
-            "- agent_completion grandchild-1 completed: review says MERGE-READY",
+            "- 1 follow-up message(s)",
+            "- agent_completion grandchild-1 completed",
         ], preview
     finally:
         store.close()
