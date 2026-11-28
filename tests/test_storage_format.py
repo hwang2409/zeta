@@ -7,6 +7,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -181,9 +182,88 @@ def test_writer_refuses_each_gated_home_shape_without_a_manifest(
     assert not (tmp_path / "storage-format.json").exists()
 
 
-def test_two_processes_can_race_to_bootstrap_one_empty_home(tmp_path: Path) -> None:
+def _hold_exclusive_lock(home: Path) -> int:
+    home.mkdir(parents=True, exist_ok=True)
+    fd = os.open(home / ".storage-format.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def test_first_start_waits_for_a_concurrent_bootstrap_then_opens(
+    tmp_path: Path,
+) -> None:
+    holder = _hold_exclusive_lock(tmp_path)
+    try:
+        command = (
+            "import sys; from zeta.cli.main import main; "
+            "sys.exit(main(['session', 'list']))"
+        )
+        started = subprocess.Popen(
+            [sys.executable, "-c", command],
+            env={**os.environ, "ZETA_HOME": str(tmp_path)},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            try:
+                started.wait(2)  # the other first start is still publishing
+            except subprocess.TimeoutExpired:
+                pass
+            (tmp_path / "storage-format.json").write_text(
+                json.dumps({"writer_epoch": storage_format.WRITER_EPOCH}) + "\n"
+            )
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+        stdout, stderr = started.communicate(timeout=30)
+    finally:
+        os.close(holder)
+    assert "manifest is missing" not in stderr
+    assert started.returncode == 0, stderr
+    assert "no stored zeta sessions" in stdout
+    assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH
+
+
+def test_first_start_wait_is_bounded_then_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # test-contract: seam shorten the 10 s bootstrap wait so a stuck holder is cheap to model
+    monkeypatch.setattr(storage_format, "_BOOTSTRAP_WAIT_SECONDS", 0.2, raising=False)
+    holder = _hold_exclusive_lock(tmp_path)
+    try:
+        with pytest.raises(storage_format.MissingManifest, match="manifest is missing"):
+            open_writer(tmp_path)
+    finally:
+        os.close(holder)
+    assert not (tmp_path / "storage-format.json").exists()
+
+
+def test_data_bearing_home_still_refuses_after_waiting(tmp_path: Path) -> None:
+    (tmp_path / "accounts.json").write_text("{}\n")
+    holder = _hold_exclusive_lock(tmp_path)
+    release = threading.Timer(0.3, fcntl.flock, (holder, fcntl.LOCK_UN))
+    release.start()
+    try:
+        with pytest.raises(storage_format.MissingManifest, match="--expected-epoch 0"):
+            open_writer(tmp_path)
+    finally:
+        release.join(10)
+        os.close(holder)
+    assert not (tmp_path / "storage-format.json").exists()
+
+
+def test_writer_creates_and_bootstraps_a_missing_home(tmp_path: Path) -> None:
+    home = tmp_path / "not" / "yet"
+
+    with open_writer(home):
+        pass
+
+    assert verify(home).writer_epoch == storage_format.WRITER_EPOCH
+
+
+def test_concurrent_first_starts_all_open_one_empty_home(tmp_path: Path) -> None:
     context = multiprocessing.get_context("spawn")
-    connections = [context.Pipe() for _ in range(2)]
+    connections = [context.Pipe() for _ in range(6)]
     processes = [
         context.Process(target=_first_open, args=(str(tmp_path), child))
         for (_parent, child) in connections
@@ -218,12 +298,12 @@ def test_two_processes_can_race_to_bootstrap_one_empty_home(tmp_path: Path) -> N
             process.close()
 
     assert all(exitcode == 0 for exitcode in exitcodes)
-    assert outcomes.count("opened") in {1, 2}
-    assert all(
-        outcome == "opened" or "stored-format manifest is missing" in outcome
-        for outcome in outcomes
-    )
+    assert outcomes == ["opened"] * len(processes)
     assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        ".storage-format.lock",
+        "storage-format.json",
+    ]
 
 
 def test_advance_is_exclusive_across_processes(tmp_path: Path) -> None:
