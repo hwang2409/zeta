@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -230,11 +231,19 @@ def test_first_start_wait_is_bounded_then_refuses(
     # test-contract: seam shorten the 10 s bootstrap wait so a stuck holder is cheap to model
     monkeypatch.setattr(storage_format, "_BOOTSTRAP_WAIT_SECONDS", 0.2, raising=False)
     holder = _hold_exclusive_lock(tmp_path)
+    # the holder lets go after 5 s, so an unbounded wait fails the elapsed check, not hangs
+    release = threading.Timer(5, fcntl.flock, (holder, fcntl.LOCK_UN))
+    release.start()
     try:
+        started = time.monotonic()
         with pytest.raises(storage_format.MissingManifest, match="manifest is missing"):
             open_writer(tmp_path)
+        elapsed = time.monotonic() - started
     finally:
+        release.cancel()
+        release.join(10)
         os.close(holder)
+    assert elapsed < 4, f"bootstrap wait took {elapsed:.2f} s; it must stop at its bound"
     assert not (tmp_path / "storage-format.json").exists()
 
 

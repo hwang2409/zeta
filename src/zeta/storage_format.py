@@ -856,21 +856,27 @@ def _home_has_gated_state(home: Path) -> bool:
         os.close(home_fd)
 
 
+def _wait_for_bootstrap(fd: int, deadline: float) -> bool:
+    """Poll for a shared lock until the exclusive holder finishes or the deadline passes."""
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+        time.sleep(0.01)
+
+
 def _bootstrap_empty_home(fd: int, home: Path) -> None:
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         # another first start or advance holds the lock: wait a bounded time, then the
         # caller reads the manifest it published (still missing -> the usual refusal)
-        deadline = time.monotonic() + _BOOTSTRAP_WAIT_SECONDS
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                return
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise _missing_manifest_error(home) from None
-                time.sleep(0.01)
+        if _wait_for_bootstrap(fd, time.monotonic() + _BOOTSTRAP_WAIT_SECONDS):
+            return
+        raise _missing_manifest_error(home) from None
     if not (home / _MANIFEST).exists():
         if _home_has_gated_state(home):
             _read_manifest(home)
