@@ -524,6 +524,7 @@ class StreamableHTTPMCPClient(MCPClient):
         content_type: str | None = None,
         extra_headers: Mapping[str, str | bytes] = (),
         json: object = None,
+        timeout: httpx.Timeout | None = None,
     ) -> AsyncIterator[httpx.Response]:
         headers = self._auth_headers(oauth_token)
         headers["accept"] = accept
@@ -537,7 +538,11 @@ class StreamableHTTPMCPClient(MCPClient):
         transport_error: str | None = None
         try:
             async with self._client.stream(
-                method, self.config.url, headers=headers, json=json
+                method,
+                self.config.url,
+                headers=headers,
+                json=json,
+                timeout=self._client.timeout if timeout is None else timeout,
             ) as response:
                 if response.status_code == 401:
                     detail = self._redact_error(await _response_detail(response))
@@ -552,6 +557,16 @@ class StreamableHTTPMCPClient(MCPClient):
             raise MCPHTTPError(
                 0, transport_error or "MCP transport request failed"
             )
+
+    def _request_timeout(self, method: str) -> httpx.Timeout | None:
+        if method != "tools/call":
+            return None
+        # the actor's call deadline owns a slow tool; the read limit is only a
+        # backstop, so it must outlast the deadline and never fire first.
+        return httpx.Timeout(
+            HTTP_TIMEOUT_SECONDS,
+            read=self._limits.deadline_seconds + HTTP_TIMEOUT_SECONDS,
+        )
 
     def _redact_error(self, message: str) -> str:
         for secret in (*self.config.headers.values(), self.config.auth_token):
@@ -580,6 +595,7 @@ class StreamableHTTPMCPClient(MCPClient):
                 content_type="application/json",
                 extra_headers=caller_trace_context(str(payload["method"])),
                 json=dict(payload),
+                timeout=self._request_timeout(str(payload["method"])),
             ) as response:
                 state.response = response
                 session_id = response.headers.get("mcp-session-id")
