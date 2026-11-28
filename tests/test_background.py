@@ -3827,7 +3827,7 @@ async def test_close_children_skips_a_sibling_that_finished_during_the_join(
     cancels: list[str] = []
 
     async def watch(instance_id: str) -> None:
-        await released.wait()
+        await asyncio.wait_for(released.wait(), 10)
         owner.unregister(instance_id)
 
     def cancel(instance_id: str) -> None:
