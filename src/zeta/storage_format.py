@@ -863,6 +863,10 @@ def _home_has_gated_state(home: Path) -> bool:
         os.close(home_fd)
 
 
+# the TUI points this at the terminal it kept while fd 2 goes to its capture log
+NOTICE_SINK: Callable[[str], None] | None = None
+
+
 def _say_waiting(fd: int, home: Path) -> None:
     pid = os.pread(fd, 32, 0).decode(errors="replace").strip()
     holder = f" (pid {pid})" if pid.isdigit() else ""
@@ -873,11 +877,11 @@ def _say_waiting(fd: int, home: Path) -> None:
             pass  # alive, owned by another user
         except (ProcessLookupError, OverflowError):
             holder = ""  # a crashed holder left its pid behind
-    print(
-        f"zeta: waiting for another zeta process{holder} to finish creating {home}",
-        file=sys.stderr,
-        flush=True,
-    )
+    message = f"zeta: waiting for another zeta process{holder} to finish creating {home}"
+    if NOTICE_SINK is not None:
+        NOTICE_SINK(message)
+    else:
+        print(message, file=sys.stderr, flush=True)
 
 
 def _wait_for_bootstrap(fd: int, home: Path, deadline: float) -> bool:
