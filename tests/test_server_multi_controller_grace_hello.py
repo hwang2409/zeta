@@ -161,8 +161,9 @@ async def test_list_sessions_marks_grace_session_resident(
         assert graced.get("resident") is True, "a session in this serve's grace must be resident"
 
         expire.set()
+        # wait_closed only waits for records already closing, so wait for retirement first.
+        await _until(lambda: record.closing, "grace expiry starts retirement")
         await await_or_fail(server.controllers.wait_closed(session_id), what="grace expiry closes")
-        await _until(lambda: server.controllers.resident(session_id) is None, "record retired")
         freed = await row(3)
         assert freed["in_use"] is False, freed
         assert freed.get("resident") is False, "an expired grace session is not resident"
