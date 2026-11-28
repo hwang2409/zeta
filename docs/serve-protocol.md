@@ -1677,29 +1677,26 @@ An accepted message is written to the child's own transcript as a pending
 prompt before the response, so it survives a restart. The child reads queued
 messages one at a time, oldest first, at its next model request.
 
-A send to a `"suspended"` row is accepted only while this server owns the run.
-The row has no field that says so directly, so clients use this rule: a
-suspended row accepts a send when `suspension_reason` is
-`"provider_unavailable"` and `current_step` does not start with `recovery
-blocked:`. Such a run waits for its provider. The send is accepted even if its
-profile does not accept follow-ups or its retry is `stopped`: the server queues
-the message and wakes the child at once, without waiting for the next probe.
-
-A row whose `current_step` starts with `recovery blocked:` has no owner, with
-any reason, including `"provider_unavailable"`: after a parent restart a
-provider reason stays on the row, and a blocked recovery keeps it and its retry
-fields. A `normal_exit` or `owner_lost` row has no owner once recovery is done.
-A send to these rows returns `-32005` and nothing is queued. While a restarted
-server resumes a child, there is a short window in which a `normal_exit` or
-`owner_lost` row still reads `"suspended"` but a send to a profile that accepts
-follow-ups is accepted. The rule is a hint: treat `-32005` as "not now" and
-call `child_run_list` again.
+Clients decide whether to offer a send from the row's `accepts_send` field
+(see above), not from `status`, `suspension_reason`, or `current_step`. A send
+to a `"suspended"` row is accepted only while this server owns the run. A
+provider-suspended run that this server owns waits for its provider. Its send
+is accepted even if its profile does not accept follow-ups or its retry is
+`stopped`: the server queues the message and wakes the child at once, without
+waiting for the next probe. A suspended run with no owner, such as a blocked
+recovery (`current_step` starts with `recovery blocked:`) or a `normal_exit` or
+`owner_lost` run after recovery is done, returns `-32005` and nothing is
+queued. While a restarted server resumes a child, a `normal_exit` or
+`owner_lost` row can still read `"suspended"` while a send to a profile that
+accepts follow-ups is accepted; `accepts_send` is `true` in that window.
+`accepts_send` is a snapshot: treat `-32005` as "not now" and call
+`child_run_list` again.
 
 Homes below storage epoch 13 never suspend a child; a restart cancels it
 instead. The server applies these send rules with or without `child_recovery`.
 Without that feature, a suspended row reads as `"running"`, its retry fields
-are removed, and a provider row's `current_step` reads `thinking`, so the
-client cannot target the suspended case.
+are removed, and a provider row's `current_step` reads `thinking`;
+`accepts_send` still gives the send result.
 
 | child state | `child_run_send` result |
 | --- | --- |
