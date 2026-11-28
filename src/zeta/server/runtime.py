@@ -494,9 +494,23 @@ class ServerRuntime:
             discovery, _, _, projection, project, _ = self._new_session_project(self.cwd, None, None)
         except (ProjectRegistryError, OSError, ValueError, StorageFormatError):
             return _LaunchScopeState.UNAVAILABLE
-        if discovery.git_unavailable or projection is None or projection.health is not None:
+        if discovery.git_unavailable or projection is None:
+            return _LaunchScopeState.UNAVAILABLE
+        if projection.health is not None:
+            # No projects/ at all means no project exists, so the launch is project-less.
+            if projection.health.code == "project_registry_unavailable" and self._registry_absent():
+                return None
             return _LaunchScopeState.UNAVAILABLE
         return project.project_id if project is not None else None
+
+    def _registry_absent(self) -> bool:
+        try:
+            self.manager.project_registry.root.lstat()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            pass  # unreadable is not absent
+        return False
 
     @property
     def launch_project_id(self) -> str | None:
