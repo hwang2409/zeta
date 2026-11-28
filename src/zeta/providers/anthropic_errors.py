@@ -7,6 +7,7 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from ..accounts.exhaustion import classify_subscription_limit
 from ..oauth import error_body_excerpt
 from .transport import retry_after_seconds
 
@@ -50,11 +51,13 @@ class AnthropicHTTPError(AnthropicBackendError):
         status_code: int | None = None,
         retry_after: float | None = None,
         retryable: bool = False,
+        response_body: bytes | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retry_after = retry_after
         self.retryable = retryable
+        self.response_body = response_body
 
 
 class AnthropicStreamError(AnthropicBackendError):
@@ -96,6 +99,8 @@ def http_error(
     status_code: int,
     body: bytes,
     headers: Mapping[str, str] | None = None,
+    *,
+    account: Any = None,
 ) -> AnthropicBackendError:
     """Classify an Anthropic HTTP response without exposing its body."""
 
@@ -112,7 +117,12 @@ def http_error(
         status_code=status_code,
         retry_after=retry_after,
         retryable=retryable,
+        response_body=body,
     )
+    if account is not None:
+        limit = classify_subscription_limit("anthropic", account, error)
+        if limit is not None:
+            error.subscription_limit = limit
     if status_code == 400 and _is_context_overflow_body(body):
         error.code = "context_length_exceeded"
         error.provider_prompt_tokens = _provider_prompt_tokens(message)
