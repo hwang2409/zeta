@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import math
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -12,6 +13,8 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import httpx
+
+from ..oauth import CredentialReadError
 
 if TYPE_CHECKING:
     from .store import AccountId, AccountStore
@@ -268,9 +271,9 @@ class AccountUsage:
                 and now - state.last_attempt_at < REFRESH_COOLDOWN
             ):
                 return None
-            self._write(account, state.snapshot, now, None, "in_flight")
             error: str | None = None
             try:
+                self._write(account, state.snapshot, now, None, "in_flight")
                 response = await asyncio.wait_for(
                     self._request(account, client), REQUEST_TIMEOUT_SECONDS
                 )
@@ -298,6 +301,10 @@ class AccountUsage:
                 error = "network error; check your connection and retry"
             except AccountCredentialLockTimeoutError:
                 raise
+            except CredentialReadError as exc:
+                if exc.errno in (errno.EMFILE, errno.ENFILE):
+                    raise  # nothing was read; the next account would fail the same way
+                error = "internal refresh error; retry or restart zeta"
             except RuntimeError as exc:
                 from ..codex import CodexAuthError
                 from ..providers.anthropic_errors import AnthropicAuthError
@@ -309,7 +316,12 @@ class AccountUsage:
                 )
             except (TypeError, ValueError, json.JSONDecodeError):
                 error = "invalid usage response; retry later"
-            self._write(account, state.snapshot, now, error, "failed", finished=now)
+            try:
+                self._write(account, state.snapshot, now, error, "failed", finished=now)
+            except CredentialReadError as exc:
+                if exc.errno in (errno.EMFILE, errno.ENFILE):
+                    raise
+                # the account directory is unreadable, so it cannot hold the failed row
             return UsageState(state.snapshot, usage_freshness(state.snapshot, now), error, now)
 
     async def _request(
