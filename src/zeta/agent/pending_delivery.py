@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..core.checkpoints import ConversationEntry
+from ..core.child_runs import read_agent_status
 from ..core.store import (
     ConversationStore,
     PendingPromptCommitTimeoutError,
@@ -818,6 +819,38 @@ class StepDeliveryFlow:
             self._wake_sink(source)
 
 
+async def _no_live_run(parent_store: ConversationStore, child_instance_id: str) -> str:
+    """Name why a child takes no follow-up, from its durable status, and what to do."""
+
+    prefix = f"no live run/child {child_instance_id!r}"
+    try:
+        rows = await asyncio.to_thread(
+            read_agent_status, parent_store, requested_handle=child_instance_id
+        )
+    except ValueError:
+        return (
+            f"{prefix}; this agent never started a child with that handle; "
+            "list your children with `agent_status`"
+        )
+    except TypeError:
+        rows = []
+    row = rows[0] if len(rows) == 1 else {}
+    state, finished_at = row.get("state"), row.get("finished_at")
+    if finished_at is None:
+        return f"{prefix}; it was canceled, finished, or never started"
+    if state == "canceled":
+        return (
+            f"{prefix}; it was canceled at {finished_at} (transcript: "
+            f"`agent_output {child_instance_id}`); canceled children do not take "
+            "follow-ups; spawn a new child and pass what it needs"
+        )
+    return (
+        f"{prefix}; it finished at {finished_at} with status {state} (report: "
+        f"`agent_output {child_instance_id}`); finished children do not take "
+        "follow-ups; spawn a new child and pass the report"
+    )
+
+
 async def send_to_run(
     parent_store: ConversationStore,
     child_instance_id: object,
@@ -833,15 +866,11 @@ async def send_to_run(
         return "child_instance_id must be a nonempty string"
     if type(message) is not str or not message.strip():
         return "message must be a nonempty string"
-    no_live_run = (
-        f"no live run/child {child_instance_id!r}; it was canceled, finished, "
-        "or never started"
-    )
     if not owner.controls_child(parent_store, child_instance_id):
-        return no_live_run
+        return await _no_live_run(parent_store, child_instance_id)
     marker = parent_store.agent_children().get(child_instance_id)
     if marker is None:
-        return no_live_run
+        return await _no_live_run(parent_store, child_instance_id)
     transition = owner.run_transition(child_instance_id)
     if not (transition is not None and transition.provider_suspended) and not has_follow_up_loop(
         accepts_follow_ups=marker.get("accepts_follow_ups") is True,
@@ -883,9 +912,9 @@ async def send_to_run(
     except ValueError as exc:
         if str(exc) != "session store is closed":
             raise
-        return no_live_run
+        return await _no_live_run(parent_store, child_instance_id)
     except (LookupError, PendingPromptsClosedError):
-        return no_live_run
+        return await _no_live_run(parent_store, child_instance_id)
     if not durable and question_id is not None:
         channel.question_answered(child_instance_id, question_id)
         await channel.produce_to_live_parent(

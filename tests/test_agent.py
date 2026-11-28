@@ -13387,6 +13387,22 @@ async def test_agent_send_rejects_every_real_terminal_child_without_revival(
         )
         assert rejected["isError"] is True
         assert "no live run/child" in rejected["content"][0]["text"]
+        finished_at = child_status["finished_at"]
+        if terminal_state == "canceled":
+            next_step = (
+                f"; it was canceled at {finished_at} (transcript: `agent_output {handle}`); "
+                "canceled children do not take follow-ups; spawn a new child and pass "
+                "what it needs"
+            )
+        else:
+            next_step = (
+                f"; it finished at {finished_at} with status {expected_state} "
+                f"(report: `agent_output {handle}`); finished children do not take "
+                "follow-ups; spawn a new child and pass the report"
+            )
+        assert rejected["content"][0]["text"] == (
+            f"agent_send error: no live run/child {handle!r}{next_step}"
+        )
         assert backend.child_calls == calls_before
         assert wakes == wakes_before
         assert [
@@ -13481,7 +13497,10 @@ async def test_send_to_run_rejects_unknown_and_finished_runs(tmp_path: Path) -> 
     owner = BackgroundAgentOwner(store)
     channel = owner.conversation_channel
     error = await send_to_run(store, "run-1", "hello", owner=owner, channel=channel)
-    assert error is not None and "no live run" in error
+    assert error == (
+        "no live run/child 'run-1'; this agent never started a child with that handle; "
+        "list your children with `agent_status`"
+    )
 
     assert await send_to_run(store, "", "hello", owner=owner, channel=channel) == (
         "child_instance_id must be a nonempty string"
@@ -23609,6 +23628,32 @@ async def test_done_registered_watcher_cannot_send_or_cancel(
     await loop.close()
     child.close()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_on_a_grandchild_names_its_parent(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    try:
+        lead = f"{store.session_id}:6"
+        grandchild = f"{lead}:34"
+        canceled = await loop.tool_registry.execute(
+            ToolCall("cancel-grandchild", "agent_cancel", {"handle": grandchild})
+        )
+        assert canceled["isError"] is True
+        assert canceled["content"][0]["text"] == (
+            f"agent error: {grandchild} is a child of {lead}, not of you; "
+            f"ask {lead} with agent_send, or cancel {lead}"
+        )
+        unknown = await loop.tool_registry.execute(
+            ToolCall("cancel-unknown", "agent_cancel", {"handle": lead})
+        )
+        assert unknown["content"][0]["text"] == "agent error: unknown child handle"
+    finally:
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio
