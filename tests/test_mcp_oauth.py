@@ -1386,7 +1386,7 @@ async def test_http_client_reports_refresh_failure_shape(
     assert "run /mcp auth live" in text
     persisted = (await MCPCredentialStore(home=home).load("live")).token
     assert persisted is not None
-    assert persisted.refresh_error is None
+    assert persisted.refresh_error == "MCP OAuth: token endpoint returned HTTP 400"
     await client.close()
 
 
@@ -2635,10 +2635,46 @@ async def test_logout_wins_failed_refresh_reload_windows(
         if replace_during_failure:
             changed = replace(original, access_token="changed-token")
             await MCPCredentialStore(home=home).save_login("live", changed)
-        race.connection.send((400, {"error": "invalid_grant"}))
+        # a transient failure; a login-required one persists needs-auth instead
+        race.connection.send((503, {"error": "temporarily_unavailable"}))
         await race.gate()
         await manager.logout("live", scope="user")
         race.release()
+        result = await race.result()
+
+        assert result["isError"] is True
+        assert race.headers == ["Bearer stale-token"]
+        authority = await MCPCredentialStore(home=home).load("live")
+        assert authority.token is None
+    finally:
+        await race.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "window", ["before_needs_auth_write", "after_needs_auth_write"]
+)
+async def test_logout_wins_needs_auth_write_windows(
+    tmp_path: Path, window: str
+) -> None:
+    home = tmp_path / "home"
+    _write_token("live", home, access_token="stale-token")
+    manager = await _oauth_manager(home, tmp_path / "project")
+    race = _CredentialRaceProcess(
+        home,
+        gate="none" if window == "before_needs_auth_write" else "after_save_if_current",
+    )
+    try:
+        await race.request(401, "expired")
+        token_request = await race.receive()
+        assert token_request[:2] == ("request", "/token")
+        if window == "before_needs_auth_write":
+            await manager.logout("live", scope="user")
+        race.connection.send((400, {"error": "invalid_grant"}))
+        if window == "after_needs_auth_write":
+            await race.gate()
+            await manager.logout("live", scope="user")
+            race.release()
         result = await race.result()
 
         assert result["isError"] is True
