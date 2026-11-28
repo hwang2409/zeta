@@ -787,6 +787,8 @@ class AgentStateMixin:
             self._load_session_state()
             if self._agent_lifecycle is None or self._agent_lifecycle["state"] not in {"running", "idle", "finishing"}:
                 return
+            if (state, turns, current_step) == (None, None, None) and (live or self._agent_lifecycle)["state"] != "running":
+                return  # a progress save queued behind a rest must not write the rested state
             if live is not None:
                 self._agent_lifecycle.update(live)
             self.update_agent_lifecycle(
