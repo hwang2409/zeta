@@ -470,6 +470,8 @@ class BackgroundAgentOwner:
             leaves = remaining - {self._parent_ids.get(child) for child in remaining}
             assert leaves, "child ownership cycle"
             for child in leaves:
+                if child not in self._watchers:
+                    continue  # it finished and unregistered while an earlier leaf was joined
                 watcher = self._watchers.get(child)
                 owner = self._runs.get(child)
                 if owner is not None and owner.recoverable:
