@@ -390,3 +390,33 @@ async def test_launcher_runs_nothing_when_zeta_dies_before_its_go_byte(
             process.kill()
             await asyncio.wait_for(process.wait(), 10)
     assert not marker.exists(), "the launcher ran the command without zeta's go byte"
+
+
+@pytest.mark.asyncio
+async def test_on_spawn_runs_before_the_go_byte_lets_the_command_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "ran"
+    events: list[str] = []
+    real_wait = tool_spawn._wait_for_launcher
+
+    async def record_go(*, process) -> None:
+        events.append("go")
+        await real_wait(process=process)
+
+    def on_spawn(pid: int) -> None:
+        events.append(f"on_spawn ran={marker.exists()}")
+
+    # test-contract: seam record when zeta lets the launcher run the command.
+    monkeypatch.setattr(tool_spawn, "_wait_for_launcher", record_go)
+    process = await asyncio.wait_for(
+        create_tool_subprocess_shell(f"touch {shlex.quote(str(marker))}", on_spawn=on_spawn), 10
+    )
+    try:
+        assert await asyncio.wait_for(process.wait(), 10) == 0
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await asyncio.wait_for(process.wait(), 10)
+    assert events == ["on_spawn ran=False", "go"], "the command could run before on_spawn recorded its pid"
+    assert marker.exists()

@@ -442,3 +442,28 @@ def test_holder_scan_finds_lsof_outside_path(tmp_path, monkeypatch):
                 assert holder.pid in module._holders(own.fileno(), record)
         finally:
             holder.kill()
+
+
+def test_holder_that_exits_between_lock_probe_and_scan_is_not_unstoppable(tmp_path, monkeypatch):
+    module = importlib.import_module("zeta.tools._shared.tool_process_record")
+    session_dir = tmp_path / "session"
+    record = module.open_record(session_dir, CALL_ID)
+    holder = subprocess.Popen(["sleep", "120"], pass_fds=(record.fd,), start_new_session=True)
+    record.set_pgid(holder.pid)
+    record.close_parent_fd()
+
+    def holder_exits_then_scan(fd, path):
+        # The last tool process ends after the busy lock probe and before the holder scan sees it.
+        holder.kill()
+        holder.wait(10)
+        return []
+
+    try:
+        # test-contract: seam the last holder exits between the lock probe and the holder scan.
+        monkeypatch.setattr(module, "_holders", holder_exits_then_scan)
+        outcome = module.stop_orphan(session_dir, CALL_ID)
+        assert outcome.kind == "exited", outcome
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait(10)

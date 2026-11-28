@@ -200,6 +200,9 @@ def stop_orphan(session_dir: Path, call_id: str) -> Outcome:
         free = _try_lock(fd)
         # A held fd also counts, because flock on some network homes is not inherited.
         groups = _tree_groups(_holders(fd, path), pgid)
+        if not groups and not free:
+            # The last holder may have exited between the probe and the scan.
+            free = _try_lock(fd)
         if not groups:
             # A free lock means the tree is gone; a busy one held by nobody we may signal cannot be stopped.
             return Outcome(("stopped" if stopping else "exited") if free else "unstoppable", (pgid,) if pgid else (), path)
