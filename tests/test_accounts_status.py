@@ -20,6 +20,8 @@ import zeta.server.accounts as server_accounts
 from tests.support.credentials import named_account_credentials
 from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountError, AccountId, AccountStore
+from zeta.accounts.session import SessionAccountContext
+from zeta.core.session import SessionManager
 from zeta.core.session_files import SessionFileReplaced
 from zeta.oauth import OAuthTokens
 
@@ -875,6 +877,112 @@ def test_startup_with_an_unreadable_account_path_warns_and_keeps_every_file(
         os.chmod(path, mode)
     assert {item: item.read_bytes() for item in files} == files
     assert path.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+@pytest.mark.parametrize("row", ["oauth", "account-dir", "out-of-files"])
+def test_one_unreadable_account_is_listed_unavailable_after_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, row: str
+) -> None:
+    default = AccountId("codex", "default")
+    work = AccountId("codex", "work")
+    _save_account(tmp_path)
+    credential = _save_account(tmp_path, name="work")
+    store = AccountStore(tmp_path)
+    assert store.migrate() == ()
+    store.set_default(default)
+    manager = SessionManager(tmp_path)
+    opened = manager.create(provider="codex", model="gpt-5.5", cwd=tmp_path)
+    try:
+        reads = {
+            "session start": lambda: SessionAccountContext.load(
+                tmp_path, manager, opened.metadata
+            ),
+            "account_list": store.catalog_snapshot,
+            "state accounts": store.state_rows,
+        }
+        if row == "out-of-files":
+            open_directory = account_store_module._open_account_directory
+
+            def exhausted(home_fd: int, account: AccountId):
+                if account == work:
+                    raise OSError(errno.EMFILE, "Too many open files", "work")
+                return open_directory(home_fd, account)
+
+            # test-contract: seam real EMFILE needs the whole process out of descriptors
+            monkeypatch.setattr(
+                account_store_module, "_open_account_directory", exhausted
+            )
+            for name, read in reads.items():
+                with pytest.raises(OSError) as caught:
+                    read()
+                assert caught.value.errno == errno.EMFILE, name
+            return
+        path = credential if row == "oauth" else credential.parent
+        mode = path.stat().st_mode
+        os.chmod(path, 0)
+        try:
+            context = reads["session start"]()
+            _, displays, _ = reads["account_list"]()
+            rows, warnings = reads["state accounts"]()
+        finally:
+            os.chmod(path, mode)
+        assert context.resolve("codex") == default
+        assert context.unavailable_accounts == (str(work),)
+        assert {item.account: item.available for item in displays} == {
+            default: True,
+            work: False,
+        }
+        assert {item["account_id"]: item["status"] for item in rows} == {
+            str(default): "selected",
+            str(work): "error",
+        }
+        assert f"{work}: credentials unavailable or expired" in warnings
+    finally:
+        opened.store.close()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+@pytest.mark.parametrize(
+    ("row", "message"),
+    [
+        (
+            "unreadable",
+            "OAuth credentials file could not be read (EACCES: Permission denied)",
+        ),
+        ("out-of-files", "OAuth credentials file was not read"),
+    ],
+)
+def test_unreadable_default_account_ends_cli_start_with_a_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    row: str,
+    message: str,
+) -> None:
+    credential = _save_account(tmp_path)
+    assert AccountStore(tmp_path).migrate() == ()
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+    monkeypatch.delenv("ZETA_ACCOUNT_HOME", raising=False)
+    argv = ["--provider", "codex", "--no-session", "--print", "hi"]
+    if row == "out-of-files":
+
+        def exhausted(*_args: object) -> None:
+            raise OSError(errno.EMFILE, "Too many open files", "oauth.json")
+
+        # test-contract: seam real EMFILE needs the whole process out of descriptors
+        monkeypatch.setattr(account_store_module, "_read_optional_bytes", exhausted)
+        assert cli_main.main(argv) == 2
+    else:
+        mode = credential.stat().st_mode
+        os.chmod(credential, 0)
+        try:
+            assert cli_main.main(argv) == 2
+        finally:
+            os.chmod(credential, mode)
+    err = capsys.readouterr().err
+    assert err.startswith("zeta: ") and message in err
+    assert "Traceback" not in err
 
 
 def test_startup_with_a_symlinked_login_is_a_bad_login_not_a_read_error(

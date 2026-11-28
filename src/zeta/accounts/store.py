@@ -35,6 +35,7 @@ from ..core.session_files import (
 from ..oauth import (
     ACCOUNT_LOCK_TURN_WAIT_SECONDS,
     OAUTH_REFRESH_TIMEOUT_SECONDS,
+    CredentialReadError,
     OAuthRefreshFailure,
     OAuthTokens,
     classify_oauth_refresh_failure,
@@ -253,10 +254,7 @@ class AccountStore(_AccountRegistry):
                 account = item.account
                 selected = registry["defaults"].get(account.provider) == str(account)
                 usage = read_usage(self, account)
-                try:
-                    tokens = _read_account_tokens(home_fd, account)
-                except AccountError:
-                    tokens = None
+                tokens = _listed_tokens(home_fd, account)
                 if tokens is None or not math.isfinite(tokens.expires_at) or tokens.expires_at <= now:
                     status = "error"
                     warnings.append(f"{account}: credentials unavailable or expired")
@@ -289,10 +287,7 @@ class AccountStore(_AccountRegistry):
             defaults = registry["defaults"]
             content = []
             for item in availability.catalog_display(registry):
-                try:
-                    available = _read_account_tokens(home_fd, item.account) is not None
-                except (AccountError, ValueError, OverflowError, RecursionError):
-                    available = False
+                available = _listed_tokens(home_fd, item.account) is not None
                 try:
                     usage = read_usage(self, item.account)
                 except (OverflowError, RecursionError):
@@ -1121,6 +1116,18 @@ def _read_account_tokens(home_fd: int, account: AccountId) -> OAuthTokens | None
     except OSError as exc:
         raise_if_unreadable(exc, "OAuth credentials file")
         raise AccountError("OAuth credentials are invalid; login required") from exc
+
+
+def _listed_tokens(home_fd: int, account: AccountId) -> OAuthTokens | None:
+    """Read one account's tokens for a listing: a bad or unreadable login lists it unavailable."""
+    try:
+        return _read_account_tokens(home_fd, account)
+    except CredentialReadError as exc:
+        if exc.errno in (errno.EMFILE, errno.ENFILE):
+            raise  # nothing was read, so no account's state is known
+        return None
+    except (AccountError, ValueError, OverflowError, RecursionError):
+        return None
 
 
 def _read_tokens(directory_fd: int, name: str) -> OAuthTokens:
