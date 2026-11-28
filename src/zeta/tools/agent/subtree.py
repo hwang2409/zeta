@@ -336,7 +336,7 @@ def read_status_result(
     account_context: SessionAccountContext | None = None,
 ) -> dict[str, object]:
     from . import (
-        _NONTERMINAL_AGENT_STATES,
+        _AGENT_STATES_REQUIRING_OWNER,
         BrokenAgentLifecycle,
         LoadedAgentLifecycle,
         MissingAgentLifecycle,
@@ -396,7 +396,7 @@ def read_status_result(
                     running_handles is not None
                     and handle not in running_handles
                     and owner_state in {None, "recovery"}
-                    and item["state"] in _NONTERMINAL_AGENT_STATES
+                    and item["state"] in _AGENT_STATES_REQUIRING_OWNER
                 ):
                     item = _lost_agent_status(
                         item, requested=requested_handle is not None

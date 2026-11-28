@@ -7,17 +7,22 @@ import math
 import os
 import time
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from ..agent.receipt import valid_killed_task_fields
+from ..agent.resume_descriptor import validate_child_resume
 from ..protocol.types import ToolCall
 from ..storage_format import (
+    CLOSED_VARIANTS,
     DeleteValue,
     Mutation,
     SetValue,
+    StorageFeature,
+    feature_enabled,
     mapping_mutations,
 )
 from .agent_progress import (
@@ -37,7 +42,10 @@ from .session_files import (
 if TYPE_CHECKING:
     from ..accounts.status import AccountStatus
 
-_AGENT_STATES = {"running", "idle", "finishing", "completed", "canceled", "failed"}
+_AGENT_STATES = CLOSED_VARIANTS["child_lifecycle.state"]
+_SUSPENSION_FIELDS = (
+    "retry_state", "retry_started_at", "retry_deadline_at", "retry_probe_at", "retry_step", "next_retry_at", "suspended_at", "suspension_reason", "resume_mode", "recovery_blocked",
+)
 _TERMINAL_AGENT_STATES = {"completed", "canceled", "failed"}
 
 
@@ -62,6 +70,47 @@ class BrokenAgentLifecycle:
 AgentLifecycleRead = MissingAgentLifecycle | LoadedAgentLifecycle | BrokenAgentLifecycle
 
 
+def _validate_provider_retry(lifecycle: dict[str, Any]) -> None:
+    retrying = lifecycle.get("retry_state")
+    if lifecycle.get("suspension_reason") == "provider_unavailable" and retrying not in {"retrying", "stopped"}:
+        raise ValueError("invalid provider retry state")
+    if retrying is not None and (lifecycle["state"] != "suspended" or lifecycle.get("suspension_reason") != "provider_unavailable"):
+        raise ValueError("provider retry state outside provider suspension")
+    if ("next_retry_at" in lifecycle) != (retrying == "retrying"):
+        raise ValueError("invalid provider retry time")
+    if retrying is not None or "retry_started_at" in lifecycle or "retry_deadline_at" in lifecycle:
+        for key in ("retry_started_at", "retry_deadline_at", "retry_probe_at", *(("next_retry_at",) if retrying == "retrying" else ())):
+            timestamp = lifecycle.get(key)
+            if type(timestamp) is not str or len(timestamp) > 40 or datetime.fromisoformat(timestamp).utcoffset() != timedelta(0):
+                raise ValueError("invalid UTC provider retry timestamp")
+        step = lifecycle.get("retry_step")
+        if type(step) is not int or not 0 <= step <= 6:
+            raise ValueError("invalid provider retry step")
+
+
+def _clear_terminal_suspension(lifecycle: dict[str, Any], replacement_step: str | None) -> None:
+    if replacement_step is not None and lifecycle.get("suspension_reason") == "provider_unavailable":
+        lifecycle["current_step"] = replacement_step
+    for key in _SUSPENSION_FIELDS:
+        lifecycle.pop(key, None)
+
+
+def _apply_provider_retry(lifecycle: dict[str, Any], retry: dict[str, str | int] | None) -> None:
+    if retry is None:
+        for key in ("retry_started_at", "retry_deadline_at", "retry_probe_at", "retry_step"):
+            lifecycle.pop(key, None)
+        return
+    if "retry_started_at" not in lifecycle:
+        lifecycle["suspension_episode"] = lifecycle.get("suspension_episode", 0) + 1
+    lifecycle.update(retry)
+    lifecycle.update(state="suspended", suspended_at=_now(), suspension_reason="provider_unavailable", resume_mode="active")
+    if "next_retry_at" not in retry:
+        lifecycle.pop("next_retry_at", None)
+    lifecycle["current_step"] = "suspended: provider unavailable"
+    if lifecycle["retry_state"] == "retrying":
+        lifecycle["current_step"] += ", retrying"
+
+
 def _validate_status_lifecycle(value: object) -> dict[str, Any]:
     if type(value) is not dict:
         raise ValueError("lifecycle data is not an object")
@@ -80,6 +129,27 @@ def _validate_status_lifecycle(value: object) -> dict[str, Any]:
             datetime.fromisoformat(timestamp)
         except ValueError as exc:
             raise ValueError("invalid child timestamps") from exc
+    episode = lifecycle.get("suspension_episode")
+    if "suspension_episode" in lifecycle and (type(episode) is not int or episode < 1):
+        raise ValueError("invalid suspension episode")
+    if "last_activated_episode" in lifecycle:
+        activated = lifecycle["last_activated_episode"]
+        if type(activated) is not int or episode is None or not 1 <= activated <= episode:
+            raise ValueError("invalid activated episode")
+    if state == "suspended":
+        suspended_at = lifecycle.get("suspended_at")
+        if (
+            episode is None
+            or lifecycle.get("resume_mode") not in ("idle", "active")
+            or lifecycle.get("suspension_reason") not in ("normal_exit", "owner_lost", "provider_unavailable")
+            or type(suspended_at) is not str or len(suspended_at) > 40
+        ):
+            raise ValueError("invalid child suspension")
+        datetime.fromisoformat(suspended_at)
+    _validate_provider_retry(lifecycle)
+    blocked = lifecycle.get("recovery_blocked")
+    if "recovery_blocked" in lifecycle and (state != "suspended" or type(blocked) is not str or not 0 < len(blocked) <= 160):
+        raise ValueError("invalid child recovery reason")
     if state in _TERMINAL_AGENT_STATES and finished_at is None:
         raise ValueError("terminal state has no finished_at")
     if state not in _TERMINAL_AGENT_STATES and finished_at is not None:
@@ -226,6 +296,7 @@ def _agent_child_registration_values(
         "accepts_follow_ups": marker.get("accepts_follow_ups", False) is True,
         "explicit_finish": marker.get("explicit_finish", False) is True,
         "turns_used": turns_used if type(turns_used) is int else 0,
+        "resume": marker.get("resume"),
     }
 
 
@@ -306,6 +377,8 @@ def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any
             )
         try:
             ToolCall.from_dict(marker["tool_call"])
+            if "resume" in marker:
+                validate_child_resume(marker["resume"])
         except ValueError as exc:
             raise ConversationIntegrityError(
                 f"session state child tool call is invalid: {state_path}"
@@ -405,6 +478,7 @@ class AgentStateMixin:
         accepts_follow_ups: bool = False,
         explicit_finish: bool = False,
         turns_used: int = 0,
+        resume: dict[str, Any] | None = None,
     ) -> None:
         """Persist a running child marker before the child starts."""
 
@@ -416,6 +490,10 @@ class AgentStateMixin:
             or turns_used < 0
         ):
             raise ValueError("child marker fields must be valid")
+        if resume is not None:
+            if not self.child_recovery_enabled or not background:
+                raise ValueError("child recovery is unavailable for this marker")
+            validate_child_resume(resume)
         with self._append_lock():
             self._load()
             self._load_session_state()
@@ -427,6 +505,8 @@ class AgentStateMixin:
             }
             if background:
                 marker["background"] = True
+            if resume is not None:
+                marker["resume"] = copy.deepcopy(resume)
             if accepts_follow_ups:
                 marker["accepts_follow_ups"] = True
             if explicit_finish:
@@ -436,6 +516,31 @@ class AgentStateMixin:
             marker.update(_agent_type_metadata(agent_type))
             marker_key = child_instance_id or tool_call.id
             self._agent_children[marker_key] = marker
+            self._write_session_state(self.bash_cwd, self._todo_items)
+
+    @property
+    def child_recovery_enabled(self) -> bool:
+        return feature_enabled(self._storage_lease.observed_epoch, StorageFeature.CHILD_RECOVERY)
+
+    @property
+    def child_question_hold_enabled(self) -> bool:
+        return feature_enabled(self._storage_lease.observed_epoch, StorageFeature.CHILD_QUESTION_HOLD)
+
+    @property
+    def provider_recovery_enabled(self) -> bool:
+        return feature_enabled(self._storage_lease.observed_epoch, StorageFeature.PROVIDER_RECOVERY)
+
+    def select_child_accounts(self, marker_key: str, pins: dict[str, str]) -> None:
+        with self._append_lock():
+            self._load_session_state()
+            descriptor = self._agent_children[marker_key]["resume"]
+            if descriptor["account_pins"] == "selected":
+                if descriptor["selected_accounts"] != pins:
+                    raise ValueError("child accounts are already pinned")
+                return
+            candidate = {**descriptor, "account_pins": "selected", "selected_accounts": pins}
+            validate_child_resume(candidate)
+            self._agent_children[marker_key]["resume"] = candidate
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def agent_children(self) -> dict[str, dict[str, Any]]:
@@ -451,6 +556,14 @@ class AgentStateMixin:
         marker = self._agent_children.get(marker_key)
         if marker is not None:
             marker["turns_used"] = turns_used
+
+    def persist_agent_child_turns(self, marker_key: str, turns: int) -> None:
+        with self._append_lock():
+            self._load_session_state()
+            marker = self._agent_children.get(marker_key)
+            if marker is not None and "resume" in marker and turns > marker["turns_used"]:
+                self.update_agent_child_turns(marker_key, turns)
+                self._write_session_state(self.bash_cwd, self._todo_items)
 
     def _finish_agent_child_unlocked(self, marker_key: str) -> bool:
         self._load_session_state()
@@ -503,7 +616,7 @@ class AgentStateMixin:
                 self._agent_parent = None
             self._write_session_state(self.bash_cwd, self._todo_items)
 
-    def mark_agent_canceled(self, parent_tool_call_id: str) -> None:
+    def mark_agent_canceled(self, parent_tool_call_id: str, *, current_step: str | None = None) -> None:
         """Persist a child cancellation and its terminal lifecycle."""
 
         if not parent_tool_call_id:
@@ -528,6 +641,7 @@ class AgentStateMixin:
                 and self._agent_lifecycle.get("finished_at") is None
             )
             if lifecycle_was_running:
+                _clear_terminal_suspension(self._agent_lifecycle, current_step)
                 self._agent_lifecycle["state"] = "canceled"
                 self._agent_lifecycle["finished_at"] = _now()
                 self._agent_lifecycle["final_result"] = "tool execution canceled"
@@ -667,6 +781,82 @@ class AgentStateMixin:
         ):
             post_child_progress(self, self._agent_lifecycle)
 
+    def persist_child_activity(self, *, state: str | None, turns: int | None, current_step: str | None = None) -> None:
+        live = live_agent_lifecycle(self.agent_lifecycle_path)
+        with self._append_lock():
+            self._load_session_state()
+            if self._agent_lifecycle is None or self._agent_lifecycle["state"] not in {"running", "idle", "finishing"}:
+                return
+            if live is not None:
+                self._agent_lifecycle.update(live)
+            self.update_agent_lifecycle(
+                state=state, turns_used=turns,
+                current_step=current_step or {"idle": "idle, waiting for follow-up", "running": "running follow-up"}.get(state),
+                idle_since=_now() if state == "idle" else None,
+            )
+            self._write_agent_lifecycle()
+
+    def transition_agent_suspension(
+        self, *, reason: str | None = None, activate: int | None = None, blocked: str | None = None,
+        provider_retry: dict[str, str | int] | None = None, retry_progress: bool = False,
+        retry_schedule: tuple[str, int] | None = None,
+        activation_stopped: Callable[[], bool] | None = None,
+    ) -> dict[str, Any] | None:
+        if not self.child_recovery_enabled:
+            raise ValueError("child recovery is unavailable at this epoch")
+        live = live_agent_lifecycle(self.agent_lifecycle_path)
+        with self._append_lock():
+            self._load_session_state()
+            lifecycle = self._agent_lifecycle
+            if lifecycle is None or lifecycle.get("finished_at") is not None:
+                return None
+            if provider_retry is not None or retry_progress:
+                if not self.provider_recovery_enabled:
+                    raise ValueError("provider recovery is unavailable at this epoch")
+                if live is not None:
+                    lifecycle.update(live)
+                _apply_provider_retry(lifecycle, None if retry_progress else provider_retry)
+            elif reason is not None and lifecycle["state"] != "suspended":
+                if live is not None:
+                    lifecycle.update(live)
+                lifecycle.update(
+                    state="suspended", current_step="suspended", suspended_at=_now(),
+                    suspension_reason=reason, suspension_episode=lifecycle.get("suspension_episode", 0) + ("retry_started_at" not in lifecycle),
+                    resume_mode="idle" if lifecycle["state"] == "idle" else "active",
+                    # Bank this episode's time; a later process cannot read this monotonic clock.
+                    elapsed=_lifecycle_elapsed(lifecycle),
+                )
+            elif activate is not None:
+                if lifecycle["state"] != "suspended" or activate != lifecycle["suspension_episode"]:
+                    return None
+                # Once admitted under the append lock, this write owns activation.
+                if activation_stopped is not None and activation_stopped():
+                    return None
+                if self.provider_recovery_enabled:
+                    lifecycle["last_activated_episode"] = activate
+                # Rebase the clock so elapsed keeps every earlier episode's banked time.
+                elapsed = _lifecycle_elapsed(lifecycle)
+                lifecycle.update(elapsed=elapsed, started_monotonic=time.monotonic() - elapsed, monotonic_pid=os.getpid())
+                lifecycle["state"] = "idle" if lifecycle["resume_mode"] == "idle" else "running"
+                lifecycle["current_step"] = "idle, waiting for follow-up" if lifecycle["state"] == "idle" else "recovering interrupted work"
+                if retry_schedule is not None:
+                    lifecycle["retry_probe_at"], lifecycle["retry_step"] = retry_schedule
+                for key in ("recovery_blocked", "suspended_at", "suspension_reason", "resume_mode", "retry_state", "next_retry_at"):
+                    lifecycle.pop(key, None)
+            elif lifecycle["state"] == "suspended" and blocked is not None:
+                lifecycle["recovery_blocked"] = blocked[:160]
+                lifecycle["current_step"] = f"recovery blocked: {blocked[:160]}"
+            else:
+                return copy.deepcopy(lifecycle)
+            _validate_status_lifecycle(lifecycle)
+            self._write_agent_lifecycle()
+            if lifecycle["state"] == "suspended":
+                remove_live_agent_lifecycle(self.agent_lifecycle_path)
+            else:
+                publish_live_agent_lifecycle(self.agent_lifecycle_path, lifecycle)
+            post_child_progress(self, lifecycle)
+            return copy.deepcopy(lifecycle)
+
     def finish_agent_lifecycle(
         self,
         state: str,
@@ -678,6 +868,7 @@ class AgentStateMixin:
         killed_task_count: int | None = None,
         killed_task_ids_truncated: bool | None = None,
         canonical_receipt: bool = False,
+        current_step: str | None = None,
     ) -> None:
         """Persist a terminal child state and its final result text."""
 
@@ -718,6 +909,7 @@ class AgentStateMixin:
                 raise ValueError("invalid killed task fields")
             resolved_finished_at = finished_at or _now()
             self._agent_lifecycle["state"] = state
+            _clear_terminal_suspension(self._agent_lifecycle, current_step)
             self._agent_lifecycle["finished_at"] = resolved_finished_at
             self._agent_lifecycle["final_result"] = final_result
             if canonical_receipt:
@@ -817,6 +1009,7 @@ class AgentStateMixin:
         killed_task_count: int | None,
         killed_task_ids_truncated: bool,
         canceled_tool_call_id: str | None = None,
+        current_step: str | None = None,
     ) -> tuple[str, ...]:
         """Transfer direct markers and durably publish one terminal lifecycle."""
 
@@ -831,7 +1024,7 @@ class AgentStateMixin:
         transferred: list[str] = []
         if canceled_tool_call_id is not None:
             await self._commit_storage_command(
-                _MarkAgentCanceledCommand(tool_call_id=canceled_tool_call_id)
+                _MarkAgentCanceledCommand(tool_call_id=canceled_tool_call_id, current_step=current_step)
             )
         else:
             for marker_key, marker in self.agent_children().items():
@@ -859,6 +1052,7 @@ class AgentStateMixin:
                 killed_task_count=killed_task_count,
                 killed_task_ids_truncated=killed_task_ids_truncated,
                 canonical_receipt=True,
+                current_step=current_step,
             )
         )
         return tuple(transferred)
@@ -883,6 +1077,6 @@ class AgentStateMixin:
         self._storage_lease.publish_json(
             self.directory_fd,
             "agent_lifecycle.json",
-            mapping_mutations(value),
+            mapping_mutations(value, delete=(key for key in _SUSPENSION_FIELDS if key not in value)),
             write_session_file,
         )

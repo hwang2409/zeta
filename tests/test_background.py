@@ -3814,3 +3814,36 @@ async def test_close_without_running_tasks_runs_no_process_table_query(
     monkeypatch.setattr(spawn_module.subprocess, "run", no_subprocess)
     registry = BackgroundTaskRegistry()
     assert not await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_close_children_skips_a_sibling_that_finished_during_the_join(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(tmp_path)
+    owner = BackgroundAgentOwner(store)
+    assert owner._child_recovery_enabled
+    released = asyncio.Event()
+    cancels: list[str] = []
+
+    async def watch(instance_id: str) -> None:
+        await asyncio.wait_for(released.wait(), 10)
+        owner.unregister(instance_id)
+
+    def cancel(instance_id: str) -> None:
+        cancels.append(instance_id)
+        released.set()
+
+    watchers = [asyncio.create_task(watch(child)) for child in ("a", "b")]
+    try:
+        for child, watcher in zip(("a", "b"), watchers):
+            owner.register(child, lambda child=child: cancel(child), watcher)
+        await await_or_fail(owner.close_children(), what="close children")
+        assert len(cancels) == 1, "a sibling that already finished must not be canceled"
+        assert not owner.running
+    finally:
+        released.set()
+        await await_or_fail(
+            asyncio.gather(*watchers, return_exceptions=True), what="watcher cleanup"
+        )
+        store.close()

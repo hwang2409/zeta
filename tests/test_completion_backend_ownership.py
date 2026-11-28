@@ -12,6 +12,7 @@ from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountId, SessionAccountContext
 from zeta.agent import child_context
 from zeta.agent import runner as agent_runner
+from zeta.agent.child_run_owner import ChildRunTransitionOwner
 from zeta.agent.presets import GENERAL_PRESET
 from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
@@ -330,6 +331,7 @@ async def test_child_registry_clone_gets_its_own_backend_owner(
                 follow_up_loop=False,
                 description="test child",
                 child_account_context=None,
+                run_owner=ChildRunTransitionOwner(child_store, "test-call"),
             )
         )
         assert policy is None

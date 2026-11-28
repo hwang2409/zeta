@@ -752,6 +752,19 @@ class AgentLoop(
         return self._finalize_tool_results([tool_call], [None])[0]
     def _existing_tool_result(self, tool_call_id: str) -> ToolResult | None:
         return self.store.tool_result(tool_call_id)
+    @staticmethod
+    def _can_recover_provider(owner, budget: CompletionRetryBudget | None) -> bool:
+        return (
+            owner is not None and owner.provider_recovery_enabled and budget is not None
+            and budget.exhausted and budget.first_failure_retryable and not budget.committed
+        )
+
+    @staticmethod
+    async def _suspend_for_provider(owner, budget: CompletionRetryBudget, *, reset: bool) -> AsyncIterator[StreamEvent]:
+        if reset:
+            yield StreamEvent(StreamEventType.ASSISTANT_RESET)
+        await owner.provider_suspend(budget.first_failure_code, budget.failure_elapsed)
+
     async def _run_turn_impl(
         self,
         user_text: str,
@@ -840,7 +853,7 @@ class AgentLoop(
             return
         yield StreamEvent(StreamEventType.AGENT_START)
         turn_number = 0
-        redispatch: Literal["context", "account"] | None = None
+        redispatch: Literal["context", "account", "provider"] | None = None
         overflow_context_tokens: int | None = None
         self._turn_provider_retry_records = []
         recovery_state = EmptyTurnRecoveryState()
@@ -850,6 +863,8 @@ class AgentLoop(
         iteration_consuming_notifications = False
         provider_retry_budget: CompletionRetryBudget | None = None
         provider_budget_prompt_id: str | None = None
+        owner = getattr(self, "_child_run_owner", None)
+        delivery_published = False
         while (
             self.max_turns is None
             or turn_number < self.max_turns
@@ -870,6 +885,7 @@ class AgentLoop(
                     if warning is not None:
                         await self._append_turn_message(warning)
                 provider_retry_budget = None
+                delivery_published = False
                 self._turn_provider_retry_records = []
                 iteration_consuming_notifications = consuming_notifications
                 consuming_notifications = False
@@ -902,115 +918,118 @@ class AgentLoop(
             # the one owner of this call's inference span: leaving the block ends it once
             with InferenceObservation() as inference:
                 try:
-                    account_context = getattr(self, "account_context", None)
-                    if (
-                        account_context is not None
-                        and account_context.account_state_unknown
-                    ):
-                        self._set_pre_dispatch_step("recovering account state")
-                        yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
-                        await watchdog.wait(
-                            "account recovery", "recovering account state",
-                            partial(account_context.ensure_account_state, self),
-                        )
-                        self._set_pre_dispatch_step("preparing context")
-                    try:
-                        should_compact = await watchdog.wait(
-                            "context preparation", "preparing context",
-                            partial(
-                                self.context_assembler.prepare_context,
-                                force=retrying_context,
-                                system_append=host_instruction,
-                            ),
-                        )
-                        if should_compact:
+                    if redispatch != "provider":
+                        account_context = getattr(self, "account_context", None)
+                        if (
+                            account_context is not None
+                            and account_context.account_state_unknown
+                        ):
+                            self._set_pre_dispatch_step("recovering account state")
+                            yield StreamEvent(StreamEventType.ACCOUNT_STATE_UNKNOWN)
+                            await watchdog.wait(
+                                "account recovery", "recovering account state",
+                                partial(account_context.ensure_account_state, self),
+                            )
+                            self._set_pre_dispatch_step("preparing context")
+                        try:
+                            should_compact = await watchdog.wait(
+                                "context preparation", "preparing context",
+                                partial(
+                                    self.context_assembler.prepare_context,
+                                    force=retrying_context,
+                                    system_append=host_instruction,
+                                ),
+                            )
+                            if should_compact:
+                                self._set_pre_dispatch_step("compacting context")
+                                yield StreamEvent(StreamEventType.COMPACTION_START, data={"turn": turn_number})
+                            context_messages = await watchdog.wait(
+                                "eviction" if should_compact else "context assembly",
+                                "compacting context" if should_compact else "assembling context",
+                                partial(
+                                    self.context_assembler.assemble,
+                                    backend=self.backend,
+                                    force=retrying_context,
+                                    emergency=retrying_context,
+                                    system_append=host_instruction,
+                                ),
+                            )
+                        except BudgetExceeded:
+                            if not notification_turn:
+                                raise
                             self._set_pre_dispatch_step("compacting context")
-                            yield StreamEvent(StreamEventType.COMPACTION_START, data={"turn": turn_number})
-                        context_messages = await watchdog.wait(
-                            "eviction" if should_compact else "context assembly",
-                            "compacting context" if should_compact else "assembling context",
+                            context_messages = await watchdog.wait(
+                                "eviction", "compacting context",
+                                partial(
+                                    self.context_assembler.assemble,
+                                    backend=self.backend,
+                                    force=True,
+                                    emergency=True,
+                                    system_append=host_instruction,
+                                ),
+                            )
+                        finally:
+                            # cancellation must not retain the prepared message graph.
+                            self.context_assembler.discard_prepared_context()
+                        if self._plan_mode:
+                            context_messages = plan_mode_messages(context_messages)
+                        context_messages = self._account_safe_context(context_messages)
+                        context = self.context_assembler.last_context
+                        if retrying_context:
+                            current_tokens = None if context is None else context.token_count
+                            ensure_context_reduced(current_tokens, overflow_context_tokens)
+                        if context is not None and context.compacted:
+                            yield StreamEvent(
+                                StreamEventType.COMPACTION_END,
+                                data={
+                                    "turn": turn_number,
+                                    "token_count": context.token_count,
+                                },
+                            )
+                        active_tools = self._active_tool_schemas()
+                        steering = self.store.pending_client_steering()
+                        notification_context = system_message if notification_turn else None
+                        self._set_pre_dispatch_step("admitting request")
+                        if owner is not None:
+                            await owner.repair_before_replay()
+                        prepared_delivery = await watchdog.wait(
+                            "request admission", "admitting request",
                             partial(
-                                self.context_assembler.assemble,
-                                backend=self.backend,
-                                force=retrying_context,
-                                emergency=retrying_context,
-                                system_append=host_instruction,
+                                step_delivery.prepare_request,
+                                "after_tools", context_messages, steering, active_tools,
+                                notification_context=notification_context,
                             ),
                         )
-                    except BudgetExceeded:
-                        if not notification_turn:
-                            raise
-                        self._set_pre_dispatch_step("compacting context")
-                        context_messages = await watchdog.wait(
-                            "eviction", "compacting context",
-                            partial(
-                                self.context_assembler.assemble,
-                                backend=self.backend,
-                                force=True,
-                                emergency=True,
-                                system_append=host_instruction,
-                            ),
+                        system_message, on_persisted = complete_notification_context_staging(
+                            prepared_delivery, system_message, notification_turn, on_persisted
                         )
-                    finally:
-                        # cancellation must not retain the prepared message graph.
-                        self.context_assembler.discard_prepared_context()
-                    if self._plan_mode:
-                        context_messages = plan_mode_messages(context_messages)
-                    context_messages = self._account_safe_context(context_messages)
-                    context = self.context_assembler.last_context
-                    if retrying_context:
-                        current_tokens = None if context is None else context.token_count
-                        ensure_context_reduced(current_tokens, overflow_context_tokens)
-                    if context is not None and context.compacted:
-                        yield StreamEvent(
-                            StreamEventType.COMPACTION_END,
-                            data={
-                                "turn": turn_number,
-                                "token_count": context.token_count,
-                            },
+                        self._delivery_wake_pending = False
+                        context_messages = list(prepared_delivery.messages)
+                        steering = prepared_delivery.steering
+                        self._delivering_prompt_id = prepared_delivery.prompt_id
+                        disposition = delivery_disposition(
+                            step_delivery,
+                            prepared_delivery,
+                            notification_turn=notification_turn,
+                            notice_sink=self._mcp_notice_sink,
                         )
-                    active_tools = self._active_tool_schemas()
-                    steering = self.store.pending_client_steering()
-                    notification_context = system_message if notification_turn else None
-                    self._set_pre_dispatch_step("admitting request")
-                    prepared_delivery = await watchdog.wait(
-                        "request admission", "admitting request",
-                        partial(
-                            step_delivery.prepare_request,
-                            "after_tools", context_messages, steering, active_tools,
-                            notification_context=notification_context,
-                        ),
-                    )
-                    system_message, on_persisted = complete_notification_context_staging(
-                        prepared_delivery, system_message, notification_turn, on_persisted
-                    )
-                    self._delivery_wake_pending = False
-                    context_messages = list(prepared_delivery.messages)
-                    steering = prepared_delivery.steering
-                    self._delivering_prompt_id = prepared_delivery.prompt_id
-                    disposition = delivery_disposition(
-                        step_delivery,
-                        prepared_delivery,
-                        notification_turn=notification_turn,
-                        notice_sink=self._mcp_notice_sink,
-                    )
-                    if disposition == "dispatch":
-                        disposition = self._dispatch_progress.admit(
-                            self.store, prepared_delivery, step_delivery, not new_request,
-                            waits_for_input=self.agent_instance_id is None or self.explicit_finish,
-                        )
-                    if disposition == "deferred":
-                        yield StreamEvent(StreamEventType.AGENT_END)
-                        return
-                    if isinstance(disposition, ErrorInfo):
-                        self._persist_partial_with_cancelled_tools(
-                            [], None, failure=disposition
-                        )
-                        if disposition.code == NO_PROGRESS_LOOP_CODE and self.agent_instance_id is not None:
-                            await self._background_owner.conversation_channel.publish_not_delivered(self, disposition.message)
-                        yield StreamEvent(StreamEventType.ERROR, error=disposition)
-                        yield StreamEvent(StreamEventType.AGENT_END)
-                        return
+                        if disposition == "dispatch":
+                            disposition = self._dispatch_progress.admit(
+                                self.store, prepared_delivery, step_delivery, not new_request,
+                                waits_for_input=self.agent_instance_id is None or self.explicit_finish,
+                            )
+                        if disposition == "deferred":
+                            yield StreamEvent(StreamEventType.AGENT_END)
+                            return
+                        if isinstance(disposition, ErrorInfo):
+                            self._persist_partial_with_cancelled_tools(
+                                [], None, failure=disposition
+                            )
+                            if disposition.code == NO_PROGRESS_LOOP_CODE and self.agent_instance_id is not None:
+                                await self._background_owner.conversation_channel.publish_not_delivered(self, disposition.message)
+                            yield StreamEvent(StreamEventType.ERROR, error=disposition)
+                            yield StreamEvent(StreamEventType.AGENT_END)
+                            return
                     if (
                         provider_retry_budget is None
                         or prepared_delivery.prompt_id != provider_budget_prompt_id
@@ -1048,7 +1067,7 @@ class AgentLoop(
                         ),
                     )
                     self._set_pre_dispatch_step("thinking")
-                    has_active_delivery = prepared_delivery.has_active_delivery
+                    has_active_delivery = prepared_delivery.has_active_delivery and not delivery_published
                     provider_stream = observed_completion(
                         completion,
                         self.store,
@@ -1061,6 +1080,8 @@ class AgentLoop(
                             StreamEventType.MESSAGE_END,
                         }:
                             provider_started = True
+                        if owner is not None and event.type in {StreamEventType.MESSAGE_UPDATE, StreamEventType.MESSAGE_END}:
+                            await owner.provider_replay_progress()
                         self.context_assembler.observe_event(event)
                         inference.observe(event)
                         if event.type is StreamEventType.ERROR:
@@ -1187,6 +1208,17 @@ class AgentLoop(
                         step_delivery
                     ):
                         yield publication
+                if self._can_recover_provider(owner, provider_retry_budget):
+                    delivery_published |= provider_started and has_active_delivery
+                    async for recovery_event in self._suspend_for_provider(
+                        owner, provider_retry_budget, reset=bool(partial_blocks or assistant_message is not None),
+                    ):
+                        yield recovery_event
+                    partial_blocks = []
+                    assistant_message = None
+                    provider_retry_budget = None
+                    redispatch = "provider"
+                    continue
                 if (
                     provider_retry_budget is not None
                     and provider_retry_budget.exhausted
@@ -1394,7 +1426,8 @@ class AgentLoop(
             finally:
                 await dispatch.aclose()
                 await self._background_owner.wait_for_store_closes()
-            if self._explicit_finish_report is not None:
+            owner = getattr(self, "_child_run_owner", None)
+            if self._explicit_finish_report is not None or (owner is not None and owner.finish_waits_for_answer):
                 if self.child_turn_control is not None:
                     self.child_turn_control.finish_completion()
                 yield StreamEvent(

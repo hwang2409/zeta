@@ -628,6 +628,7 @@ def test_recursive_agent_card_renders_nested_send_and_question_readably(
             "message": f"{first_line}\n{second_line}",
         },
     )
+    next_retry = "2026-11-27T06:00:05+00:00"
     snapshot = AgentTranscriptTreeSnapshot(
         root,
         (
@@ -720,6 +721,10 @@ def test_recursive_agent_card_renders_nested_send_and_question_readably(
                 AgentTailSnapshot((), ()),
             ),
         ),
+        (
+            {"handle": HANDLE, "state": "running"},
+            {"handle": worker_handle, "state": "suspended", "suspension_reason": "provider_unavailable", "next_retry_at": next_retry},
+        ),
     )
     transcript = TranscriptWidget()
     console = Console(
@@ -768,6 +773,8 @@ def test_recursive_agent_card_renders_nested_send_and_question_readably(
     output = Text.from_ansi(transcript.render(width)).plain
 
     assert "tool: read path=README.md" in output
+    assert "suspended: provider unavailable, retrying" in output
+    assert next_retry in output
     assert "read: done" in output
     assert f"send → {worker_name} :159:1 · queued" in output
     assert first_line in output

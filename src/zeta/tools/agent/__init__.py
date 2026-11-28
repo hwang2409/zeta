@@ -49,7 +49,7 @@ from ...core.checkpoints import (
     load_session_json,
 )
 from ...core.child_lifecycle import select_legacy_child_lifecycle
-from ...core.session_execution import execution_owner_state
+from ...core.child_runs import read_child_lifecycle
 from ...core.session_files import (
     child_directory,
     open_session_file,
@@ -85,7 +85,8 @@ _TERMINAL_AGENT_STATES = frozenset(
     {"completed", "failed", "canceled", "turn_limit"}
 )
 _DURABLE_TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
-_NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
+_AGENT_STATES_REQUIRING_OWNER = frozenset({"running", "idle", "finishing"})
+_NONTERMINAL_AGENT_STATES = _AGENT_STATES_REQUIRING_OWNER | {"suspended"}
 _VALID_AGENT_STATES = _NONTERMINAL_AGENT_STATES | _DURABLE_TERMINAL_AGENT_STATES
 _STATUS_REASON_FALLBACK = "child status unavailable"
 _STATUS_REASON_MAX_BYTES = MAX_AGENT_RESULT_BYTES
@@ -325,18 +326,7 @@ def _read_child_file(store: ConversationStore, child_path: Path, name: str) -> b
 def _read_child_lifecycle(
     store: ConversationStore, child_path: Path
 ) -> tuple[object, str | None]:
-    with ExitStack() as cleanup:
-        directory_fd = store.directory_fd
-        for component in child_path.relative_to(store.session_dir.absolute()).parts:
-            directory_fd = cleanup.enter_context(
-                child_directory(directory_fd, component)
-            )
-        return (
-            read_agent_lifecycle_state(
-                directory_fd, child_path / "agent_lifecycle.json"
-            ),
-            execution_owner_state(directory_fd),
-        )
+    return read_child_lifecycle(store, child_path, read_state=read_agent_lifecycle_state)
 
 
 def _read_agent_transcript(
@@ -839,7 +829,7 @@ def _read_agent_status(
                     running_handles is not None
                     and handle not in running_handles
                     and owner_state in {None, "recovery"}
-                    and item["state"] in _NONTERMINAL_AGENT_STATES
+                    and item["state"] in _AGENT_STATES_REQUIRING_OWNER
                 ):
                     item = _lost_agent_status(
                         item, requested=requested_handle is not None

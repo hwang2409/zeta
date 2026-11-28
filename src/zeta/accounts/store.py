@@ -38,6 +38,7 @@ from ..oauth import (
     OAuthTokens,
     classify_oauth_refresh_failure,
     credential_file_lock,
+    raise_if_out_of_files,
 )
 from ..storage_format import (
     DeleteValue,
@@ -1093,6 +1094,7 @@ def _read_account_tokens(home_fd: int, account: AccountId) -> OAuthTokens | None
     except AccountError:
         raise
     except OSError as exc:
+        raise_if_out_of_files(exc)
         raise AccountError("OAuth credentials are invalid; login required") from exc
 
 
@@ -1105,6 +1107,7 @@ def _read_tokens(directory_fd: int, name: str) -> OAuthTokens:
     except AccountError:
         raise
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise_if_out_of_files(exc)
         raise AccountError("OAuth credentials are invalid; login required") from exc
 
 

@@ -417,13 +417,15 @@ def session_directory(
 
     Shared leases cover store lifetimes and metadata mutations. Deletion needs
     an exclusive lease. Closing the descriptors (including on process death)
-    releases the lease without leaving a stale lock file.
+    releases the lease without leaving a stale lock file. A lifetime lease
+    yields no root descriptor: every open store would otherwise pin its parent.
     """
     with ExitStack() as cleanup:
         cleanup.enter_context(nullcontext() if lifetime else shape_lock())
+        root_scope = cleanup.enter_context(ExitStack())
         try:
             _component(session_id)
-            root_fd = cleanup.enter_context(session_root(root))
+            root_fd = root_scope.enter_context(session_root(root))
             session_fd = cleanup.enter_context(child_directory(root_fd, session_id))
             if exclusive:
                 drain_releases()  # a store this process dropped must not refuse deletion
@@ -453,6 +455,9 @@ def session_directory(
             raise SessionError(
                 f"session {session_id} could not be accessed: {exc.strerror}"
             ) from exc
+        if lifetime:
+            root_scope.close()
+            root_fd = None
         # Translate acquisition errors only; preserve the caller's domain errors.
         yield root_fd, session_fd
 
