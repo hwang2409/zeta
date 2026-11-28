@@ -2,11 +2,11 @@
 
 Detection rules, kept simple on purpose:
 - wait hint: the command text has `sleep N` (N >= 30 seconds, optional s/m/h
-  suffix), or `gh pr checks ... --watch`, or `gh run watch`. Text inside
-  quotes is not parsed out, so `echo "sleep 60"` also gets the hint; that
-  false positive is accepted because the hint never changes the command.
+  suffix), or `gh pr checks ... --watch`, or `gh run watch`, and the call
+  really blocked (it timed out, or ran for 30 seconds or more).
 - rg hint: exit 127 and stderr says `rg: command not found`.
-- grep hint: exit 1, empty stdout, and the last pipeline stage is grep/rg.
+- grep hint: exit 1, empty stdout and stderr, and the last pipeline stage is
+  grep/rg.
 - gh hint: exit 8 and the command runs `gh pr checks`.
 A hint is one `hint: ...` line after the normal output; nothing else changes.
 """
@@ -63,22 +63,23 @@ async def test_long_foreground_sleep_names_run_background(
     assert len(hints) == 1, text
     assert "run_background" in hints[0]
     assert "blocked your turn for" in hints[0]
+    assert "for 0s" not in hints[0], hints[0]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "command",
     [
-        "gh() { :; }; gh pr checks 12 --watch --interval 60",
-        "gh() { :; }; gh run watch 99",
+        "gh() { sleep 5; }; gh pr checks 12 --watch --interval 60",
+        "gh() { sleep 5; }; gh run watch 99",
     ],
 )
 async def test_foreground_ci_watch_names_run_background(
     tmp_path: Path, command: str
 ) -> None:
-    text, result = await _run(tmp_path, command)
+    # the stub watch waits; a short tool timeout ends the call while it blocks
+    text, _ = await _run(tmp_path, command, timeout=0.2)
 
-    assert result["isError"] is False
     hints = _hint_lines(text)
     assert len(hints) == 1, text
     assert "run_background" in hints[0]
@@ -124,6 +125,9 @@ async def test_gh_pr_checks_exit_8_says_pending(tmp_path: Path) -> None:
         "false",
         "grep zzz /nonexistent-file",
         "gh() { return 8; }; gh run list",
+        "cd /nonexistent && grep x f",
+        "(sleep 45; echo hi) >/dev/null 2>&1 & echo bg",
+        "gh() { :; }; gh run watch 1",
     ],
 )
 async def test_ordinary_results_have_no_hint(tmp_path: Path, command: str) -> None:

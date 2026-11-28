@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import math
 import os
 import re
 import shlex
@@ -112,22 +113,29 @@ _GREP_TOOLS = frozenset({"grep", "egrep", "fgrep", "rg"})
 
 
 def _result_hint(
-    command: str, exit_code: int, stdout: str, stderr: str, elapsed: float
+    command: str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    elapsed: float,
+    timed_out: bool,
 ) -> str | None:
-    """Return one plain-meaning hint for known result shapes; rules match command text only."""
+    """Return one plain-meaning hint for known result shapes."""
 
     sleeps = (
         float(n) * {"": 1, "s": 1, "m": 60, "h": 3600}[unit]
         for n, unit in _SLEEP.findall(command)
     )
-    if any(s >= _LONG_SLEEP_SECONDS for s in sleeps) or _CI_WATCH.search(command):
+    blocked = timed_out or elapsed >= _LONG_SLEEP_SECONDS
+    waits = any(s >= _LONG_SLEEP_SECONDS for s in sleeps) or _CI_WATCH.search(command)
+    if blocked and waits:
         return (
-            f"this blocked your turn for {elapsed:.0f}s; start it with "
+            f"this blocked your turn for {math.ceil(elapsed)}s; start it with "
             "run_background and end your turn; its exit wakes you"
         )
     if exit_code == 127 and "rg: command not found" in stderr:
         return "rg is not installed; use `git grep -n` or `grep -rn`"
-    if exit_code == 1 and not stdout:
+    if exit_code == 1 and not stdout and not stderr:
         stages = [s for s in _LAST_STAGE.split(command) if s.strip()]
         words = stages[-1].split() if stages else []
         if words[:1] == ["git"]:
@@ -367,7 +375,12 @@ async def _bash(
         marker_prefix = marker + "\n" if marker is not None else ""
         combined_full_size += len(marker_prefix.encode())
         hint = _result_hint(
-            shell_command, exit_code, stdout, stderr, time.monotonic() - started
+            shell_command,
+            exit_code,
+            stdout,
+            stderr,
+            time.monotonic() - started,
+            timed_out,
         )
         hint_suffix = f"\nhint: {hint}" if hint is not None else ""
         if combined_full_size > output_limit:
@@ -403,7 +416,7 @@ async def _bash(
             )
             content = text_block(
                 shown + hint_suffix,
-                full_size=combined_full_size + len(hint_suffix.encode()),
+                full_size=combined_full_size,
             )
             content["truncated"] = True
             content["spill_path"] = str(spill_path)
