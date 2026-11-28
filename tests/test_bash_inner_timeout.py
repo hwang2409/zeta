@@ -47,8 +47,12 @@ async def _run(tmp_path: Path, arguments: dict[str, Any]) -> tuple[str, dict]:
 
 
 @pytest.mark.asyncio
-async def test_inner_timeout_sets_the_tool_timeout(tmp_path: Path) -> None:
+async def test_inner_timeout_sets_the_tool_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # the tool kills at N plus the 5 s margin, far before the 30 s default
+    # test-contract: seam a small default proves the inner timeout raises it
+    monkeypatch.setattr(bash_tool, "_DEFAULT_TIMEOUT_SECONDS", 0.2)
     _, result = await _run(tmp_path, {"command": _IGNORE_N + "timeout 0.3 sleep 30"})
 
     assert result["structuredContent"]["timed_out"] is True
@@ -60,9 +64,24 @@ async def test_inner_timeout_longer_than_default_is_not_killed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # test-contract: seam the 30 s default cannot be waited out in a unit test
-    monkeypatch.setattr(bash_tool, "_DEFAULT_TIMEOUT_SECONDS", 0.2, raising=False)
+    monkeypatch.setattr(bash_tool, "_DEFAULT_TIMEOUT_SECONDS", 0.2)
     text, result = await _run(
         tmp_path, {"command": _IGNORE_N + "timeout 2 sleep 0.5; echo done"}
+    )
+
+    assert result["isError"] is False, text
+    assert result["structuredContent"]["stdout"] == "done\n"
+
+
+@pytest.mark.asyncio
+async def test_short_inner_timeout_does_not_lower_the_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # test-contract: seam small values keep the test fast; the ratio matches 2 s vs 30 s
+    monkeypatch.setattr(bash_tool, "_DEFAULT_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(bash_tool, "_INNER_TIMEOUT_MARGIN_SECONDS", 0.1)
+    text, result = await _run(
+        tmp_path, {"command": _IGNORE_N + "timeout 0.1 true && sleep 0.5 && echo done"}
     )
 
     assert result["isError"] is False, text
@@ -87,11 +106,12 @@ async def test_explicit_tool_timeout_wins(tmp_path: Path) -> None:
         ("timeout 1.5h x", 3600.0),
         ("timeout 1d x", 3600.0),
         ("timeout 4000 x", 3600.0),
-        ("timeout -k 5 -s KILL 10 x", 20.0),
+        ("timeout -k 5 -s KILL 40 x", 50.0),
         ("timeout --kill-after=1m --signal=TERM 30s x", 95.0),
-        ("timeout -k5 --preserve-status --foreground -v 10 x", 20.0),
+        ("timeout -k5 --preserve-status --foreground -v 40 x", 50.0),
         ("cd /tmp && timeout 120 du -xsh .", 125.0),
         ("timeout 10 a; timeout 60 b", 65.0),
+        ("timeout 2 true && sleep 60", 30.0),  # never lower the default
         ("FOO=1 timeout 60 x", 30.0),  # not parsed: keep the default
         ("timeout abc x", 30.0),
         ("timeout 0 x", 30.0),  # 0 means no limit in coreutils

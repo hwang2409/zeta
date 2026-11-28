@@ -149,7 +149,7 @@ def _result_hint(
     return None
 
 
-_DURATION = re.compile(r"(\d+(?:\.\d*)?|\.\d+)([smhd]?)")
+_DURATION = re.compile(r"([0-9]+(?:\.[0-9]*)?|\.[0-9]+)([smhd]?)")
 _DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 _TIMEOUT_FLAGS = frozenset({"--preserve-status", "--foreground", "-v", "--verbose"})
 _TIMEOUT_HINT = "pass a larger `timeout` (max 3600) or use run_background"
@@ -201,7 +201,9 @@ def _effective_timeout(arguments: BashArguments, command: str) -> float:
     longest = max((span for span in spans if span is not None), default=None)
     if longest is None:
         return _DEFAULT_TIMEOUT_SECONDS
-    return min(longest + _INNER_TIMEOUT_MARGIN_SECONDS, MAX_TIMEOUT_SECONDS)
+    # never lower the default: a short `timeout 2 x && make` still gets 30 s
+    raised = max(longest + _INNER_TIMEOUT_MARGIN_SECONDS, _DEFAULT_TIMEOUT_SECONDS)
+    return min(raised, MAX_TIMEOUT_SECONDS)
 
 
 def _extract_command(arguments: BashArguments) -> str:
