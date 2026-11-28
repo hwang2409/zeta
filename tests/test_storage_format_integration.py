@@ -277,7 +277,14 @@ def test_real_console_start_has_one_storage_format_owner(
         else:
             assert not started
             assert return_code == 2
-            assert stderr.splitlines() == [f"zeta: {expected_error}"]
+            # a home locked past the notice delay says once that it waits, then refuses;
+            # the TUI sends startup stderr to its capture log, not this pipe
+            waiting = (
+                [f"zeta: waiting for another zeta process to finish creating {home}"]
+                if shape == "locked" and surface != "tui"
+                else []
+            )
+            assert stderr.splitlines() == [*waiting, f"zeta: {expected_error}"]
             if shape == "realistic-old":
                 startup_lock = home / ".storage-format.lock"
                 assert startup_lock.is_file()
