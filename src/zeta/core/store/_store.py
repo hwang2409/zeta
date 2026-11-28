@@ -242,6 +242,13 @@ class ConversationStore(
             self._todo_dismissed = False
             self._agent_counter = 0
             self._agent_children: dict[str, dict[str, Any]] = {}
+            # Marker keys changed in memory since this store last published its state.
+            self._dirty_agent_children: set[str] = set()
+            # The last session_state.json bytes this store read or wrote, and their
+            # validated parse, so an unchanged file is not parsed or validated again.
+            self._session_state_cache: (
+                tuple[bytes, tuple[str, list[TodoItem], bool, dict[str, Any]]] | None
+            ) = None
             self._agent_parent: dict[str, Any] | None = None
             self._agent_canceled: dict[str, Any] | None = None
             self._agent_lifecycle: dict[str, Any] | None = None
@@ -376,15 +383,11 @@ class ConversationStore(
             self._todo_dismissed = True
             self._write_session_state(self.bash_cwd, self._todo_items)
 
-    def _load_session_state(self) -> None:
-        try:
-            value = load_session_json(
-                read_session_file(self.directory_fd, "session_state.json")
-            )
-        except FileNotFoundError:
-            if not self._read_only:
-                self._write_session_state(self.cwd, ())
-            value = {"bash_cwd": self.cwd}
+    def _parse_session_state(
+        self, value: object
+    ) -> tuple[str, list[TodoItem], bool, dict[str, Any]]:
+        """Validate a parsed session state; markers equal to cached ones skip validation."""
+
         bash_cwd = value.get("bash_cwd") if isinstance(value, dict) else None
         if type(bash_cwd) is not str or not bash_cwd:
             raise ConversationIntegrityError(
@@ -396,29 +399,57 @@ class ConversationStore(
             raise ConversationIntegrityError(
                 f"session state todo list is invalid: {self.state_path}"
             ) from exc
-        agent_state = _parse_agent_state(value, self.state_path)
-        self.bash_cwd = bash_cwd
-        self._todo_items = todo_items
+        cached = self._session_state_cache
+        agent_state = _parse_agent_state(
+            value,
+            self.state_path,
+            None if cached is None else cached[1][3]["agent_children"],
+        )
         todo_dismissed = value.get("todo_dismissed", False)
         if type(todo_dismissed) is not bool:
             raise ConversationIntegrityError(
                 f"session state todo dismissal is invalid: {self.state_path}"
             )
+        return bash_cwd, todo_items, todo_dismissed, agent_state
+
+    def _load_session_state(self) -> None:
+        try:
+            raw = read_session_file(self.directory_fd, "session_state.json")
+        except FileNotFoundError:
+            if not self._read_only:
+                self._write_session_state(self.cwd, ())
+            parsed = self._parse_session_state({"bash_cwd": self.cwd})
+        else:
+            cached = self._session_state_cache
+            if cached is not None and cached[0] == raw:
+                parsed = cached[1]
+            else:
+                parsed = self._parse_session_state(load_session_json(raw))
+                self._session_state_cache = (raw, parsed)
+        bash_cwd, todo_items, todo_dismissed, agent_state = parsed
+        self.bash_cwd = bash_cwd
+        self._todo_items = [dict(item) for item in todo_items]
         self._todo_dismissed = todo_dismissed
-        loaded_children = agent_state["agent_children"]
-        for marker_key, loaded_marker in loaded_children.items():
+        loaded_children = dict(agent_state["agent_children"])
+        for marker_key, loaded_marker in agent_state["agent_children"].items():
             live_marker = self._agent_children.get(marker_key)
-            if live_marker is not None and live_marker.get(
-                "child_session_path"
-            ) == loaded_marker.get("child_session_path"):
-                loaded_marker["turns_used"] = max(
+            if (
+                live_marker is not None
+                and live_marker.get("child_session_path")
+                == loaded_marker.get("child_session_path")
+            ):
+                turns_used = max(
                     loaded_marker.get("turns_used", 0),
                     live_marker.get("turns_used", 0),
                 )
+                if loaded_marker.get("turns_used") != turns_used:
+                    # A process-local turn count the file does not hold yet.
+                    loaded_children[marker_key] = {**loaded_marker, "turns_used": turns_used}
+                    self._dirty_agent_children.add(marker_key)
         self._agent_counter = agent_state["agent_counter"]
         self._agent_children = loaded_children
-        self._agent_parent = agent_state["agent_parent"]
-        self._agent_canceled = agent_state["agent_canceled"]
+        self._agent_parent = copy.deepcopy(agent_state["agent_parent"])
+        self._agent_canceled = copy.deepcopy(agent_state["agent_canceled"])
         self._agent_lifecycle = None
         try:
             lifecycle = load_session_json(

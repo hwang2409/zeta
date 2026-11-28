@@ -275,10 +275,18 @@ def _dedupe_id(
     return hashlib.sha256(material).hexdigest()
 
 
+def _copy_patch_value(field: str, value: object) -> object:
+    # Child markers are replaced, never mutated, so a shallow map copy is a faithful snapshot.
+    if field == "_agent_children":
+        assert isinstance(value, dict)
+        return dict(value)
+    return copy.deepcopy(value)
+
+
 def _snapshot_patch(
     store: ConversationStore, fields: tuple[str, ...]
 ) -> dict[str, object]:
-    return {field: copy.deepcopy(getattr(store, field)) for field in fields}
+    return {field: _copy_patch_value(field, getattr(store, field)) for field in fields}
 
 
 def _resolve_append_dedupe[ResultT](
@@ -500,7 +508,7 @@ def _execute_store_command[ResultT](
             tuple(store._resident_rows.stream_rows(store._resident_rows.rows))
         )
     changed_patch = {
-        field: copy.deepcopy(getattr(store, field))
+        field: _copy_patch_value(field, getattr(store, field))
         for field, old in baseline_patch.items()
         if getattr(store, field) != old
     }

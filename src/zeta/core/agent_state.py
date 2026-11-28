@@ -7,7 +7,7 @@ import math
 import os
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -332,8 +332,17 @@ def drop_invalid_killed_task_metadata(
     return lifecycle
 
 
-def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any]:
-    """Validate and return the agent-lifecycle fields of a session state dict."""
+def _parse_agent_state(
+    value: dict[str, Any],
+    state_path: Path,
+    known_markers: Mapping[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Validate and return the agent-lifecycle fields of a session state dict.
+
+    Child markers are never mutated in place, so the returned map shares them with
+    ``value``. A marker equal to the one in ``known_markers`` (already validated) is
+    not validated again; the known object is reused.
+    """
 
     agent_counter = value.get("agent_counter", 0)
     if type(agent_counter) is not int or agent_counter < 0:
@@ -345,7 +354,13 @@ def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any
         raise ConversationIntegrityError(
             f"session state child markers are invalid: {state_path}"
         )
+    children: dict[str, dict[str, Any]] = {}
     for call_id, marker in agent_children.items():
+        known = None if known_markers is None else known_markers.get(call_id)
+        if known is not None and known == marker:
+            children[call_id] = known
+            continue
+        children[call_id] = marker
         if (
             type(call_id) is not str
             or not call_id
@@ -419,7 +434,7 @@ def _parse_agent_state(value: dict[str, Any], state_path: Path) -> dict[str, Any
         )
     return {
         "agent_counter": agent_counter,
-        "agent_children": copy.deepcopy(agent_children),
+        "agent_children": children,
         "agent_parent": copy.deepcopy(agent_parent),
         "agent_canceled": copy.deepcopy(agent_canceled),
     }
@@ -433,12 +448,15 @@ def _apply_agent_state(
     agent_parent: dict[str, Any] | None,
     agent_canceled: dict[str, Any] | None,
 ) -> None:
-    """Add the nonempty agent-lifecycle fields into a session state dict."""
+    """Add the nonempty agent-lifecycle fields into a session state dict.
+
+    ``agent_children`` holds only the markers to publish; the writer copies values.
+    """
 
     if agent_counter:
         state["agent_counter"] = agent_counter
     if agent_children:
-        state["agent_children"] = copy.deepcopy(agent_children)
+        state["agent_children"] = agent_children
     if agent_parent is not None:
         state["agent_parent"] = copy.deepcopy(agent_parent)
     if agent_canceled is not None:
@@ -516,6 +534,7 @@ class AgentStateMixin:
             marker.update(_agent_type_metadata(agent_type))
             marker_key = child_instance_id or tool_call.id
             self._agent_children[marker_key] = marker
+            self._dirty_agent_children.add(marker_key)
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     @property
@@ -533,18 +552,20 @@ class AgentStateMixin:
     def select_child_accounts(self, marker_key: str, pins: dict[str, str]) -> None:
         with self._append_lock():
             self._load_session_state()
-            descriptor = self._agent_children[marker_key]["resume"]
+            marker = self._agent_children[marker_key]
+            descriptor = marker["resume"]
             if descriptor["account_pins"] == "selected":
                 if descriptor["selected_accounts"] != pins:
                     raise ValueError("child accounts are already pinned")
                 return
             candidate = {**descriptor, "account_pins": "selected", "selected_accounts": pins}
             validate_child_resume(candidate)
-            self._agent_children[marker_key]["resume"] = candidate
+            self._agent_children[marker_key] = {**marker, "resume": candidate}
+            self._dirty_agent_children.add(marker_key)
             self._write_session_state(self.bash_cwd, self._todo_items)
 
     def agent_children(self) -> dict[str, dict[str, Any]]:
-        """Return durable markers for children that did not finish."""
+        """Return a detached copy of the markers for children that did not finish."""
 
         return copy.deepcopy(self._agent_children)
 
@@ -554,8 +575,10 @@ class AgentStateMixin:
         if type(turns_used) is not int or turns_used < 0:
             raise ValueError("child turns must be a nonnegative integer")
         marker = self._agent_children.get(marker_key)
-        if marker is not None:
-            marker["turns_used"] = turns_used
+        if marker is not None and marker.get("turns_used") != turns_used:
+            # Markers are shared with snapshots and the state cache: replace, never mutate.
+            self._agent_children[marker_key] = {**marker, "turns_used": turns_used}
+            self._dirty_agent_children.add(marker_key)
 
     def persist_agent_child_turns(self, marker_key: str, turns: int) -> None:
         with self._append_lock():

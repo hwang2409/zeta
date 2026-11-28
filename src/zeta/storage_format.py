@@ -1080,7 +1080,16 @@ def apply_mutations(raw: object, mutations: Iterable[Mutation]) -> dict[str, Any
 
     if type(raw) is not dict:
         raise StorageFormatError("stored JSON root must be an object")
-    output = copy.deepcopy(raw)
+    return _apply_mutations_in_place(copy.deepcopy(raw), mutations)
+
+
+def _apply_mutations_in_place(
+    output: object, mutations: Iterable[Mutation]
+) -> dict[str, Any]:
+    """Apply deltas to a root the caller owns, such as a fresh parse."""
+
+    if type(output) is not dict:
+        raise StorageFormatError("stored JSON root must be an object")
     for mutation in mutations:
         parent, key = _mapping_at(
             output, mutation.path, create=not isinstance(mutation, DeleteValue)
@@ -1221,14 +1230,15 @@ class WriterLease:
             try:
                 fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             except FileNotFoundError:
-                raw = {} if initial is None else initial
+                raw = {} if initial is None else copy.deepcopy(initial)
             else:
                 try:
                     with os.fdopen(fd, "rb") as stream:
                         raw = json.load(stream)
                 except (OSError, ValueError) as exc:
                     raise StorageFormatError(f"stored JSON is invalid: {name}") from exc
-            output = apply_mutations(raw, mutations)
+            # The parse is owned here, so it is patched without a whole-file copy.
+            output = _apply_mutations_in_place(raw, mutations)
             encoded = (
                 json.dumps(output, separators=(",", ":"), sort_keys=True) + "\n"
             ).encode()

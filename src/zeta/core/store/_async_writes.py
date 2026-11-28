@@ -17,6 +17,7 @@ from ..checkpoints.mutation import (
     ConversationGenerationConflict,
     ConversationMutation,
     MutationCancellationPolicy,
+    _copy_patch_value,
     _cursor,
     _ResidentPatch,
     execute_mutation,
@@ -42,20 +43,13 @@ _PATCH_FIELDS = (
     "_agent_canceled",
     "_agent_lifecycle",
 )
-_DEEP_PATCH_FIELDS = frozenset({"_agent_children"})
 
 
 def _snapshot_patch_fields(
     store: ConversationStore, fields: tuple[str, ...]
 ) -> dict[str, object]:
-    return {
-        field: (
-            copy.deepcopy(getattr(store, field))
-            if field in _DEEP_PATCH_FIELDS
-            else copy.copy(getattr(store, field))
-        )
-        for field in fields
-    }
+    # Child markers are replaced, never mutated, so a shallow copy of their map is enough.
+    return {field: copy.copy(getattr(store, field)) for field in fields}
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -820,7 +814,7 @@ class AsyncDurableWritesMixin:
         entries = self._install_delta_entries(entries_to_install, delta)
         for field, value in delta._resident_patch.values.items():
             if getattr(self, field) == delta._resident_patch.expected[field]:
-                setattr(self, field, copy.deepcopy(value))
+                setattr(self, field, _copy_patch_value(field, value))
         cursor = delta.log_cursor
         self._entry_prefix_digest = cursor.entry_prefix_digest
         self._log_identity = cursor.identity
@@ -881,7 +875,7 @@ class AsyncDurableWritesMixin:
             committed_entries=(),
             entries_to_install=(),
             _resident_patch=_ResidentPatch(
-                {field: copy.deepcopy(getattr(writer, field)) for field in _PATCH_FIELDS},
+                {field: _copy_patch_value(field, getattr(writer, field)) for field in _PATCH_FIELDS},
                 baseline.patch,
                 replace_entries=True,
             ),

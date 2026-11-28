@@ -8,6 +8,7 @@ from typing import Any
 
 from ...storage_format import WriterLease
 from ..agent_state import _apply_agent_state, _session_state_mutations
+from ..checkpoints import ConversationIntegrityError
 from ..session_files import write_session_file
 from ..todo import TodoItem, parse_todo_items
 
@@ -50,17 +51,36 @@ class SessionStatePersistenceMixin:
             state["todo_items"] = normalized_items
         if self._todo_dismissed:
             state["todo_dismissed"] = True
+        deleted = tuple(deleted_agent_children)
+        dirty, self._dirty_agent_children = self._dirty_agent_children, set()
         _apply_agent_state(
             state,
             agent_counter=self._agent_counter,
-            agent_children=self._agent_children,
+            agent_children={
+                key: self._agent_children[key]
+                for key in dirty
+                if key in self._agent_children and key not in deleted
+            },
             agent_parent=self._agent_parent,
             agent_canceled=self._agent_canceled,
         )
-        mutations = _session_state_mutations(state, tuple(deleted_agent_children))
-        self._storage_lease.publish_json(
-            self.directory_fd,
-            "session_state.json",
-            mutations,
-            write_session_file,
-        )
+        mutations = _session_state_mutations(state, deleted)
+        published: list[bytes] = []
+
+        def publish(directory_fd: int, name: str, data: bytes) -> None:
+            write_session_file(directory_fd, name, data)
+            published.append(data)
+
+        try:
+            output = self._storage_lease.publish_json(
+                self.directory_fd, "session_state.json", mutations, publish
+            )
+        except BaseException:
+            self._session_state_cache = None
+            self._dirty_agent_children |= dirty
+            raise
+        try:
+            # Writes hold the session append lock, so these bytes are the file now.
+            self._session_state_cache = (published[0], self._parse_session_state(output))
+        except ConversationIntegrityError:
+            self._session_state_cache = None
