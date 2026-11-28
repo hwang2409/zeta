@@ -2161,8 +2161,22 @@ def test_remote_first_open_waits_for_a_held_bootstrap(tmp_path: Path) -> None:
     assert "initializing" not in stderr
 
 
+_BOOTSTRAP_OWNER = (
+    storage_format._home_has_gated_state,
+    storage_format._say_waiting,
+    storage_format._wait_for_bootstrap,
+    storage_format._publish_manifest,
+    storage_format._lease_home,
+)
+_SHIPPED_PROGRAMS = {
+    name: value
+    for name, value in vars(ssh_module).items()
+    if isinstance(value, str) and "def _writer_epoch(" in value
+}
+
+
 def test_remote_first_open_ships_the_local_bootstrap_owner() -> None:
-    # A second bootstrap (its own lock name, manifest publish, or exclusive lock)
+    # A second bootstrap (its own lock, manifest write, or exclusive lock)
     # anywhere outside storage_format fails here.
     root = Path(storage_format.__file__).parent
     spelled = sorted(
@@ -2171,21 +2185,40 @@ def test_remote_first_open_ships_the_local_bootstrap_owner() -> None:
         if path.name != "storage_format.py" and ".storage-format.lock" in path.read_text()
     )
     assert spelled == [], f"stored-format lock opened outside its owner: {spelled}"
-    program = ssh_module._REMOTE_WRITER_EPOCH
-    owners = [
-        storage_format._home_has_gated_state,
-        storage_format._wait_for_bootstrap,
-        storage_format._publish_manifest,
-        storage_format._lease_home,
-    ]
-    for owner in owners:
-        assert program.count(f"def {owner.__name__}(") == 1, owner.__name__
-        assert inspect.getsource(owner) in program, f"{owner.__name__} is not the shipped owner"
-    rest = program
-    for owner in owners:
+    lock_users = {
+        path.relative_to(root).as_posix(): path.read_text().count("storage_format._LOCK")
+        for path in root.rglob("*.py")
+        if "storage_format._LOCK" in path.read_text()
+    }
+    # the one remote open of the lock, whose fd goes straight to _lease_home
+    assert lock_users == {"remote_sync/ssh.py": 1}, lock_users
+    assert set(_SHIPPED_PROGRAMS) >= {"_REMOTE_WRITER_EPOCH", "_PROJECT_FETCH_SCRIPT"}
+    for name, program in _SHIPPED_PROGRAMS.items():
+        rest = program
+        for owner in _BOOTSTRAP_OWNER:
+            assert program.count(f"def {owner.__name__}(") == 1, (name, owner.__name__)
+            assert inspect.getsource(owner) in program, (name, owner.__name__)
+            rest = rest.replace(inspect.getsource(owner), "")
+        assert rest.count(repr(storage_format._LOCK)) == 1, f"{name} opens the lock twice"
+        for line in rest.splitlines():
+            if "_MANIFEST" in line or storage_format._MANIFEST in line:
+                assert line.startswith("_MANIFEST = ") or "read_text()" in line, (
+                    f"{name} touches the manifest outside the owner: {line.strip()}"
+                )
+    rest = ssh_module._REMOTE_WRITER_EPOCH
+    for owner in _BOOTSTRAP_OWNER:
         rest = rest.replace(inspect.getsource(owner), "")
     for primitive in ("LOCK_EX", "os.replace", "os.rename"):
         assert primitive not in rest, f"remote program bootstraps outside the owner: {primitive}"
+
+
+def test_shipped_remote_programs_parse_as_python_3_8() -> None:
+    # Remote hosts run /usr/bin/python3 (3.8 on Ubuntu 20.04). This catches 3.9+
+    # syntax and the str.remove{prefix,suffix} slip only, not every newer API.
+    for name, program in _SHIPPED_PROGRAMS.items():
+        ast.parse(program, feature_version=(3, 8))
+        for api in ("removesuffix", "removeprefix"):
+            assert api not in program, f"{name} uses str.{api} (Python 3.9)"
 
 
 def test_p06_3_generated_project_program_retains_stored_format_lease(

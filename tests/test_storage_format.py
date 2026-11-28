@@ -225,12 +225,19 @@ def test_first_start_waits_for_a_concurrent_bootstrap_then_opens(
     assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH
 
 
-@pytest.mark.parametrize(("held", "notices"), [(2.0, 1), (0.05, 0)])
+@pytest.mark.parametrize(
+    ("held", "notices", "alive"), [(2.0, 1, True), (0.05, 0, True), (2.0, 1, False)]
+)
 def test_first_start_says_once_that_it_waits_for_a_slow_bootstrap(
-    tmp_path: Path, held: float, notices: int
+    tmp_path: Path, held: float, notices: int, alive: bool
 ) -> None:
+    pid = os.getpid()
+    if not alive:  # a crashed holder's pid: the process is gone
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait(30)
+        pid = dead.pid
     holder = _hold_exclusive_lock(tmp_path)
-    os.pwrite(holder, f"{os.getpid()}\n".encode(), 0)
+    os.pwrite(holder, f"{pid}\n".encode(), 0)
     try:
         started = subprocess.Popen(
             [
@@ -256,8 +263,9 @@ def test_first_start_says_once_that_it_waits_for_a_slow_bootstrap(
     finally:
         os.close(holder)
     assert started.returncode == 0, stderr
+    named = f" (pid {pid})" if alive else ""
     expected = (
-        f"zeta: waiting for another zeta process (pid {os.getpid()}) "
+        f"zeta: waiting for another zeta process{named} "
         f"to finish creating {tmp_path.resolve()}"
     )
     assert stderr.splitlines().count(expected) == notices, stderr

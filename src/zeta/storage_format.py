@@ -832,7 +832,7 @@ def _home_has_gated_state(home: Path) -> bool:
     home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for pattern, _owner in GATED_HOME_PATHS:
-            name = pattern.removesuffix("/*")
+            name = pattern[:-2] if pattern.endswith("/*") else pattern
             try:
                 info = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -857,10 +857,26 @@ def _home_has_gated_state(home: Path) -> bool:
         os.close(home_fd)
 
 
+def _say_waiting(fd: int, home: Path) -> None:
+    pid = os.pread(fd, 32, 0).decode(errors="replace").strip()
+    holder = f" (pid {pid})" if pid.isdigit() else ""
+    if holder:
+        try:
+            os.kill(int(pid), 0)
+        except PermissionError:
+            pass  # alive, owned by another user
+        except (ProcessLookupError, OverflowError):
+            holder = ""  # a crashed holder left its pid behind
+    print(
+        f"zeta: waiting for another zeta process{holder} to finish creating {home}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _wait_for_bootstrap(fd: int, home: Path, deadline: float) -> bool:
     """Poll for a shared lock until the exclusive holder finishes or the deadline passes."""
     notice = time.monotonic() + _BOOTSTRAP_NOTICE_SECONDS
-    noticed = False
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -869,16 +885,9 @@ def _wait_for_bootstrap(fd: int, home: Path, deadline: float) -> bool:
             now = time.monotonic()
             if now >= deadline:
                 return False
-            if not noticed and now >= notice:
-                noticed = True
-                pid = os.pread(fd, 32, 0).decode(errors="replace").strip()
-                holder = f" (pid {pid})" if pid.isdigit() else ""
-                print(
-                    f"zeta: waiting for another zeta process{holder} "
-                    f"to finish creating {home}",
-                    file=sys.stderr,
-                    flush=True,
-                )
+            if now >= notice:
+                notice = deadline  # say it once
+                _say_waiting(fd, home)
         time.sleep(0.01)
 
 
@@ -888,7 +897,8 @@ def _lease_home(fd: int, home: Path) -> str:
     The one first-open owner: every writer open, local or remote, calls this.
     Returns "" with the lease held, "busy" when another holder outlasts the
     bounded wait, or "gated" when stored state exists without a manifest.
-    Stdlib only: remote_sync ships this source to hosts without zeta.
+    Shipped to remote hosts: Python 3.8 stdlib only. remote_sync ships this
+    source (and its helpers) to hosts without zeta.
     """
     if (home / _MANIFEST).exists():
         fcntl.flock(fd, fcntl.LOCK_SH)

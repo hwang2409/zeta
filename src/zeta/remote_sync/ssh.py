@@ -87,10 +87,12 @@ finally:
 
 
 # Remote Python need not have zeta installed: ship the local first-open owner itself.
+# Shipped to remote hosts: Python 3.8 stdlib only (Ubuntu 20.04 /usr/bin/python3).
 _REMOTE_LEASE_HOME = "\n".join(
     inspect.getsource(function)
     for function in (
         storage_format._home_has_gated_state,
+        storage_format._say_waiting,
         storage_format._wait_for_bootstrap,
         storage_format._publish_manifest,
         storage_format._lease_home,
