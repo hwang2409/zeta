@@ -832,7 +832,8 @@ def _home_has_gated_state(home: Path) -> bool:
     home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for pattern, _owner in GATED_HOME_PATHS:
-            name = pattern[:-2] if pattern.endswith("/*") else pattern
+            # not str.remove*suffix (Python 3.9): this source ships to 3.8 hosts
+            name = pattern[:-2] if pattern.endswith("/*") else pattern  # noqa: FURB188
             try:
                 info = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
             except FileNotFoundError:
