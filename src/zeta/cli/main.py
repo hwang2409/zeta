@@ -1036,7 +1036,8 @@ def _exec_restart(entrypoint: str, argv: list[str], session_id: str) -> int:
     return 0
 def _has_console_message(exc: Exception) -> bool:
     from ..accounts import AccountError
-    return isinstance(exc, StorageFormatError | AccountError)
+    from ..oauth import CredentialReadError
+    return isinstance(exc, StorageFormatError | AccountError | CredentialReadError)
 def _run_console(run: Callable[[], int]) -> int:
     try:
         return run()
