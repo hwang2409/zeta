@@ -501,6 +501,15 @@ class SessionControllers:
             and not record.closing
         ), None)
 
+    def resident_session_ids(self) -> frozenset[str]:
+        """The sessions ``resident`` returns a record for, at this moment."""
+        candidates = {
+            *self._by_session, *self._parked,
+            *(record.runtime.session_id for record in self._records.values()
+              if record.runtime.opened is not None),
+        }
+        return frozenset(sid for sid in candidates if self.resident(sid) is not None)
+
     @staticmethod
     def _controlled(session_id: str) -> ProtocolError:
         return ProtocolError(
