@@ -3,6 +3,9 @@
 import asyncio
 import json
 import os
+import select
+import subprocess
+import sys
 from collections import Counter
 from contextlib import ExitStack
 from dataclasses import replace
@@ -21,6 +24,7 @@ from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import ToolCall
 from zeta.server import ZetaServer, protocol
+from zeta.server.read_sessions import read_session_page
 from zeta.tools._shared.process import background_tasks_for_session
 
 MARKER = "PRIVATE-CONTENT-STATE-S6C"
@@ -223,3 +227,45 @@ async def test_session_state_websocket(tmp_path, monkeypatch, case):
                 assert all(row["session_id"] == sid and row["summary"] is None for row in reply["items"])
     finally:
         await await_or_fail(server.close(), what="serve close")
+
+
+_HOLD_LEASE = """
+import os, sys
+from zeta.core.session_execution import OwnerHint, SessionExecutionLease
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+lease = SessionExecutionLease.acquire(fd, session_id=sys.argv[2], owner=OwnerHint(sys.argv[3]))
+print("held", flush=True)
+sys.stdin.read()
+lease.close()
+"""
+
+
+@pytest.mark.parametrize(("surface", "expected"), (("serve", "unknown"), ("tui", "unknown"), ("headless", "running")))
+def test_external_lease_holder_status(tmp_path, surface, expected):
+    home = tmp_path / "home"
+    opened = SessionManager(home).create(provider="codex", model="offline", cwd=tmp_path, auto_project=False)
+    sid = opened.metadata.session_id
+    opened.store.close()
+
+    def statuses():
+        listed = read_session_page(home, protocol.MethodDescriptor.STATE_SESSIONS, {}, lambda _: True, {})
+        detail = read_session_page(home, protocol.MethodDescriptor.STATE_SESSION, {"session_id": sid, "collection": "agents"},
+                                   lambda _: True, {}, detail=True)
+        return [row["status"] for row in listed["items"]], detail["session"]["status"]
+
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_LEASE, str(home / "sessions" / sid), sid, surface],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        ready, _, _ = select.select([holder.stdout], [], [], 10)
+        assert ready and holder.stdout.readline() == "held\n", "lease holder did not start"
+        assert statuses() == ([expected], expected), f"{surface} holder"
+        holder.stdin.close()
+        assert holder.wait(10) == 0
+        assert statuses() == (["idle"], "idle"), "released lease"
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+        holder.wait(10)
+        holder.stdout.close()
