@@ -1614,8 +1614,8 @@ active session. Params are `session_id` plus optional nonnegative `offset` and `
 from 1 to 100. The result is `runs` and, when more rows remain, `next_offset`.
 Each row contains `run_id`, the top-level `session_id`, nullable
 `parent_run_id`, `description`, `agent_type`, `status`, `accepts_follow_ups`,
-`turns_used`, `tool_count`, `current_step`, `started_at`, optional or null
-`finished_at`, and `elapsed_seconds`. `tool_count` is the total for the whole
+`accepts_send`, `turns_used`, `tool_count`, `current_step`, `started_at`,
+optional or null `finished_at`, and `elapsed_seconds`. `tool_count` is the total for the whole
 child run, cumulative across its follow-up segments, and never decreases. The
 public `run_id` is the existing child
 instance id. Child-local store ids and the agent tool's `handle` name are not
@@ -1642,6 +1642,29 @@ cache is stale. The server does not refresh usage to produce this row. A count
 of zero means no alternatives are known from the cache, not that the provider
 is exhausted. Rows without a snapshot and terminal rows omit `account_status`.
 
+`accepts_send` is a boolean. It is `true` when `child_run_send` with valid
+`text` from a controller is accepted for this run now, and `false` when it
+returns `-32005`. The server computes it with the same check that
+`child_run_send` uses, so clients use this field and do not parse `status`,
+`suspension_reason`, or `current_step`. Observers receive the same value, but
+their own `child_run_send` returns `observer_read_only`.
+
+| run | `accepts_send` |
+| --- | --- |
+| `running` or `idle` background run, profile accepts follow-ups | `true` |
+| `running` run, profile does not accept follow-ups, or foreground run | `false` |
+| `suspended` with `provider_unavailable`, live in this server (any profile) | `true` |
+| `suspended` with no live owner in this server, including `recovery blocked:` | `false` |
+| `completed`, `failed`, or `canceled` | `false` |
+
+The value is a snapshot. The run can end between `child_run_list` and
+`child_run_send`, so a client still treats `-32005` as "not now". The field is
+additive and needs no new feature. `child_run_list` exists only with
+`child_runs`, which a 1.0 handshake cannot negotiate, so every row has it.
+`child_run_events`, the agent run catalog, and lifecycle event rows do not
+carry `accepts_send`: those rows come from durable lifecycle records, not from
+the live run owner.
+
 `child_run_send` queues one message at the child's existing safe delivery
 point. Params are `session_id`, `run_id`, and nonempty `text`; success returns
 `{"accepted":true,"run_id":"..."}`. A missing or terminal child returns
@@ -1654,29 +1677,26 @@ An accepted message is written to the child's own transcript as a pending
 prompt before the response, so it survives a restart. The child reads queued
 messages one at a time, oldest first, at its next model request.
 
-A send to a `"suspended"` row is accepted only while this server owns the run.
-The row has no field that says so directly, so clients use this rule: a
-suspended row accepts a send when `suspension_reason` is
-`"provider_unavailable"` and `current_step` does not start with `recovery
-blocked:`. Such a run waits for its provider. The send is accepted even if its
-profile does not accept follow-ups or its retry is `stopped`: the server queues
-the message and wakes the child at once, without waiting for the next probe.
-
-A row whose `current_step` starts with `recovery blocked:` has no owner, with
-any reason, including `"provider_unavailable"`: after a parent restart a
-provider reason stays on the row, and a blocked recovery keeps it and its retry
-fields. A `normal_exit` or `owner_lost` row has no owner once recovery is done.
-A send to these rows returns `-32005` and nothing is queued. While a restarted
-server resumes a child, there is a short window in which a `normal_exit` or
-`owner_lost` row still reads `"suspended"` but a send to a profile that accepts
-follow-ups is accepted. The rule is a hint: treat `-32005` as "not now" and
-call `child_run_list` again.
+Clients decide whether to offer a send from the row's `accepts_send` field
+(see above), not from `status`, `suspension_reason`, or `current_step`. A send
+to a `"suspended"` row is accepted only while this server owns the run. A
+provider-suspended run that this server owns waits for its provider. Its send
+is accepted even if its profile does not accept follow-ups or its retry is
+`stopped`: the server queues the message and wakes the child at once, without
+waiting for the next probe. A suspended run with no owner, such as a blocked
+recovery (`current_step` starts with `recovery blocked:`) or a `normal_exit` or
+`owner_lost` run after recovery is done, returns `-32005` and nothing is
+queued. While a restarted server resumes a child, a `normal_exit` or
+`owner_lost` row can still read `"suspended"` while a send to a profile that
+accepts follow-ups is accepted; `accepts_send` is `true` in that window.
+`accepts_send` is a snapshot: treat `-32005` as "not now" and call
+`child_run_list` again.
 
 Homes below storage epoch 13 never suspend a child; a restart cancels it
 instead. The server applies these send rules with or without `child_recovery`.
 Without that feature, a suspended row reads as `"running"`, its retry fields
-are removed, and a provider row's `current_step` reads `thinking`, so the
-client cannot target the suspended case.
+are removed, and a provider row's `current_step` reads `thinking`;
+`accepts_send` still gives the send result.
 
 | child state | `child_run_send` result |
 | --- | --- |
@@ -2279,7 +2299,7 @@ identical filters). There is no offset or update event.
 
 The result is `{revision,data:{items,next_cursor?}}`. `revision` is a lowercase
 SHA-256 of the returned page data, not a snapshot or a write token. `items`
-uses the `child_run_list` row shape, including `run_id`, `session_id` (root),
+uses the `child_run_list` row shape without `accepts_send`, including `run_id`, `session_id` (root),
 `parent_run_id` (null for direct children), `description`, `agent_type`,
 `status`, `accepts_follow_ups`, `turns_used`, `tool_count`, `current_step`,
 `started_at`, `finished_at`, and `elapsed_seconds`. The read uses durable
@@ -3233,7 +3253,7 @@ error code and message. Provider status and origin remain internal.
   final `assistant_message` or `tool_end` still carries all of it. The
   result and every other event are unchanged; without the feature the join is
   unchanged. serve-only: no TUI surface.
-- `child_run_events`: takes exactly `{session_id, run_id}` for the active top-level session. It atomically returns the newest child history page plus `replay: {stream_id, history_seq: 0}`, `child`, and `revision`, then subscribes that connection to a child scope. The scope delivers: the `child_started`, `child_progress`, and `child_ended` lifecycle events of the selected run's own children; and the selected run's and its descendants' own `tool_start`/`tool_output`/`tool_end` and `approval_request`/`approval_end` events (every event whose `agent_instance_id` equals the selected `run_id` or starts with `run_id + ":"`). The selected run's own `child_progress` and `child_ended` go only to its immediate parent's scope, not this stream. The selected run's `assistant_message`, `assistant_delta`, `usage`, and turn events are never streamed; read them with `child_run_history`. Parent snapshot rows are event-shaped `child_progress` rows placed in `messages` immediately after their `child_started` row. A `session_history_and_subscribe` connection with `child_run_events` negotiated receives durable parent lifecycle rows and these bounded snapshot rows; without that feature, parent history is unchanged. `child_run_events` connections receive the same baseline for the selected child scope. Live events carry `stream_id` and consecutive `seq`; progress also carries `revision`. The shared child payload is the z5 child-run row, whose `parent_run_id` is null for a direct child of the session and the parent run's `run_id` for a nested child. Malformed parameters use `-32602` (`invalid_params`), an absent child uses `-32012` (`child_run_not_found`), and an invalid join uses `-32009` (`stale_event_sequence`).
+- `child_run_events`: takes exactly `{session_id, run_id}` for the active top-level session. It atomically returns the newest child history page plus `replay: {stream_id, history_seq: 0}`, `child`, and `revision`, then subscribes that connection to a child scope. The scope delivers: the `child_started`, `child_progress`, and `child_ended` lifecycle events of the selected run's own children; and the selected run's and its descendants' own `tool_start`/`tool_output`/`tool_end` and `approval_request`/`approval_end` events (every event whose `agent_instance_id` equals the selected `run_id` or starts with `run_id + ":"`). The selected run's own `child_progress` and `child_ended` go only to its immediate parent's scope, not this stream. The selected run's `assistant_message`, `assistant_delta`, `usage`, and turn events are never streamed; read them with `child_run_history`. Parent snapshot rows are event-shaped `child_progress` rows placed in `messages` immediately after their `child_started` row. A `session_history_and_subscribe` connection with `child_run_events` negotiated receives durable parent lifecycle rows and these bounded snapshot rows; without that feature, parent history is unchanged. `child_run_events` connections receive the same baseline for the selected child scope. Live events carry `stream_id` and consecutive `seq`; progress also carries `revision`. The shared child payload is the z5 child-run row without `accepts_send`, whose `parent_run_id` is null for a direct child of the session and the parent run's `run_id` for a nested child. Malformed parameters use `-32602` (`invalid_params`), an absent child uses `-32012` (`child_run_not_found`), and an invalid join uses `-32009` (`stale_event_sequence`).
 - `session_history`: takes optional nonnegative `offset` (default 0). Returns
   `messages` and `next_offset` (null at the end). With negotiated
   `session_history_backward`, `before: null` returns the newest page and returns
