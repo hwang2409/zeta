@@ -411,6 +411,10 @@ def make_child_progress_callbacks(
                 last_turns = live.get("turns_used")
                 continue  # the turn-end write just saved progress
             await child_store._commit_storage_command(_ChildActivityCommand())
+            # The save publishes live progress from a worker thread; republish this loop's copy so
+            # a tool call counted while the save ran is not replaced by the older snapshot.
+            if live_agent_lifecycle(child_store.agent_lifecycle_path) is not None:
+                child_store.update_agent_lifecycle()
 
     return update_turns, record_tool_call, save_progress_while_running
 

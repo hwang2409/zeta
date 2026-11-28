@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import shutil
+import threading
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -451,15 +452,20 @@ def _saved_lifecycle(path):
     return json.loads(path.read_text())
 
 
-async def _saved_progress(path, elapsed):
-    """Wait, best effort, until the running child saved ``elapsed`` to disk."""
+async def _saved_progress(path, expected):
+    """Wait, best effort, until the running child saved ``(elapsed, tool_calls)`` to disk."""
 
+    def saved():
+        value = _saved_lifecycle(path)
+        return value["elapsed"], value["tool_calls"]
+
+    # The tool call is counted when the runner consumes its start event, which can trail the
+    # bash process start; a save in between has the new elapsed and the old count.
     with contextlib.suppress(TimeoutError):
         async with asyncio.timeout(10):
-            while _saved_lifecycle(path)["elapsed"] != elapsed:
+            while saved() != expected:
                 await asyncio.sleep(0)
-    value = _saved_lifecycle(path)
-    return value["elapsed"], value["tool_calls"]
+    return saved()
 
 
 async def _wait_for_file(path):
@@ -498,7 +504,7 @@ async def test_crash_during_long_tool_call_keeps_saved_progress(tmp_path, monkey
                 clock[0] += 40.0
                 # 30 s model call + 40 s inside the bash call, and the started call counts.
                 # Asserted after recovery, so a run without saves reaches the recovered totals first.
-                saved_mid_call = await _saved_progress(lifecycle_file, 70.0)
+                saved_mid_call = await _saved_progress(lifecycle_file, (70.0, 1))
                 # A copy taken mid-run is what a killed process leaves on disk.
                 shutil.copytree(root, tmp_path / "crashed")
             finally:
@@ -565,7 +571,7 @@ async def test_progress_saves_stop_when_the_long_step_ends(tmp_path, monkeypatch
                 await _wait_for_file(pid_file)
                 lifecycle_file = _child_lifecycle_file(store)
                 clock[0] += 40.0
-                assert await _saved_progress(lifecycle_file, 70.0) == (70.0, 1), "progress inside a long step must be saved"
+                assert await _saved_progress(lifecycle_file, (70.0, 1)) == (70.0, 1), "progress inside a long step must be saved"
                 await asyncio.to_thread(go.touch)
                 if ending == "completed":
                     await await_or_fail(loop._background_owner.wait(), what="child completes")
@@ -577,6 +583,8 @@ async def test_progress_saves_stop_when_the_long_step_ends(tmp_path, monkeypatch
                         while (writes[-1], len(backend.calls)) != ("idle", 3):
                             await asyncio.sleep(0)
                     assert len(_progress_savers()) == 1
+                    # A save checked just before the child went idle may still land; the saver awaits it before its next tick.
+                    await more_ticks(2)
                     saved = len(writes)
                     await more_ticks(20)
                     assert len(writes) == saved, f"an idle child must not write progress: {writes[saved:]}"
@@ -586,3 +594,39 @@ async def test_progress_saves_stop_when_the_long_step_ends(tmp_path, monkeypatch
                 await await_or_fail(loop.close(), what="close parent")
     finally:
         _kill_bash(pid_file)
+
+
+@pytest.mark.asyncio
+async def test_tool_call_counted_while_progress_saves_is_kept(tmp_path, monkeypatch):
+    more_ticks = _fast_progress_saves(monkeypatch)
+    reached, release = threading.Event(), threading.Event()
+    live = agent_state.live_agent_lifecycle
+
+    def held(path):
+        value = live(path)
+        if threading.current_thread() is not threading.main_thread() and not release.is_set():
+            reached.set()
+            release.wait(10)
+        return value
+
+    # test-contract: seam hold the save's worker thread after it read live progress (the bad order).
+    monkeypatch.setattr(agent_state, "live_agent_lifecycle", held)
+    with ConversationStore(tmp_path / "child") as store:
+        store.start_agent_lifecycle(
+            handle="child-1", started_at="2026-01-01T00:00:00+00:00", depth=1, agent_type="worker", description="work",
+        )
+        *_, save_progress = turn_limit.make_child_progress_callbacks(
+            loop=None, child_store=store, child_marker_key="child-1", child_tool_call_id="call", recoverable=True,
+        )
+        saver = asyncio.create_task(save_progress())
+        try:
+            assert await await_or_fail(asyncio.to_thread(reached.wait, 10), what="a save reads live progress")
+            store.update_agent_lifecycle(tool_calls=1)  # the runner counts a tool call while the save runs
+            release.set()
+            await more_ticks(5)
+        finally:
+            release.set()
+            saver.cancel()
+            await await_or_fail(asyncio.gather(saver, return_exceptions=True), what="join the progress saver")
+        saved = json.loads(store.agent_lifecycle_path.read_text())
+        assert (saved["state"], saved["tool_calls"]) == ("running", 1), "a save must not drop a tool call counted meanwhile"
