@@ -23,6 +23,7 @@ from .._shared.process import (
     tool_subprocess_env,
 )
 from .._shared.shell_cwd import bind_shell_cwd_async
+from .._shared import tool_process_record
 from .._shared.tool_spawn import create_tool_subprocess_shell
 from ..registry import (
     ToolExecutionContext,
@@ -255,13 +256,19 @@ async def _bash(
     abort_wait: asyncio.Task[None] | None = None
     timeout_wait: asyncio.Task[None] | None = None
     timed_out = False
+    # The command inherits this record's lock, so recovery can find it if zeta dies mid-call.
+    record: tool_process_record.ToolProcessRecord | None = None
     try:
         try:
+            if (session_dir := registry.session_dir) is not None and execution_context is not None:
+                record = await asyncio.to_thread(
+                    tool_process_record.open_record, session_dir, execution_context.tool_call.id
+                )
             spawn_kwargs = {
                 "stdin": asyncio.subprocess.DEVNULL,
                 "stdout": asyncio.subprocess.PIPE,
                 "stderr": asyncio.subprocess.PIPE,
-                "pass_fds": (write_fd,),
+                "pass_fds": (write_fd,) if record is None else (write_fd, record.fd),
                 "env": _shell_environment(execution_context, start_cwd),
                 "niceness": registry.command_niceness,
             }
@@ -282,6 +289,9 @@ async def _bash(
         finally:
             os.close(cwd_fd)
             cwd_fd = -1
+        if record is not None:
+            record.set_pgid(process.pid)
+            record.close_parent_fd()
         os.close(write_fd)
         write_fd = -1
         if process.stdout is None or process.stderr is None:
@@ -402,6 +412,11 @@ async def _bash(
         if write_fd >= 0:
             os.close(write_fd)
         os.close(read_fd)
+        if record is not None:
+            if process is None or process.returncode is not None:
+                record.unlink()
+            else:
+                record.close_parent_fd()
 
 
 def register(registry: ToolRegistry) -> None:

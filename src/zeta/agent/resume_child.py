@@ -18,6 +18,7 @@ from ..core.store._async_writes import (
 from ..protocol.types import ToolCall
 from ..runtime.approval_recovery import _end_payload
 from ..runtime.offload import await_joined_offload
+from ..tools._shared import tool_process_record
 from .background_lifecycle import _recoverable_marker
 from .child_context import resolve_child_backend
 from .recovery_lease import acquire_recovery_subtree
@@ -38,8 +39,44 @@ def _resolve_backend(parent: AgentLoop, saved: dict[str, Any], context: Any) -> 
     return backend
 
 
+class OrphanedToolProcessError(RuntimeError):
+    """A command from before the crash still runs and could not be stopped."""
+
+
+_STOPPED_NOTE = (
+    "tool execution canceled: zeta crashed while this command ran. recovery stopped its leftover "
+    "processes (process group {groups}) before resuming. the command may have partly run; "
+    "check its effects before you run it again."
+)
+_ENDED_NOTE = (
+    "tool execution canceled: zeta crashed while this command ran. the command ended before "
+    "recovery, and its output and exit status were lost. it may have finished; check its "
+    "effects before you run it again."
+)
+
+
+def _stop_orphans(store: ConversationStore) -> dict[str, str]:
+    notes = {}
+    for call_id in store.unresolved_tool_call_ids():
+        outcome = tool_process_record.stop_orphan(store.session_dir, call_id)
+        groups = ", ".join(map(str, outcome.groups)) or "unknown"
+        if outcome.kind == "unstoppable":
+            raise OrphanedToolProcessError(
+                "a command from before the crash is still running and could not be stopped "
+                f"(process group {groups}, lock {outcome.path})"
+            )
+        if outcome.kind == "stopped":
+            notes[call_id] = _STOPPED_NOTE.format(groups=groups)
+        elif outcome.kind == "exited":
+            notes[call_id] = _ENDED_NOTE
+    return notes
+
+
 async def repair_interrupted_child(root: ConversationStore, store: ConversationStore, run_id: str) -> None:
-    await store._commit_storage_command(_RepairChildInterruptionCommand())
+    # Stop leftover tool processes first, so a restart at any point here kills again or finds them gone.
+    notes = await asyncio.to_thread(_stop_orphans, store)
+    await store._commit_storage_command(_RepairChildInterruptionCommand(notes=notes))
+    await asyncio.to_thread(tool_process_record.sweep, store.session_dir)
     for wire_id, tool_call in root.delegated_unmatched_requests(run_id):
         request_id = tool_call.get("id")
         if isinstance(request_id, str) and (resolution := store.approval_resolution_now(request_id)) is not None:
@@ -128,7 +165,11 @@ async def _resume_child(
             await owner.block_recovery("saved model or account is unavailable")
             return
         if state["resume_mode"] == "active":
-            await repair_interrupted_child(tree.notification_store, store, run_id)
+            try:
+                await repair_interrupted_child(tree.notification_store, store, run_id)
+            except OrphanedToolProcessError as exc:
+                await owner.block_recovery(str(exc))
+                return
         store.bind_owner_thread()
         try:
             child, policy = await _build_child_loop(
