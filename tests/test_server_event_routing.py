@@ -27,9 +27,9 @@ from zeta.server.protocol import EventDescriptor
 ])
 @pytest.mark.asyncio
 async def test_event_routing_table(tmp_path: Path, transport: Transport, case: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    assert set(EVENT_FEATURES) == set(EventDescriptor) and len(EVENT_FEATURES) == 45
+    assert set(EVENT_FEATURES) == set(EventDescriptor) and len(EVENT_FEATURES) == 47
     assert Counter(route.destination for route in EVENT_FEATURES.values()) == {
-        "session": 42, "connection": 2, "global": 1,
+        "session": 44, "connection": 2, "global": 1,
     }
     server = replay_server(tmp_path, transport, _backend_factory)
     await server.start()

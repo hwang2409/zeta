@@ -11,6 +11,7 @@ from ..core.store import (
     MAX_AGENT_NOTIFICATION_TEXT,
     ConversationStore,
 )
+from ..core.store._async_writes import _ChildActivityCommand
 from ..protocol.types import (
     MessageOrigin,
     StreamEvent,
@@ -41,8 +42,10 @@ _IDLE_NUDGE_PROMPT = (
 )
 
 
-def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
-    if getattr(child_loop, "explicit_finish", False):
+async def _transition_running(child_loop: AgentLoop, child_store: ConversationStore) -> None:
+    if getattr(getattr(child_loop, "_child_run_owner", None), "recoverable", False):
+        await child_store._commit_storage_command(_ChildActivityCommand(state="running"))
+    elif getattr(child_loop, "explicit_finish", False):
         child_store.update_agent_lifecycle(
             state="running",
             current_step="running follow-up",
@@ -153,6 +156,7 @@ async def consume_run(
     *,
     child_store: ConversationStore,
     tool_call_id: str = "",
+    resumed_idle: bool = False,
     max_receipt_bytes: int = MAX_AGENT_RESULT_BYTES,
     receipt_components: dict[str, str] | None = None,
     **kwargs: Any,
@@ -201,11 +205,86 @@ async def consume_run(
 
     safety_started: float | None = None
     safety_task: asyncio.Task[tuple[str, ...]] | None = None
+    owner = getattr(child_loop, "_child_run_owner", None)
+    control = getattr(child_loop, "child_turn_control", None)
+
+    def held_at_limit() -> bool:
+        return bool(control is not None and control.exhausted and owner is not None and owner.settlement_due())
+
+    async def wait_for_answers(*, settlement: bool = False):
+        assert owner is not None
+        text = "waiting for parent's answer"
+        await child_store._commit_storage_command(_ChildActivityCommand(state="idle", current_step=text))
+        channel = child_loop._background_owner.conversation_channel
+
+        def show_idle() -> None:
+            child_loop._publish_background_event(StreamEvent(
+                StreamEventType.AGENT_NOTIFICATION,
+                data={
+                    "origin": "notification", "kind": "child_idle", "status": "child_idle",
+                    "child_instance_id": owner.run_id, "child_session_path": str(child_store.session_dir),
+                    "description": child_loop._background_owner.description(owner.run_id),
+                    "text": text, "display_only": True,
+                },
+            ))
+
+        flow = await child_loop._ensure_step_delivery()
+        show_idle()
+        while owner.pending_questions() and (settlement or not flow.has_pending_edge):
+            action = await idle_lifecycle.wait_for_idle_action(
+                lambda: channel.wait(owner.run_id), owner, display_only=True,
+            )
+            if action == "nudge" and owner.pending_questions():
+                show_idle()
+        owner.finish_waits_for_answer = False
+        if not settlement:
+            await _transition_running(child_loop, child_store)
+            return await consume_child(
+                child_loop, "", origin=MessageOrigin.NOTIFICATION, notification_turn=True, **kwargs,
+            )
+        assert control is not None
+        if not await owner.reserve_question_settlement(control.used + 1):
+            # Suspension or cancellation won before admission. The owner will settle the run.
+            raise asyncio.CancelledError
+        control.admit_settlement()
+        flow.question_settlement = True
+        try:
+            await _transition_running(child_loop, child_store)
+            return await consume_child(
+                child_loop, "", origin=MessageOrigin.HARNESS_NUDGE,
+                harness_notice_message=harness_notice(
+                    "parent answer", "Use the parent answer to settle the existing work and call finish. Do not start new work.",
+                    event="child_question_settlement",
+                ), **kwargs,
+            )
+        finally:
+            flow.question_settlement = False
+            owner.question_settlement = False
+
     try:
-        result = await consume_child(
-            child_loop, prompt, origin=MessageOrigin.AGENT_PROMPT, **kwargs
-        )
+        if held_at_limit():
+            result = await wait_for_answers(settlement=True)
+        elif resumed_idle and owner is not None and owner.pending_questions():
+            result = await wait_for_answers()
+        elif resumed_idle:
+            flow = await child_loop._ensure_step_delivery()
+            while not flow.has_pending_edge:
+                await child_loop._background_owner.conversation_channel.wait(child_loop.agent_instance_id)
+            await _transition_running(child_loop, child_store)
+            result = await consume_child(
+                child_loop, "", origin=MessageOrigin.NOTIFICATION, notification_turn=True, **kwargs,
+            )
+        else:
+            result = await consume_child(
+                child_loop, prompt, origin=MessageOrigin.AGENT_PROMPT, **kwargs
+            )
         while not result.get("isError"):
+            if held_at_limit():
+                result = await wait_for_answers(settlement=True)
+                continue
+            if owner is not None and owner.finish_waits_for_answer:
+                result = await wait_for_answers()
+                continue
             structured = result.get("structuredContent")
             recoverable_error = (
                 structured.get("recoverable_error")
@@ -246,7 +325,7 @@ async def consume_run(
                 flow.reset_stalled_episode()
                 ordinary_idle_presented = False
                 idle_lifecycle.reset_idle_period()
-                _transition_running(child_loop, child_store)
+                await _transition_running(child_loop, child_store)
                 result = await consume_child(
                     child_loop,
                     "",
@@ -256,7 +335,10 @@ async def consume_run(
                 )
                 continue
             if idle:
-                _transition_idle(child_store)
+                if getattr(getattr(child_loop, "_child_run_owner", None), "recoverable", False):
+                    await child_store._commit_storage_command(_ChildActivityCommand(state="idle"))
+                else:
+                    _transition_idle(child_store)
                 content = result.get("content")
                 text = "child is idle"
                 if (
@@ -320,10 +402,10 @@ async def consume_run(
                     ended_with_text
                     and not isinstance(recoverable_error, dict)
                     and await idle_lifecycle.reserve_immediate_reminder(
-                        child_loop._terminal_transition_fence
+                        child_loop._child_run_owner
                     )
                 ):
-                    _transition_running(child_loop, child_store)
+                    await _transition_running(child_loop, child_store)
                     result = await consume_child(
                         child_loop,
                         _IMMEDIATE_FINISH_REMINDER,
@@ -348,13 +430,13 @@ async def consume_run(
                     lambda: child_loop._background_owner.conversation_channel.wait(
                         child_loop.agent_instance_id
                     ),
-                    child_loop._terminal_transition_fence,
+                    child_loop._child_run_owner,
                 )
                 if action == "external_input":
                     continue
                 if (await flow.admit_terminal("nudge")).pending:
                     continue
-                _transition_running(child_loop, child_store)
+                await _transition_running(child_loop, child_store)
                 result = await consume_child(
                     child_loop,
                     _IDLE_NUDGE_PROMPT,
@@ -410,5 +492,3 @@ async def consume_run(
                 if receipt_components is not None
                 else _without_agent_receipt_suffix(text),
             )
-            if receipt_components is not None:
-                child_store.update_agent_lifecycle_result(text, canonical_receipt=True)

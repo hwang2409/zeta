@@ -29,9 +29,9 @@ from tests.test_server import (
     _request,
 )
 from tests.test_server_observers import _controller_event_stream
+from zeta.agent.child_run_owner import ChildRunTransitionOwner
 from zeta.agent.finish_gate import FinishGateState
 from zeta.agent.run_consumer import consume_run
-from zeta.agent.terminal_fence import TerminalTransitionFence
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     CompletionBackend,
@@ -727,8 +727,8 @@ async def test_display_only_idle_reaches_serve_without_parent_turn(
             agent_type="worker",
             description="idle worker",
         )
-        child_loop._terminal_transition_fence = TerminalTransitionFence(
-            child_store,
+        child_loop._child_run_owner = ChildRunTransitionOwner(
+            child_store, "test-call", explicit_finish=True,
             owned_work=lambda: (),
             delivering_prompt_id=lambda: None,
         )

@@ -366,10 +366,10 @@ class AccountUsage:
         self.store._write_usage_bytes(account, data)
 
 
-def record_subscription_limit(
+def record_usage_snapshot(
     store: AccountStore, account: AccountId, snapshot: UsageSnapshot, captured_at: datetime
 ) -> None:
-    """Persist verified provider-error usage under the existing account lock."""
+    """Persist normalized provider usage under the account lock."""
 
     with store.usage_guard(account):
         AccountUsage(store)._write(account, snapshot, captured_at, None, "succeeded", finished=captured_at)

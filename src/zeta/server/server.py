@@ -940,7 +940,7 @@ class _Client:
         else:
             if request["method"] in {"session_history_and_subscribe", "child_run_events"}:
                 baseline_builder = (
-                    self.connections.child_runs.with_baseline
+                    lambda result: self.connections._shape_history_for_features(self, self.connections.child_runs.with_baseline(result))
                     if request["method"] in {"session_history_and_subscribe", "child_run_events"}
                     else None
                 )
@@ -1360,6 +1360,8 @@ class _Client:
             and not CHILD_RUN_EVENTS_PREREQUISITES <= set(accepted)
         ):
             accepted.remove("child_run_events")
+        if "child_recovery" in accepted and "child_runs" not in accepted:
+            accepted.remove("child_recovery")
         return _HelloNegotiation(
             protocol_version,
             client_version,

@@ -57,6 +57,7 @@ CONTROLLER_FEATURES = (
     "child_runs",
     "child_run_history",
     "child_run_events",
+    "child_recovery",
 )
 Route = tuple[EventDescriptor, str]
 
@@ -128,7 +129,7 @@ async def _serve(tmp_path: Path, transport: Transport, backend: Any) -> Serve:
     observer = await connect_replay(server, transport)
     await negotiate(controller, extra=CONTROLLER_FEATURES, protocol_version="1.2")
     created = await controller.request(2, "new_session", {"provider": "codex"})
-    await negotiate(observer, observer=True, protocol_version="1.2")
+    await negotiate(observer, observer=True, extra=("child_runs", "child_recovery"), protocol_version="1.2")
     serve = Serve(server, transport, controller, observer, created["result"]["session"]["session_id"])
     assert server.connections is not None
     original = server.connections._replay_covers
@@ -460,7 +461,21 @@ NOTIFICATIONS: dict[EventDescriptor, Callable[[Any], None]] = {
 
 def _notification(event: EventDescriptor) -> Callable[[Serve, Any], Awaitable[None]]:
     async def run(serve: Serve, backend: Any) -> None:
-        NOTIFICATIONS[event](serve.store)
+        if event in {EventDescriptor.CHILD_RECOVERED, EventDescriptor.CHILD_SUSPENDED}:
+            # Recovery publishes immediately, not as part of the next model turn.
+            store = serve.store
+            notice, _ = store.append_child_recovered(
+                f"{store.session_id}:1", 1, path="/tmp/child", description="child",
+                suspension={"code": "server_error", "text": "suspended: provider unavailable"}
+                if event is EventDescriptor.CHILD_SUSPENDED else None
+            )
+            await serve.server.controllers.attached().control._event(
+                StreamEvent(StreamEventType.AGENT_NOTIFICATION,
+                            data={"notification_id": notice.id, **notice.data}, row_seq=notice.seq),
+                session_id=store.session_id, background=True,
+            )
+        else:
+            NOTIFICATIONS[event](serve.store)
         await serve.controller.request(serve.request_id(), "send", {"text": "go"})
         await _wait_event(serve.observer, event.value)
         await _wait_event(serve.observer, "agent_end")
@@ -534,7 +549,7 @@ SCENARIOS = {
             lambda tmp: _text_backend("ok"),
             _notification(event),
         )
-        for event in NOTIFICATIONS
+        for event in (*NOTIFICATIONS, EventDescriptor.CHILD_RECOVERED, EventDescriptor.CHILD_SUSPENDED)
     },
 }
 
@@ -552,7 +567,8 @@ PREMISE_SCENARIOS: dict[Route, tuple[str, ...]] = {
     (EventDescriptor.DELIVERY_STATUS, ""): ("dropped_steer",),
     (EventDescriptor.CHILD_STARTED, ""): ("background_child",),
     (EventDescriptor.CHILD_ENDED, ""): ("background_child",),
-    **{(event, "durable"): (f"notification_{event.value}",) for event in NOTIFICATIONS},
+    **{(event, "durable"): (f"notification_{event.value}",)
+       for event in (*NOTIFICATIONS, EventDescriptor.CHILD_RECOVERED, EventDescriptor.CHILD_SUSPENDED)},
 }
 ROW_BACKED = [
     route for route, source in rows.ROUTES.items() if source is not rows.LIVE

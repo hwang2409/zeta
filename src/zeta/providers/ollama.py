@@ -318,10 +318,10 @@ class OllamaBackend(CompletionBackend):
         )
 
     async def _complete_once(
-        self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema]
+        self, messages: Sequence[Message], tool_schemas: Sequence[ToolSchema], *, probe: bool = False
     ) -> AsyncIterator[StreamEvent]:
         async with self._lease.borrow("ollama completion") as client:
-            events = self._complete_once_with_client(client, messages, tool_schemas)
+            events = self._complete_once_with_client(client, messages, tool_schemas, probe=probe)
             try:
                 async for event in events:
                     yield event
@@ -333,6 +333,8 @@ class OllamaBackend(CompletionBackend):
         client: httpx.AsyncClient,
         messages: Sequence[Message],
         tool_schemas: Sequence[ToolSchema],
+        *,
+        probe: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -340,6 +342,8 @@ class OllamaBackend(CompletionBackend):
             "stream": True,
             "options": {"num_ctx": self.token_budget},
         }
+        if probe:
+            payload["options"]["num_predict"] = 1
         tools = _tools(tool_schemas)
         if tools:
             payload["tools"] = tools

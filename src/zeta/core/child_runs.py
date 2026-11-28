@@ -29,7 +29,7 @@ from .store import ConversationStore
 from .store._child_runs import parse_child_run_id, run_row_identity
 
 TERMINAL_AGENT_STATES = frozenset({"completed", "failed", "canceled"})
-NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing"})
+NONTERMINAL_AGENT_STATES = frozenset({"running", "idle", "finishing", "suspended"})
 _VALID_AGENT_STATES = NONTERMINAL_AGENT_STATES | TERMINAL_AGENT_STATES
 _MISSING = object()
 _STATUS_REASON_FALLBACK = "child status unavailable"
@@ -158,6 +158,28 @@ def active_agent_receipts(store: object) -> dict[str, Path]:
     return receipts
 
 
+def marker_supports_recovery(marker: dict[str, Any]) -> bool:
+    # Reading validated markers with a resume descriptor implies the recovery epoch.
+    return bool(marker.get("background") and "resume" in marker)
+
+
+def project_orphaned_lifecycle(
+    lifecycle: dict[str, Any], owner: str | None, marker: dict[str, Any],
+    *, child_path: Path, completed: bool = False,
+) -> dict[str, Any]:
+    if (
+        owner is None and lifecycle.get("state") in NONTERMINAL_AGENT_STATES - {"suspended"}
+        and marker_supports_recovery(marker) and not completed and not lifecycle.get("finished_at")
+    ):
+        with ConversationStore(child_path.parent, session_id=child_path.name, _read_only=True, _must_exist=True) as child:
+            if (
+                child.child_recovery_enabled and child.agent_canceled() is None
+                and child.pending_prompt_queue.explicit_finish_report_snapshot() is None
+            ):
+                return {**lifecycle, "state": "suspended", "current_step": "suspended (parent crashed)"}
+    return lifecycle
+
+
 def read_child_lifecycle(
     store: ConversationStore,
     child_path: Path,
@@ -165,15 +187,33 @@ def read_child_lifecycle(
     read_state: Callable[..., object] = read_agent_lifecycle_state,
 ) -> tuple[object, str | None]:
     with ExitStack() as cleanup:
-        directory_fd = store.directory_fd
+        directory_fd = parent_fd = store.directory_fd
         for component in child_path.relative_to(store.session_dir.absolute()).parts:
-            directory_fd = cleanup.enter_context(
-                child_directory(directory_fd, component)
-            )
-        return (
-            read_state(directory_fd, child_path / "agent_lifecycle.json"),
-            execution_owner_state(directory_fd),
-        )
+            if component == "agents":
+                parent_fd = directory_fd
+            directory_fd = cleanup.enter_context(child_directory(directory_fd, component))
+        result = read_state(directory_fd, child_path / "agent_lifecycle.json")
+        owner = execution_owner_state(directory_fd)
+        if owner is not None or not isinstance(result, LoadedAgentLifecycle):
+            return result, owner
+        lifecycle = result.value
+        if lifecycle.get("state") not in NONTERMINAL_AGENT_STATES - {"suspended"}:
+            return result, owner
+        run_id = lifecycle.get("handle")
+        if parent_fd == store.directory_fd:
+            markers = store.agent_children()
+            completed = run_id in store.agent_completion_notifications_by_child()
+        else:
+            try:
+                parent_state = load_session_json(read_session_file(parent_fd, "session_state.json"))
+            except FileNotFoundError:
+                return result, owner
+            markers = _parse_agent_state(parent_state, child_path.parent.parent / "session_state.json")["agent_children"]
+            completed = False
+        marker = markers.get(run_id, {})
+
+        projected = project_orphaned_lifecycle(lifecycle, owner, marker, child_path=child_path, completed=completed)
+        return LoadedAgentLifecycle(projected), owner
 
 
 def unreadable_agent_status(
@@ -262,6 +302,7 @@ def project_agent_status(
         "turns_used": turns_used,
         "tool_calls": tool_calls,
         "current_step": current_step,
+        **_provider_retry_fields(lifecycle),
         "depth": depth,
         "agent_type": agent_type,
         "description": description,
@@ -338,11 +379,9 @@ def read_agent_status(
                     running_handles is not None
                     and handle not in running_handles
                     and owner_state in {None, "recovery"}
-                    and item["state"] in NONTERMINAL_AGENT_STATES
+                    and item["state"] in NONTERMINAL_AGENT_STATES - {"suspended"}
                 ):
-                    item = _lost_agent_status(
-                        item, requested=requested_handle is not None
-                    )
+                    item = _lost_agent_status(item, requested=requested_handle is not None)
             else:
                 raise TypeError("unknown lifecycle read result")
         except Exception as exc:  # noqa: BLE001 - every child needs a safe row
@@ -355,6 +394,26 @@ def read_agent_status(
             continue
         children.append(item)
     return sorted(children, key=lambda child: str(child["started_at"]))
+
+
+_PROVIDER_RETRY_FIELDS = ("suspension_reason", "retry_state", "retry_started_at", "retry_deadline_at", "next_retry_at")
+
+
+def _provider_retry_fields(lifecycle: dict) -> dict:
+    if lifecycle.get("suspension_reason") != "provider_unavailable":
+        return {}
+    return {key: lifecycle[key] for key in _PROVIDER_RETRY_FIELDS if key in lifecycle}
+
+
+def child_run_for_features(row: dict[str, Any], *, child_recovery: bool) -> dict[str, Any]:
+    """Project a child run row, not its event or history envelope."""
+    if not child_recovery and row.get("status") == "suspended":
+        legacy = {key: value for key, value in row.items() if key not in _PROVIDER_RETRY_FIELDS}
+        legacy["status"] = "running"
+        if row.get("suspension_reason") == "provider_unavailable":
+            legacy["current_step"] = "thinking"
+        return legacy
+    return row
 
 
 def project_child_run_row(
@@ -380,6 +439,7 @@ def project_child_run_row(
         "turns_used": item["turns_used"],
         "tool_count": item["tool_calls"],
         "current_step": _bounded_text(item["current_step"], 3_998),
+        **_provider_retry_fields(item),
         "started_at": _bounded_text(item["started_at"], 3_998),
         "finished_at": (
             _bounded_text(item["finished_at"], 3_998)

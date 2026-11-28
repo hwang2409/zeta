@@ -239,6 +239,8 @@ class EventDescriptor(StrEnum):
     TOOL_END = "tool_end"
     SUB_AGENT_RECEIPT = "sub_agent_receipt"
     CHILD_IDLE = "child_idle"
+    CHILD_RECOVERED = "child_recovered"
+    CHILD_SUSPENDED = "child_suspended"
     CHILD_HOLD = "child_hold"
     TASK_EXIT_NOTIFICATION = "task_exit_notification"
     PROJECT_INBOX_NOTIFICATION = "project_inbox_notification"
@@ -308,6 +310,7 @@ _LEGACY_FEATURES = (
     "session_grants",
     "path_completion",
     "child_runs",
+    "child_recovery",
     "delivery_session_guard",
     "run_work",
     "zeta_updated",

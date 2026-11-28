@@ -74,7 +74,7 @@ async def consume_run(
 
 
 def resolve_child_backend(
-    loop: AgentLoop, model: object
+    loop: AgentLoop, model: object, *, pinned_context: Any = None
 ) -> tuple[CompletionBackend | None, str | None]:
     """Give composed child loops a distinct backend owner."""
     if model is None:
@@ -87,7 +87,7 @@ def resolve_child_backend(
         provider = provider_for_model(model)
     except ValueError as exc:
         return None, f"agent error: {exc}"
-    context = getattr(loop, "account_context", None)
+    context = pinned_context if pinned_context is not None else getattr(loop, "account_context", None)
     account_kwargs = context.backend_kwargs(provider) if context is not None else {}
     store = credential_store(provider, **account_kwargs)
     if (error := child_credential_error(store, provider)) is not None:

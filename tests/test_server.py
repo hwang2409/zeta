@@ -122,12 +122,13 @@ from zeta.server.approval_lifecycle import (
     Start,
     approval_display_fields,
 )
-from zeta.server.connections import Admission
+from zeta.server.connections import EVENT_FEATURES, Admission
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.server.event_contract import (
     LIVE_NOTIFICATION_KINDS,
     NOTIFICATION_WIRE_EVENTS,
     STREAM_EVENT_WIRE_EVENTS,
+    notification_wire_event,
     tool_end,
 )
 from zeta.server.handlers import registry
@@ -947,9 +948,18 @@ async def test_protocol_1_1_client_receives_sub_agent_receipt_for_known_kinds(
                 ),
                 session_id=session_id,
             )
-        events = [(await _read(reader))["params"]["event"] for _ in NOTIFICATION_KINDS]
-
-        assert events == ["sub_agent_receipt"] * len(NOTIFICATION_KINDS)
+        # Read through a later response so both missing and extra events fail without a wait.
+        await _send(reader, writer, 3, "list_sessions")
+        frames = await read_until(reader, lambda frame: frame.get("id") == 3, what="legacy notification fence")
+        expected = [
+            ("sub_agent_receipt", kind)
+            for kind in NOTIFICATION_KINDS
+            if not EVENT_FEATURES[notification_wire_event(kind, "1.1")].features
+        ]
+        assert [
+            (frame["params"]["event"], frame["params"]["data"]["kind"])
+            for frame in frames if "params" in frame
+        ] == expected
     finally:
         await close_serve(server, writer)
 
@@ -962,7 +972,7 @@ async def test_protocol_1_2_client_receives_explicit_notification_events(
     reader, writer = await _connect(server)
     try:
         hello = (
-            await _request(reader, writer, 1, "hello", {"protocol_version": "1.2"})
+            await _request(reader, writer, 1, "hello", {"protocol_version": "1.2", "features": ["child_runs", "child_recovery"]})
         )[-1]["result"]
         assert hello["protocol_version"] == "1.2"
         await _request(reader, writer, 2, "new_session", {"provider": "codex"})

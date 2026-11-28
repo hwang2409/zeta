@@ -901,9 +901,6 @@ def finalize_agent_results(
             )
             else None
         )
-        if foreground_child is not None and result.is_canceled:
-            # the lifecycle is final before the parent installs the receipt
-            foreground_child.mark_agent_canceled(call.id)
         receipt = _append_tool_result(owner, call, result)
         if foreground_child is not None:
             handle = foreground_child.agent_handle()
