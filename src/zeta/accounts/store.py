@@ -19,6 +19,7 @@ from contextlib import (
     ExitStack,
     asynccontextmanager,
     contextmanager,
+    suppress,
 )
 from enum import Enum
 from pathlib import Path
@@ -570,7 +571,7 @@ class AccountStore(_AccountRegistry):
             ):
                 return ()
             with self._lock_at(home_fd, ".accounts-migration.lock"):
-                with self._registry_guard(home_fd):
+                with self._keeping_unreadable(warnings), self._registry_guard(home_fd):
                     state, value = self._load_registry(home_fd)
                     if state is _Registry.LOADED:
                         self._sweep_orphan_directories(
@@ -588,7 +589,8 @@ class AccountStore(_AccountRegistry):
                     if state is _Registry.MISSING and warnings:
                         logger.warning("%s", warnings[-1])
                 for provider in ("anthropic", "codex"):
-                    self._migrate_provider(home_fd, provider, warnings)
+                    with self._keeping_unreadable(warnings):
+                        self._migrate_provider(home_fd, provider, warnings)
         return tuple(warnings)
 
     def refuse_orphaning_registration(self, account: AccountId) -> None:
@@ -597,41 +599,26 @@ class AccountStore(_AccountRegistry):
         with self._home() as home_fd:
             self._refuse_orphaning_registration(home_fd, account)
 
-    def _migrate_provider(
-        self, home_fd: int, provider: str, warnings: list[str]
-    ) -> None:
+    @contextmanager
+    def _keeping_unreadable(self, warnings: list[str]) -> Iterator[None]:
         """The one owner of a failed read at startup: warn, keep every file, go on."""
 
         try:
-            self._migrate_provider_files(home_fd, provider, warnings)
+            yield
         except OSError as exc:
             if exc.errno in (errno.EMFILE, errno.ENFILE):
                 raise
-            directory = self.accounts / provider / "default"
-            # reads go through dir_fd, so the error names only the last component
-            path = next(
-                (
-                    candidate
-                    for candidate in (
-                        self.home / f"{provider}-oauth.json",
-                        self.accounts,
-                        self.accounts / provider,
-                        directory / "oauth.json",
-                        directory / "publish-pending.json",
-                    )
-                    if candidate.name == exc.filename
-                ),
-                directory,
-            )
             code = errno.errorcode.get(exc.errno or 0, "unknown error")
             reason = f"{code}: {os.strerror(exc.errno)}" if exc.errno else code
-            warnings.append(
-                f"kept {path}: could not be read ({reason}); "
-                "fix its permissions, then restart zeta"
+            warning = (
+                f"kept {_failed_path(self.home, exc.filename)}: could not be read "
+                f"or written ({reason}); fix its permissions, then restart zeta"
             )
-            logger.warning("%s", warnings[-1])
+            if warning not in warnings:  # each later step trips on the same path
+                warnings.append(warning)
+                logger.warning("%s", warning)
 
-    def _migrate_provider_files(
+    def _migrate_provider(
         self, home_fd: int, provider: str, warnings: list[str]
     ) -> None:
         account = AccountId(provider, "default")
@@ -1202,8 +1189,30 @@ def _read_optional_tokens(directory_fd: int) -> OAuthTokens | None:
         credential = _read_optional_bytes(directory_fd, "oauth.json")
     except OSError as exc:
         raise_if_unreadable(exc, "OAuth credentials file")
+        if exc.errno == errno.ELOOP:  # a symlinked login is a bad login, as in _read_tokens
+            raise AccountError("OAuth credentials are invalid; login required") from exc
         raise
     return None if credential is None else _tokens_from_bytes(credential)
+
+
+def _failed_path(home: Path, name: str | None) -> Path:
+    """Reads go through dir_fd, so an error names only the last component; find it."""
+
+    matches = [home / item for item in os.listdir(home) if item == name]
+    level = [home / "accounts", home / "account-locks"]
+    for _ in range(4):
+        matches += [path for path in level if path.name == name]
+        children: list[Path] = []
+        for directory in level:
+            with suppress(OSError):
+                if directory.is_dir() and not directory.is_symlink():
+                    children += directory.iterdir()
+        level = children
+    # the same name can sit in several trees: the unreadable one failed
+    return next(
+        (path for path in matches if not os.access(path, os.R_OK)),
+        matches[0] if matches else home / str(name),
+    )
 
 
 def _tokens_from_bytes(credential: bytes) -> OAuthTokens:
