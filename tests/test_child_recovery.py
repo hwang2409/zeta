@@ -633,6 +633,52 @@ async def test_tool_call_counted_while_progress_saves_is_kept(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_progress_save_queued_behind_a_rest_does_not_write(tmp_path, monkeypatch):
+    from zeta.agent.run_consumer import _transition_idle
+    from zeta.core.store._async_writes import _ChildActivityCommand
+
+    _fast_progress_saves(monkeypatch)
+    writes = _record_lifecycle_writes(monkeypatch)
+    with ConversationStore(tmp_path / "child") as store:
+        store.start_agent_lifecycle(
+            handle="child-1", started_at="2026-01-01T00:00:00+00:00", depth=1, agent_type="worker", description="work",
+        )
+        commit, queued, release, saved = store._commit_storage_command, asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def held(command):
+            queued.set()
+            await await_or_fail(release.wait(), what="release the held save")
+            try:
+                return await commit(command)
+            finally:
+                saved.set()
+
+        # test-contract: seam hold the saver's first save after its running check (the bad order).
+        monkeypatch.setattr(store, "_commit_storage_command", held)
+        *_, save_progress = turn_limit.make_child_progress_callbacks(
+            loop=None, child_store=store, child_marker_key="child-1", child_tool_call_id="call", recoverable=True,
+        )
+        saver = asyncio.create_task(save_progress())
+        try:
+            await await_or_fail(queued.wait(), what="the saver submits a save while running")
+            # test-contract: seam later saves and the idle transition commit normally.
+            monkeypatch.setattr(store, "_commit_storage_command", commit)
+            del writes[:]
+            _transition_idle(store)  # the child rests while the save waits
+            release.set()
+            await await_or_fail(saved.wait(), what="the held save lands")
+            assert writes == [], f"a progress save queued behind a rest must not write: {writes}"
+            # test-contract: seam commit the idle transition the way the run consumer does.
+            await await_or_fail(store._commit_storage_command(_ChildActivityCommand(state="idle")), what="commit idle")
+        finally:
+            release.set()
+            saver.cancel()
+            await await_or_fail(asyncio.gather(saver, return_exceptions=True), what="join the progress saver")
+        saved_lifecycle = json.loads(store.agent_lifecycle_path.read_text())
+        assert writes == ["idle"] and saved_lifecycle["idle_since"], "the idle transition writes the rest with idle_since"
+
+
+@pytest.mark.asyncio
 async def test_canceled_progress_save_keeps_tool_call_counted_meanwhile(tmp_path, monkeypatch):
     _fast_progress_saves(monkeypatch)
     reached, release = threading.Event(), threading.Event()
