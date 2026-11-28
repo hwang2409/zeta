@@ -2651,6 +2651,41 @@ async def test_logout_wins_failed_refresh_reload_windows(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "window", ["before_needs_auth_write", "after_needs_auth_write"]
+)
+async def test_logout_wins_needs_auth_write_windows(
+    tmp_path: Path, window: str
+) -> None:
+    home = tmp_path / "home"
+    _write_token("live", home, access_token="stale-token")
+    manager = await _oauth_manager(home, tmp_path / "project")
+    race = _CredentialRaceProcess(
+        home,
+        gate="none" if window == "before_needs_auth_write" else "after_save_if_current",
+    )
+    try:
+        await race.request(401, "expired")
+        token_request = await race.receive()
+        assert token_request[:2] == ("request", "/token")
+        if window == "before_needs_auth_write":
+            await manager.logout("live", scope="user")
+        race.connection.send((400, {"error": "invalid_grant"}))
+        if window == "after_needs_auth_write":
+            await race.gate()
+            await manager.logout("live", scope="user")
+            race.release()
+        result = await race.result()
+
+        assert result["isError"] is True
+        assert race.headers == ["Bearer stale-token"]
+        authority = await MCPCredentialStore(home=home).load("live")
+        assert authority.token is None
+    finally:
+        await race.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_refresh_adopts_changed_durable_token(tmp_path: Path) -> None:
     home = tmp_path / "home"
     original = _write_token("live", home, access_token="stale-token")
