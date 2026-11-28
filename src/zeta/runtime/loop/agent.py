@@ -986,6 +986,8 @@ class AgentLoop(
                                     "token_count": context.token_count,
                                 },
                             )
+                        # a tool result can announce new tools; give that refresh its capped wait
+                        await self._wait_for_pending_mcp_refreshes()
                         active_tools = self._active_tool_schemas()
                         steering = self.store.pending_client_steering()
                         notification_context = system_message if notification_turn else None
