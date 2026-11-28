@@ -140,7 +140,10 @@ async def test_ordinary_results_have_no_hint(tmp_path: Path, command: str) -> No
 async def test_short_sleep_under_threshold_has_no_hint(tmp_path: Path) -> None:
     text, _ = await _run(tmp_path, "sleep 29", timeout=0.2)
 
-    assert _hint_lines(text) == [], text
+    # no wait hint; the plain timeout hint (F066) is the only line
+    assert _hint_lines(text) == [
+        "hint: pass a larger `timeout` (max 3600) or use run_background"
+    ], text
 
 
 @pytest.mark.asyncio

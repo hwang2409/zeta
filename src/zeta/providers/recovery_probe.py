@@ -52,6 +52,13 @@ async def _exhausted(backend, credentials: AccountCredentials) -> bool:
     return UsageState(snapshot, "now").known_exhausted(now)
 
 
+def _waiting(error: object, event_data=None) -> Readiness:
+    # an exhausted plan is still waiting for its reset, like the usage pre-check above
+    if getattr(error, "subscription_limit", None) is not None or retryable_provider_error(error, event_data):
+        return Readiness.RETRY
+    return Readiness.STOP
+
+
 async def probe_readiness(backend) -> Readiness:
     try:
         if isinstance(credentials := getattr(backend, "token_store", None), AccountCredentials) and await _exhausted(backend, credentials):
@@ -60,12 +67,12 @@ async def probe_readiness(backend) -> Readiness:
         async with aclosing(backend._complete_once(messages, (), probe=True)) as events:
             async for event in events:
                 if event.type == StreamEventType.ERROR:
-                    return Readiness.RETRY if retryable_provider_error(event.error, event.data) else Readiness.STOP
+                    return _waiting(event.error, event.data)
                 if event.type == StreamEventType.MESSAGE_UPDATE and (event.delta or event.content):
                     return Readiness.READY
     except Exception as exc:  # noqa: BLE001 - classify only; never persist a provider's error body
         status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
         if status in {401, 403}:
             return Readiness.STOP
-        return Readiness.RETRY if retryable_provider_error(exc) else Readiness.STOP
+        return _waiting(exc)
     return Readiness.RETRY

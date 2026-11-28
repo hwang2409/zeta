@@ -43,7 +43,7 @@ from ..protocol.types import (
 )
 from ..providers.rate_limit_hold import (
     ForegroundChildHeld,
-    foreground_hold_abandoned,
+    caller_outwaited,
     foreground_hold_text,
     rate_limit_hold_text,
 )
@@ -67,6 +67,7 @@ from .child_context import (
     _compose_child_project_context,
     _prepare_child_project_context,
     consume_run,
+    refuse_held_child_backend,
     resolve_child_backend,
 )
 from .child_run_owner import ChildControlError, ChildRunTransitionOwner
@@ -184,7 +185,7 @@ async def consume_child(
         async for event in events:
             forward_nested_agent_start(child_loop, event)
             if await hold_wake.observe(event):
-                if not background and foreground_hold_abandoned(event.data):
+                if not background and caller_outwaited(event.data):
                     raise ForegroundChildHeld(foreground_hold_text(event.data))
                 account_text = hold_wake.held_account_text()
                 hold_text = rate_limit_hold_text(event.data, pinned=account_text is not None)
@@ -752,6 +753,8 @@ async def _run_child(
         return failure(
             backend_error, code="state_unavailable",
         )
+    if (hold_error := await refuse_held_child_backend(loop, child_backend)) is not None:
+        return failure(hold_error, code="state_unavailable", public_detail=True)
     # The long kinds default to background -- a run on someone else's model, or
     # one sized for a big task. Waiting on either blocks the orchestrator for
     # the whole thing. An explicit background argument still wins.

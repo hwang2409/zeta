@@ -1972,7 +1972,11 @@ async def test_bash_timeout_marker_is_not_output_capped(
     text = result["content"][0]["text"]
     assert result["isError"] is True
     assert text.startswith(marker + "\n")
-    assert len(text.encode()) <= len(marker.encode()) + 1 + max_output
+    # the hint line (F066) follows the capped output and is not counted
+    hint = "\nhint: pass a larger `timeout` (max 3600) or use run_background"
+    assert text.endswith(hint)
+    capped = text.removesuffix(hint)
+    assert len(capped.encode()) <= len(marker.encode()) + 1 + max_output
     assert result["structuredContent"]["timed_out"] is True
 
 

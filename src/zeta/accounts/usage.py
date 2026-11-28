@@ -45,14 +45,17 @@ class UsageState:
     last_attempt_at: datetime | None = None
 
     def known_exhausted(self, now: datetime | None = None) -> bool:
+        return self.exhausted_until(now) is not None
+
+    def exhausted_until(self, now: datetime | None = None) -> datetime | None:
+        """Return when the last spent cached window resets, or None if none is spent."""
         current = _utc(now or datetime.now(UTC))
-        return bool(
-            self.snapshot
-            and any(
-                window.used_percent >= 100 and window.resets_at > current
-                for window in self.snapshot.windows
-            )
-        )
+        ends = [
+            window.resets_at
+            for window in (self.snapshot.windows if self.snapshot else ())
+            if window.used_percent >= 100 and window.resets_at > current
+        ]
+        return max(ends, default=None)
 
 
 def usage_freshness(snapshot: UsageSnapshot | None, now: datetime) -> str:

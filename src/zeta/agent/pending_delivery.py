@@ -44,6 +44,7 @@ from ..core.store._step_delivery import (
 from ..protocol.types import ErrorInfo, Message, MessageOrigin, StreamEvent
 from ._delivery_notifications import (
     _message_notification_ids,
+    _notification_digest,
     _select_notification_delivery,
 )
 from .conversation_channel import ConversationChannel, has_follow_up_loop
@@ -737,6 +738,31 @@ class StepDeliveryFlow:
         elif pending:
             pending = False
         return TerminalResult(pending, closed)
+
+    def pending_preview(self) -> str:
+        """Name each durable input that blocks a terminal call, without its text.
+
+        The input itself is delivered on the next turn; repeating its text here
+        would put it into the model context twice.
+        """
+
+        fold = self.store.delivery_fold
+        prompts = len(fold.active_prompts)
+        lines = [f"{prompts} follow-up message(s)"] if prompts else []
+        for entry in fold.active_notifications.values():
+            if entry.data.get("display_only") is True:
+                continue
+            digest = _notification_digest(entry)
+            label = " ".join(
+                str(digest[key])
+                for key in ("kind", "child_instance_id", "status")
+                if digest[key]
+            )
+            lines.append(label)
+        shown = "\n".join("- " + line for line in lines[:5])
+        if len(lines) > 5:
+            shown += f"\n- … (+{len(lines) - 5} more)"
+        return shown
 
     def initialize_resident_edges(self) -> None:
         """Seed level state from the already-loaded resident store."""

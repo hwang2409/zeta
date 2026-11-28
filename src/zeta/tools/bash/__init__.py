@@ -38,6 +38,8 @@ from ..registry import (
 )
 
 MAX_TIMEOUT_SECONDS = 3600.0
+_DEFAULT_TIMEOUT_SECONDS = 30.0
+_INNER_TIMEOUT_MARGIN_SECONDS = 5.0
 MAX_OUTPUT_BYTES = 1_048_576
 
 
@@ -147,6 +149,63 @@ def _result_hint(
     return None
 
 
+_DURATION = re.compile(r"([0-9]+(?:\.[0-9]*)?|\.[0-9]+)([smhd]?)")
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+_TIMEOUT_FLAGS = frozenset({"--preserve-status", "--foreground", "-v", "--verbose"})
+_TIMEOUT_HINT = "pass a larger `timeout` (max 3600) or use run_background"
+
+
+def _duration(text: str) -> float | None:
+    match = _DURATION.fullmatch(text)
+    return float(match[1]) * _DURATION_UNITS[match[2]] if match else None
+
+
+def _inner_timeout_span(args: list[str]) -> float | None:
+    """Return DURATION plus any -k grace from coreutils `timeout` arguments."""
+
+    kill: float | None = 0.0
+    while args and args[0].startswith("-"):
+        flag = args.pop(0)
+        if flag in ("-k", "--kill-after", "-s", "--signal"):
+            value = args.pop(0) if args else ""
+            if flag in ("-k", "--kill-after"):
+                kill = _duration(value)
+        elif flag.startswith(("--kill-after=", "-k")):
+            kill = _duration(flag.split("=", 1)[1] if "=" in flag else flag[2:])
+        elif flag not in _TIMEOUT_FLAGS and not flag.startswith(("--signal=", "-s")):
+            return None
+    duration = _duration(args[0]) if args else None
+    if not duration or kill is None:
+        return None  # 0 means no limit; unknown syntax keeps the default
+    return duration + kill
+
+
+def _effective_timeout(arguments: BashArguments, command: str) -> float:
+    """Use the tool timeout, else a `timeout N` the command starts, else the default."""
+
+    if "timeout" in arguments:
+        return arguments["timeout"]
+    try:
+        lexer = shlex.shlex(
+            command.replace("\n", ";"), posix=True, punctuation_chars=True
+        )
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return _DEFAULT_TIMEOUT_SECONDS
+    spans = [
+        _inner_timeout_span(tokens[index + 1 :])
+        for index, token in enumerate(tokens)
+        if token == "timeout" and (index == 0 or not tokens[index - 1].strip("();<>|&"))
+    ]
+    longest = max((span for span in spans if span is not None), default=None)
+    if longest is None:
+        return _DEFAULT_TIMEOUT_SECONDS
+    # never lower the default: a short `timeout 2 x && make` still gets 30 s
+    raised = max(longest + _INNER_TIMEOUT_MARGIN_SECONDS, _DEFAULT_TIMEOUT_SECONDS)
+    return min(raised, MAX_TIMEOUT_SECONDS)
+
+
 def _extract_command(arguments: BashArguments) -> str:
     command = arguments.get("command")
     if isinstance(command, str) and command:
@@ -220,7 +279,6 @@ async def _bash(
         if isinstance(approved_execution, ApprovedCwdExecution)
         else None
     )
-    timeout = arguments.get("timeout", 30.0)
     output_limit = arguments.get(
         "max_output", min(registry.max_output_chars, MAX_OUTPUT_BYTES)
     )
@@ -228,6 +286,7 @@ async def _bash(
         raise ValueError(f"max_output must be an integer from 1 to {MAX_OUTPUT_BYTES}")
     log_path = arguments.get("_log_path")
     shell_command = _extract_command(arguments)
+    timeout = _effective_timeout(arguments, shell_command)
     if arguments.get("_background") is True:
         if log_path is not None:
             await create_log_off_loop(
@@ -381,7 +440,7 @@ async def _bash(
             stderr,
             time.monotonic() - started,
             timed_out,
-        )
+        ) or (_TIMEOUT_HINT if timed_out else None)
         hint_suffix = f"\nhint: {hint}" if hint is not None else ""
         if combined_full_size > output_limit:
             call_id = (
