@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import shutil
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from rich.console import Console
 
-from tests.support.fake_backend import FakeBackend
+from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
 from zeta.agent import runner
 from zeta.agent.recovery_lease import activate_agent_children
+from zeta.core import agent_state
 from zeta.core.child_runs import LoadedAgentLifecycle, read_child_lifecycle
 from zeta.core.store import ConversationStore
-from zeta.protocol.types import StreamEvent, StreamEventType
+from zeta.protocol.types import StreamEvent, StreamEventType, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -278,14 +283,6 @@ class _ObservedBackend(FakeBackend):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_mode", ["normal-exit", "crash"])
 async def test_recovered_child_stats_cover_every_episode(tmp_path, monkeypatch, exit_mode):
-    import os
-    import shutil
-    from types import SimpleNamespace
-
-    from tests.support.fake_backend import ScriptedTurn
-    from zeta.core import agent_state
-    from zeta.protocol.types import TextContent, ToolCall
-
     clock = [1000.0]
     pid = [1]
 
@@ -349,5 +346,50 @@ async def test_recovered_child_stats_cover_every_episode(tmp_path, monkeypatch, 
             # test-contract: latency the reported child duration is the contract, read from an injected clock
             assert (value["elapsed"], stats["elapsed"]) == (seconds, seconds), "elapsed must cover every episode"
             assert f"3 turns · {seconds:.1f}s · 2 tool calls" in receipt.data["text"], receipt.data["text"]
+        finally:
+            await await_or_fail(loop.close(), what="close resumed parent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("epoch", [5, 12])
+async def test_crashed_parent_below_recovery_epoch_cancels_running_child(tmp_path, monkeypatch, epoch):
+    # Pin the home manifest before first open so the observed epoch is exact.
+    (tmp_path / "storage-format.json").write_text(json.dumps({"writer_epoch": epoch}) + "\n")
+    running = asyncio.Event()
+    first = _ObservedBackend([ScriptedTurn([TextContent("never")], delay=60)], lambda index: running.set())
+    root = tmp_path / "sessions"
+    with ConversationStore(root, cwd=tmp_path) as store:
+        session_id = store.session_id
+        assert (store._storage_lease.observed_epoch, store.child_recovery_enabled) == (epoch, False)
+        loop = AgentLoop(first, store, skill_catalog=SkillCatalog.empty())
+        try:
+            run_id = await await_or_fail(
+                runner.spawn_child(loop, agent_type="general", task="work", cwd=None),
+                what="spawn child",
+            )
+            await await_or_fail(running.wait(), what="background child is mid-turn")
+            # A copy taken mid-run is what a killed process leaves on disk.
+            shutil.copytree(root, tmp_path / "crashed")
+        finally:
+            await await_or_fail(loop.close(), what="close first parent")
+    shutil.rmtree(root)
+    shutil.move(tmp_path / "crashed", root)
+
+    dispatched = []
+    resolve = lambda *a, **kw: dispatched.append(a) or (FakeBackend([]), None)
+    monkeypatch.setattr("zeta.agent.resume_child.resolve_child_backend", resolve)
+    monkeypatch.setattr(runner, "resolve_child_backend", resolve)
+    with ConversationStore(root, session_id=session_id, cwd=tmp_path) as store:
+        loop = _loop(store)
+        try:
+            await await_or_fail(loop.activate(), what="resume parent")
+            await await_or_fail(loop._background_owner.wait(), what="no recovered child left running")
+            assert dispatched == [], "a home below the recovery epoch must not re-dispatch the child"
+            receipt = store.agent_completion_notifications_by_child()[run_id]
+            lifecycle, _ = read_child_lifecycle(store, Path(receipt.data["child_session_path"]))
+            assert isinstance(lifecycle, LoadedAgentLifecycle)
+            assert (receipt.data["status"], lifecycle.value["state"]) == ("canceled", "canceled"), receipt.data
+            assert "session exited" in receipt.data["text"], receipt.data["text"]
+            assert len(first.calls) == 1 and store.agent_children() == {}
         finally:
             await await_or_fail(loop.close(), what="close resumed parent")
