@@ -361,6 +361,7 @@ RECOVERY_STATE_MEMORY_PAIRS: Final[frozenset[tuple[str, str]]] = frozenset(
 _MANIFEST = "storage-format.json"
 _LOCK = ".storage-format.lock"
 _BOOTSTRAP_WAIT_SECONDS = 10.0
+_BOOTSTRAP_NOTICE_SECONDS = 1.0
 
 
 class StorageFormatError(ValueError):
@@ -831,7 +832,8 @@ def _home_has_gated_state(home: Path) -> bool:
     home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         for pattern, _owner in GATED_HOME_PATHS:
-            name = pattern.removesuffix("/*")
+            # not str.remove*suffix (Python 3.9): this source ships to 3.8 hosts
+            name = pattern[:-2] if pattern.endswith("/*") else pattern  # noqa: FURB188
             try:
                 info = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
             except FileNotFoundError:
@@ -856,32 +858,71 @@ def _home_has_gated_state(home: Path) -> bool:
         os.close(home_fd)
 
 
-def _wait_for_bootstrap(fd: int, deadline: float) -> bool:
+def _say_waiting(fd: int, home: Path) -> None:
+    pid = os.pread(fd, 32, 0).decode(errors="replace").strip()
+    holder = f" (pid {pid})" if pid.isdigit() else ""
+    if holder:
+        try:
+            os.kill(int(pid), 0)
+        except PermissionError:
+            pass  # alive, owned by another user
+        except (ProcessLookupError, OverflowError):
+            holder = ""  # a crashed holder left its pid behind
+    print(
+        f"zeta: waiting for another zeta process{holder} to finish creating {home}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _wait_for_bootstrap(fd: int, home: Path, deadline: float) -> bool:
     """Poll for a shared lock until the exclusive holder finishes or the deadline passes."""
+    notice = time.monotonic() + _BOOTSTRAP_NOTICE_SECONDS
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             return True
         except BlockingIOError:
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline:
                 return False
+            if now >= notice:
+                notice = deadline  # say it once
+                _say_waiting(fd, home)
         time.sleep(0.01)
 
 
-def _bootstrap_empty_home(fd: int, home: Path) -> None:
+def _lease_home(fd: int, home: Path) -> str:
+    """Take a shared lease on the lock ``fd``, first publishing an empty home's manifest.
+
+    The one first-open owner: every writer open, local or remote, calls this.
+    Returns "" with the lease held, "busy" when another holder outlasts the
+    bounded wait, or "gated" when stored state exists without a manifest.
+    Shipped to remote hosts: Python 3.8 stdlib only. remote_sync ships this
+    source (and its helpers) to hosts without zeta.
+    """
+    if (home / _MANIFEST).exists():
+        fcntl.flock(fd, fcntl.LOCK_SH)
+        return ""
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         # another first start or advance holds the lock: wait a bounded time, then the
         # caller reads the manifest it published (still missing -> the usual refusal)
-        if _wait_for_bootstrap(fd, time.monotonic() + _BOOTSTRAP_WAIT_SECONDS):
-            return
-        raise _missing_manifest_error(home) from None
+        if _wait_for_bootstrap(fd, home, time.monotonic() + _BOOTSTRAP_WAIT_SECONDS):
+            return ""
+        return "busy"
     if not (home / _MANIFEST).exists():
         if _home_has_gated_state(home):
-            _read_manifest(home)
-        _publish_manifest(home, WRITER_EPOCH)
+            return "gated"
+        # the pid lets a waiting first start name this process; the lock is not stored state
+        os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
+        try:
+            _publish_manifest(home, WRITER_EPOCH)
+        finally:
+            os.ftruncate(fd, 0)
     fcntl.flock(fd, fcntl.LOCK_SH)
+    return ""
 
 
 @contextmanager
@@ -925,10 +966,8 @@ def _open_writer(home: str | Path, *, capability: int) -> WriterLease:
             )
         fd = _open_lock(canonical)
         try:
-            if (canonical / _MANIFEST).exists():
-                fcntl.flock(fd, fcntl.LOCK_SH)
-            else:
-                _bootstrap_empty_home(fd, canonical)
+            if _lease_home(fd, canonical):
+                raise _missing_manifest_error(canonical)
             epoch = _read_manifest(canonical)
             if epoch > capability:
                 raise StorageFormatError(

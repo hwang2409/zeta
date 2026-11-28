@@ -225,6 +225,70 @@ def test_first_start_waits_for_a_concurrent_bootstrap_then_opens(
     assert verify(tmp_path).writer_epoch == storage_format.WRITER_EPOCH
 
 
+@pytest.mark.parametrize(
+    ("held", "notices", "alive"), [(2.0, 1, True), (0.05, 0, True), (2.0, 1, False)]
+)
+def test_first_start_says_once_that_it_waits_for_a_slow_bootstrap(
+    tmp_path: Path, held: float, notices: int, alive: bool
+) -> None:
+    pid = os.getpid()
+    if not alive:  # a crashed holder's pid: the process is gone
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait(30)
+        pid = dead.pid
+    holder = _hold_exclusive_lock(tmp_path)
+    os.pwrite(holder, f"{pid}\n".encode(), 0)
+    try:
+        started = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import sys; from zeta.storage_format import open_writer; "
+                    "open_writer(sys.argv[1]).close()"
+                ),
+                str(tmp_path),
+            ],
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            time.sleep(held)
+            (tmp_path / "storage-format.json").write_text(
+                json.dumps({"writer_epoch": storage_format.WRITER_EPOCH}) + "\n"
+            )
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+        _stdout, stderr = started.communicate(timeout=30)
+    finally:
+        os.close(holder)
+    assert started.returncode == 0, stderr
+    named = f" (pid {pid})" if alive else ""
+    expected = (
+        f"zeta: waiting for another zeta process{named} "
+        f"to finish creating {tmp_path.resolve()}"
+    )
+    assert stderr.splitlines().count(expected) == notices, stderr
+    assert stderr.count("waiting for another zeta process") == notices, stderr
+
+
+def test_bootstrap_names_its_pid_in_the_lock_only_while_publishing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publish = storage_format._publish_manifest
+    seen: list[str] = []
+
+    def observed(home: Path, epoch: int) -> None:
+        seen.append((home / ".storage-format.lock").read_text())
+        publish(home, epoch)
+
+    # test-contract: seam observe the lock payload a concurrent first start would read
+    monkeypatch.setattr(storage_format, "_publish_manifest", observed)
+    open_writer(tmp_path).close()
+    assert seen == [f"{os.getpid()}\n"]
+    assert (tmp_path / ".storage-format.lock").read_bytes() == b""
+
+
 def test_first_start_wait_is_bounded_then_refuses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

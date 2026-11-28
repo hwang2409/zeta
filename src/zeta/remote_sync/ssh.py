@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import BinaryIO
 from urllib.parse import unquote, urlparse
 
-from .. import memory_migration_plan, project_schema
+from .. import memory_migration_plan, project_schema, storage_format
 from ..core.session_files import (
     REFERENCES_DOMAIN,
     SESSION_REFERENCE_GENERATION,
@@ -86,63 +86,51 @@ finally:
 '''
 
 
+# Remote Python need not have zeta installed: ship the local first-open owner itself.
+# Shipped to remote hosts: Python 3.8 stdlib only (Ubuntu 20.04 /usr/bin/python3).
+_REMOTE_LEASE_HOME = "\n".join(
+    inspect.getsource(function)
+    for function in (
+        storage_format._home_has_gated_state,
+        storage_format._say_waiting,
+        storage_format._wait_for_bootstrap,
+        storage_format._publish_manifest,
+        storage_format._lease_home,
+    )
+)
+
+
 _REMOTE_WRITER_EPOCH = rf'''
-import contextlib, fcntl, json, os, pathlib, secrets, stat, sys
+import contextlib, fcntl, json, os, pathlib, secrets, stat, sys, time
+from pathlib import Path
 _PROJECT_LOCKS_FEATURE_EPOCH = {FEATURE_EPOCHS[StorageFeature.PROJECT_LOCKS]}
-_WRITER_EPOCH = {writer_epoch()}
-_GATED_HOME_PATHS = {tuple(pattern for pattern, _owner in GATED_HOME_PATHS)!r}
+_WRITER_EPOCH = WRITER_EPOCH = {writer_epoch()}
+GATED_HOME_PATHS = {GATED_HOME_PATHS!r}
+_MANIFEST = {storage_format._MANIFEST!r}
+_BOOTSTRAP_WAIT_SECONDS = {storage_format._BOOTSTRAP_WAIT_SECONDS!r}
+_BOOTSTRAP_NOTICE_SECONDS = {storage_format._BOOTSTRAP_NOTICE_SECONDS!r}
 _LEASE = None
 
 def _reject(reason): print(f"zeta-remote: {{reason}}", file=sys.stderr); sys.exit(46)
 
 def _epoch_fail(reason): print(f"zeta-remote: {{reason}}", file=sys.stderr); sys.exit(53)
 
-def _has_gated_state(home):
-    for pattern in _GATED_HOME_PATHS:
-        listed = pattern.endswith("/*")
-        path = home / (pattern[:-2] if listed else pattern)
-        if not os.path.lexists(path): continue
-        if not listed or path.is_symlink() or not path.is_dir(): return True
-        try:
-            if next(path.iterdir(), None) is not None: return True
-        except OSError: return True
-    return False
-
-def _publish_manifest(home):
-    temporary = home / f".storage-format.json.{{secrets.token_hex(16)}}.tmp"
-    try:
-        with temporary.open("x") as stream:
-            stream.write(json.dumps({{"writer_epoch": _WRITER_EPOCH}}, separators=(",", ":")) + "\n")
-            stream.flush(); os.fsync(stream.fileno())
-        os.replace(temporary, home / "storage-format.json")
-        directory_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
-        try: os.fsync(directory_fd)
-        finally: os.close(directory_fd)
-    finally:
-        try: temporary.unlink()
-        except FileNotFoundError: pass
+{_REMOTE_LEASE_HOME}
 
 def _writer_epoch(home):
-    # Mirror storage_format.open_writer: bootstrap only an empty home, then
+    # storage_format.open_writer's lease: bootstrap only an empty home, then
     # retain a shared stored-format lease for the life of this program.
     global _LEASE
     if _LEASE is not None: return _LEASE[1]
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    manifest_path = home / "storage-format.json"
     try:
-        lock_fd = os.open(home / ".storage-format.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        lock_fd = os.open(home / {storage_format._LOCK!r}, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     except OSError: _epoch_fail("cannot open the remote stored-format lock")
     try:
-        if manifest_path.exists():
-            fcntl.flock(lock_fd, fcntl.LOCK_SH)
-        else:
-            try: fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError: _epoch_fail("another process is initializing the remote home")
-            if not manifest_path.exists():
-                if _has_gated_state(home): _epoch_fail("remote home has gated state but no stored-format manifest")
-                _publish_manifest(home)
-            fcntl.flock(lock_fd, fcntl.LOCK_SH)
-        manifest = json.loads(manifest_path.read_text())
+        reason = _lease_home(lock_fd, home)
+        if reason == "busy": _epoch_fail("another process is initializing the remote home")
+        if reason: _epoch_fail("remote home has gated state but no stored-format manifest")
+        manifest = json.loads((home / _MANIFEST).read_text())
     except (OSError, ValueError):
         os.close(lock_fd); _epoch_fail("remote stored-format manifest is unreadable")
     if type(manifest) is not dict or set(manifest) != {{"writer_epoch"}}: _epoch_fail("remote stored-format manifest is invalid")

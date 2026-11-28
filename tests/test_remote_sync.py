@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import fcntl
 import hashlib
+import inspect
 import io
 import json
 import multiprocessing
@@ -17,6 +18,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -26,6 +28,7 @@ import pytest
 from tests.support.branch_reads import branch_entries
 from tests.support.storage_homes import initialize_storage_home
 from zeta import remote_sync as remote_sync_module
+from zeta import storage_format
 from zeta.cli.main import main as cli_main
 from zeta.core.session import SessionManager
 from zeta.core.session_files import (
@@ -70,7 +73,12 @@ from zeta.remote_sync.project_publish import (
 )
 from zeta.remote_sync.ssh import SshTransport
 from zeta.skills import SkillCatalog
-from zeta.storage_format import GATED_HOME_PATHS, StorageFormatError, open_writer
+from zeta.storage_format import (
+    GATED_HOME_PATHS,
+    StorageFormatError,
+    open_writer,
+    writer_epoch,
+)
 from zeta.tools import ToolRegistry
 from zeta.tools import session_push as session_push_tool
 from zeta.tools.session_push import register as register_session_push
@@ -2072,6 +2080,145 @@ def test_p06_3_generated_project_programs_refuse_manifestless_state_like_local(
     assert fetch.returncode == 53, "generated program wrote over gated state"
     assert not (remote_home / "storage-format.json").exists()
     assert not (local_home / "storage-format.json").exists()
+
+
+def test_concurrent_remote_first_opens_all_wait_for_one_bootstrap(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "remote-home"
+    # every program starts at one shared instant so their first opens collide
+    start = time.time() + 1.5
+    gate = f"import time; time.sleep(max(0.0, {start!r} - time.time()))\n"
+    programs = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                gate + ssh_module._PROJECT_FETCH_SCRIPT,
+                str(home),
+                "missing-project",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(12)
+    ]
+    results = []
+    try:
+        for program in programs:
+            _stdout, stderr = program.communicate(timeout=60)
+            results.append((program.returncode, stderr))
+    finally:
+        for program in programs:
+            if program.poll() is None:
+                program.kill()
+                program.communicate(timeout=10)
+
+    # 44 = project not found, reached only after the stored-format lease is held
+    failed = [(code, stderr) for code, stderr in results if code != 44]
+    assert failed == [], f"remote first opens refused: {failed}"
+    assert json.loads((home / "storage-format.json").read_text()) == {
+        "writer_epoch": writer_epoch()
+    }
+    assert sorted(path.name for path in home.glob("*storage-format.json*")) == [
+        "storage-format.json"
+    ]
+
+
+def test_remote_first_open_waits_for_a_held_bootstrap(tmp_path: Path) -> None:
+    home = tmp_path / "remote-home"
+    home.mkdir()
+    holder = os.open(home / ".storage-format.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        fetch = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                ssh_module._PROJECT_FETCH_SCRIPT,
+                str(home),
+                "missing-project",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            try:
+                fetch.wait(0.5)  # the other first open is still publishing
+            except subprocess.TimeoutExpired:
+                pass
+            (home / "storage-format.json").write_text(
+                json.dumps({"writer_epoch": writer_epoch()}) + "\n"
+            )
+        finally:
+            fcntl.flock(holder, fcntl.LOCK_UN)
+        _stdout, stderr = fetch.communicate(timeout=30)
+    finally:
+        os.close(holder)
+    assert fetch.returncode == 44, stderr
+    assert "initializing" not in stderr
+
+
+_BOOTSTRAP_OWNER = (
+    storage_format._home_has_gated_state,
+    storage_format._say_waiting,
+    storage_format._wait_for_bootstrap,
+    storage_format._publish_manifest,
+    storage_format._lease_home,
+)
+_SHIPPED_PROGRAMS = {
+    name: value
+    for name, value in vars(ssh_module).items()
+    if isinstance(value, str) and "def _writer_epoch(" in value
+}
+
+
+def test_remote_first_open_ships_the_local_bootstrap_owner() -> None:
+    # A second bootstrap (its own lock, manifest write, or exclusive lock)
+    # anywhere outside storage_format fails here.
+    root = Path(storage_format.__file__).parent
+    spelled = sorted(
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*.py")
+        if path.name != "storage_format.py" and ".storage-format.lock" in path.read_text()
+    )
+    assert spelled == [], f"stored-format lock opened outside its owner: {spelled}"
+    lock_users = {
+        path.relative_to(root).as_posix(): path.read_text().count("storage_format._LOCK")
+        for path in root.rglob("*.py")
+        if "storage_format._LOCK" in path.read_text()
+    }
+    # the one remote open of the lock, whose fd goes straight to _lease_home
+    assert lock_users == {"remote_sync/ssh.py": 1}, lock_users
+    assert set(_SHIPPED_PROGRAMS) >= {"_REMOTE_WRITER_EPOCH", "_PROJECT_FETCH_SCRIPT"}
+    for name, program in _SHIPPED_PROGRAMS.items():
+        rest = program
+        for owner in _BOOTSTRAP_OWNER:
+            assert program.count(f"def {owner.__name__}(") == 1, (name, owner.__name__)
+            assert inspect.getsource(owner) in program, (name, owner.__name__)
+            rest = rest.replace(inspect.getsource(owner), "")
+        assert rest.count(repr(storage_format._LOCK)) == 1, f"{name} opens the lock twice"
+        for line in rest.splitlines():
+            if "_MANIFEST" in line or storage_format._MANIFEST in line:
+                assert line.startswith("_MANIFEST = ") or "read_text()" in line, (
+                    f"{name} touches the manifest outside the owner: {line.strip()}"
+                )
+    rest = ssh_module._REMOTE_WRITER_EPOCH
+    for owner in _BOOTSTRAP_OWNER:
+        rest = rest.replace(inspect.getsource(owner), "")
+    for primitive in ("LOCK_EX", "os.replace", "os.rename"):
+        assert primitive not in rest, f"remote program bootstraps outside the owner: {primitive}"
+
+
+def test_shipped_remote_programs_parse_as_python_3_8() -> None:
+    # Remote hosts run /usr/bin/python3 (3.8 on Ubuntu 20.04). This catches 3.9+
+    # syntax and the str.remove{prefix,suffix} slip only, not every newer API.
+    for name, program in _SHIPPED_PROGRAMS.items():
+        ast.parse(program, feature_version=(3, 8))
+        for api in ("removesuffix", "removeprefix"):
+            assert api not in program, f"{name} uses str.{api} (Python 3.9)"
 
 
 def test_p06_3_generated_project_program_retains_stored_format_lease(
