@@ -18,6 +18,12 @@ from ..providers.login import LOGIN_PROVIDER_ERRORS, build_login_provider, pkce_
 from .store import AccountError, AccountId, AccountStore
 
 
+def no_accounts_message(provider: str | None = None) -> str:
+    if provider is None:
+        return "no accounts; run zeta login <provider> --account <name>"
+    return f"no {provider} accounts; run zeta login {provider} --account <name>"
+
+
 def login_failure_message(exc: Exception) -> str:
     """Return a credential-safe cause and recovery action for login failures."""
 
