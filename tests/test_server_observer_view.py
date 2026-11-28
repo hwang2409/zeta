@@ -69,7 +69,7 @@ async def _read_during_replay_eviction(
         with monkeypatch.context() as patch:
             # test-contract: seam hold the real worker after it computes A's settings.
             patch.setattr(settings, "settings", held)
-            await observer.send(3, "session_settings", {})
+            await observer.send(3, "session_settings", {"session_id": sid})
             await await_or_fail(entered.wait(), what="observer settings computed")
             # A's send publishes replay frames. The production replay budget evicts
             # the observer stream, but A's controller and record stay live.
@@ -87,7 +87,7 @@ async def _read_during_replay_eviction(
         release.set()
     joined = await observer.response(4)
     assert "result" in joined, joined
-    reply = await observer.request(5, "session_settings", {})
+    reply = await observer.request(5, "session_settings", {"session_id": other})
     assert reply.get("result") == {"model": b_model, "approval_mode": "ask"}, reply
 
 
@@ -153,6 +153,8 @@ async def test_observer_view_table(
             params = {"scope": "project"}
         elif method in {"skill_read", "agent_profile_read"}:
             params = {"scope": "project", "name": "view"}
+        elif method == "session_settings":
+            params = {"session_id": sid}
         elif method == "session_history_read":
             params = {"session_id": archived}
 
@@ -212,3 +214,58 @@ async def test_observer_view_table(
             unjoined = await connect(observer=True)
             denied = await unjoined.request(2, method, params)
             assert denied.get("error") == _NO_VIEW, denied
+
+
+@pytest.mark.asyncio
+async def test_observer_session_settings_honors_session_id(tmp_path: Path) -> None:
+    """An observer's session_settings must answer for the requested session_id,
+    not blindly return the viewed session's settings.
+
+    Before the fix, read_settings ignored params["session_id"] and always
+    returned the viewed session's model/approval_mode, so a request naming a
+    different session (or no session) still succeeded with the wrong settings.
+    """
+    project_a, project_b = (_project(tmp_path, name) for name in ("alpha", "beta"))
+    server = replay_server(
+        tmp_path / "home", "unix",
+        lambda _, model, __: (ServerFakeBackend(delay=0), model or "offline"),
+    )
+    async with AsyncExitStack() as cleanup:
+        cleanup.push_async_callback(lambda: await_or_fail(server.close(), what="close server"))
+        await await_or_fail(server.start(), what="start server")
+
+        async def connect(*, observer: bool = False) -> ReplayClient:
+            client = await await_or_fail(connect_replay(server, "unix"), what="connect client")
+            cleanup.push_async_callback(lambda c=client: await_or_fail(c.close(), what="close socket"))
+            features = _FEATURES if observer else (*_FEATURES, "multi_controller")
+            hello = await negotiate(client, observer=observer, extra=features, protocol_version="1.2")
+            assert "result" in hello, hello
+            return client
+
+        async def new_session(client: ReplayClient, request_id: int, project: Path, model: str) -> str:
+            reply = await client.request(request_id, "new_session", {"cwd": str(project), "model": model})
+            assert "result" in reply, reply
+            return reply["result"]["session"]["session_id"]
+
+        a_model, b_model = "gpt-5.4", "gpt-5.6-luna"
+        a = await connect()
+        sid = await new_session(a, 2, project_a, a_model)
+        b = await connect()
+        other = await new_session(b, 2, project_b, b_model)
+        assert other != sid
+
+        observer = await connect(observer=True)
+        joined = await observer.request(2, "session_history_and_subscribe", {"session_id": sid})
+        assert "result" in joined, joined
+
+        # matching id: the viewed session's real settings.
+        matched = await observer.request(3, "session_settings", {"session_id": sid})
+        assert matched.get("result") == {"model": a_model, "approval_mode": "ask"}, matched
+
+        # a different, live session must error, not leak the viewed session's settings.
+        mismatched = await observer.request(4, "session_settings", {"session_id": other})
+        assert mismatched.get("error") == _NO_VIEW, mismatched
+
+        # a missing session id is an invalid request.
+        missing = await observer.request(5, "session_settings", {})
+        assert missing.get("error", {}).get("code") == -32602, missing
