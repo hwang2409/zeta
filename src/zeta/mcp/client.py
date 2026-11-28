@@ -548,10 +548,10 @@ def prompt_text_from_result(value: Mapping[str, object]) -> str:
 
 
 __all__ = [
+    "MCPAuthRequiredError",
     "MCPCanceled",
     "MCPClient",
     "MCPError",
-    "MCPAuthRequiredError",
     "MCPHTTPError",
     "MCPPrompt",
     "MCPPromptArgument",

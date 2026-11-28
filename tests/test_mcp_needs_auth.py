@@ -78,6 +78,7 @@ async def _start(
         transport = httpx.AsyncClient(transport=httpx.MockTransport(server.handle))
         return StreamableHTTPMCPClient(config, client=transport, home=str(home))
 
+    # test-contract: seam the documented client factory seam; it routes HTTP to the fake
     monkeypatch.setattr(mount_module, "_build_client", build)
     (tmp_path / "tools").mkdir(exist_ok=True)
     registry = ToolRegistry(
