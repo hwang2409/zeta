@@ -224,8 +224,10 @@ async def list_sessions(client, request_id, params, controller):
             "method is unavailable to read-only observers",
             {"method": "list_sessions"},
         )
+    # snapshot on the loop: the read runs on a worker thread.
+    resident = client.server.controllers.resident_session_ids()
     result, _ = await client.connections.run_read(
-        client, lambda: lifecycle.list_sessions(client, request_id, params)
+        client, lambda: lifecycle.list_sessions(client, request_id, params, resident)
     )
     return result
 

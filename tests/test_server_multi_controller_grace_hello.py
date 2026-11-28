@@ -5,6 +5,7 @@ connects through the real serve socket."""
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
@@ -108,3 +109,85 @@ async def test_fresh_multi_hello_is_admitted_while_only_grace_holds_multi(
         for client in clients:
             await client.close()
         await await_or_fail(server.close(), what="close grace hello server")
+
+
+_HOLD_LEASE = """
+import sys
+from zeta.core.session import SessionManager
+with SessionManager(sys.argv[1]).open(sys.argv[2]).store:
+    print("owned", flush=True)
+    sys.stdin.read()
+"""
+
+
+@pytest.mark.parametrize("transport", ("unix", "websocket"))
+@pytest.mark.asyncio
+async def test_list_sessions_marks_grace_session_resident(
+    tmp_path: Path, transport: Transport, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = replay_server(tmp_path, transport, _backend_factory)
+    await await_or_fail(server.start(), what="start resident list server")
+    clients: list[ReplayClient] = []
+    expire = asyncio.Event()
+    holder: asyncio.subprocess.Process | None = None
+
+    async def held_deadline() -> None:
+        await await_or_fail(expire.wait(), what="grace deadline", timeout=60)
+
+    try:
+        owner = await await_or_fail(connect_replay(server, transport), what="owner socket")
+        clients.append(owner)
+        assert "result" in await negotiate(owner, replay=False, extra=MULTI)
+        session_id = (await owner.request(2, "new_session", {}))["result"]["session"]["session_id"]
+        record = server.controllers.resident(session_id)
+        assert record is not None
+        # test-contract: seam an event in place of the wall-clock grace deadline.
+        monkeypatch.setattr(record.control, "_grace_deadline", held_deadline)
+        await await_or_fail(owner.close(), what="clean close of the only controller")
+        await _until(
+            lambda: isinstance(server.controllers.owner_of(record), _MultiGrace), "idle grace"
+        )
+
+        lister = await await_or_fail(connect_replay(server, transport), what="lister socket")
+        clients.append(lister)
+        assert "result" in await negotiate(lister, replay=False, extra=MULTI)
+
+        async def row(request_id: int) -> dict[str, object]:
+            sessions = (await lister.request(request_id, "list_sessions", {}))["result"]["sessions"]
+            return next(item for item in sessions if item["session_id"] == session_id)
+
+        graced = await row(2)
+        assert graced["in_use"] is True, graced
+        assert graced.get("resident") is True, "a session in this serve's grace must be resident"
+
+        expire.set()
+        # wait_closed only waits for records already closing, so wait for retirement first.
+        await _until(lambda: record.closing, "grace expiry starts retirement")
+        await await_or_fail(server.controllers.wait_closed(session_id), what="grace expiry closes")
+        freed = await row(3)
+        assert freed["in_use"] is False, freed
+        assert freed.get("resident") is False, "an expired grace session is not resident"
+
+        holder = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", _HOLD_LEASE, str(tmp_path), session_id,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        )
+        assert holder.stdout is not None
+        line = await await_or_fail(holder.stdout.readline(), what="other process holds the lease")
+        assert line.strip() == b"owned", line
+        foreign = await row(4)
+        assert foreign["in_use"] is True, foreign
+        assert foreign.get("resident") is False, "a session held by another process is not resident"
+    finally:
+        expire.set()
+        if holder is not None and holder.returncode is None:
+            assert holder.stdin is not None
+            holder.stdin.close()
+            try:
+                await asyncio.wait_for(holder.wait(), 10)
+            except TimeoutError:
+                holder.kill()
+                await asyncio.wait_for(holder.wait(), 10)
+        for client in clients:
+            await client.close()
+        await await_or_fail(server.close(), what="close resident list server")
