@@ -1312,6 +1312,15 @@ class ConversationStore(
                 return True
         return False
 
+    def unresolved_tool_call_ids(self) -> list[str]:
+        """Return active-branch tool call ids that have no result yet, in order."""
+        return list(dict.fromkeys(
+            item.tool_call.id
+            for ref in self.branch_refs() if ref.type == "message"
+            for item in Message.from_dict(self.entry(ref).data["message"]).content
+            if isinstance(item, ToolUseContent) and item.tool_call.id not in self._delivery_fold.tool_result_seqs
+        ))
+
     def tool_result(self, tool_call_id: str) -> ToolResult | None:
         """Return a strict tool result after waiting for concurrent writers."""
         with self._append_lock():

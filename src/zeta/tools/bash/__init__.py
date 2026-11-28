@@ -18,6 +18,7 @@ from ...core.abort import AbortSignal
 from ...core.approval import ApprovedCwdExecution
 from ...protocol.types import StructuredToolResult
 from .._results import _spill_preview
+from .._shared import tool_process_record
 from .._shared.background_spawn import _kill_and_reap
 from .._shared.log_open import create_log_off_loop, open_log_off_loop
 from .._shared.process import (
@@ -360,13 +361,18 @@ async def _bash(
     timeout_wait: asyncio.Task[None] | None = None
     timed_out = False
     started = time.monotonic()
+    # The command inherits this record's lock, so recovery can find it if zeta dies mid-call.
+    record: tool_process_record.ToolProcessRecord | None = None
     try:
         try:
+            if (session_dir := registry.session_dir) is not None and execution_context is not None:
+                # Synchronous (about 0.1 ms), so a cancel cannot lose the returned fd and its lock.
+                record = tool_process_record.open_record(session_dir, execution_context.tool_call.id)
             spawn_kwargs = {
                 "stdin": asyncio.subprocess.DEVNULL,
                 "stdout": asyncio.subprocess.PIPE,
                 "stderr": asyncio.subprocess.PIPE,
-                "pass_fds": (write_fd,),
+                "pass_fds": (write_fd,) if record is None else (write_fd, record.fd),
                 "env": _shell_environment(execution_context, start_cwd),
                 "niceness": registry.command_niceness,
             }
@@ -387,6 +393,9 @@ async def _bash(
         finally:
             os.close(cwd_fd)
             cwd_fd = -1
+        if record is not None:
+            record.set_pgid(process.pid)
+            record.close_parent_fd()
         os.close(write_fd)
         write_fd = -1
         if process.stdout is None or process.stderr is None:
@@ -519,6 +528,11 @@ async def _bash(
         if write_fd >= 0:
             os.close(write_fd)
         os.close(read_fd)
+        if record is not None:
+            if process is None or process.returncode is not None:
+                record.remove()
+            else:
+                record.close_parent_fd()
 
 
 def register(registry: ToolRegistry) -> None:
