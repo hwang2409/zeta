@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -13,15 +14,18 @@ from rich.console import Console
 
 from tests.support.fake_backend import FakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
-from zeta.agent import runner
+from tests.support.processes import kill_group_if_present
+from zeta.agent import runner, turn_limit
+from zeta.agent.presets import AgentPreset
 from zeta.agent.recovery_lease import activate_agent_children
-from zeta.core import agent_state
+from zeta.core import agent_progress, agent_state
 from zeta.core.child_runs import LoadedAgentLifecycle, read_child_lifecycle
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import StreamEvent, StreamEventType, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
+from zeta.skills.agent_catalog import AgentCatalog
 from zeta.tui.render import render_event
 
 
@@ -283,19 +287,8 @@ class _ObservedBackend(FakeBackend):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exit_mode", ["normal-exit", "crash"])
 async def test_recovered_child_stats_cover_every_episode(tmp_path, monkeypatch, exit_mode):
-    clock = [1000.0]
-    pid = [1]
-
-    class _Os:
-        def __getattr__(self, name):
-            return getattr(os, name)
-
-        def getpid(self):
-            return pid[0]
-
-    # test-contract: seam a fake monotonic clock and a new owner pid per process.
-    monkeypatch.setattr(agent_state, "time", SimpleNamespace(monotonic=lambda: clock[0]))
-    monkeypatch.setattr(agent_state, "os", _Os())
+    clock, pid = [1000.0], [1]
+    _fake_clock_and_pid(monkeypatch, clock, pid)
     (tmp_path / "note.txt").write_text("note\n")
     read = ScriptedTurn(tool_calls=[ToolCall("read-1", "read", {"path": str(tmp_path / "note.txt")})])
     blocked = asyncio.Event()
@@ -368,6 +361,7 @@ async def test_crashed_parent_below_recovery_epoch_cancels_running_child(tmp_pat
                 what="spawn child",
             )
             await await_or_fail(running.wait(), what="background child is mid-turn")
+            assert not _progress_savers(), "below the recovery epoch a running child saves no progress"
             # A copy taken mid-run is what a killed process leaves on disk.
             shutil.copytree(root, tmp_path / "crashed")
         finally:
@@ -393,3 +387,200 @@ async def test_crashed_parent_below_recovery_epoch_cancels_running_child(tmp_pat
             assert len(first.calls) == 1 and store.agent_children() == {}
         finally:
             await await_or_fail(loop.close(), what="close resumed parent")
+
+
+def _fake_clock_and_pid(monkeypatch, clock, pid):
+    class _Os:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def getpid(self):
+            return pid[0]
+
+    # test-contract: seam a fake monotonic clock and a new owner pid per process.
+    monkeypatch.setattr(agent_state, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(agent_state, "os", _Os())
+
+
+def _fast_progress_saves(monkeypatch):
+    """Run the progress saver every millisecond; return a waiter for more saver wakeups."""
+
+    ticks = [0, 0, asyncio.Event()]
+    live = agent_progress.live_agent_lifecycle
+
+    def counted(path):
+        ticks[0] += 1
+        if ticks[0] >= ticks[1]:
+            ticks[2].set()
+        return live(path)
+
+    # test-contract: seam inject the save interval and count saver wakeups (raising=False reaches base's behavior).
+    monkeypatch.setattr(turn_limit, "_PROGRESS_SAVE_SECONDS", 0.001, raising=False)
+    monkeypatch.setattr(turn_limit, "live_agent_lifecycle", counted, raising=False)
+
+    async def more_ticks(count):
+        ticks[1], ticks[2] = ticks[0] + count, asyncio.Event()
+        await await_or_fail(ticks[2].wait(), what=f"{count} saver wakeups")
+
+    return more_ticks
+
+
+def _record_lifecycle_writes(monkeypatch):
+    writes = []
+    write = ConversationStore._write_agent_lifecycle
+
+    def recorded(self):
+        write(self)
+        writes.append(self._agent_lifecycle["state"])
+
+    # test-contract: durability count every durable lifecycle write.
+    monkeypatch.setattr(ConversationStore, "_write_agent_lifecycle", recorded)
+    return writes
+
+
+def _progress_savers():
+    return [task for task in asyncio.all_tasks() if "save_progress_while_running" in repr(task.get_coro())]
+
+
+def _child_lifecycle_file(store):
+    (marker,) = store.agent_children().values()
+    return Path(marker["child_session_path"]) / "agent_lifecycle.json"
+
+
+def _saved_lifecycle(path):
+    return json.loads(path.read_text())
+
+
+async def _saved_progress(path, elapsed):
+    """Wait, best effort, until the running child saved ``elapsed`` to disk."""
+
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(10):
+            while _saved_lifecycle(path)["elapsed"] != elapsed:
+                await asyncio.sleep(0)
+    value = _saved_lifecycle(path)
+    return value["elapsed"], value["tool_calls"]
+
+
+async def _wait_for_file(path):
+    async with asyncio.timeout(10):
+        while not await asyncio.to_thread(path.exists):
+            await asyncio.sleep(0)
+
+
+def _kill_bash(pid_file):
+    if pid_file.exists() and pid_file.read_text().strip():
+        kill_group_if_present(int(pid_file.read_text()))
+
+
+@pytest.mark.asyncio
+async def test_crash_during_long_tool_call_keeps_saved_progress(tmp_path, monkeypatch):
+    clock, pid = [1000.0], [1]
+    _fake_clock_and_pid(monkeypatch, clock, pid)
+    _fast_progress_saves(monkeypatch)
+    writes = _record_lifecycle_writes(monkeypatch)
+    pid_file = tmp_path / "bash.pid"
+    (tmp_path / "note.txt").write_text("note\n")
+    bash = ToolCall("bash-1", "bash", {"command": f"echo $$ > {pid_file}; exec sleep 300", "timeout": 300})
+    first = _ObservedBackend([ScriptedTurn(tool_calls=[bash])], lambda index: clock.__setitem__(0, clock[0] + 30.0))
+    root = tmp_path / "sessions"
+    try:
+        with ConversationStore(root, cwd=tmp_path) as store:
+            session_id = store.session_id
+            loop = AgentLoop(first, store, skill_catalog=SkillCatalog.empty())
+            try:
+                run_id = await await_or_fail(
+                    runner.spawn_child(loop, agent_type="general", task="work", cwd=None),
+                    what="spawn child",
+                )
+                await _wait_for_file(pid_file)
+                lifecycle_file = _child_lifecycle_file(store)
+                clock[0] += 40.0
+                # 30 s model call + 40 s inside the bash call, and the started call counts.
+                assert await _saved_progress(lifecycle_file, 70.0) == (70.0, 1), "progress inside a long step must be saved"
+                # A copy taken mid-run is what a killed process leaves on disk.
+                shutil.copytree(root, tmp_path / "crashed")
+            finally:
+                await await_or_fail(loop.close(), what="close first parent")
+            assert not _progress_savers(), "shutdown must join the progress saver"
+            assert writes[-1] == "suspended", writes
+            # test-contract: latency the saved child duration is the contract, read from an injected clock
+            assert _saved_lifecycle(lifecycle_file)["elapsed"] == 70.0
+    finally:
+        _kill_bash(pid_file)
+    shutil.rmtree(root)
+    shutil.move(tmp_path / "crashed", root)
+
+    pid[0] = 2
+    second = _ObservedBackend([
+        ScriptedTurn(tool_calls=[ToolCall("read-2", "read", {"path": str(tmp_path / "note.txt")})]),
+        ScriptedTurn([TextContent("done")]),
+    ], lambda index: clock.__setitem__(0, clock[0] + 10.0))
+    monkeypatch.setattr("zeta.agent.resume_child.resolve_child_backend", lambda *a, **kw: (second, None))
+    with ConversationStore(root, session_id=session_id, cwd=tmp_path) as store:
+        loop = _loop(store)
+        try:
+            await await_or_fail(loop.activate(), what="recover child")
+            await await_or_fail(loop._background_owner.wait(), what="recovered child completes")
+            receipt = store.agent_completion_notifications_by_child()[run_id]
+            lifecycle, _ = read_child_lifecycle(store, Path(receipt.data["child_session_path"]))
+            assert isinstance(lifecycle, LoadedAgentLifecycle)
+            stats = receipt.data["stats"]
+            # Episode 1 saved 70 s and the bash call; episode 2 adds 20 s and the read call.
+            # test-contract: latency the reported child duration is the contract, read from an injected clock
+            assert (lifecycle.value["elapsed"], stats["elapsed"]) == (90.0, 90.0), "elapsed must keep the long step"
+            assert (lifecycle.value["tool_calls"], stats["tool_calls"]) == (2, 2), receipt.data
+            assert "90.0s · 2 tool calls" in receipt.data["text"], receipt.data["text"]
+        finally:
+            await await_or_fail(loop.close(), what="close resumed parent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["completed", "idle"])
+async def test_progress_saves_stop_when_the_long_step_ends(tmp_path, monkeypatch, ending):
+    clock, pid = [1000.0], [1]
+    _fake_clock_and_pid(monkeypatch, clock, pid)
+    more_ticks = _fast_progress_saves(monkeypatch)
+    writes = _record_lifecycle_writes(monkeypatch)
+    pid_file, go = tmp_path / "bash.pid", tmp_path / "go"
+    command = f"echo $$ > {pid_file}; while [ ! -e {go} ]; do sleep 0.01; done"
+    backend = _ObservedBackend(
+        [ScriptedTurn(tool_calls=[ToolCall("bash-1", "bash", {"command": command, "timeout": 300})]),
+         *[ScriptedTurn([TextContent("done")])] * 2],
+        lambda index: clock.__setitem__(0, clock[0] + {0: 30.0, 1: 10.0}.get(index, 0.0)),
+    )
+    explicit = AgentPreset(name="explicit-test", preamble="", selection_guidance="test only", tool_names=None,
+                           accepts_follow_ups=True, explicit_finish=True)
+    agent_type, catalog = ("explicit-test", AgentCatalog((explicit,))) if ending == "idle" else ("general", None)
+    try:
+        with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
+            loop = AgentLoop(backend, store, skill_catalog=SkillCatalog.empty(), agent_catalog=catalog)
+            loop.explicit_finish = ending == "idle"
+            try:
+                await await_or_fail(
+                    runner.spawn_child(loop, agent_type=agent_type, task="work", cwd=None), what="spawn child",
+                )
+                await _wait_for_file(pid_file)
+                lifecycle_file = _child_lifecycle_file(store)
+                clock[0] += 40.0
+                assert await _saved_progress(lifecycle_file, 70.0) == (70.0, 1), "progress inside a long step must be saved"
+                await asyncio.to_thread(go.touch)
+                if ending == "completed":
+                    await await_or_fail(loop._background_owner.wait(), what="child completes")
+                    assert _saved_lifecycle(lifecycle_file)["state"] == "completed"
+                    assert not _progress_savers(), "a finished run must join its progress saver"
+                else:
+                    # The finish gate nudges an idle explicit-finish child once (turn 3) before it rests.
+                    async with asyncio.timeout(10):
+                        while (writes[-1], len(backend.calls)) != ("idle", 3):
+                            await asyncio.sleep(0)
+                    assert len(_progress_savers()) == 1
+                    saved = len(writes)
+                    await more_ticks(20)
+                    assert len(writes) == saved, f"an idle child must not write progress: {writes[saved:]}"
+                    # test-contract: latency the saved child duration is the contract, read from an injected clock
+                    assert _saved_lifecycle(lifecycle_file)["elapsed"] == 80.0
+            finally:
+                await await_or_fail(loop.close(), what="close parent")
+    finally:
+        _kill_bash(pid_file)
