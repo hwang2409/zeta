@@ -14,6 +14,7 @@ import zeta.cli.main as cli_main
 from tests.support.credentials import named_account_credentials
 from zeta.accounts import AccountError, AccountStore
 from zeta.codex import CodexCredentialDriver
+from zeta.core import session_files
 from zeta.core.store import ConversationStore
 from zeta.oauth import OAuthTokens
 from zeta.providers.anthropic import AnthropicCredentialDriver
@@ -120,19 +121,34 @@ def _assert_descriptor_error(error: BaseException) -> None:
     assert _error_info(error, provider_error=True).provider_auth_failure is False
 
 
+@pytest.mark.parametrize(
+    ("module", "attribute", "name"),
+    [
+        # opening accounts/codex/default (_read_account_tokens)
+        (session_files, "_open_child_directory", "default"),
+        # opening oauth.json inside it (_read_tokens)
+        (account_files, "open_session_file", "oauth.json"),
+    ],
+)
 def test_exhausted_account_token_read_is_not_a_login_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    module: object,
+    attribute: str,
+    name: str,
 ) -> None:
     credentials = named_account_credentials(tmp_path, "codex", "default")
     credentials.save(OAuthTokens("access", "refresh", 9_999_999_999))
-    real_open = account_files.open_session_file
+    real_open = getattr(module, attribute)
 
-    def open_file(directory_fd: int, name: str, flags: int) -> int:
-        if name == "oauth.json":
+    def open_file(
+        directory_fd: int, opened: str, *args: object, **kwargs: object
+    ) -> int:
+        if opened == name:
             return _exhausted()
-        return real_open(directory_fd, name, flags)
+        return real_open(directory_fd, opened, *args, **kwargs)
 
-    monkeypatch.setattr(account_files, "open_session_file", open_file)
+    monkeypatch.setattr(module, attribute, open_file)
 
     with pytest.raises(Exception) as caught:
         credentials.read()
