@@ -23,17 +23,20 @@ from zeta.skills import SkillCatalog
 from zeta.tools import ToolRegistry
 
 
-def _registry(tmp_path: Path) -> ToolRegistry:
-    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
-    return ToolRegistry(
-        tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
-    )
-
-
 async def _run(tmp_path: Path, command: str, timeout: float = 10.0) -> tuple[str, dict]:
-    result = await _registry(tmp_path).execute(
-        ToolCall("hint", "bash", {"command": command, "timeout": timeout})
-    )
+    store = ConversationStore(tmp_path / "sessions", cwd=tmp_path)
+    try:
+        registry = ToolRegistry(
+            tmp_path, session_store=store, skill_catalog=SkillCatalog.empty()
+        )
+        try:
+            result = await registry.execute(
+                ToolCall("hint", "bash", {"command": command, "timeout": timeout})
+            )
+        finally:
+            await registry.close()
+    finally:
+        store.close()
     return result["content"][0]["text"], result
 
 
