@@ -387,6 +387,21 @@ class ConversationChannel:
         )
         return result.entries[0] if result.entries else None
 
+    async def publish_note(
+        self, *, child_instance_id: str, child_session_path: str, note: str
+    ) -> None:
+        """Send a no-reply child note as an idle notice; it never opens a question."""
+
+        await self.publish_idle(
+            child_instance_id=child_instance_id,
+            child_session_path=child_session_path,
+            description=self._owner.description(child_instance_id),
+            text=(
+                f"child {child_instance_id} notes (no reply needed; it keeps "
+                f"working): {note}"
+            ),
+        )
+
     async def publish_hold(
         self,
         *,
