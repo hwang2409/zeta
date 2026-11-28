@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib
+import json
 import multiprocessing
 import os
 import shlex
@@ -22,13 +24,22 @@ from tests.support.processes import (
     wait_pid_exited,
 )
 from zeta.agent import runner
+from zeta.core.child_runs import LoadedAgentLifecycle, read_child_lifecycle
+from zeta.core.session import env_home
 from zeta.core.store import ConversationStore
+from zeta.core.store._async_writes import _RepairChildInterruptionCommand
 from zeta.protocol.types import MessageRole, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 
 CALL_ID = "orphan-call"
+
+
+@pytest.fixture(autouse=True)
+def _own_home(tmp_path, monkeypatch):
+    # The suite shares one isolated home; give each test its own so record checks see only this test.
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path / "home"))
 
 
 def _backend(turns):
@@ -54,6 +65,15 @@ def _parent_with_running_bash(root: str, cwd: str, command: str, pipe) -> None:
         await asyncio.sleep(300)  # the test kills this process with SIGKILL
 
     asyncio.run(main())
+
+
+def _seam(monkeypatch, name: str, value) -> None:
+    # Imported here so that a checkout without the record module still reaches the behavior assertions.
+    try:
+        module = importlib.import_module("zeta.tools._shared.tool_process_record")
+    except ImportError:
+        return
+    monkeypatch.setattr(module, name, value)
 
 
 def _alive(pid: int) -> bool:
@@ -124,17 +144,29 @@ def _owned_groups(pids: list[int]):
             kill_group_if_present(group)
 
 
-async def _resume(tmp_path: Path, monkeypatch, session_id: str, pids: list[int]) -> _Recovered:
+async def _resume(
+    tmp_path: Path, monkeypatch, session_id: str, pids: list[int], *, expect_call: bool = True,
+) -> tuple[_Recovered, dict]:
+    """Resume the crashed parent through AgentLoop.activate(); return the child backend and lifecycle."""
+
     recovered = _Recovered(pids)
     monkeypatch.setattr("zeta.agent.resume_child.resolve_child_backend", lambda *a, **kw: (recovered, None))
     with ConversationStore(tmp_path / "sessions", session_id=session_id, cwd=tmp_path) as store:
         loop = AgentLoop(_backend([]), store, skill_catalog=SkillCatalog.empty())
         try:
             await await_or_fail(loop.activate(), what="resume crashed parent")
-            await await_or_fail(recovered.called.wait(), what="recovered child called its model")
+            if expect_call:
+                await await_or_fail(recovered.called.wait(), what="recovered child called its model")
+            (marker,) = store.agent_children().values()
+            lifecycle, _ = read_child_lifecycle(store, Path(marker["child_session_path"]))
+            assert isinstance(lifecycle, LoadedAgentLifecycle)
         finally:
             await await_or_fail(loop.close(), what="close resumed parent")
-    return recovered
+    return recovered, lifecycle.value
+
+
+def _records() -> list[Path]:
+    return sorted((env_home() / "run" / "tool-processes").rglob("*.lock"))
 
 
 @pytest.mark.asyncio
@@ -142,8 +174,111 @@ async def test_running_orphan_is_stopped_before_child_resumes(tmp_path, monkeypa
     session_id, pids = await _crash_with_running_bash(tmp_path, "exec sleep 120", pid_files=("pid",))
     with _owned_groups(pids):
         assert _alive(pids[0]), "the orphan must outlive the killed parent"
-        recovered = await _resume(tmp_path, monkeypatch, session_id, pids)
+        recovered, _ = await _resume(tmp_path, monkeypatch, session_id, pids)
         assert recovered.alive_at_first_call == [], "the orphan still ran when the child resumed"
         (result,) = _call_results(recovered)
         assert result.startswith("tool execution canceled"), result
         assert "stopped its leftover processes" in result, result
+        assert not _records(), "recovery left a record behind"
+
+
+@pytest.mark.asyncio
+async def test_orphan_descendant_after_leader_exit_is_stopped(tmp_path, monkeypatch):
+    bgpid = shlex.quote(str(tmp_path / "bgpid"))
+    session_id, (leader, background) = await _crash_with_running_bash(
+        tmp_path, f"sleep 120 & echo $! > {bgpid}; wait", pid_files=("pid", "bgpid"),
+    )
+    with _owned_groups([leader, background]):
+        os.kill(leader, signal.SIGKILL)
+        await wait_pid_exited(leader)
+        assert _alive(background), "only the background descendant should hold the lock now"
+        recovered, _ = await _resume(tmp_path, monkeypatch, session_id, [background])
+        assert recovered.alive_at_first_call == [], "the descendant still ran when the child resumed"
+        (result,) = _call_results(recovered)
+        assert "stopped its leftover processes" in result, result
+
+
+@pytest.mark.asyncio
+async def test_exited_orphan_is_not_killed_and_child_is_told(tmp_path, monkeypatch):
+    session_id, (pid,) = await _crash_with_running_bash(tmp_path, "sleep 0.3", pid_files=("pid",))
+    await wait_pid_exited(pid)
+    unrelated = await asyncio.create_subprocess_exec("sleep", "120", start_new_session=True)
+    try:
+        # A stale pgid in the record must never be signalled; only the lock and its holders count.
+        for record in _records():
+            record.write_text(json.dumps({"call_id": CALL_ID, "pgid": unrelated.pid, "stopping": False}))
+        signalled = []
+        # test-contract: seam record any signal the stop step sends.
+        _seam(monkeypatch, "_signal_groups", lambda groups, signum: signalled.append(groups))
+        recovered, _ = await _resume(tmp_path, monkeypatch, session_id, [])
+        (result,) = _call_results(recovered)
+        assert result.startswith("tool execution canceled"), result
+        assert "ended before recovery" in result, result
+        assert signalled == []
+        assert _alive(unrelated.pid), "an unrelated process group was signalled"
+        assert not _records()
+    finally:
+        kill_group_if_present(unrelated.pid)
+        await await_or_fail(unrelated.wait(), what="reap unrelated sleep")
+
+
+@pytest.mark.asyncio
+async def test_restart_during_stop_resumes_once_without_a_second_copy(tmp_path, monkeypatch):
+    session_id, pids = await _crash_with_running_bash(tmp_path, "trap '' TERM; exec sleep 120", pid_files=("pid",))
+    with _owned_groups(pids):
+        original = ConversationStore._commit_storage_command
+
+        async def crash_after_kill(store, command):
+            if isinstance(command, _RepairChildInterruptionCommand):
+                raise InterruptedError("crashed after the kill")
+            return await original(store, command)
+
+        with monkeypatch.context() as crash:
+            # test-contract: seam crash between the kill and the durable canceled result.
+            crash.setattr(ConversationStore, "_commit_storage_command", crash_after_kill)
+            with contextlib.suppress(InterruptedError):
+                await _resume(tmp_path, monkeypatch, session_id, pids, expect_call=False)
+        assert not _alive(pids[0]), "the first recovery did not stop the orphan"
+        recovered, _ = await _resume(tmp_path, monkeypatch, session_id, pids)
+        assert recovered.alive_at_first_call == []
+        (result,) = _call_results(recovered)
+        assert "stopped its leftover processes" in result, result
+        assert not _records()
+
+
+@pytest.mark.asyncio
+async def test_unstoppable_orphan_blocks_recovery(tmp_path, monkeypatch):
+    session_id, pids = await _crash_with_running_bash(tmp_path, "exec sleep 120", pid_files=("pid",))
+    with _owned_groups(pids):
+        # test-contract: seam the holder scan finds nobody while the lock is busy (lsof missing, EPERM).
+        _seam(monkeypatch, "_holders", lambda fd, path: [])
+        recovered, lifecycle = await _resume(tmp_path, monkeypatch, session_id, pids, expect_call=False)
+        assert lifecycle["state"] == "suspended"
+        assert f"process group {pids[0]}" in lifecycle.get("recovery_blocked", ""), lifecycle
+        assert recovered.calls == []
+        assert _alive(pids[0])
+        assert _records(), "the record must stay so the next resume tries again"
+
+
+@pytest.mark.asyncio
+async def test_normal_quit_leaves_no_record(tmp_path, monkeypatch):
+    child = _backend([
+        ScriptedTurn(tool_calls=[ToolCall(CALL_ID, "bash", {
+            "command": f"echo $$ > {shlex.quote(str(tmp_path / 'pid'))}; exec sleep 120", "timeout": 300,
+        })]),
+        ScriptedTurn([TextContent("never")], delay=300),
+    ])
+    monkeypatch.setattr(runner, "resolve_child_backend", lambda *a, **kw: (child, None))
+    with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
+        loop = AgentLoop(_backend([]), store, skill_catalog=SkillCatalog.empty())
+        pid = None
+        try:
+            await await_or_fail(runner.spawn_child(loop, agent_type="general", task="work", cwd=None), what="spawn")
+            pid = await read_pid_file(tmp_path / "pid", timeout=30)
+            assert _records()
+        finally:
+            await await_or_fail(loop.close(), what="quit normally")
+            if pid is not None:
+                kill_group_if_present(pid)
+        assert not _alive(pid)
+        assert not _records()
