@@ -878,13 +878,13 @@ async def status(
 
 
 def list_sessions(
-    self, request_id: str | int, params: dict[str, Any]
+    self, request_id: str | int, params: dict[str, Any], resident: frozenset[str]
 ) -> tuple[dict[str, object], list[str]]:
-    return _list_sessions(self, request_id, params)
+    return _list_sessions(self, request_id, params, resident)
 
 
 def _list_sessions(
-    self, request_id: str | int, params: dict[str, Any]
+    self, request_id: str | int, params: dict[str, Any], resident: frozenset[str]
 ) -> tuple[dict[str, object], list[str]]:
     paging = "list_sessions_paging" in self.features
     for name in ("offset", "limit"):
@@ -913,6 +913,7 @@ def _list_sessions(
                 **item.to_catalog_dict(),
                 "first_message_preview": preview.preview,
                 "in_use": preview.in_use,
+                "resident": item.session_id in resident,
                 **(
                     {"owner_pid": preview.owner_pid}
                     if preview.owner_pid is not None
@@ -923,6 +924,7 @@ def _list_sessions(
     if self.protocol_version == "1.0":
         for item in sessions:
             item.pop("name", None)
+            item.pop("resident")
     page: list[dict[str, Any]] = []
     for index, item in enumerate(sessions):
         candidate = [*page, item]
