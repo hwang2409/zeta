@@ -615,3 +615,52 @@ async def test_provider_readiness_uses_context_free_generation(tmp_path, provide
                 assert (payload["max_tokens"] if provider == "claude" else payload["options"]["num_predict"]) == 1
         finally:
             await backend.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fixture",
+    [
+        "anthropic_messages_429_rate_limit_error.json",
+        "anthropic_messages_400_extra_usage.json",
+        "codex_responses_429_usage_limit_reached.json",
+    ],
+)
+async def test_provider_readiness_keeps_waiting_on_an_exhausted_account(tmp_path, fixture):
+    import json
+
+    import httpx
+
+    from tests.support.credentials import named_account_credentials
+    from tests.test_codex import store_for
+    from zeta.oauth import OAuthTokens
+    from zeta.providers import recovery_probe
+    from zeta.providers.anthropic import AnthropicBackend
+    from zeta.providers.codex import CodexBackend
+
+    payload = json.loads((Path(__file__).parent / "fixtures/usage" / fixture).read_text())
+    meta = payload.pop("_fixture")
+    requests = []
+
+    def handler(request):
+        requests.append(request.method)
+        if request.method == "GET":
+            # the usage pre-check cannot tell; only the generation reply shows the exhausted plan
+            return httpx.Response(503)
+        return httpx.Response(meta["http_status"], headers=meta.get("headers", {}), json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        if fixture.startswith("codex"):
+            backend = CodexBackend(client=client, token_store=store_for(tmp_path / "codex.json"))
+        else:
+            credentials = named_account_credentials(tmp_path / "home", "anthropic", "first")
+            credentials.save(OAuthTokens("token-first", "refresh", 4_000_000_000))
+            backend = AnthropicBackend(
+                client=client, token_store=credentials, base_url="https://test.invalid/v1/messages"
+            )
+        try:
+            result = await recovery_probe.probe_readiness(backend)
+        finally:
+            await backend.aclose()
+    assert requests[-1] == "POST", "the probe must reach the generation request"
+    assert result is recovery_probe.Readiness.RETRY, "an exhausted account is still waiting, not a stop"
