@@ -15,6 +15,7 @@ import pytest
 
 import zeta.accounts.store as account_store_module
 import zeta.cli.main as cli_main
+import zeta.server.accounts as server_accounts
 from tests.support.credentials import named_account_credentials
 from tests.support.storage_homes import initialize_storage_home
 from zeta.accounts import AccountId, AccountStore
@@ -652,6 +653,45 @@ def test_accounts_status_corrupt_login_keeps_json_valid_and_reports_other_accoun
     assert "secret-file-content" not in captured.out + captured.err
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+def test_accounts_status_unreadable_login_is_unknown_not_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    credential_path = _save_account(tmp_path)
+    os.chmod(credential_path, 0)
+    try:
+        with pytest.raises(OSError, match=r"could not be read \(EACCES") as caught:
+            named_account_credentials(tmp_path, "codex", "default").read()
+        assert "login" not in str(caught.value)
+
+        assert _run_json(tmp_path, monkeypatch, "--refresh") == 1
+        assert json.loads(capsys.readouterr().out) == [
+            {
+                "provider": "codex",
+                "account": "default",
+                "is_default": True,
+                "logged_in": None,
+                "access_token_expires_at": None,
+                "error": "unreadable_credentials",
+                "retryable": False,
+                "refresh": {
+                    "ok": False,
+                    "code": "unreadable_credentials",
+                    "retryable": False,
+                },
+            }
+        ]
+        assert cli_main.main(["accounts", "status"]) == 1
+        assert capsys.readouterr().out.strip() == (
+            "codex:default  login unknown (unreadable_credentials)"
+            "  expires unknown  default"
+        )
+    finally:
+        os.chmod(credential_path, 0o600)
+
+
 def test_accounts_status_corrupt_login_human_output_has_one_line_per_account(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -747,3 +787,52 @@ def test_accounts_status_never_blocks_on_account_locks(
     if refresh:
         assert row["refresh"] == {"ok": True, "code": None, "retryable": None}
     assert blocking == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+def test_startup_with_unreadable_registry_warns_and_keeps_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _save_account(tmp_path)
+    registry = tmp_path / "accounts.json"
+    original = registry.read_bytes()
+    warning = (
+        f"accounts.json is unreadable: {registry}; kept it and every account directory; "
+        "move it aside to a backup, then run login again or restore it from a backup, "
+        "then restart zeta"
+    )
+    os.chmod(registry, 0)
+    try:
+        startup = ("accounts.json is unreadable; kept it and every account directory",)
+        assert AccountStore(tmp_path).migrate() == startup
+        assert asyncio.run(server_accounts.migrate(tmp_path)) == startup
+
+        monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+        assert cli_main.main(["accounts", "status"]) == 1
+        assert capsys.readouterr().err == warning + "\n"
+    finally:
+        os.chmod(registry, 0o600)
+    assert registry.read_bytes() == original
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
+def test_startup_migration_with_unreadable_login_warns_and_keeps_running(
+    tmp_path: Path,
+) -> None:
+    credential_path = _save_account(tmp_path)
+    original = credential_path.read_bytes()
+    os.chmod(credential_path, 0)
+    try:
+        warnings = asyncio.run(server_accounts.migrate(tmp_path))
+        assert warnings == (
+            (
+                f"kept {credential_path}: OAuth credentials file could not be read "
+                "(EACCES: Permission denied); fix its permissions, then restart zeta"
+            ),
+        )
+        assert AccountStore(tmp_path).migrate() == warnings
+    finally:
+        os.chmod(credential_path, 0o600)
+    assert credential_path.read_bytes() == original

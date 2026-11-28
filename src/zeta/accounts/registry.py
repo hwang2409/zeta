@@ -343,5 +343,6 @@ class _AccountRegistry:
                     raise ValueError
             return _Registry.LOADED, normalized
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise_if_out_of_files(exc)
+            # any other failed read is BROKEN: startup warns and keeps the file
+            raise_if_out_of_files(exc, "account registry")
             return _Registry.BROKEN, empty
