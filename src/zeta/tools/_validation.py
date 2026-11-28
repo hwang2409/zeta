@@ -130,7 +130,14 @@ def _validate_json_data(value: Any, path: str) -> None:
     raise ValueError(f"schema must contain JSON data at {path}")
 
 
+def _reject_context_placeholder(arguments: object) -> None:
+    # Evicted calls show {"eviction_receipt": ...} as their arguments; models copy it.
+    if type(arguments) is dict and set(arguments) == {"eviction_receipt"}:
+        raise ValueError("you copied a context placeholder; send the real arguments")
+
+
 def _validate_arguments(arguments: object, schema: Mapping[str, Any]) -> dict[str, Any]:
+    _reject_context_placeholder(arguments)
     if type(arguments) is not dict:
         raise ValueError("arguments must be an object")
     _validate_finite_numbers(arguments, "arguments")
@@ -139,6 +146,7 @@ def _validate_arguments(arguments: object, schema: Mapping[str, Any]) -> dict[st
 
 
 def _coerce_arguments(arguments: object) -> dict[str, Any]:
+    _reject_context_placeholder(arguments)
     if type(arguments) is not dict:
         raise ValueError("arguments must be an object")
     _validate_finite_numbers(arguments, "arguments")
@@ -170,9 +178,13 @@ def _validate_schema(value: Any, schema: Mapping[str, Any], path: str) -> None:
         raise ValueError(f"{path} is not an allowed value")
     if isinstance(value, str):
         if len(value) < schema.get("minLength", 0):
-            raise ValueError(f"{path} is too short")
+            raise ValueError(
+                f"{path} is too short ({len(value)} < {schema['minLength']} characters)"
+            )
         if "maxLength" in schema and len(value) > schema["maxLength"]:
-            raise ValueError(f"{path} is too long")
+            raise ValueError(
+                f"{path} is too long ({len(value)} > {schema['maxLength']} characters)"
+            )
         if "pattern" in schema and re.fullmatch(schema["pattern"], value) is None:
             raise ValueError(f"{path} does not match the required pattern")
     if type(value) in {int, float} and type(value) is not bool:
@@ -201,7 +213,9 @@ def _validate_schema(value: Any, schema: Mapping[str, Any], path: str) -> None:
         if "minItems" in schema and len(value) < schema["minItems"]:
             raise ValueError(f"{path} has too few items")
         if "maxItems" in schema and len(value) > schema["maxItems"]:
-            raise ValueError(f"{path} has too many items")
+            raise ValueError(
+                f"{path} has too many items ({len(value)} > {schema['maxItems']})"
+            )
         item_schema = schema.get("items")
         if isinstance(item_schema, Mapping):
             for index, item in enumerate(value):

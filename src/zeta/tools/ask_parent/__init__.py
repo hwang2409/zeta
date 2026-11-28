@@ -1,4 +1,4 @@
-"""Let an eligible background child ask its parent without blocking."""
+"""Let an eligible background child ask or notify its parent without blocking."""
 
 from __future__ import annotations
 
@@ -32,6 +32,9 @@ def register_ask_parent(
     ) -> dict[str, object]:
         question = arguments.get("question")
         options = arguments.get("options")
+        kind = arguments.get("kind", "question")
+        if kind not in ("question", "note"):
+            return _error('kind must be "question" or "note"')
         if (
             type(question) is not str
             or not question.strip()
@@ -50,6 +53,21 @@ def register_ask_parent(
             )
         ):
             return _error("options must contain 1 to 10 nonempty strings")
+        if kind == "note":
+            if options is not None:
+                return _error("options apply only to questions; a note needs no reply")
+            await channel.publish_note(
+                child_instance_id=child_instance_id,
+                child_session_path=str(_registry.session_store.session_dir),
+                note=question,
+            )
+            return {
+                "content": [
+                    text_block("note sent; no reply will come; continue your work")
+                ],
+                "isError": False,
+                "structuredContent": None,
+            }
         question_id = uuid.uuid4().hex
         await channel.publish_question(
             child_instance_id=child_instance_id,
@@ -73,7 +91,10 @@ def register_ask_parent(
         binding="loop",
         description=(
             "Send your parent one non-blocking question. Continue working; "
-            "the answer arrives later as an ordinary follow-up message."
+            "the answer arrives later as an ordinary follow-up message. "
+            'Use kind "note" for a milestone or status that needs no reply: '
+            "the parent gets it as a background update, and it is never an "
+            "open question."
         ),
         parameters={
             "type": "object",
@@ -83,6 +104,7 @@ def register_ask_parent(
                     "minLength": 1,
                     "maxLength": MAX_QUESTION_LENGTH,
                 },
+                "kind": {"type": "string", "enum": ["question", "note"]},
                 "options": {
                     "type": "array",
                     "items": {

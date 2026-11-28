@@ -194,6 +194,15 @@ async def test_ask_parent_schema_and_handler_reject_oversized_question(
     )
     assert result["isError"] is True
     assert "too long" in result["content"][0]["text"]
+    note = await registry.execute(
+        ToolCall(
+            "ask-2",
+            "ask_parent",
+            {"question": "done", "kind": "note", "options": ["ok"]},
+        )
+    )
+    assert note["isError"] is True
+    assert "options apply only to questions" in note["content"][0]["text"]
     owner.cancel_all()
 
 

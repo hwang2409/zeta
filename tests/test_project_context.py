@@ -10,6 +10,7 @@ import pytest
 
 from zeta.core.project_context import (
     PromptArgumentError,
+    discover_project,
     discover_repo_root,
     load_project_context,
     resolve_prompt_argument,
@@ -417,6 +418,30 @@ def test_discover_repo_root_finds_git_root_from_subdirectory(tmp_path: Path) -> 
 
 def test_discover_repo_root_falls_back_outside_git(tmp_path: Path) -> None:
     assert discover_repo_root(tmp_path) == tmp_path.resolve()
+
+
+def test_discover_project_outside_git_logs_no_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="zeta.core.project_context"):
+        discovery = discover_project(tmp_path, user_home=tmp_path.parent)
+
+    assert discovery.repo_root == tmp_path.resolve()
+    assert discovery.git_unavailable is False
+    assert [r.getMessage() for r in caplog.records] == []
+
+
+def test_discover_project_real_git_error_still_logs_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    missing = tmp_path / "missing"  # git -C <missing> exits 128 with "cannot change to"
+    with caplog.at_level("WARNING", logger="zeta.core.project_context"):
+        discovery = discover_project(missing, user_home=tmp_path)
+
+    assert discovery.git_unavailable is True
+    assert [r.getMessage() for r in caplog.records] == [
+        f"git project discovery failed for {missing.resolve()} (exit 128)"
+    ]
 
 
 def test_project_context_escapes_structured_content(tmp_path: Path) -> None:

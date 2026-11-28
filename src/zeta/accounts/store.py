@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import hashlib
 import json
@@ -34,10 +35,12 @@ from ..core.session_files import (
 from ..oauth import (
     ACCOUNT_LOCK_TURN_WAIT_SECONDS,
     OAUTH_REFRESH_TIMEOUT_SECONDS,
+    CredentialReadError,
     OAuthRefreshFailure,
     OAuthTokens,
     classify_oauth_refresh_failure,
     credential_file_lock,
+    raise_if_unreadable,
 )
 from ..storage_format import (
     DeleteValue,
@@ -159,19 +162,25 @@ class AccountStore(_AccountRegistry):
     def _lifecycle_guard(
         self, home_fd: int, account: AccountId, *, wait: bool = True
     ) -> Iterator[None]:
-        with (
-            _account_lock_directory(home_fd, account) as lock_fd,
-            self._lock_at(lock_fd, "lifecycle.lock", wait=wait),
-        ):
+        with self._account_lock(home_fd, account, "lifecycle.lock", wait=wait):
             yield
 
     @contextmanager
     def usage_guard(self, account: AccountId) -> Iterator[None]:
         with (
             self._home() as home_fd,
-            _account_lock_directory(home_fd, account) as lock_fd,
-            self._lock_at(lock_fd, "usage.lock"),
+            self._account_lock(home_fd, account, "usage.lock"),
         ):
+            yield
+
+    @contextmanager
+    def _account_lock(
+        self, home_fd: int, account: AccountId, name: str, *, wait: bool = True
+    ) -> Iterator[None]:
+        with ExitStack() as stack:
+            with unreadable_account_directory(account):  # e.g. a root-owned lock dir
+                lock_fd = stack.enter_context(_account_lock_directory(home_fd, account))
+                stack.enter_context(self._lock_at(lock_fd, name, wait=wait))
             yield
 
     def _read_usage_bytes(self, account: AccountId) -> bytes | None:
@@ -251,10 +260,7 @@ class AccountStore(_AccountRegistry):
                 account = item.account
                 selected = registry["defaults"].get(account.provider) == str(account)
                 usage = read_usage(self, account)
-                try:
-                    tokens = _read_account_tokens(home_fd, account)
-                except AccountError:
-                    tokens = None
+                tokens = _listed_tokens(home_fd, account)
                 if tokens is None or not math.isfinite(tokens.expires_at) or tokens.expires_at <= now:
                     status = "error"
                     warnings.append(f"{account}: credentials unavailable or expired")
@@ -287,10 +293,7 @@ class AccountStore(_AccountRegistry):
             defaults = registry["defaults"]
             content = []
             for item in availability.catalog_display(registry):
-                try:
-                    available = _read_account_tokens(home_fd, item.account) is not None
-                except (AccountError, ValueError, OverflowError, RecursionError):
-                    available = False
+                available = _listed_tokens(home_fd, item.account) is not None
                 try:
                     usage = read_usage(self, item.account)
                 except (OverflowError, RecursionError):
@@ -568,7 +571,7 @@ class AccountStore(_AccountRegistry):
             ):
                 return ()
             with self._lock_at(home_fd, ".accounts-migration.lock"):
-                with self._registry_guard(home_fd):
+                with self._keeping_unreadable(warnings), self._registry_guard(home_fd):
                     state, value = self._load_registry(home_fd)
                     if state is _Registry.LOADED:
                         self._sweep_orphan_directories(
@@ -586,7 +589,8 @@ class AccountStore(_AccountRegistry):
                     if state is _Registry.MISSING and warnings:
                         logger.warning("%s", warnings[-1])
                 for provider in ("anthropic", "codex"):
-                    self._migrate_provider(home_fd, provider, warnings)
+                    with self._keeping_unreadable(warnings):
+                        self._migrate_provider(home_fd, provider, warnings)
         return tuple(warnings)
 
     def refuse_orphaning_registration(self, account: AccountId) -> None:
@@ -594,6 +598,28 @@ class AccountStore(_AccountRegistry):
 
         with self._home() as home_fd:
             self._refuse_orphaning_registration(home_fd, account)
+
+    @contextmanager
+    def _keeping_unreadable(self, warnings: list[str]) -> Iterator[None]:
+        """The one owner of a failed read at startup: warn, keep every file, go on."""
+
+        try:
+            yield
+        except OSError as exc:
+            if exc.errno in (errno.EMFILE, errno.ENFILE):
+                raise
+            code = errno.errorcode.get(exc.errno or 0, "unknown error")
+            reason = f"{code}: {os.strerror(exc.errno)}" if exc.errno else code
+            warning = (
+                f"kept every account file: account migration failed ({reason}); "
+                "fix it, then restart zeta"
+                if exc.filename is None  # e.g. ENOSPC from os.write: no path to name
+                else f"kept {_failed_path(self.home, exc.filename)}: could not be read "
+                f"or written ({reason}); fix its permissions, then restart zeta"
+            )
+            if warning not in warnings:  # each later step trips on the same path
+                warnings.append(warning)
+                logger.warning("%s", warning)
 
     def _migrate_provider(
         self, home_fd: int, provider: str, warnings: list[str]
@@ -631,9 +657,10 @@ class AccountStore(_AccountRegistry):
                 )
                 logger.warning("%s", warnings[-1])
                 return
+            # read before creating the account directory: a failed read leaves no trace
+            tokens = _read_tokens(home_fd, legacy_name) if keep is _Keep.LEGACY else None
             with _account_directory(home_fd, account) as account_fd:
-                if keep is _Keep.LEGACY:
-                    tokens = _read_tokens(home_fd, legacy_name)
+                if tokens is not None:
                     self._stage_account_tokens(account_fd, account, tokens)
                 if str(account) not in self._read_registry(home_fd)["accounts"]:
                     self._register_account(home_fd, account)
@@ -1027,27 +1054,43 @@ def _account_lock_directory(home_fd: int, account: AccountId) -> Iterator[int]:
 
 
 @contextmanager
+def unreadable_account_directory(account: AccountId) -> Iterator[None]:
+    """The one owner of a failed open of one account's directory: a read error naming it.
+
+    A missing directory and descriptor exhaustion keep their meaning (see raise_if_unreadable).
+    """
+    try:
+        yield
+    except OSError as exc:
+        raise_if_unreadable(exc, f"account {account} directory")
+        raise
+
+
+@contextmanager
 def _account_directory(home_fd: int, account: AccountId) -> Iterator[int]:
     with ExitStack() as stack:
-        accounts_fd = stack.enter_context(
-            _owned_fd(_mkdir_child_durable(home_fd, "accounts"))
-        )
-        provider_fd = stack.enter_context(
-            _owned_fd(_mkdir_child_durable(accounts_fd, account.provider))
-        )
-        account_fd = stack.enter_context(
-            _owned_fd(_mkdir_child_durable(provider_fd, account.name))
-        )
+        with unreadable_account_directory(account):
+            accounts_fd = stack.enter_context(
+                _owned_fd(_mkdir_child_durable(home_fd, "accounts"))
+            )
+            provider_fd = stack.enter_context(
+                _owned_fd(_mkdir_child_durable(accounts_fd, account.provider))
+            )
+            account_fd = stack.enter_context(
+                _owned_fd(_mkdir_child_durable(provider_fd, account.name))
+            )
         yield account_fd
 
 
 @contextmanager
 def _open_account_directory(home_fd: int, account: AccountId) -> Iterator[int]:
-    with (
-        child_directory(home_fd, "accounts") as accounts_fd,
-        child_directory(accounts_fd, account.provider) as provider_fd,
-        child_directory(provider_fd, account.name) as account_fd,
-    ):
+    with ExitStack() as stack:
+        with unreadable_account_directory(account):
+            accounts_fd = stack.enter_context(child_directory(home_fd, "accounts"))
+            provider_fd = stack.enter_context(
+                child_directory(accounts_fd, account.provider)
+            )
+            account_fd = stack.enter_context(child_directory(provider_fd, account.name))
         yield account_fd
 
 
@@ -1093,7 +1136,20 @@ def _read_account_tokens(home_fd: int, account: AccountId) -> OAuthTokens | None
     except AccountError:
         raise
     except OSError as exc:
+        raise_if_unreadable(exc, "OAuth credentials file")
         raise AccountError("OAuth credentials are invalid; login required") from exc
+
+
+def _listed_tokens(home_fd: int, account: AccountId) -> OAuthTokens | None:
+    """Read one account's tokens for a listing: a bad or unreadable login lists it unavailable."""
+    try:
+        return _read_account_tokens(home_fd, account)
+    except CredentialReadError as exc:
+        if exc.errno in (errno.EMFILE, errno.ENFILE):
+            raise  # nothing was read, so no account's state is known
+        return None
+    except (AccountError, ValueError, OverflowError, RecursionError):
+        return None
 
 
 def _read_tokens(directory_fd: int, name: str) -> OAuthTokens:
@@ -1105,6 +1161,7 @@ def _read_tokens(directory_fd: int, name: str) -> OAuthTokens:
     except AccountError:
         raise
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise_if_unreadable(exc, "OAuth credentials file")
         raise AccountError("OAuth credentials are invalid; login required") from exc
 
 
@@ -1159,8 +1216,40 @@ def _keep_token(
 
 
 def _read_optional_tokens(directory_fd: int) -> OAuthTokens | None:
-    credential = _read_optional_bytes(directory_fd, "oauth.json")
+    try:
+        credential = _read_optional_bytes(directory_fd, "oauth.json")
+    except OSError as exc:
+        raise_if_unreadable(exc, "OAuth credentials file")
+        if exc.errno == errno.ELOOP:  # a symlinked login is a bad login, as in _read_tokens
+            raise AccountError("OAuth credentials are invalid; login required") from exc
+        raise
     return None if credential is None else _tokens_from_bytes(credential)
+
+
+def _children(directory: Path) -> list[Path]:
+    try:
+        return [] if directory.is_symlink() else list(directory.iterdir())
+    except OSError:  # missing, unreadable, or a file
+        return []
+
+
+def _failed_path(home: Path, name: str) -> Path:
+    """Reads go through dir_fd, so an error names only the last component; find it."""
+
+    roots = [home / "accounts", home / "account-locks"]
+    providers = [root / provider for root in roots for provider in _PROVIDERS]
+    accounts = [path for provider in providers for path in _children(provider)]
+    files = [path for account in accounts for path in _children(account)]
+    matches = [
+        path
+        for path in (home / name, *roots, *providers, *accounts, *files)
+        if path.name == name and os.path.lexists(path)
+    ]
+    # the same name can sit in several trees: the unreadable one failed
+    return next(
+        (path for path in matches if not os.access(path, os.R_OK)),
+        matches[0] if matches else home / name,
+    )
 
 
 def _tokens_from_bytes(credential: bytes) -> OAuthTokens:

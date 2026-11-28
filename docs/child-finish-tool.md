@@ -175,7 +175,10 @@ immediate extra model turn. `idle` is non-terminal: keep the parent marker,
 pending-prompt queue, loop, registry, and store open.
 
 on each transition into `idle`, publish exactly one bounded, nonterminal
-`child_idle` notification to the direct parent and wake it without polling. the
+`child_idle` notification to the direct parent and wake it without polling.
+`child_idle` is the generic nonterminal child notice: the same kind also carries
+a stall notice and an `ask_parent` note (`kind: note`, sent while the child
+keeps running; the TUI labels it `note` from its text prefix). the
 notification has the dedicated kind `child_idle`, and includes a bounded
 `child_instance_id`, `child_session_path`, `text` excerpt of the last assistant
 text, and optional `ask_parent_question_id`. its status is `child_idle`; it is a

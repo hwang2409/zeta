@@ -16,8 +16,10 @@ from typing import TypeVar
 import httpx
 
 from ..core.abort import AbortSignal
+from ..oauth import OAuthRefreshFailure, classify_oauth_refresh_failure
 from ..tools._spill import SpillStore
 from .client import (
+    MCPAuthRequiredError,
     MCPCanceled,
     MCPClient,
     MCPError,
@@ -53,6 +55,7 @@ from .envelope import (
 )
 from .oauth import (
     MCPOAuthError,
+    MCPOAuthTokenEndpointError,
     refresh_access_token,
 )
 from .oauth_store import (
@@ -402,7 +405,12 @@ class StreamableHTTPMCPClient(MCPClient):
         if self._sealed:
             raise _Sealed()
         if snapshot.token is None:
-            raise self._auth_error(MCPHTTPError(401, "authorization required"))
+            raise self._auth_error(
+                MCPHTTPError(401, "authorization required"), reauthorize=False
+            )
+        if snapshot.token.refresh_error is not None:
+            # a rejected refresh was persisted; only /mcp auth can replace this token
+            raise self._auth_error(MCPHTTPError(401, snapshot.token.refresh_error))
         try:
             return await send(snapshot.token)
         except MCPHTTPError as exc:
@@ -442,7 +450,24 @@ class StreamableHTTPMCPClient(MCPClient):
                 access = response.get("access_token")
                 if type(access) is not str or not access:
                     raise MCPOAuthError("refresh response missing access_token")
-            except MCPOAuthError:
+            except MCPOAuthError as error:
+                if (
+                    isinstance(error, MCPOAuthTokenEndpointError)
+                    and classify_oauth_refresh_failure(
+                        status_code=error.status_code, response_body=error.body
+                    )
+                    is OAuthRefreshFailure.LOGIN_REQUIRED
+                ):
+                    marked = await self._credential_store.save_if_current(
+                        self.config.name,
+                        current.generation,
+                        replace(token, refresh_error=str(error)),
+                    )
+                    # stale: another writer (a new login) won, so retry with its token
+                    return (
+                        marked.disposition is SaveDisposition.STALE
+                        and marked.snapshot.token is not None
+                    )
                 after_failure = await self._credential_store.load(self.config.name)
                 return (
                     after_failure.token is not None
@@ -480,11 +505,13 @@ class StreamableHTTPMCPClient(MCPClient):
             )
             return saved.disposition is not SaveDisposition.DELETED
 
-    def _auth_error(self, exc: MCPHTTPError) -> MCPHTTPError:
+    def _auth_error(
+        self, exc: MCPHTTPError, *, reauthorize: bool = True
+    ) -> MCPAuthRequiredError:
         hint = OAUTH_HINT.format(name=self.config.name)
-        return MCPHTTPError(
-            401,
+        return MCPAuthRequiredError(
             f"MCP OAuth token refresh failed ({exc}); {hint}",
+            reauthorize=reauthorize,
         )
 
     @contextlib.asynccontextmanager

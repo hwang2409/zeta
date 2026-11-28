@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import math
 import os
+import re
 import shlex
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any, BinaryIO, TypedDict
@@ -36,6 +39,8 @@ from ..registry import (
 )
 
 MAX_TIMEOUT_SECONDS = 3600.0
+_DEFAULT_TIMEOUT_SECONDS = 30.0
+_INNER_TIMEOUT_MARGIN_SECONDS = 5.0
 MAX_OUTPUT_BYTES = 1_048_576
 
 
@@ -101,6 +106,105 @@ def _shell_environment(
     )
     environment["PWD"] = start_cwd
     return environment
+
+
+_LONG_SLEEP_SECONDS = 30.0
+_SLEEP = re.compile(r"\bsleep\s+(\d+(?:\.\d+)?)([smh]?)\b")
+_CI_WATCH = re.compile(r"\bgh\s+pr\s+checks\b[^|;&\n]*\s--watch\b|\bgh\s+run\s+watch\b")
+_LAST_STAGE = re.compile(r"[|;&\n]")
+_GREP_TOOLS = frozenset({"grep", "egrep", "fgrep", "rg"})
+
+
+def _result_hint(
+    command: str,
+    exit_code: int,
+    stdout: str,
+    stderr: str,
+    elapsed: float,
+    timed_out: bool,
+) -> str | None:
+    """Return one plain-meaning hint for known result shapes."""
+
+    sleeps = (
+        float(n) * {"": 1, "s": 1, "m": 60, "h": 3600}[unit]
+        for n, unit in _SLEEP.findall(command)
+    )
+    blocked = timed_out or elapsed >= _LONG_SLEEP_SECONDS
+    waits = any(s >= _LONG_SLEEP_SECONDS for s in sleeps) or _CI_WATCH.search(command)
+    if blocked and waits:
+        return (
+            f"this blocked your turn for {math.ceil(elapsed)}s; start it with "
+            "run_background and end your turn; its exit wakes you"
+        )
+    if exit_code == 127 and "rg: command not found" in stderr:
+        return "rg is not installed; use `git grep -n` or `grep -rn`"
+    if exit_code == 1 and not stdout and not stderr:
+        stages = [s for s in _LAST_STAGE.split(command) if s.strip()]
+        words = stages[-1].split() if stages else []
+        if words[:1] == ["git"]:
+            words = words[1:]
+        if words and words[0] in _GREP_TOOLS:
+            return "exit 1 from grep means no match"
+    if exit_code == 8 and re.search(r"\bgh\s+pr\s+checks\b", command):
+        return "exit 8 from gh pr checks means checks are pending"
+    return None
+
+
+_DURATION = re.compile(r"([0-9]+(?:\.[0-9]*)?|\.[0-9]+)([smhd]?)")
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+_TIMEOUT_FLAGS = frozenset({"--preserve-status", "--foreground", "-v", "--verbose"})
+_TIMEOUT_HINT = "pass a larger `timeout` (max 3600) or use run_background"
+
+
+def _duration(text: str) -> float | None:
+    match = _DURATION.fullmatch(text)
+    return float(match[1]) * _DURATION_UNITS[match[2]] if match else None
+
+
+def _inner_timeout_span(args: list[str]) -> float | None:
+    """Return DURATION plus any -k grace from coreutils `timeout` arguments."""
+
+    kill: float | None = 0.0
+    while args and args[0].startswith("-"):
+        flag = args.pop(0)
+        if flag in ("-k", "--kill-after", "-s", "--signal"):
+            value = args.pop(0) if args else ""
+            if flag in ("-k", "--kill-after"):
+                kill = _duration(value)
+        elif flag.startswith(("--kill-after=", "-k")):
+            kill = _duration(flag.split("=", 1)[1] if "=" in flag else flag[2:])
+        elif flag not in _TIMEOUT_FLAGS and not flag.startswith(("--signal=", "-s")):
+            return None
+    duration = _duration(args[0]) if args else None
+    if not duration or kill is None:
+        return None  # 0 means no limit; unknown syntax keeps the default
+    return duration + kill
+
+
+def _effective_timeout(arguments: BashArguments, command: str) -> float:
+    """Use the tool timeout, else a `timeout N` the command starts, else the default."""
+
+    if "timeout" in arguments:
+        return arguments["timeout"]
+    try:
+        lexer = shlex.shlex(
+            command.replace("\n", ";"), posix=True, punctuation_chars=True
+        )
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return _DEFAULT_TIMEOUT_SECONDS
+    spans = [
+        _inner_timeout_span(tokens[index + 1 :])
+        for index, token in enumerate(tokens)
+        if token == "timeout" and (index == 0 or not tokens[index - 1].strip("();<>|&"))
+    ]
+    longest = max((span for span in spans if span is not None), default=None)
+    if longest is None:
+        return _DEFAULT_TIMEOUT_SECONDS
+    # never lower the default: a short `timeout 2 x && make` still gets 30 s
+    raised = max(longest + _INNER_TIMEOUT_MARGIN_SECONDS, _DEFAULT_TIMEOUT_SECONDS)
+    return min(raised, MAX_TIMEOUT_SECONDS)
 
 
 def _extract_command(arguments: BashArguments) -> str:
@@ -176,7 +280,6 @@ async def _bash(
         if isinstance(approved_execution, ApprovedCwdExecution)
         else None
     )
-    timeout = arguments.get("timeout", 30.0)
     output_limit = arguments.get(
         "max_output", min(registry.max_output_chars, MAX_OUTPUT_BYTES)
     )
@@ -184,6 +287,7 @@ async def _bash(
         raise ValueError(f"max_output must be an integer from 1 to {MAX_OUTPUT_BYTES}")
     log_path = arguments.get("_log_path")
     shell_command = _extract_command(arguments)
+    timeout = _effective_timeout(arguments, shell_command)
     if arguments.get("_background") is True:
         if log_path is not None:
             await create_log_off_loop(
@@ -256,6 +360,7 @@ async def _bash(
     abort_wait: asyncio.Task[None] | None = None
     timeout_wait: asyncio.Task[None] | None = None
     timed_out = False
+    started = time.monotonic()
     # The command inherits this record's lock, so recovery can find it if zeta dies mid-call.
     record: tool_process_record.ToolProcessRecord | None = None
     try:
@@ -270,6 +375,8 @@ async def _bash(
                 "pass_fds": (write_fd,) if record is None else (write_fd, record.fd),
                 "env": _shell_environment(execution_context, start_cwd),
                 "niceness": registry.command_niceness,
+                # Record the group before the command runs, so a crash at any later point leaves it findable.
+                "on_spawn": None if record is None else record.set_pgid,
             }
             if approved_cwd is not None:
                 spawn = create_subprocess_shell_in_fd(
@@ -289,7 +396,6 @@ async def _bash(
             os.close(cwd_fd)
             cwd_fd = -1
         if record is not None:
-            record.set_pgid(process.pid)
             record.close_parent_fd()
         os.close(write_fd)
         write_fd = -1
@@ -337,6 +443,15 @@ async def _bash(
         combined_full_size += stderr_capture.full_size
         marker_prefix = marker + "\n" if marker is not None else ""
         combined_full_size += len(marker_prefix.encode())
+        hint = _result_hint(
+            shell_command,
+            exit_code,
+            stdout,
+            stderr,
+            time.monotonic() - started,
+            timed_out,
+        ) or (_TIMEOUT_HINT if timed_out else None)
+        hint_suffix = f"\nhint: {hint}" if hint is not None else ""
         if combined_full_size > output_limit:
             call_id = (
                 execution_context.tool_call.id
@@ -368,13 +483,16 @@ async def _bash(
                 output_limit,
                 tail=combined_tail,
             )
-            content = text_block(shown, full_size=combined_full_size)
+            content = text_block(
+                shown + hint_suffix,
+                full_size=combined_full_size,
+            )
             content["truncated"] = True
             content["spill_path"] = str(spill_path)
         else:
             content = text_block(
-                marker_prefix + combined,
-                full_size=combined_full_size,
+                marker_prefix + combined + hint_suffix,
+                full_size=combined_full_size + len(hint_suffix.encode()),
             )
         structured_content: dict[str, Any] = {
             "stdout": stdout,
