@@ -6,15 +6,20 @@ import asyncio
 import fcntl
 import json
 import os
+import threading
+import time
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from tests.support.owned import await_or_fail
 from tests.support.storage_homes import initialize_storage_home
 from zeta.mcp import StreamableHTTPMCPClient, load_mcp_config
 from zeta.mcp import mount as mount_module
+from zeta.mcp import oauth_store as oauth_store_module
 from zeta.mcp.client import MCPAuthRequiredError
 from zeta.mcp.config import MCPServerConfig
 from zeta.mcp.management import MCPManagementService
@@ -189,36 +194,50 @@ async def test_needs_auth_write_waits_for_the_store_lock_off_the_event_loop(
     home = await _home(tmp_path, monkeypatch)
     lock_path = token_store_path("slack", home).with_suffix(".lock")
     loop = asyncio.get_running_loop()
+    loop_thread = threading.current_thread()
     held = os.open(lock_path, os.O_RDWR)
-    ticks = 0
+    contended = asyncio.Event()
+    waiting_threads: list[threading.Thread] = []
 
-    async def heartbeat() -> None:
-        nonlocal ticks
-        while True:
-            await asyncio.sleep(0.01)
-            ticks += 1
+    def contended_sleep(seconds: float) -> None:
+        # the store retries a busy lock with sleep; report where that wait runs
+        waiting_threads.append(threading.current_thread())
+        loop.call_soon_threadsafe(contended.set)
+        time.sleep(seconds)
+
+    monkeypatch.setattr(
+        oauth_store_module,
+        "time",
+        SimpleNamespace(monotonic=time.monotonic, sleep=contended_sleep),
+    )
+
+    async def release_when_contended() -> None:
+        # the loop must stay free to run this while the writer waits for the lock
+        await await_or_fail(contended.wait(), what="needs-auth write lock wait")
+        fcntl.flock(held, fcntl.LOCK_UN)
 
     async def handle(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/token":
             # another process holds the credential lock while the marker is written
             fcntl.flock(held, fcntl.LOCK_EX)
-            loop.call_later(0.3, fcntl.flock, held, fcntl.LOCK_UN)
             return httpx.Response(401, json={"error": "invalid_client"})
         return httpx.Response(401, text="expired", request=request)
 
     config = load_mcp_config(home / "mcp.json").configured_servers["slack"]
     transport = httpx.AsyncClient(transport=httpx.MockTransport(handle))
     client = StreamableHTTPMCPClient(config, client=transport, home=str(home))
-    beat = asyncio.create_task(heartbeat())
+    release = asyncio.create_task(release_when_contended())
     try:
         with pytest.raises(MCPAuthRequiredError):
-            await asyncio.wait_for(client.connect(), 10)
-        assert ticks >= 10, "the event loop stalled while the store lock was held"
+            await await_or_fail(client.connect(), what="connect")
+        await await_or_fail(release, what="lock release")
+        assert waiting_threads, "the needs-auth write never waited for the lock"
+        assert loop_thread not in waiting_threads, "lock wait ran on the event loop"
         token = (await MCPCredentialStore(home=home).load("slack")).token
         assert token is not None
         assert token.refresh_error == "MCP OAuth: token endpoint returned HTTP 401"
     finally:
-        beat.cancel()
-        await asyncio.gather(beat, return_exceptions=True)
+        release.cancel()
+        await asyncio.wait_for(asyncio.gather(release, return_exceptions=True), 10)
         await client.close()
         os.close(held)
