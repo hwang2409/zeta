@@ -823,6 +823,8 @@ class AgentStateMixin:
                     state="suspended", current_step="suspended", suspended_at=_now(),
                     suspension_reason=reason, suspension_episode=lifecycle.get("suspension_episode", 0) + ("retry_started_at" not in lifecycle),
                     resume_mode="idle" if lifecycle["state"] == "idle" else "active",
+                    # Bank this episode's time; a later process cannot read this monotonic clock.
+                    elapsed=_lifecycle_elapsed(lifecycle),
                 )
             elif activate is not None:
                 if lifecycle["state"] != "suspended" or activate != lifecycle["suspension_episode"]:
@@ -832,6 +834,9 @@ class AgentStateMixin:
                     return None
                 if self.provider_recovery_enabled:
                     lifecycle["last_activated_episode"] = activate
+                # Rebase the clock so elapsed keeps every earlier episode's banked time.
+                elapsed = _lifecycle_elapsed(lifecycle)
+                lifecycle.update(elapsed=elapsed, started_monotonic=time.monotonic() - elapsed, monotonic_pid=os.getpid())
                 lifecycle["state"] = "idle" if lifecycle["resume_mode"] == "idle" else "running"
                 lifecycle["current_step"] = "idle, waiting for follow-up" if lifecycle["state"] == "idle" else "recovering interrupted work"
                 if retry_schedule is not None:

@@ -14,6 +14,7 @@ from zeta.agent.recovery_lease import activate_agent_children
 from zeta.core.child_runs import LoadedAgentLifecycle, read_child_lifecycle
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import StreamEvent, StreamEventType
+from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
 from zeta.tui.render import render_event
@@ -257,3 +258,96 @@ async def test_resume_reconstructs_saved_model_accounts_and_lifetime_budget(tmp_
         finally:
             await await_or_fail(loop.close(), what="close reconstructed runtime")
             release.set()
+
+
+class _ObservedBackend(FakeBackend):
+    """Scripted backend that reports each provider call index before it streams."""
+
+    def __init__(self, turns, on_call):
+        super().__init__(turns)
+        self.model, self.provider = "gpt-5.6-sol", "codex"
+        self._on_call = on_call
+
+    @owned_completion
+    async def complete(self, messages, tool_schemas):
+        self._on_call(len(self.calls))
+        async for event in FakeBackend.complete.__wrapped__(self, messages, tool_schemas):
+            yield event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_mode", ["normal-exit", "crash"])
+async def test_recovered_child_stats_cover_every_episode(tmp_path, monkeypatch, exit_mode):
+    import os
+    import shutil
+    from types import SimpleNamespace
+
+    from tests.support.fake_backend import ScriptedTurn
+    from zeta.core import agent_state
+    from zeta.protocol.types import TextContent, ToolCall
+
+    clock = [1000.0]
+    pid = [1]
+
+    class _Os:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def getpid(self):
+            return pid[0]
+
+    # test-contract: seam a fake monotonic clock and a new owner pid per process.
+    monkeypatch.setattr(agent_state, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(agent_state, "os", _Os())
+    (tmp_path / "note.txt").write_text("note\n")
+    read = ScriptedTurn(tool_calls=[ToolCall("read-1", "read", {"path": str(tmp_path / "note.txt")})])
+    blocked = asyncio.Event()
+    first = _ObservedBackend([read, ScriptedTurn([TextContent("never")], delay=60)],
+                             lambda index: (clock.__setitem__(0, clock[0] + (30.0, 20.0)[index]), index == 1 and blocked.set()))
+    root = tmp_path / "sessions"
+    with ConversationStore(root, cwd=tmp_path) as store:
+        session_id = store.session_id
+        loop = AgentLoop(first, store, skill_catalog=SkillCatalog.empty())
+        try:
+            run_id = await await_or_fail(
+                runner.spawn_child(loop, agent_type="general", task="work", cwd=None),
+                what="spawn child",
+            )
+            await await_or_fail(blocked.wait(), what="first episode used a tool and is blocked")
+            clock[0] += 50.0
+            if exit_mode == "crash":
+                # A copy taken mid-run is what a killed process leaves on disk.
+                shutil.copytree(root, tmp_path / "crashed")
+        finally:
+            await await_or_fail(loop.close(), what="close first parent")
+    if exit_mode == "crash":
+        # Markers hold absolute child paths, so the crash image replaces the original tree.
+        shutil.rmtree(root)
+        shutil.move(tmp_path / "crashed", root)
+
+    pid[0] = 2
+    second = _ObservedBackend([
+        ScriptedTurn(tool_calls=[ToolCall("read-2", "read", {"path": str(tmp_path / "note.txt")})]),
+        ScriptedTurn([TextContent("done")]),
+    ], lambda index: clock.__setitem__(0, clock[0] + 10.0))
+    monkeypatch.setattr("zeta.agent.resume_child.resolve_child_backend", lambda *a, **kw: (second, None))
+    with ConversationStore(root, session_id=session_id, cwd=tmp_path) as store:
+        loop = _loop(store)
+        try:
+            await await_or_fail(activate_agent_children(loop), what="recover child")
+            await await_or_fail(loop._background_owner.wait(), what="recovered child completes")
+            receipt = store.agent_completion_notifications_by_child()[run_id]
+            lifecycle, _ = read_child_lifecycle(store, Path(receipt.data["child_session_path"]))
+            assert isinstance(lifecycle, LoadedAgentLifecycle)
+            value = lifecycle.value
+            # Episode 1 runs 30 s + 20 s before the restart, then 50 s more; episode 2 runs 20 s.
+            # A crash keeps episode 1 up to its last durable progress (30 s) and loses the tail.
+            seconds = 120.0 if exit_mode == "normal-exit" else 50.0
+            stats = receipt.data["stats"]
+            assert (value["state"], value["tool_calls"], value["turns_used"]) == ("completed", 2, 3), value
+            assert (stats["tool_calls"], stats["turns_used"]) == (2, 3), receipt.data
+            # test-contract: latency the reported child duration is the contract, read from an injected clock
+            assert (value["elapsed"], stats["elapsed"]) == (seconds, seconds), "elapsed must cover every episode"
+            assert f"3 turns · {seconds:.1f}s · 2 tool calls" in receipt.data["text"], receipt.data["text"]
+        finally:
+            await await_or_fail(loop.close(), what="close resumed parent")
