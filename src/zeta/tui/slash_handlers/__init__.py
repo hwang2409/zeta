@@ -25,7 +25,11 @@ from ...accounts import (
     AccountUsage,
     account_provider,
 )
-from ...accounts.login import login_failure_message, login_named_account
+from ...accounts.login import (
+    login_failure_message,
+    login_named_account,
+    no_accounts_message,
+)
 from ...accounts.store import rename_account_command
 from ...config.settings import load_settings
 from ...core.approval import ApprovalDecision
@@ -386,7 +390,7 @@ class SlashHandlerMixin:
         snapshot = await context.list_snapshot()
         if not snapshot.displays:
             unavailable = self._accounts_switching_unavailable()
-            return unavailable or "no accounts; run zeta login <provider> --account <name>"
+            return unavailable or no_accounts_message()
         self._show_accounts_picker(snapshot)
         return ""
 
