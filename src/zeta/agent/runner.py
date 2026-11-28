@@ -750,9 +750,7 @@ async def _run_child(
             resolve_child_backend, loop, effective_model
         )
     if backend_error is not None:
-        return failure(
-            backend_error, code="state_unavailable",
-        )
+        return failure(backend_error, code="state_unavailable")
     if (hold_error := await refuse_held_child_backend(loop, child_backend)) is not None:
         return failure(hold_error, code="state_unavailable", public_detail=True)
     # The long kinds default to background -- a run on someone else's model, or
@@ -764,9 +762,7 @@ async def _run_child(
         or (preset.source == "packaged" and preset.name == RUN_PRESET.name),
     )
     if type(background) is not bool:
-        return failure(
-            "agent error: background must be a boolean",
-        )
+        return failure("agent error: background must be a boolean")
     if getattr(loop, "one_shot", False):
         if external:
             raise ChildControlError("operation_busy")
