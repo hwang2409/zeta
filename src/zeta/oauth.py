@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import fcntl
 import hashlib
 import io
 import json
 import os
+import resource
 import secrets
 import time
 from collections.abc import Iterator, Mapping
@@ -28,6 +30,14 @@ ACCOUNT_LOCK_TURN_WAIT_SECONDS = 30.0
 
 class ProviderLoginRequiredError(RuntimeError):
     """Raised when a provider cannot run until the operator logs in."""
+
+
+def raise_if_out_of_files(exc: BaseException) -> None:
+    """Re-raise descriptor exhaustion honestly: it is not a bad or missing login."""
+    if isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE):
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        message = f"too many open files (soft limit {soft}); credentials were not read"
+        raise OSError(exc.errno, message) from exc
 
 
 class OAuthRefreshFailure(Enum):

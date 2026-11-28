@@ -32,6 +32,7 @@ from ..oauth import (
     OAuthRefreshFailure,
     ProviderLoginRequiredError,
     classify_oauth_refresh_failure,
+    raise_if_out_of_files,
 )
 from .anthropic_errors import (
     AnthropicAuthError,
@@ -294,6 +295,7 @@ class AnthropicCredentialDriver:
             except self.auth_error_type:
                 raise
             except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise_if_out_of_files(exc)
                 raise self.auth_error_type(
                     f"{self.provider_label} credentials could not be read"
                 ) from exc
