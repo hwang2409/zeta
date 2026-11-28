@@ -120,7 +120,7 @@ jobs:
         with:
           version: "0.13.7"
           enable-cache: false
-      - name: Start installed zeta on old home
+      - name: Start installed zeta on empty, login-only, and old homes
         run: python scripts/smoke_old_home.py
       - name: Compare stored-format predecessor
         env:
