@@ -39,7 +39,7 @@ FEATURES = ["serve_observers", "session_history_read_v1", "session_history_backw
 
 
 class Harness:
-    def __init__(self, tmp_path: Path, *, launch_project: bool) -> None:
+    def __init__(self, tmp_path: Path, *, launch_project: bool, registry: bool = True) -> None:
         cwd = tmp_path / "launch"
         cwd.mkdir()
         self.server = ZetaServer(
@@ -49,6 +49,8 @@ class Harness:
         # keep the background retention writer idle
         (self.server.home / "settings.toml").write_text("[retention]\ndays = 0\n")
         self.writers: list[asyncio.StreamWriter] = []
+        if not registry:  # a fresh home: no projects/ directory at all
+            return
         registry = ProjectRegistry(self.server.home / "projects")
         self.project = registry.create_project("alpha", "repo", str(cwd.resolve()) if launch_project else None).project_id
         self.other_project = registry.create_project("beta", "repo").project_id
@@ -321,6 +323,57 @@ async def test_idle_history_keeps_launch_scope_after_registry_change(tmp_path: P
         reply = await read(observer, "original-scope", session_id=original)
         assert "result" in reply, reply
         assert texts(reply["result"]) == ["turn 0 question", "turn 0 answer"]
+    finally:
+        await close_serve(harness.server, *harness.writers)
+
+
+@pytest.mark.asyncio
+async def test_idle_history_reads_projectless_sessions_in_a_fresh_home(tmp_path: Path) -> None:
+    harness = await asyncio.to_thread(Harness, tmp_path, launch_project=False, registry=False)
+    try:
+        first = await asyncio.to_thread(harness.session, None, 1)
+        second = await asyncio.to_thread(harness.session, None, 2)
+        projects = harness.server.home / "projects"
+        assert not projects.exists()
+        await harness.server.start()
+
+        # a session created later in a git repo registers a project; it stays out of the captured scope
+        repo = tmp_path / "repo"
+        await asyncio.to_thread(subprocess.run, ["git", "init", str(repo)], check=True, capture_output=True)
+        late = await asyncio.to_thread(
+            harness.server.controllers.attached().runtime.manager.create, provider="codex", model="offline", cwd=repo,
+        )
+        late.store.close()
+        assert late.metadata.project_id is not None and projects.is_dir()
+        foreign = late.metadata.session_id
+
+        observer = await harness.client()
+        reply = await read(observer, "first", session_id=first)
+        assert "result" in reply, reply
+        assert texts(reply["result"]) == ["turn 0 question", "turn 0 answer"]
+        reply = await read(observer, "second", session_id=second, direction="forward")
+        assert "result" in reply, reply
+        assert texts(reply["result"]) == [f"turn {n} {kind}" for n in range(2) for kind in ("question", "answer")]
+        reply = await read(observer, "late-project", session_id=foreign)
+        assert "error" in reply, reply
+        assert (reply["error"]["code"], reply["error"]["data"]["code"]) == (-32602, "session_not_found")
+    finally:
+        await close_serve(harness.server, *harness.writers)
+
+
+@pytest.mark.asyncio
+async def test_idle_history_read_rejects_an_unsafe_registry_root(tmp_path: Path) -> None:
+    harness = await asyncio.to_thread(Harness, tmp_path, launch_project=False, registry=False)
+    try:
+        target = await asyncio.to_thread(harness.session, None, 1)
+        await asyncio.to_thread((harness.server.home / "projects").mkdir, mode=0o755)
+        await asyncio.to_thread(os.chmod, harness.server.home / "projects", 0o755)
+        await harness.server.start()
+
+        observer = await harness.client()
+        reply = await read(observer, "unsafe", session_id=target)
+        assert "error" in reply, reply
+        assert (reply["error"]["code"], reply["error"]["data"]["code"]) == (-32005, "state_unavailable")
     finally:
         await close_serve(harness.server, *harness.writers)
 
