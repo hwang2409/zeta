@@ -7,7 +7,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from ..providers.rate_limit_hold import RATE_LIMIT_PROBE_SECONDS
 from .store import AccountId
 from .usage import UsageSnapshot, UsageState, UsageWindow
 
@@ -98,6 +97,7 @@ def _anthropic_limit(
     """Accept the recorded Anthropic Messages exhaustion responses (F073)."""
 
     from ..providers.completion import MAX_PROVIDER_RETRY_SECONDS
+    from ..providers.rate_limit_hold import RATE_LIMIT_PROBE_SECONDS
 
     status = getattr(failure, "status_code", None)
     now = datetime.now(UTC)
