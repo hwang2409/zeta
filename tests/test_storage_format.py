@@ -243,6 +243,7 @@ def test_first_start_wait_is_bounded_then_refuses(
         release.cancel()
         release.join(10)
         os.close(holder)
+    # test-contract: latency the refusal must come at its bound, before the 5 s release
     assert elapsed < 4, f"bootstrap wait took {elapsed:.2f} s; it must stop at its bound"
     assert not (tmp_path / "storage-format.json").exists()
 
