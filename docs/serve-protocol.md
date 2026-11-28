@@ -20,7 +20,8 @@ listeners share the same limits.
 The server uses a Unix socket by default: `$ZETA_HOME/run/serve.sock`.
 `zeta serve --socket PATH` selects another Unix socket. `zeta serve --port N`
 selects `127.0.0.1:N`. `zeta serve --approval-reconnect-grace SECONDS` sets the
-negotiated approval and turn reconnect grace and defaults to `90`. Set
+negotiated approval and turn reconnect grace, and the idle
+multi-controller grace, and defaults to `90`. Set
 `ZETA_ACCOUNT_HOME` to an absolute directory when
 served sessions must use a shared provider account store while all other state
 remains under `ZETA_HOME`.
@@ -417,6 +418,18 @@ session has never had a default set, and clients must fall back to their own
 configured default in that case. Catalog rows bound `system_prompt` to 512
 codepoints. `first_message_preview` is the bounded first user message in durable
 log order. It can differ from the active branch after a fork or rewind.
+
+Each row also has `in_use` and, on protocol 1.1 and later, `resident`.
+`in_use` is `true` when some process holds the session's runtime lease, and
+`owner_pid` then names that process when it is known. `resident` is `true` when
+this serve holds the session: a live controller, a parked session, or a
+session in reconnect or idle grace after its controller closed. A row with
+`in_use` and not `resident` is held by another process. A row with `in_use` and
+`resident` is held by this serve: a session in grace can be reclaimed by its
+exact id (see [`multi_controller`](#multi_controller)), and one held by another
+live controller returns `session_controlled`. `resident` is an
+additive 1.1 field and needs no feature negotiation; a 1.0 connection does not
+receive it.
 
 Server mode uses the effective launch provider after CLI and settings resolution.
 When no provider is configured, Zeta derives it from the configured model. If
@@ -2764,7 +2777,8 @@ SessionMetadata = {
   },
   optional: {
     tool_allow_layers: array[array[string]],
-    first_message_preview: string
+    first_message_preview: string, in_use: boolean, owner_pid: integer,
+    resident: boolean
   }
 }
 ToolCall = { required: { id: string, name: string, arguments: object } }
@@ -2804,8 +2818,9 @@ written back to this metadata, and a later resume rediscovers skills.
 describe the project association and the owned project-memory block in
 `system_prompt`. `parent_session_id` names the parent of a child session.
 `tool_allow` is `null` when no allowlist applies. `tool_allow_layers` appears
-only when more than one allowlist layer applies. `first_message_preview`
-appears only in `list_sessions`. A 1.0 `list_sessions` omits `name`.
+only when more than one allowlist layer applies. `first_message_preview`,
+`in_use`, `owner_pid`, and `resident` appear only in `list_sessions`. A 1.0
+`list_sessions` omits `name` and `resident`.
 
 `created_at` and `updated_at` are ISO-8601 strings. IDs, names, paths, and
 provider values are strings. `retained_tail` and `compaction_budget` are

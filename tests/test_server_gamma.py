@@ -1287,7 +1287,9 @@ def test_documented_session_metadata_matches_the_serializer() -> None:
     ).to_dict()
     assert required == set(plain)
     assert set(layered) - set(plain) <= optional
-    assert optional == (set(layered) - set(plain)) | {"first_message_preview"}
+    assert optional == (set(layered) - set(plain)) | {
+        "first_message_preview", "in_use", "owner_pid", "resident"
+    }
 
 
 # Finding 6: abort emits turn_aborted in every running state.
