@@ -24,7 +24,7 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, open_created, shape_lock
 
-WRITER_EPOCH: Final = 15
+WRITER_EPOCH: Final = 13
 P06_FEATURE_EPOCH: Final = 6
 CHILD_QUESTION_STATES: Final = frozenset({"pending", "answered", "withdrawn"})
 
@@ -57,8 +57,9 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.SESSION_RETENTION_ACTIVATION: 11,
     StorageFeature.TRANSCRIPT_TAIL_EVIDENCE: 12,
     StorageFeature.CHILD_RECOVERY: 13,
-    StorageFeature.CHILD_QUESTION_HOLD: 14,
-    StorageFeature.PROVIDER_RECOVERY: 15,
+    # feature-branch epochs 14 and 15 collapse into main's single +1 epoch.
+    StorageFeature.CHILD_QUESTION_HOLD: 13,
+    StorageFeature.PROVIDER_RECOVERY: 13,
     # APPROVAL_RESTART_REASON and INBOX_DURABLE_INTENT must be fixed int literals
     # (test_storage_feature_epochs forbids referencing WRITER_EPOCH here).
     # Recheck main+1 at the final merge.
