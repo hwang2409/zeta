@@ -261,9 +261,8 @@ async def _bash(
     try:
         try:
             if (session_dir := registry.session_dir) is not None and execution_context is not None:
-                record = await asyncio.to_thread(
-                    tool_process_record.open_record, session_dir, execution_context.tool_call.id
-                )
+                # Synchronous (about 0.1 ms), so a cancel cannot lose the returned fd and its lock.
+                record = tool_process_record.open_record(session_dir, execution_context.tool_call.id)
             spawn_kwargs = {
                 "stdin": asyncio.subprocess.DEVNULL,
                 "stdout": asyncio.subprocess.PIPE,

@@ -10,6 +10,7 @@ import multiprocessing
 import os
 import shlex
 import signal
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,7 @@ from zeta.core.child_runs import LoadedAgentLifecycle, read_child_lifecycle
 from zeta.core.session import env_home
 from zeta.core.store import ConversationStore
 from zeta.core.store._async_writes import _RepairChildInterruptionCommand
-from zeta.protocol.types import MessageRole, TextContent, ToolCall
+from zeta.protocol.types import MessageOrigin, MessageRole, TextContent, ToolCall
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -199,15 +200,27 @@ async def test_orphan_descendant_after_leader_exit_is_stopped(tmp_path, monkeypa
         assert "stopped its leftover processes" in result, result
 
 
+async def _open_record_elsewhere(record: Path) -> asyncio.subprocess.Process:
+    """Start an unrelated process in its own session that holds ``record`` open, like a file indexer."""
+    opener = await asyncio.create_subprocess_exec(
+        "sh", "-c", 'exec 9<"$0"; echo open; exec sleep 120', str(record),
+        stdout=asyncio.subprocess.PIPE, start_new_session=True,
+    )
+    assert opener.stdout is not None
+    assert await await_or_fail(opener.stdout.readline(), what="unrelated opener") == b"open\n"
+    return opener
+
+
 @pytest.mark.asyncio
 async def test_exited_orphan_is_not_killed_and_child_is_told(tmp_path, monkeypatch):
-    session_id, (pid,) = await _crash_with_running_bash(tmp_path, "sleep 0.3", pid_files=("pid",))
+    session_id, (pid,) = await _crash_with_running_bash(tmp_path, "sleep 2", pid_files=("pid",))
     await wait_pid_exited(pid)
+    (record,) = _records()
     unrelated = await asyncio.create_subprocess_exec("sleep", "120", start_new_session=True)
+    opener = await _open_record_elsewhere(record)
     try:
         # A stale pgid in the record must never be signalled; only the lock and its holders count.
-        for record in _records():
-            record.write_text(json.dumps({"call_id": CALL_ID, "pgid": unrelated.pid, "stopping": False}))
+        record.write_text(json.dumps({"call_id": CALL_ID, "pgid": unrelated.pid, "stopping": False}))
         signalled = []
         # test-contract: seam record any signal the stop step sends.
         _seam(monkeypatch, "_signal_groups", lambda groups, signum: signalled.append(groups))
@@ -215,12 +228,29 @@ async def test_exited_orphan_is_not_killed_and_child_is_told(tmp_path, monkeypat
         (result,) = _call_results(recovered)
         assert result.startswith("tool execution canceled"), result
         assert "ended before recovery" in result, result
-        assert signalled == []
+        assert signalled == [], "a process outside the tool tree was signalled"
         assert _alive(unrelated.pid), "an unrelated process group was signalled"
         assert not _records()
     finally:
+        for process in (unrelated, opener):
+            kill_group_if_present(process.pid)
+            await await_or_fail(process.wait(), what="reap unrelated process")
+
+
+@pytest.mark.asyncio
+async def test_unrelated_holder_of_a_busy_record_is_not_signalled(tmp_path, monkeypatch):
+    session_id, pids = await _crash_with_running_bash(tmp_path, "exec sleep 120", pid_files=("pid",))
+    (record,) = _records()
+    unrelated = await _open_record_elsewhere(record)
+    try:
+        with _owned_groups(pids):
+            recovered, _ = await _resume(tmp_path, monkeypatch, session_id, pids)
+            assert recovered.alive_at_first_call == [], "the orphan still ran when the child resumed"
+            assert "stopped its leftover processes" in _call_results(recovered)[0]
+            assert _alive(unrelated.pid), "a process outside the tool tree that holds the record was signalled"
+    finally:
         kill_group_if_present(unrelated.pid)
-        await await_or_fail(unrelated.wait(), what="reap unrelated sleep")
+        await await_or_fail(unrelated.wait(), what="reap unrelated opener")
 
 
 @pytest.mark.asyncio
@@ -284,3 +314,77 @@ async def test_normal_quit_leaves_no_record(tmp_path, monkeypatch):
                 kill_group_if_present(pid)
         assert not _alive(pid)
         assert not _records()
+
+
+@pytest.mark.asyncio
+async def test_normal_quit_with_unstoppable_record_blocks_recovery(tmp_path, monkeypatch):
+    child = _backend([
+        ScriptedTurn(tool_calls=[ToolCall(CALL_ID, "bash", {
+            "command": f"echo $$ > {shlex.quote(str(tmp_path / 'pid'))}; exec sleep 120", "timeout": 300,
+        })]),
+        ScriptedTurn([TextContent("never")], delay=300),
+    ])
+    monkeypatch.setattr(runner, "resolve_child_backend", lambda *a, **kw: (child, None))
+    resume_child = importlib.import_module("zeta.agent.resume_child")
+
+    def unstoppable(session_dir, call_ids):
+        raise resume_child.OrphanedToolProcessError("could not be stopped (process group 4242)")
+
+    # test-contract: seam a record survives the in-process cancel and its holder cannot be stopped.
+    monkeypatch.setattr(resume_child, "_stop_orphans", unstoppable)
+    with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
+        loop = AgentLoop(_backend([]), store, skill_catalog=SkillCatalog.empty())
+        pid = None
+        try:
+            await await_or_fail(runner.spawn_child(loop, agent_type="general", task="work", cwd=None), what="spawn")
+            pid = await read_pid_file(tmp_path / "pid", timeout=30)
+        finally:
+            await await_or_fail(loop.close(), what="quit normally")
+            if pid is not None:
+                kill_group_if_present(pid)
+        (marker,) = store.agent_children().values()
+        lifecycle, _ = read_child_lifecycle(store, Path(marker["child_session_path"]))
+        assert isinstance(lifecycle, LoadedAgentLifecycle)
+        assert lifecycle.value["state"] == "suspended", lifecycle.value
+        assert "process group 4242" in lifecycle.value.get("recovery_blocked", ""), lifecycle.value
+
+
+@pytest.mark.asyncio
+async def test_root_session_bash_removes_its_record(tmp_path):
+    listing = tmp_path / "records"
+    records = shlex.quote(str(env_home() / "run" / "tool-processes"))
+    backend = _backend([
+        ScriptedTurn(tool_calls=[
+            ToolCall("root-done", "bash", {"command": f"ls -R {records} > {shlex.quote(str(listing))}"}),
+            ToolCall("root-timeout", "bash", {"command": "exec sleep 120", "timeout": 0.5}),
+        ]),
+        ScriptedTurn([TextContent("done")]),
+    ])
+    with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
+        loop = AgentLoop(backend, store, max_turns=2, skill_catalog=SkillCatalog.empty())
+        try:
+            async for _ in loop.run_turn("go", origin=MessageOrigin.USER):
+                pass
+        finally:
+            await await_or_fail(loop.close(), what="close root loop")
+    messages, _ = backend.calls[-1]
+    results = [m.tool_result for m in messages if m.role is MessageRole.TOOL_RESULT]
+    assert [r.tool_call_id for r in results] == ["root-done", "root-timeout"], results
+    assert "timed out" in results[1].content, results[1].content
+    assert ".lock" in listing.read_text(), "a root-session call must hold a record while it runs"
+    assert not _records(), "a finished or timed-out root-session call left its record behind"
+
+
+def test_holder_scan_finds_lsof_outside_path(tmp_path, monkeypatch):
+    module = importlib.import_module("zeta.tools._shared.tool_process_record")
+    if os.path.isdir("/proc/self/fd") or not any(os.access(p, os.X_OK) for p in ("/usr/sbin/lsof", "/usr/bin/lsof")):
+        pytest.skip("the lsof scan runs only without /proc and with lsof installed")
+    record = tmp_path / "record"
+    record.write_text("")
+    with open(record) as holder_file, subprocess.Popen(["sleep", "120"], stdin=holder_file) as holder:
+        try:
+            monkeypatch.setenv("PATH", "")
+            with open(record) as own:
+                assert holder.pid in module._holders(own.fileno(), record)
+        finally:
+            holder.kill()

@@ -4,7 +4,8 @@ Before a tool command spawns, zeta takes an exclusive ``flock`` on a record file
 and passes that fd to the command. The parent closes its copy after spawn, so
 the lock stays held exactly while some process of the tool tree is alive, also
 after ``kill -9`` of zeta. Recovery probes the lock: free means nothing is left;
-busy means the fd holders are our orphans, found by the file's inode.
+busy means some fd holders are our orphans, found by the file's inode and kept
+to the recorded session, so an unrelated opener of the file is never signalled.
 
 Records live under ``$ZETA_HOME/run/tool-processes``, outside the session tree.
 """
@@ -15,6 +16,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
@@ -105,33 +107,60 @@ class Outcome:
     path: Path | None = None
 
 
-def _holders(fd: int, path: Path) -> list[int]:
-    """Return other processes that hold an fd on the record open as ``fd``."""
-    own = os.getpid()
-    if os.path.isdir("/proc/self/fd"):
-        target = os.fstat(fd)
-        found = set()
-        for pid in filter(str.isdigit, os.listdir("/proc")):
+def _proc_holders(fd: int) -> set[int]:
+    target = os.fstat(fd)
+    found = set()
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            names = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for name in names:
             try:
-                names = os.listdir(f"/proc/{pid}/fd")
+                info = os.stat(f"/proc/{pid}/fd/{name}")
             except OSError:
                 continue
-            for name in names:
-                try:
-                    info = os.stat(f"/proc/{pid}/fd/{name}")
-                except OSError:
-                    continue
-                if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
-                    found.add(int(pid))
-                    break
-        return sorted(found - {own})
+            if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
+                found.add(int(pid))
+                break
+    return found
+
+
+def _lsof_holders(path: Path) -> set[int]:
+    # A service PATH often lacks /usr/sbin, where macOS keeps lsof.
+    lsof = shutil.which("lsof") or next(
+        (candidate for candidate in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.access(candidate, os.X_OK)), None,
+    )
+    if lsof is None:
+        return set()
     try:
         listed = subprocess.run(
-            ["lsof", "-t", "--", str(path)], capture_output=True, text=True, timeout=10, check=False,
+            [lsof, "-t", "--", str(path)], capture_output=True, text=True, timeout=10, check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return []
-    return sorted({int(pid) for pid in listed.stdout.split() if pid.isdigit()} - {own})
+        return set()
+    return {int(pid) for pid in listed.stdout.split() if pid.isdigit()}
+
+
+def _holders(fd: int, path: Path) -> list[int]:
+    """Return other processes that hold an fd on the record open as ``fd``."""
+    found = _proc_holders(fd) if os.path.isdir("/proc/self/fd") else _lsof_holders(path)
+    return sorted(found - {os.getpid()})
+
+
+def _tree_groups(holders: list[int], pgid: int | None) -> set[int]:
+    """Return the process groups of holders in our tool tree; other openers are never ours to stop."""
+    groups = set()
+    for holder in holders:
+        try:
+            group, session = os.getpgid(holder), os.getsid(holder)
+        except OSError:
+            continue
+        # The tool runs in its own session led by the recorded pid.
+        if pgid is not None and pgid in (group, session):
+            groups.add(group)
+    groups.discard(os.getpgrp())
+    return groups
 
 
 def _try_lock(fd: int) -> bool:
@@ -166,28 +195,20 @@ def stop_orphan(session_dir: Path, call_id: str) -> Outcome:
             pgid, stopping = None, False
         free = _try_lock(fd)
         # A held fd also counts, because flock on some network homes is not inherited.
-        holders = _holders(fd, path)
-        if free and not holders:
-            return Outcome("stopped" if stopping else "exited", (pgid,) if pgid else (), path)
-        own_group = os.getpgrp()
-        groups = set()
-        for holder in holders:
-            try:
-                groups.add(os.getpgid(holder))
-            except OSError:
-                pass
-        groups.discard(own_group)
-        shown = tuple(sorted(groups)) or ((pgid,) if pgid else ())
+        groups = _tree_groups(_holders(fd, path), pgid)
         if not groups:
-            return Outcome("unstoppable", shown, path)
+            # A free lock means the tree is gone; a busy one held by nobody we may signal cannot be stopped.
+            return Outcome(("stopped" if stopping else "exited") if free else "unstoppable", (pgid,) if pgid else (), path)
+        shown = tuple(sorted(groups))
         _write(fd, {"call_id": call_id, "pgid": pgid, "stopping": True})
         _signal_groups(groups, signal.SIGTERM)
         time.sleep(0.1)
-        _signal_groups(groups, signal.SIGKILL)
+        # Scan again, so a group that already exited (its id may be reused) is not killed.
+        _signal_groups(_tree_groups(_holders(fd, path), pgid), signal.SIGKILL)
         deadline = time.monotonic() + _STOP_TIMEOUT_SECONDS
         while True:
             free = free or _try_lock(fd)
-            if free and not _holders(fd, path):
+            if free and not _tree_groups(_holders(fd, path), pgid):
                 return Outcome("stopped", shown, path)
             if time.monotonic() >= deadline:
                 return Outcome("unstoppable", shown, path)
