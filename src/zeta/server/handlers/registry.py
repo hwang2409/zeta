@@ -395,7 +395,7 @@ async def model_catalog(client, request_id, params, controller):
 
 async def session_settings(client, request_id, params, controller):
     if client.role == "observer":
-        return await client.connections.read_settings(client, controller)
+        return await client.connections.read_settings(client, params, controller)
     validation.active(controller.runtime, params)
     return settings.settings(
         controller.runtime, include_plan_mode=True, telemetry=settings.telemetry(client)
