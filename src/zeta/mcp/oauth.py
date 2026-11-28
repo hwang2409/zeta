@@ -47,6 +47,15 @@ class MCPOAuthStateError(MCPOAuthError):
     """Raised when the redirect state parameter does not match."""
 
 
+class MCPOAuthTokenEndpointError(MCPOAuthError):
+    """Raised when the token endpoint answers with an HTTP error status."""
+
+    def __init__(self, message: str, status_code: int, body: object) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
 BrowserOpener = Callable[[str], None]
 
 
@@ -698,8 +707,14 @@ async def _post_token_request(
     except httpx.HTTPError as exc:
         raise MCPOAuthError(f"MCP OAuth: token request failed: {exc}") from exc
     if response.status_code >= 400:
-        raise MCPOAuthError(
-            f"MCP OAuth: token endpoint returned HTTP {response.status_code}"
+        try:
+            body: object = response.json()
+        except ValueError:
+            body = None
+        raise MCPOAuthTokenEndpointError(
+            f"MCP OAuth: token endpoint returned HTTP {response.status_code}",
+            response.status_code,
+            body,
         )
     try:
         value = response.json()
@@ -895,6 +910,7 @@ __all__ = [
     "BrowserOpener",
     "MCPOAuthError",
     "MCPOAuthStateError",
+    "MCPOAuthTokenEndpointError",
     "ProtectedResourceMetadata",
     "authorize",
     "build_authorization_url",

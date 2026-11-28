@@ -647,9 +647,12 @@ class AnthropicBackend(CompletionBackend):
             entered = True
             try:
                 if response.status_code >= 400:
+                    account = getattr(self.token_store, "account", None)
                     raise await build_response_error(
                         response,
-                        _http_error,
+                        lambda status, body, headers: _http_error(
+                            status, body, headers, account=account
+                        ),
                     )
                 async for event in _decode_response(
                     response,

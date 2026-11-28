@@ -1,0 +1,15 @@
+{
+  "_fixture": {
+    "captured_at": "2026-11-08",
+    "endpoint_kind": "anthropic messages (claude subscription oauth)",
+    "http_status": 429,
+    "headers": {"retry-after": "213277"},
+    "note": "real provider response from session c29ab0ed seq 2; request_id redacted"
+  },
+  "type": "error",
+  "error": {
+    "type": "rate_limit_error",
+    "message": "This request would exceed your account's rate limit. Please try again later."
+  },
+  "request_id": "req_redacted"
+}

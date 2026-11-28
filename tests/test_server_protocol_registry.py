@@ -436,7 +436,9 @@ async def test_every_observer_request_has_transport_parity(
             "controller-catalog", "model_catalog"
         )
         assert catalog["result"] == controller_catalog["result"]
-        settings = await observer.request("observer-settings", "session_settings")
+        settings = await observer.request(
+            "observer-settings", "session_settings", {"session_id": session_id}
+        )
         assert settings["result"] == {
             "model": "gpt-5.6-luna",
             "approval_mode": "ask",
@@ -1618,7 +1620,7 @@ async def test_session_settings_telemetry_is_negotiated_on_every_reply(
                 "set_settings",
                 {"session_id": session_id, "model": "gpt-5.6-luna", "approval_mode": "ask"},
             ),
-            await observer.request_raw("observe", "session_settings"),
+            await observer.request_raw("observe", "session_settings", {"session_id": session_id}),
         ]
     finally:
         await contract.close()

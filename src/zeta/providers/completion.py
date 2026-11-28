@@ -993,6 +993,8 @@ class CompletionRun(AsyncIterator[StreamEvent]):
                 data["until"] = limit.resets_at.timestamp()
                 data["account"] = str(limit.account)
                 data["text"] = f"{limit.account} {rate_limit_hold_text(data)}"
+                if limit.detail:
+                    data["text"] += f" ({limit.detail})"
                 return StreamEvent(StreamEventType.RETRY, data=data)
             data["text"] = (
                 f"{self._adapter.provider} {rate_limit_hold_text(data)} "
