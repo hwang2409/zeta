@@ -796,12 +796,17 @@ def _open_lock(home: Path) -> int:
     return fd
 
 
-def _missing_manifest_error(home: Path) -> MissingManifest:
-    return MissingManifest(
+# Shipped to remote hosts (remote_sync/ssh.py): Python 3.8 stdlib only.
+def _missing_manifest_text(home: Path) -> str:
+    return (
         f"stored-format manifest is missing at {home}; run "
         "zeta storage-format advance --expected-epoch 0 "
         f"--target-epoch {WRITER_EPOCH}"
     )
+
+
+def _missing_manifest_error(home: Path) -> MissingManifest:
+    return MissingManifest(_missing_manifest_text(home))
 
 
 def _read_manifest(home: Path, *, absent_epoch: int | None = None) -> int:

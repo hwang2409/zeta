@@ -96,6 +96,7 @@ _REMOTE_LEASE_HOME = "\n".join(
         storage_format._wait_for_bootstrap,
         storage_format._publish_manifest,
         storage_format._lease_home,
+        storage_format._missing_manifest_text,
     )
 )
 
@@ -129,7 +130,7 @@ def _writer_epoch(home):
     try:
         reason = _lease_home(lock_fd, home)
         if reason == "busy": _epoch_fail("another process is initializing the remote home")
-        if reason: _epoch_fail("remote home has gated state but no stored-format manifest")
+        if reason: _epoch_fail(f"{{_missing_manifest_text(home)}} on the remote host, with ZETA_HOME set to that path")
         manifest = json.loads((home / _MANIFEST).read_text())
     except (OSError, ValueError):
         os.close(lock_fd); _epoch_fail("remote stored-format manifest is unreadable")
