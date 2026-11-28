@@ -375,3 +375,44 @@ async def test_last_turn_finish_card_matches_durable_status(tmp_path, monkeypatc
                     if row.get("kind") == "agent_completion"] == ["completed"]
         finally:
             await await_or_fail(loop.close(), what="close parent")
+
+
+@pytest.mark.asyncio
+async def test_note_reaches_parent_as_notice_and_survives_finish(tmp_path, monkeypatch):
+    note = ToolCall(
+        "note", "ask_parent", {"question": "milestone: PR opened", "kind": "note"}
+    )
+    with ConversationStore(tmp_path / "sessions", cwd=tmp_path) as store:
+        loop = _loop(
+            store, monkeypatch, [ScriptedTurn(tool_calls=[note, _finish("done")])]
+        )
+        try:
+            run_id = await await_or_fail(
+                runner.spawn_child(loop, agent_type="run", task="work", cwd=None),
+                what="start noting child",
+            )
+            await await_or_fail(
+                loop._background_owner.wait(), what="child finishes without an answer"
+            )
+            rows = store.agent_notifications()
+            notes = [
+                row
+                for row in rows
+                if "milestone: PR opened" in row.data.get("text", "")
+            ]
+            assert [row.data["kind"] for row in notes] == ["child_idle"], (
+                "a note reaches the parent as a notice"
+            )
+            assert "no reply" in notes[0].data["text"]
+            assert not _cards(store), "a note is not an open child question"
+            assert all(
+                row.data["kind"] != "child_question_withdrawn" for row in rows
+            ), "finish must not withdraw a note"
+            assert not loop._background_owner.conversation_channel.has_pending_question(
+                run_id
+            )
+            assert len(loop.backend.calls) == 1, (
+                "finish is not refused while a note is unread"
+            )
+        finally:
+            await await_or_fail(loop.close(), what="close noting parent")
