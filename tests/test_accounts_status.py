@@ -922,8 +922,9 @@ def test_startup_failure_without_a_path_names_no_path(
 
     # test-contract: seam os.write/fsync ENOSPC carries no file name and needs a full disk
     monkeypatch.setattr(account_store_module, "_open_account_directory", full_disk)
-    assert AccountStore(tmp_path).migrate() == (
+    warning = (
         "kept every account file: account migration failed "
-        "(ENOSPC: No space left on device); fix it, then restart zeta",
+        "(ENOSPC: No space left on device); fix it, then restart zeta"
     )
+    assert AccountStore(tmp_path).migrate() == (warning,)
     assert credential.read_bytes() == original

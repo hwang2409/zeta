@@ -19,7 +19,6 @@ from contextlib import (
     ExitStack,
     asynccontextmanager,
     contextmanager,
-    suppress,
 )
 from enum import Enum
 from pathlib import Path
@@ -611,7 +610,10 @@ class AccountStore(_AccountRegistry):
             code = errno.errorcode.get(exc.errno or 0, "unknown error")
             reason = f"{code}: {os.strerror(exc.errno)}" if exc.errno else code
             warning = (
-                f"kept {_failed_path(self.home, exc.filename)}: could not be read "
+                f"kept every account file: account migration failed ({reason}); "
+                "fix it, then restart zeta"
+                if exc.filename is None  # e.g. ENOSPC from os.write: no path to name
+                else f"kept {_failed_path(self.home, exc.filename)}: could not be read "
                 f"or written ({reason}); fix its permissions, then restart zeta"
             )
             if warning not in warnings:  # each later step trips on the same path
@@ -1195,23 +1197,29 @@ def _read_optional_tokens(directory_fd: int) -> OAuthTokens | None:
     return None if credential is None else _tokens_from_bytes(credential)
 
 
-def _failed_path(home: Path, name: str | None) -> Path:
+def _children(directory: Path) -> list[Path]:
+    try:
+        return [] if directory.is_symlink() else list(directory.iterdir())
+    except OSError:  # missing, unreadable, or a file
+        return []
+
+
+def _failed_path(home: Path, name: str) -> Path:
     """Reads go through dir_fd, so an error names only the last component; find it."""
 
-    matches = [home / item for item in os.listdir(home) if item == name]
-    level = [home / "accounts", home / "account-locks"]
-    for _ in range(4):
-        matches += [path for path in level if path.name == name]
-        children: list[Path] = []
-        for directory in level:
-            with suppress(OSError):
-                if directory.is_dir() and not directory.is_symlink():
-                    children += directory.iterdir()
-        level = children
+    roots = [home / "accounts", home / "account-locks"]
+    providers = [root / provider for root in roots for provider in _PROVIDERS]
+    accounts = [path for provider in providers for path in _children(provider)]
+    files = [path for account in accounts for path in _children(account)]
+    matches = [
+        path
+        for path in (home / name, *roots, *providers, *accounts, *files)
+        if path.name == name and os.path.lexists(path)
+    ]
     # the same name can sit in several trees: the unreadable one failed
     return next(
         (path for path in matches if not os.access(path, os.R_OK)),
-        matches[0] if matches else home / str(name),
+        matches[0] if matches else home / name,
     )
 
 
