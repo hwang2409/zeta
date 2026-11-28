@@ -527,10 +527,8 @@ def _handle_login(args: argparse.Namespace) -> int:
     return 0
 
 
-_NO_ACCOUNTS = "no accounts; run zeta login <provider> --account <name>"
-
-
 def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
+    from ..accounts.login import no_accounts_message
     from ..accounts.usage import format_usage_lines, usage_json
 
     accounts = store.list_display()
@@ -568,7 +566,7 @@ def _print_accounts(store: AccountStore, *, as_json: bool) -> None:
             + marker
         )
         lines.extend(f"  {line}" for line in format_usage_lines(item.usage))
-    print("\n".join(lines) or _NO_ACCOUNTS)
+    print("\n".join(lines) or no_accounts_message())
 
 
 def _expiry_iso(expires_at: float) -> str:
@@ -756,14 +754,16 @@ async def _account_statuses(
 
 
 def _print_account_statuses(
-    statuses: list[dict[str, object]], *, as_json: bool
+    statuses: list[dict[str, object]], provider: str | None, *, as_json: bool
 ) -> None:
+    from ..accounts.login import no_accounts_message
+
     if as_json:
         print(json.dumps(statuses))
         return
     if not statuses:
         # status exits 1 here, so the hint goes to stderr like other failures.
-        print(_NO_ACCOUNTS, file=sys.stderr)
+        print(no_accounts_message(provider), file=sys.stderr)
         return
     lines = []
     for status in statuses:
@@ -816,7 +816,7 @@ def _run_accounts_action(store: AccountStore, args: argparse.Namespace) -> int:
         statuses, all_ok = asyncio.run(
             _account_statuses(store, provider, refresh=args.status_refresh)
         )
-        _print_account_statuses(statuses, as_json=args.json)
+        _print_account_statuses(statuses, provider, as_json=args.json)
         return 0 if all_ok else 1
     _print_accounts(store, as_json=args.json)
     return 0

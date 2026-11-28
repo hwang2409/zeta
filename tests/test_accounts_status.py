@@ -768,3 +768,20 @@ def test_accounts_commands_say_how_to_log_in_when_home_has_no_accounts(
 
     assert cli_main.main(["accounts", "status", "--json"]) == 1
     assert capsys.readouterr().out == "[]\n"
+
+
+def test_accounts_status_filter_names_the_provider_that_has_no_accounts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    initialize_storage_home(tmp_path)
+    _save_account(tmp_path, "codex")
+    monkeypatch.setenv("ZETA_HOME", str(tmp_path))
+
+    assert cli_main.main(["accounts", "status", "anthropic"]) == 1
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == (
+        "",
+        "no anthropic accounts; run zeta login anthropic --account <name>\n",
+    )
