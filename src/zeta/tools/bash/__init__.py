@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import codecs
 import os
+import re
 import shlex
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any, BinaryIO, TypedDict
@@ -100,6 +102,41 @@ def _shell_environment(
     )
     environment["PWD"] = start_cwd
     return environment
+
+
+_LONG_SLEEP_SECONDS = 30.0
+_SLEEP = re.compile(r"\bsleep\s+(\d+(?:\.\d+)?)([smh]?)\b")
+_CI_WATCH = re.compile(r"\bgh\s+pr\s+checks\b[^|;&\n]*\s--watch\b|\bgh\s+run\s+watch\b")
+_LAST_STAGE = re.compile(r"[|;&\n]")
+_GREP_TOOLS = frozenset({"grep", "egrep", "fgrep", "rg"})
+
+
+def _result_hint(
+    command: str, exit_code: int, stdout: str, stderr: str, elapsed: float
+) -> str | None:
+    """Return one plain-meaning hint for known result shapes; rules match command text only."""
+
+    sleeps = (
+        float(n) * {"": 1, "s": 1, "m": 60, "h": 3600}[unit]
+        for n, unit in _SLEEP.findall(command)
+    )
+    if any(s >= _LONG_SLEEP_SECONDS for s in sleeps) or _CI_WATCH.search(command):
+        return (
+            f"this blocked your turn for {elapsed:.0f}s; start it with "
+            "run_background and end your turn; its exit wakes you"
+        )
+    if exit_code == 127 and "rg: command not found" in stderr:
+        return "rg is not installed; use `git grep -n` or `grep -rn`"
+    if exit_code == 1 and not stdout:
+        stages = [s for s in _LAST_STAGE.split(command) if s.strip()]
+        words = stages[-1].split() if stages else []
+        if words[:1] == ["git"]:
+            words = words[1:]
+        if words and words[0] in _GREP_TOOLS:
+            return "exit 1 from grep means no match"
+    if exit_code == 8 and re.search(r"\bgh\s+pr\s+checks\b", command):
+        return "exit 8 from gh pr checks means checks are pending"
+    return None
 
 
 def _extract_command(arguments: BashArguments) -> str:
@@ -255,6 +292,7 @@ async def _bash(
     abort_wait: asyncio.Task[None] | None = None
     timeout_wait: asyncio.Task[None] | None = None
     timed_out = False
+    started = time.monotonic()
     try:
         try:
             spawn_kwargs = {
@@ -328,6 +366,10 @@ async def _bash(
         combined_full_size += stderr_capture.full_size
         marker_prefix = marker + "\n" if marker is not None else ""
         combined_full_size += len(marker_prefix.encode())
+        hint = _result_hint(
+            shell_command, exit_code, stdout, stderr, time.monotonic() - started
+        )
+        hint_suffix = f"\nhint: {hint}" if hint is not None else ""
         if combined_full_size > output_limit:
             call_id = (
                 execution_context.tool_call.id
@@ -359,13 +401,16 @@ async def _bash(
                 output_limit,
                 tail=combined_tail,
             )
-            content = text_block(shown, full_size=combined_full_size)
+            content = text_block(
+                shown + hint_suffix,
+                full_size=combined_full_size + len(hint_suffix.encode()),
+            )
             content["truncated"] = True
             content["spill_path"] = str(spill_path)
         else:
             content = text_block(
-                marker_prefix + combined,
-                full_size=combined_full_size,
+                marker_prefix + combined + hint_suffix,
+                full_size=combined_full_size + len(hint_suffix.encode()),
             )
         structured_content: dict[str, Any] = {
             "stdout": stdout,
