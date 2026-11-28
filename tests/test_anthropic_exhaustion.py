@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -112,6 +113,8 @@ class _Held:
         self, tmp_path: Path, recorded: tuple[int, dict[str, str], bytes]
     ) -> None:
         self.recorded = recorded
+        # the first account answers once with `recorded`, then recovers
+        self.exhausted_once = False
         home = tmp_path / "home"
         advance(home, expected_epoch=0)
         self.first = ACCOUNT
@@ -149,7 +152,9 @@ class _Held:
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        if request.headers["authorization"] == "Bearer token-first":
+        if request.headers["authorization"] == "Bearer token-first" and (
+            not self.exhausted_once or len(self.requests) == 1
+        ):
             status, headers, body = self.recorded
             return httpx.Response(
                 status, headers=headers, content=body, request=request
@@ -161,9 +166,11 @@ class _Held:
             request=request,
         )
 
-    async def run(self):
+    async def run(self, *, user_switches: bool = True):
         async def user_switches_on_first_poll(delay: float) -> None:
             self.waits.append(delay)
+            if not user_switches:
+                return
             await self.context.switch_active(
                 self.loop,
                 self.second,
@@ -239,4 +246,35 @@ async def test_recorded_exhaustion_holds_turn_with_plain_message(
         "Bearer token-first",
         "Bearer token-second",
     ]
+    assert any(event.delta == "hello" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_short_limit_holds_exactly_retry_after_and_never_switches_by_itself(
+    tmp_path: Path,
+) -> None:
+    status, _headers, body = RATE_LIMIT_429
+    held = await asyncio.to_thread(
+        _Held, tmp_path, (status, {"retry-after": "120"}, body)
+    )
+    held.exhausted_once = True
+    before = time.time()
+    events = await held.run(user_switches=False)
+    after = time.time()
+
+    hold = next(event for event in events if event.type is StreamEventType.RETRY)
+    assert hold.data["limit"] == "subscription"
+    # the hold ends at now + Retry-After, with no longer default hold
+    assert before + 120 <= hold.data["until"] <= after + 120
+    assert 119 <= hold.data["delay"] <= 120
+    assert sum(held.waits) == pytest.approx(hold.data["delay"])
+    state = read_usage(held.context.store, held.first, now=datetime.now(UTC))
+    assert state.snapshot is not None
+    assert [w.window_minutes for w in state.snapshot.windows] == [300]
+    # another account exists, yet only the user may switch to it
+    assert [request.headers["authorization"] for request in held.requests] == [
+        "Bearer token-first",
+        "Bearer token-first",
+    ]
+    assert held.loop.backend is held.backends[held.first]
     assert any(event.delta == "hello" for event in events)
