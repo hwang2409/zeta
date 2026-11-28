@@ -1637,6 +1637,29 @@ Observers can call `child_run_list`, but `child_run_send` returns the existing
 `-32008` `observer_read_only` error. This feature emits no event; clients call
 `child_run_list` again to read changes.
 
+An accepted message is written to the child's own transcript as a pending
+prompt before the response, so it survives a restart. The child reads queued
+messages one at a time, oldest first, at its next model request. A
+`"suspended"` row with `suspension_reason: "provider_unavailable"` belongs to a
+live run that waits for its provider. A send to it is accepted even if its
+profile does not accept follow-ups or its retry is `stopped`: the server queues
+the message and wakes the child at once, without waiting for the next probe.
+Any other `"suspended"` row has no live owner in this server (recovery after a
+restart did not finish, for example `current_step` starts with `recovery
+blocked:`). Such a send is refused and nothing is queued. Homes below storage
+epoch 13 never suspend a child; a restart cancels it instead. The server
+applies these rules with or without `child_recovery`; that feature changes
+only the reported `status`.
+
+| child state | `child_run_send` result |
+| --- | --- |
+| `running` or `idle`, profile accepts follow-ups | accepted; delivered at the next safe point |
+| `running`, profile does not accept follow-ups, or foreground child | `-32005` |
+| `suspended`, `provider_unavailable` (retrying or stopped) | accepted; the child wakes now and reads it |
+| `suspended`, other reason, no live owner (recovery blocked or not done) | `-32005`; nothing queued |
+| `completed`, `failed`, `canceled`, or unknown `run_id` | `-32005` |
+| `text` over 16,000 characters | `-32602` |
+
 ### `abort`
 
 Params: optional `scope` with the `abort_scope` feature. It is `"session"`

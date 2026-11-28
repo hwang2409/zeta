@@ -445,6 +445,15 @@ async def test_suspension_projection_and_recovered_notice_over_serve(tmp_path: P
             joined = await peer.request("baseline", "session_history_and_subscribe", {"session_id": session_id})
             [progress] = [row["child"] for row in joined["result"]["messages"] if row.get("event") == "child_progress"]
             check_row(progress, expected)
+        # A suspended run with no live owner here (restart-suspended or recovery blocked) refuses the message.
+        refused = await client.request("send-suspended", "child_run_send", {"session_id": session_id, "run_id": run_id, "text": "wake"})
+        assert refused["error"]["code"] == -32005, refused
+
+        def queued_prompts():
+            with ConversationStore(root.session_dir / "agents", session_id="1", _storage_lease=root._storage_lease) as child:
+                return child.pending_prompts()
+
+        assert await asyncio.to_thread(queued_prompts) == [], "a refused send must not queue the message"
 
         def publish_progress():
             with ConversationStore(root.session_dir / "agents", session_id="1", _storage_lease=root._storage_lease) as child:
