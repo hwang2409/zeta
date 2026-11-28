@@ -795,30 +795,30 @@ class StepDeliveryFlow:
             self._wake_sink(source)
 
 
-async def send_to_run(
-    parent_store: ConversationStore,
-    child_instance_id: object,
-    message: object,
-    *,
-    owner: BackgroundAgentOwner,
-    channel: ConversationChannel,
-    origin: MessageOrigin = MessageOrigin.AGENT_SEND,
-) -> str | None:
-    """Queue one follow-up through the child's resident delivery flow."""
-
-    if type(child_instance_id) is not str or not child_instance_id.strip():
-        return "child_instance_id must be a nonempty string"
-    if type(message) is not str or not message.strip():
-        return "message must be a nonempty string"
-    no_live_run = (
+def _no_live_run(child_instance_id: str) -> str:
+    return (
         f"no live run/child {child_instance_id!r}; it was canceled, finished, "
         "or never started"
     )
+
+
+def send_rejection(
+    parent_store: ConversationStore,
+    child_instance_id: str,
+    markers: dict[str, dict[str, Any]],
+    *,
+    owner: BackgroundAgentOwner,
+) -> str | None:
+    """Return why `send_to_run` refuses this child now, or None when it accepts.
+
+    `markers` is `parent_store.agent_children()`, read once per listing.
+    """
+
     if not owner.controls_child(parent_store, child_instance_id):
-        return no_live_run
-    marker = parent_store.agent_children().get(child_instance_id)
+        return _no_live_run(child_instance_id)
+    marker = markers.get(child_instance_id)
     if marker is None:
-        return no_live_run
+        return _no_live_run(child_instance_id)
     transition = owner.run_transition(child_instance_id)
     if not (transition is not None and transition.provider_suspended) and not has_follow_up_loop(
         accepts_follow_ups=marker.get("accepts_follow_ups") is True,
@@ -834,6 +834,31 @@ async def send_to_run(
             f"agent_send rejected for {agent_type} child {child_instance_id!r}: "
             f"{reason}"
         )
+    return None
+
+
+async def send_to_run(
+    parent_store: ConversationStore,
+    child_instance_id: object,
+    message: object,
+    *,
+    owner: BackgroundAgentOwner,
+    channel: ConversationChannel,
+    origin: MessageOrigin = MessageOrigin.AGENT_SEND,
+) -> str | None:
+    """Queue one follow-up through the child's resident delivery flow."""
+
+    if type(child_instance_id) is not str or not child_instance_id.strip():
+        return "child_instance_id must be a nonempty string"
+    if type(message) is not str or not message.strip():
+        return "message must be a nonempty string"
+    rejection = send_rejection(
+        parent_store, child_instance_id, parent_store.agent_children(), owner=owner
+    )
+    if rejection is not None:
+        return rejection
+    no_live_run = _no_live_run(child_instance_id)
+    transition = owner.run_transition(child_instance_id)
     match = QUESTION_ANSWER_PATTERN.match(message)
     question_id = match.group(1) if match is not None else None
 
