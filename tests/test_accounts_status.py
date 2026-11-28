@@ -19,7 +19,7 @@ import zeta.cli.main as cli_main
 import zeta.server.accounts as server_accounts
 from tests.support.credentials import named_account_credentials
 from tests.support.storage_homes import initialize_storage_home
-from zeta.accounts import AccountId, AccountStore
+from zeta.accounts import AccountError, AccountId, AccountStore
 from zeta.core.session_files import SessionFileReplaced
 from zeta.oauth import OAuthTokens
 
@@ -827,22 +827,39 @@ def _unreadable_row(home: Path, row: str) -> tuple[Path, str]:
     else:
         credential = _save_account(home)
         path = {
+            "accounts-root": home / "accounts",
+            "provider-dir": credential.parent.parent,
             "account-dir": credential.parent,
+            "orphan-dir": credential.parent.with_name("work"),
+            "locks-dir": home / "account-locks" / "codex",
             "oauth": credential,
             "pending": credential.with_name("publish-pending.json"),
             "registry": home / "accounts.json",
         }[row]
         if row == "pending":
             path.write_text("{}")
+        if row == "orphan-dir":
+            path.mkdir()
     if row == "registry":
         return path, "accounts.json is unreadable; kept it and every account directory"
-    reason = "could not be read (EACCES: Permission denied)"
+    reason = "could not be read or written (EACCES: Permission denied)"
     return path, f"kept {path}: {reason}; fix its permissions, then restart zeta"
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads mode-000 files")
 @pytest.mark.parametrize(
-    "row", ["account-dir", "oauth", "legacy", "pending", "registry"]
+    "row",
+    [
+        "accounts-root",
+        "provider-dir",
+        "account-dir",
+        "orphan-dir",
+        "locks-dir",
+        "oauth",
+        "legacy",
+        "pending",
+        "registry",
+    ],
 )
 def test_startup_with_an_unreadable_account_path_warns_and_keeps_every_file(
     tmp_path: Path, row: str
@@ -857,6 +874,26 @@ def test_startup_with_an_unreadable_account_path_warns_and_keeps_every_file(
     finally:
         os.chmod(path, mode)
     assert {item: item.read_bytes() for item in files} == files
+    assert path.exists()
+
+
+def test_startup_with_a_symlinked_login_is_a_bad_login_not_a_read_error(
+    tmp_path: Path,
+) -> None:
+    credential = _save_account(tmp_path)
+    target = tmp_path / "elsewhere-oauth.json"
+    credential.rename(target)
+    credential.symlink_to(target)
+    original = target.read_bytes()
+
+    for migrate in (
+        AccountStore(tmp_path).migrate,
+        lambda: asyncio.run(server_accounts.migrate(tmp_path)),
+    ):
+        with pytest.raises(AccountError, match="OAuth credentials are invalid; login required"):
+            migrate()
+    assert credential.is_symlink()
+    assert target.read_bytes() == original
 
 
 def test_startup_out_of_files_is_not_a_warning(
