@@ -909,3 +909,21 @@ def test_startup_out_of_files_is_not_a_warning(
     with pytest.raises(OSError) as caught:
         AccountStore(tmp_path).migrate()
     assert caught.value.errno == errno.EMFILE
+
+
+def test_startup_failure_without_a_path_names_no_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credential = _save_account(tmp_path)
+    original = credential.read_bytes()
+
+    def full_disk(*_args: object) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    # test-contract: seam os.write/fsync ENOSPC carries no file name and needs a full disk
+    monkeypatch.setattr(account_store_module, "_open_account_directory", full_disk)
+    assert AccountStore(tmp_path).migrate() == (
+        "kept every account file: account migration failed "
+        "(ENOSPC: No space left on device); fix it, then restart zeta",
+    )
+    assert credential.read_bytes() == original
