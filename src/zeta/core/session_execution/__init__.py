@@ -77,7 +77,7 @@ _REGISTRY: dict[tuple[int, int], _OwnedLease] = {}
 _REGISTRY_LOCK = RegistryLock()
 
 
-def _read_owner_hint(fd: int) -> tuple[str | None, int | None, str | None]:
+def _read_owner_hint(fd: int) -> tuple[OwnerSurface | None, int | None, str | None]:
     try:
         os.lseek(fd, 0, os.SEEK_SET)
         raw = os.read(fd, 4096)
@@ -98,26 +98,33 @@ def _read_owner_hint(fd: int) -> tuple[str | None, int | None, str | None]:
     return surface, pid, epoch
 
 
-def session_owner_status(directory_fd: int) -> tuple[bool, int | None]:
-    """Read the diagnostic owner hint without taking the execution lock."""
+def session_owner(directory_fd: int) -> tuple[OwnerSurface | None, int] | None:
+    """Read the live owner's (surface, pid) hint without taking the execution lock."""
 
     try:
         fd = open_session_file(directory_fd, RUNTIME_LEASE_NAME, os.O_RDONLY)
     except FileNotFoundError:
-        return False, None
+        return None
     try:
-        _surface, pid, _epoch = _read_owner_hint(fd)
+        surface, pid, _epoch = _read_owner_hint(fd)
     finally:
         os.close(fd)
     if pid is None or pid <= 0:
-        return False, None
+        return None
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
-        return False, None
+        return None
     except PermissionError:
         pass
-    return True, pid
+    return surface, pid
+
+
+def session_owner_status(directory_fd: int) -> tuple[bool, int | None]:
+    """Read the diagnostic owner hint without taking the execution lock."""
+
+    owner = session_owner(directory_fd)
+    return (False, None) if owner is None else (True, owner[1])
 
 
 def execution_owner_state(

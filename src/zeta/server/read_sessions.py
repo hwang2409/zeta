@@ -19,7 +19,7 @@ from ..core.session import (
     read_session_metadata,
     validate_session_id,
 )
-from ..core.session_execution import session_owner_status
+from ..core.session_execution import session_owner, session_owner_status
 from ..core.session_files import (
     SessionError,
     SessionNotFoundError,
@@ -63,7 +63,13 @@ def _size(fd):
 
 
 def _session_status(session_id, fd, active):
-    return active.get(session_id) or ("running" if session_owner_status(fd)[0] else "idle")
+    if session_id in active:
+        return active[session_id]
+    owner = session_owner(fd)
+    if owner is None:
+        return "idle"
+    # serve and tui hold the lease while idle, and this serve cannot see their turn.
+    return "unknown" if owner[0] in {"serve", "tui"} else "running"
 
 
 def _session_row(metadata, fd, status, updated_ns, root, epoch):
