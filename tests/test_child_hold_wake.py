@@ -19,12 +19,16 @@ from tests.support.fake_backend import (
 )
 from tests.support.notification_fixtures import notification_payloads
 from tests.support.owned import await_or_fail
+from tests.support.credentials import named_account_credentials
 from tests.test_accounts_exhaustion import _account_context
+from tests.test_anthropic_exhaustion import EXTRA_USAGE_400
 from tests.test_rate_limit_hold import _collect
 from zeta.accounts.exhaustion import classify_subscription_limit
-from zeta.accounts.store import AccountId
+from zeta.accounts.store import AccountId, AccountStore
 from zeta.accounts.usage import UsageSnapshot, UsageWindow, record_usage_snapshot
 from zeta.agent.conversation_channel import HoldWake
+from zeta.accounts import SessionAccountContext
+from zeta.core.session import SessionManager
 from zeta.core.store import ConversationStore
 from zeta.core.store._step_delivery import NotificationInput
 from zeta.protocol.types import (
@@ -35,10 +39,13 @@ from zeta.protocol.types import (
     ToolCall,
     ToolResult,
 )
+from zeta.oauth import OAuthTokens
+from zeta.providers.anthropic_errors import http_error
 from zeta.providers.completion import owned_completion
 from zeta.runtime.loop import AgentLoop
 from zeta.server.control import NotificationPresentation, ServeControl
 from zeta.skills import SkillCatalog
+from zeta.storage_format import advance
 from zeta.tui.render import render_event
 
 pytestmark = pytest.mark.usefixtures("close_direct_test_agent_loops")
@@ -126,8 +133,10 @@ class HeldChildBackend(PerActorFakeBackend):
 class HeldTree:
     """A root loop with named codex accounts and one background child in a hold."""
 
-    def __init__(self, tmp_path: Path, backend: HeldChildBackend) -> None:
-        self.context, self.opened, _first, _second = _account_context(tmp_path)
+    def __init__(
+        self, tmp_path: Path, backend: HeldChildBackend, accounts=_account_context
+    ) -> None:
+        self.context, self.opened, _first, _second = accounts(tmp_path)
         self.backend = backend
         self.loop = AgentLoop(
             backend, self.opened.store, max_turns=1, skill_catalog=SkillCatalog.empty()
@@ -403,6 +412,53 @@ async def test_subscription_limit_days_away_wakes_parent_once(tmp_path: Path) ->
     finally:
         # the reset is days away; closing the tree cancels the held child
         await tree.close()
+
+
+class AnthropicHeldChildBackend(HeldChildBackend):
+    provider = "anthropic"
+
+
+def _anthropic_accounts(tmp_path: Path):
+    home = tmp_path / "home"
+    advance(home, expected_epoch=0)
+    first = AccountId("anthropic", "first")
+    second = AccountId("anthropic", "second")
+    for account in (first, second):
+        named_account_credentials(home, "anthropic", account.name).save(
+            OAuthTokens(f"token-{account.name}", "refresh", 4_000_000_000)
+        )
+    AccountStore(home).set_default(first)
+    manager = SessionManager(home)
+    opened = manager.create(provider="anthropic", model="claude-opus-5-5", cwd=tmp_path)
+    return SessionAccountContext.load(home, manager, opened.metadata), opened, first, second
+
+
+@pytest.mark.asyncio
+async def test_extra_usage_hold_wakes_parent_once_across_reprobes(
+    tmp_path: Path,
+) -> None:
+    # the extra-usage 400 holds only one 300 s probe, and every probe repeats it
+    status, headers, body = EXTRA_USAGE_400
+    first = AccountId("anthropic", "first")
+    backend = AnthropicHeldChildBackend(
+        [http_error(status, body, headers, account=first) for _ in range(2)],
+        parent_turns=1,
+    )
+    tree = await asyncio.to_thread(HeldTree, tmp_path, backend, _anthropic_accounts)
+    try:
+        await tree.start_and_hold()
+        holds = tree.holds()
+        assert len(holds) == 1, "a subscription hold must wake the parent, however short"
+        assert holds[0]["reason"] == "subscription_limit"
+        assert holds[0]["account"] == "anthropic:first"
+        backend.release.set()
+        assert tree.child_ended is not None
+        await await_or_fail(tree.child_ended, what="held child end")
+    finally:
+        await tree.close()
+
+    assert len(backend.waits) > 1, "the second probe must re-enter the hold"
+    assert len(tree.holds(pending_only=False)) == 1, "a re-probe is the same hold"
 
 
 @pytest.mark.asyncio
