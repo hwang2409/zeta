@@ -1218,7 +1218,7 @@ async def _run_installed_child(
         elif lifecycle_sink is not None:
             lifecycle_sink(kind, call, data, tool_result)
 
-    update_turns, record_tool_call = make_child_progress_callbacks(
+    update_turns, record_tool_call, save_progress_while_running = make_child_progress_callbacks(
         loop=loop,
         child_store=child_store,
         child_marker_key=child_instance_id,
@@ -1293,22 +1293,29 @@ async def _run_installed_child(
             child_instance_id, child_path, description, child_account_pins, child_store,
         )
         await hold_wake.start()
-        result = await consume(
-            child_loop,
-            prompt,
-            **run_kwargs,
-            child_path=child_path,
-            publish=publish,
-            hold_wake=hold_wake,
-            child_turns=child_turns,
-            update_turns=update_turns,
-            record_tool_call=record_tool_call,
-            update_step=update_step,
-            finish_lifecycle=finish_lifecycle,
-            publish_lifecycle=publish_lifecycle,
-            child_result=child_result,
-            error_message=error_message,
-        )
+        # Joined before this task returns, so no save lands after the suspend or finish write.
+        progress_saver = loop._create_task(save_progress_while_running()) if run_owner.recoverable else None
+        try:
+            result = await consume(
+                child_loop,
+                prompt,
+                **run_kwargs,
+                child_path=child_path,
+                publish=publish,
+                hold_wake=hold_wake,
+                child_turns=child_turns,
+                update_turns=update_turns,
+                record_tool_call=record_tool_call,
+                update_step=update_step,
+                finish_lifecycle=finish_lifecycle,
+                publish_lifecycle=publish_lifecycle,
+                child_result=child_result,
+                error_message=error_message,
+            )
+        finally:
+            if progress_saver is not None:
+                progress_saver.cancel()
+                await asyncio.gather(progress_saver, return_exceptions=True)
         await commit_foreground_terminal(result)
         return result
 
