@@ -5582,6 +5582,43 @@ def test_nested_stalled_idle_background_event_renders_last_message(
     assert "nested verifier is waiting for review" in rendered
 
 
+@pytest.mark.parametrize(
+    ("text", "header", "body"),
+    [
+        (
+            "child root:1 notes (no reply needed; it keeps working): PR opened #1",
+            "note ← worker :1 · running",
+            "PR opened #1",
+        ),
+        ("waiting for review", "idle ← worker :1 · idle", "waiting for review"),
+    ],
+    ids=["note", "idle"],
+)
+def test_child_idle_card_names_a_note_as_note(
+    text: str, header: str, body: str
+) -> None:
+    from zeta.tui.cards.agent_message import render_agent_notification_message
+
+    card = render_agent_notification_message(
+        StreamEvent(
+            StreamEventType.AGENT_NOTIFICATION,
+            data={
+                "kind": "child_idle",
+                "child_instance_id": "root:1",
+                "description": "worker",
+                "status": "child_idle",
+                "text": text,
+            },
+        ),
+        None,
+    )
+    output = StringIO()
+    Console(file=output, width=100, color_system=None).print(card)
+    rendered = output.getvalue()
+    assert header in rendered, rendered
+    assert body in rendered, rendered
+
+
 @pytest.mark.asyncio
 async def test_held_input_notice_renders_on_root_transcript(tmp_path: Path) -> None:
     output = StringIO()

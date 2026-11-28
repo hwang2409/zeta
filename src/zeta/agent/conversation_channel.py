@@ -112,6 +112,12 @@ def recover_completion_mirrors(
     return root_notification
 
 
+def child_note_prefix(child_instance_id: str) -> str:
+    """Start of a note's ``child_idle`` text; the TUI reads it to label the card."""
+
+    return f"child {child_instance_id} notes (no reply needed; it keeps working): "
+
+
 @dataclass(slots=True)
 class _DeliveryTarget:
     loop: asyncio.AbstractEventLoop
@@ -396,10 +402,7 @@ class ConversationChannel:
             child_instance_id=child_instance_id,
             child_session_path=child_session_path,
             description=self._owner.description(child_instance_id),
-            text=(
-                f"child {child_instance_id} notes (no reply needed; it keeps "
-                f"working): {note}"
-            ),
+            text=child_note_prefix(child_instance_id) + note,
         )
 
     async def publish_hold(

@@ -12,6 +12,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from ...accounts.status import account_status_text, project_account_status
+from ...agent.conversation_channel import child_note_prefix
 from ...agent.receipt import (
     finish_report_truncation_note,
     has_agent_receipt_suffix,
@@ -601,6 +602,14 @@ def _render_child_idle(
     report = event.data.get("text")
     if identity is None or not isinstance(report, str):
         return _unavailable_notification()
+    prefix = child_note_prefix(str(event.data.get("child_instance_id")))
+    if report.startswith(prefix):
+        # a note travels as child_idle (no stored-format change); the child keeps running
+        return render_agent_message(
+            agent_header("note", "←", identity, state="running"),
+            body=report.removeprefix(prefix),
+            state="running",
+        )
     return render_agent_message(
         agent_header("idle", "←", identity, state="idle"),
         body=report,
