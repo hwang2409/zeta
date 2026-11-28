@@ -145,8 +145,28 @@ class IncrementalValidationMixin:
             fold.apply(entry, approvals)
         self._delivery_fold = fold
 
-    def _accept_incremental_entries(self, entries: list[ConversationEntry]) -> bool:
-        """Validate a tail against staged state, then publish it as one update."""
+    def _validate_linear_tail(self, entries: list[ConversationEntry]) -> None:
+        """Check the relations of new rows that extend the validated active tip.
+
+        Raises the texts the complete validator raises for these rows; the caller
+        already fixed their seq, ids and parents.
+        """
+        approvals = (
+            self._full_branch_approval_overlay()
+            if _ApprovalValidationOverlay.touched(entries)
+            else _ApprovalValidationOverlay()
+        )
+        fold = self._delivery_fold.staged()
+        for entry in entries:
+            fold.apply(entry, approvals)
+
+    def _accept_incremental_entries(
+        self, entries: list[ConversationEntry], spans: list[tuple[int, int]]
+    ) -> bool:
+        """Validate a tail against staged state, then publish it as one update.
+
+        ``spans`` holds each entry's real (byte offset, length) in the log.
+        """
         staged = copy.copy(self)
         staged._resident_rows = self._resident_rows.clone()
         staged._entry_ids = set(self._entry_ids)
@@ -178,9 +198,8 @@ class IncrementalValidationMixin:
         self._task_notification_ids = staged._task_notification_ids
         self._sent_message_receipts = staged._sent_message_receipts
         # Publish entries last so readers never see rows without matching indexes.
-        self._resident_rows.replace(
-            staged._resident_rows.stream_rows(staged._resident_rows.rows)
-        )
+        for entry, (offset, length) in zip(entries, spans, strict=True):
+            self._resident_rows.append(entry, offset=offset, length=length)
         self._record_client_delivery_entries(entries)
         return True
 
