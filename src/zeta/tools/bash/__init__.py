@@ -270,6 +270,8 @@ async def _bash(
                 "pass_fds": (write_fd,) if record is None else (write_fd, record.fd),
                 "env": _shell_environment(execution_context, start_cwd),
                 "niceness": registry.command_niceness,
+                # Record the group before the command runs, so a crash at any later point leaves it findable.
+                "on_spawn": None if record is None else record.set_pgid,
             }
             if approved_cwd is not None:
                 spawn = create_subprocess_shell_in_fd(
@@ -289,7 +291,6 @@ async def _bash(
             os.close(cwd_fd)
             cwd_fd = -1
         if record is not None:
-            record.set_pgid(process.pid)
             record.close_parent_fd()
         os.close(write_fd)
         write_fd = -1
