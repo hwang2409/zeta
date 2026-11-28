@@ -869,6 +869,10 @@ class ToolRegistry(_CallPreparationMixin, _LiveConfigRegistryMixin):
         return self._session_store
 
     @property
+    def session_dir(self) -> Path | None:
+        return None if self._session_store is None else self._session_store.session_dir
+
+    @property
     def todo_store(self) -> ConversationStore:
         if self._todo_store is None:
             raise ValueError("todo tool requires a bound session store")

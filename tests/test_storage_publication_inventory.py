@@ -148,6 +148,8 @@ _RAW_DELETION = {
     ("tools/_atomic_replace.py", "atomic_create", "unlink"),
     ("tools/_atomic_replace.py", "atomic_replace", "unlink"),
     ("tools/_shared/background_output_archive.py", "_remove_generated_log", "unlink"),
+    ("tools/_shared/tool_process_record.py", "remove", "unlink"),
+    ("tools/_shared/tool_process_record.py", "sweep", "unlink"),
     ("attention_forks.py", "remove_attention_source_links", "unlink"),
     ("attention_replies.py", "stage", "unlink"),
     ("attention_replies.py", "_send_staged_locked", "unlink"),
