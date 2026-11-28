@@ -17,7 +17,7 @@ from ..core.store import MAX_AGENT_NOTIFICATION_TEXT, ConversationStore
 from ..core.store._child_runs import child_run_segments
 from ..core.store._step_delivery import TerminalTargetSealedError
 from ..protocol.types import StreamEvent, StreamEventType
-from ..providers.rate_limit_hold import LONG_HOLD_WAKE_SECONDS
+from ..providers.rate_limit_hold import caller_outwaited
 from ..runtime.offload import await_joined_offload
 
 if TYPE_CHECKING:
@@ -218,11 +218,7 @@ class HoldWake:
         hold = event.data
         if self._status is None or not self._status["held"]:
             await self._update_status(held=True)
-        if (
-            self._channel is None
-            or self._woken
-            or hold["retry_after"] <= LONG_HOLD_WAKE_SECONDS
-        ):
+        if self._channel is None or self._woken or not caller_outwaited(hold):
             return True
         self._woken = True
         # a subscription hold names its account; a rate limit uses the child's pin

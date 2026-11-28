@@ -124,6 +124,10 @@ def _schedule_cleanup_failure(
     _retain_background_closes((task,), None)
 
 
+# no provider window is longer than a year; a larger Retry-After is a bad header, not a wait
+_MAX_RETRY_AFTER_SECONDS = 366 * 86400.0
+
+
 def retry_after_seconds(headers: Mapping[str, str] | None) -> float | None:
     if headers is None:
         return None
@@ -137,7 +141,7 @@ def retry_after_seconds(headers: Mapping[str, str] | None) -> float | None:
             parsed = parsedate_to_datetime(value).timestamp() - time.time()
         except (TypeError, ValueError, OverflowError):
             return None
-    return parsed if parsed >= 0 else None
+    return parsed if 0 <= parsed <= _MAX_RETRY_AFTER_SECONDS else None
 
 
 def format_retry_delay(delay: float) -> str:
