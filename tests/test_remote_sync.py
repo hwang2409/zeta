@@ -2140,13 +2140,14 @@ def test_remote_first_open_waits_for_a_held_bootstrap(tmp_path: Path) -> None:
                 str(home),
                 "missing-project",
             ],
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
         )
         try:
             try:
-                fetch.wait(0.5)  # the other first open is still publishing
+                # hold past the notice so the shipped program prints its waiting line
+                fetch.wait(storage_format._BOOTSTRAP_NOTICE_SECONDS + 0.5)
             except subprocess.TimeoutExpired:
                 pass
             (home / "storage-format.json").write_text(
@@ -2154,10 +2155,13 @@ def test_remote_first_open_waits_for_a_held_bootstrap(tmp_path: Path) -> None:
             )
         finally:
             fcntl.flock(holder, fcntl.LOCK_UN)
-        _stdout, stderr = fetch.communicate(timeout=30)
+        stdout, stderr = fetch.communicate(timeout=30)
     finally:
         os.close(holder)
+    assert "Traceback" not in stderr, stderr
     assert fetch.returncode == 44, stderr
+    assert f"zeta: waiting for another zeta process to finish creating {home}" in stderr
+    assert stdout == ""
     assert "initializing" not in stderr
 
 

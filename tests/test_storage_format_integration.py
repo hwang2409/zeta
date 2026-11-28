@@ -278,10 +278,10 @@ def test_real_console_start_has_one_storage_format_owner(
             assert not started
             assert return_code == 2
             # a home locked past the notice delay says once that it waits, then refuses;
-            # the TUI sends startup stderr to its capture log, not this pipe
+            # the TUI writes it to the terminal stderr it kept, not to its capture log
             waiting = (
                 [f"zeta: waiting for another zeta process to finish creating {home}"]
-                if shape == "locked" and surface != "tui"
+                if shape == "locked"
                 else []
             )
             assert stderr.splitlines() == [*waiting, f"zeta: {expected_error}"]
