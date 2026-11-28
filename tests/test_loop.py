@@ -2295,7 +2295,9 @@ async def test_child_backend_build_runs_off_loop_and_retries_server_error(
         max_turns=1,
         skill_catalog=SkillCatalog.empty(),
     )
-    loop.account_context = SimpleNamespace(child_snapshot=lambda _provider: None)
+    loop.account_context = SimpleNamespace(
+        child_snapshot=lambda _provider: None, spawn_hold_refusal=lambda _provider: None
+    )
     call = ToolCall(
         "agent-1",
         "agent",

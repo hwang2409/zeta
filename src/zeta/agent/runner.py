@@ -752,6 +752,20 @@ async def _run_child(
         return failure(
             backend_error, code="state_unavailable",
         )
+    accounts = getattr(loop, "account_context", None)
+    hold_error = (
+        await asyncio.to_thread(
+            accounts.spawn_hold_refusal, getattr(child_backend, "provider", None)
+        )
+        if accounts is not None
+        else None
+    )
+    if hold_error is not None:
+        if child_backend is not loop.backend and is_owned_completion_backend(
+            child_backend
+        ):
+            await loop.close_backend(child_backend, stage="child_construction")
+        return failure(hold_error, code="state_unavailable", public_detail=True)
     # The long kinds default to background -- a run on someone else's model, or
     # one sized for a big task. Waiting on either blocks the orchestrator for
     # the whole thing. An explicit background argument still wins.

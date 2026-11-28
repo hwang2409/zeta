@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
-from typing import TypedDict
+from datetime import UTC, datetime, timedelta
+from typing import Any, TypedDict
 
+from ..models.catalog import DEFAULT_MODELS
 from .availability import AccountDisplay
 from .registry import AccountId
+
+# a cached hold that ends sooner than this is left for the child's own hold to wait out
+SPAWN_REFUSE_HOLD_OVER = timedelta(minutes=10)
+_MODEL_PROVIDER = {"anthropic": "claude", "codex": "codex"}
 
 
 class AccountStatus(TypedDict):
@@ -27,26 +32,71 @@ def account_status(
         usage = item.usage
         if item.account.provider != account.provider or usage is None:
             continue
-        snapshot = usage.snapshot
-        if item.account == account and usage.known_exhausted(now):
+        if item.account != account:
+            alternatives += _has_headroom(item, now)
+            continue
+        if usage.known_exhausted(now):
             used_percent = 100.0
-        if snapshot is None or usage.freshness != "now":
-            continue
-        windows = [
-            window.used_percent for window in snapshot.windows if window.resets_at > now
-        ]
-        if not windows:
-            continue
-        if item.account == account:
+        if (windows := _live_windows(usage, now)) and usage.freshness == "now":
             used_percent = max(windows)
-        elif item.available and not usage.known_exhausted(now):
-            alternatives += 1
     return {
         "account": str(account),
         "held": held,
         "usable_alternatives": alternatives,
         "cached_used_percent": used_percent,
     }
+
+
+def spawn_hold_refusal(
+    displays: Sequence[AccountDisplay], account: AccountId
+) -> str | None:
+    """Name a long cached hold on ``account`` and the accounts with cached headroom."""
+    now = datetime.now(UTC)
+    usage = next((item.usage for item in displays if item.account == account), None)
+    end = usage.exhausted_until(now) if usage is not None else None
+    if end is None or end - now <= SPAWN_REFUSE_HOLD_OVER:
+        return None
+    local = end.astimezone().strftime("%b %d %H:%M %Z").lower()
+    others = [
+        f"{item.account} (model {DEFAULT_MODELS[_MODEL_PROVIDER[item.account.provider]]}"
+        + (
+            ")"
+            if item.account.provider != account.provider
+            else "; switch with /accounts)"
+        )
+        for item in displays
+        if item.account != account and _has_headroom(item, now)
+    ]
+    return (
+        f"agent error: {account} is at its subscription limit until "
+        f"{end.isoformat(timespec='seconds')} ({local}, cached); the child was not started. "
+        + (
+            "accounts with cached headroom: " + ", ".join(others)
+            if others
+            else "no other account has confirmed cached headroom"
+        )
+        + ". pass model=... for another provider, or wait for the reset."
+    )
+
+
+def _live_windows(usage: Any, now: datetime) -> list[float]:
+    snapshot = usage.snapshot
+    if snapshot is None:
+        return []
+    return [
+        window.used_percent for window in snapshot.windows if window.resets_at > now
+    ]
+
+
+def _has_headroom(item: AccountDisplay, now: datetime) -> bool:
+    usage = item.usage
+    return bool(
+        item.available
+        and usage is not None
+        and usage.freshness == "now"
+        and _live_windows(usage, now)
+        and not usage.known_exhausted(now)
+    )
 
 
 def account_status_text(status: Mapping[str, object]) -> str:
