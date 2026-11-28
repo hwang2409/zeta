@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
+import socket
 import subprocess
 import sys
 import warnings
 from asyncio import events, unix_events
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import IO, Any
 
@@ -49,6 +51,9 @@ for signum in (signal.SIGPIPE, getattr(signal, 'SIGXFSZ', None)):
     if signum is not None:
         signal.signal(signum, signal.SIG_DFL)
 os.write(ready_fd, b'1')
+# Run nothing until zeta has recorded this process; if zeta died first, EOF ends the launcher here.
+if os.read(ready_fd, 1) != b'1':
+    os._exit(1)
 os.close(ready_fd)
 os.execvpe('/bin/sh', ['sh', '-c', sys.argv[4]], os.environ)
 """
@@ -139,8 +144,12 @@ async def create_tool_subprocess_shell(
     pass_fds: Sequence[int] = (),
     env: Mapping[str, str] | None = None,
     niceness: int = 0,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> asyncio.subprocess.Process:
-    """Start a session-owned shell after its stdio and inherited fds are installed."""
+    """Start a session-owned shell after its stdio and inherited fds are installed.
+
+    ``on_spawn`` gets the pid before the launcher may run the command.
+    """
 
     if cwd_fd is None:
         directory = os.fspath(cwd if cwd is not None else os.getcwd())
@@ -185,6 +194,8 @@ async def create_tool_subprocess_shell(
             raise
         proc = transport._proc
         try:
+            if on_spawn is not None:
+                on_spawn(proc.pid)
             await waiter
             await _wait_for_launcher(process=proc)
         except BaseException:
@@ -218,6 +229,9 @@ async def _wait_for_launcher(*, process: _SpawnedProcess) -> None:
             raise RuntimeError("tool subprocess launcher failed to start") from None
         if ready_byte != b"1":
             raise RuntimeError("tool subprocess launcher failed to start")
+        with contextlib.suppress(OSError):
+            # A launcher that already died reports through its exit status.
+            os.write(fd, b"1")
     finally:
         loop.remove_reader(fd)
         process.ready.close()
@@ -229,7 +243,8 @@ class _PipeOwner:
         self.parent_stdin: IO[bytes] | None = None
         self.parent_stdout: IO[bytes]
         self.parent_stderr: IO[bytes] | None = None
-        parent_ready, self.child_ready = os.pipe()
+        # Two-way: the launcher says ready, then waits for zeta's go byte.
+        parent_ready, self.child_ready = (end.detach() for end in socket.socketpair())
         self.opened.update((parent_ready, self.child_ready))
         self.parent_ready = os.fdopen(parent_ready, "rb", buffering=0)
         self.opened.remove(parent_ready)
