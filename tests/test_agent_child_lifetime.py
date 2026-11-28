@@ -91,7 +91,9 @@ async def test_child_owner_lifetime(tmp_path, monkeypatch, action, point):
             def child_snapshot(provider):
                 return None
 
-            loop.account_context = SimpleNamespace(child_snapshot=child_snapshot)
+            loop.account_context = SimpleNamespace(
+                child_snapshot=child_snapshot, spawn_hold_refusal=lambda provider: None
+            )
         if point == "append_child_start":
             monkeypatch.setattr(runner, "append_child_start", pause)
         if point in {"build_child_loop", "cleanup_cancel"}:

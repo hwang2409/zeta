@@ -19,7 +19,7 @@ from ..oauth import OAUTH_REFRESH_TIMEOUT_SECONDS
 from ..protocol.types import is_owned_completion_backend
 from .availability import AccountDisplay
 from .exhaustion import classify_subscription_limit, recovery_alternatives
-from .status import AccountStatus, account_status
+from .status import AccountStatus, account_status, spawn_hold_refusal
 from .store import AccountError, AccountId, AccountStore
 from .usage import read_usage, record_usage_snapshot
 
@@ -241,6 +241,21 @@ class SessionAccountContext:
         except (AccountError, OSError, ValueError):
             return []
         return [account_status(displays, account, held=held) for account in accounts]
+
+    def spawn_hold_refusal(self, provider: str | None) -> str | None:
+        """Read cached usage off-loop; refuse a child whose account holds for long."""
+        canonical = account_provider(provider or "")
+        if canonical is None or api_key_mode(canonical) or self._account_state_unknown:
+            return None
+        try:
+            account = self._pins.get(canonical) or self.store.default(canonical)
+            if account is None:
+                return None
+            return spawn_hold_refusal(
+                read_usage(self.store, account), account, self.store.list_display
+            )
+        except (AccountError, OSError, ValueError):
+            return None
 
     async def list_snapshot(self) -> AccountListSnapshot:
         selected = self.snapshot()

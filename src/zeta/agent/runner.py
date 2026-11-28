@@ -67,6 +67,7 @@ from .child_context import (
     _compose_child_project_context,
     _prepare_child_project_context,
     consume_run,
+    refuse_held_child_backend,
     resolve_child_backend,
 )
 from .child_run_owner import ChildControlError, ChildRunTransitionOwner
@@ -752,6 +753,8 @@ async def _run_child(
         return failure(
             backend_error, code="state_unavailable",
         )
+    if (hold_error := await refuse_held_child_backend(loop, child_backend)) is not None:
+        return failure(hold_error, code="state_unavailable", public_detail=True)
     # The long kinds default to background -- a run on someone else's model, or
     # one sized for a big task. Waiting on either blocks the orchestrator for
     # the whole thing. An explicit background argument still wins.
