@@ -13387,6 +13387,22 @@ async def test_agent_send_rejects_every_real_terminal_child_without_revival(
         )
         assert rejected["isError"] is True
         assert "no live run/child" in rejected["content"][0]["text"]
+        finished_at = child_status["finished_at"]
+        if terminal_state == "canceled":
+            next_step = (
+                f"; it was canceled at {finished_at} (transcript: `agent_output {handle}`); "
+                "canceled children do not take follow-ups; spawn a new child and pass "
+                "what it needs"
+            )
+        else:
+            next_step = (
+                f"; it finished at {finished_at} with status {expected_state} "
+                f"(report: `agent_output {handle}`); finished children do not take "
+                "follow-ups; spawn a new child and pass the report"
+            )
+        assert rejected["content"][0]["text"] == (
+            f"agent_send error: no live run/child {handle!r}{next_step}"
+        )
         assert backend.child_calls == calls_before
         assert wakes == wakes_before
         assert [
@@ -13481,7 +13497,10 @@ async def test_send_to_run_rejects_unknown_and_finished_runs(tmp_path: Path) -> 
     owner = BackgroundAgentOwner(store)
     channel = owner.conversation_channel
     error = await send_to_run(store, "run-1", "hello", owner=owner, channel=channel)
-    assert error is not None and "no live run" in error
+    assert error == (
+        "no live run/child 'run-1'; this agent never started a child with that handle; "
+        "list your children with `agent_status`"
+    )
 
     assert await send_to_run(store, "", "hello", owner=owner, channel=channel) == (
         "child_instance_id must be a nonempty string"
@@ -21735,6 +21754,159 @@ async def test_unread_follow_up_still_blocks_finish(
     await loop.close()
 
 
+class FinishDraftBackend(CompletionBackend):
+    """Child finishes twice while a follow-up is queued, then with no summary."""
+
+    report = "long report " * 40
+
+    def __init__(self, retry_summary: str = "") -> None:
+        self.retry_summary = retry_summary
+        self.child_paused = asyncio.Event()
+        self.release_finish = asyncio.Event()
+        self.child_turns = 0
+
+    @owned_completion
+    async def complete(
+        self,
+        messages: Sequence[Message],
+        tool_schemas: Sequence[ToolSchema],
+    ) -> AsyncIterator[StreamEvent]:
+        del tool_schemas
+        last_user = next(
+            (
+                block.text
+                for message in reversed(messages)
+                if message.role is MessageRole.USER
+                for block in message.content
+                if isinstance(block, TextContent)
+            ),
+            "",
+        )
+        yield StreamEvent(StreamEventType.MESSAGE_START)
+        if last_user == "start":
+            blocks = [ToolUseContent(_run_agent_call())]
+        else:
+            self.child_turns += 1
+            if self.child_turns == 1:
+                self.child_paused.set()
+                await await_or_fail(
+                    self.release_finish.wait(), what="finish draft release"
+                )
+                # Two refused calls before the notice is delivered.
+                args = {"status": "done", "summary": self.report, "verdict": "pass"}
+                blocks = [
+                    ToolUseContent(ToolCall("finish-1", "finish", args)),
+                    ToolUseContent(ToolCall("finish-2", "finish", dict(args))),
+                ]
+            else:
+                # A third turn means the retry was refused; end with a
+                # different report so the run stays bounded.
+                summary = self.retry_summary if self.child_turns == 2 else "fallback"
+                blocks = [
+                    ToolUseContent(
+                        ToolCall(
+                            f"finish-{self.child_turns + 1}",
+                            "finish",
+                            {"status": "done", "summary": summary},
+                        )
+                    )
+                ]
+        for block in blocks:
+            yield StreamEvent(StreamEventType.MESSAGE_UPDATE, content=block)
+        yield StreamEvent(
+            StreamEventType.MESSAGE_END,
+            message=Message(MessageRole.ASSISTANT, blocks),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_summary", ["", "NOT READY: macos run failed"])
+async def test_finish_refusal_shows_notice_and_keeps_draft_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, retry_summary: str
+) -> None:
+    backend = FinishDraftBackend(retry_summary)
+    monkeypatch.setitem(
+        AGENT_PRESETS, "run", replace(AGENT_PRESETS["run"], explicit_finish=True)
+    )
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(backend, store, max_turns=1, skill_catalog=SkillCatalog.empty())
+    loop.explicit_finish = True
+    child_store: ConversationStore | None = None
+    try:
+        await _collect(loop.run_turn("start", origin=MessageOrigin.USER))
+        await asyncio.wait_for(backend.child_paused.wait(), timeout=10)
+        handle = _run_handle_from_receipt(store)
+        child_path = Path(str(store.agent_children()[handle]["child_session_path"]))
+        await _send_follow_up(loop, handle, "notice: also check the macos run")
+        backend.release_finish.set()
+        await wait_background_owner(loop)
+
+        child_store = ConversationStore(child_path.parent, session_id=child_path.name)
+        results = [
+            message.tool_result
+            for message in branch_messages(child_store)
+            if message.tool_result is not None
+        ]
+        for refusal in results[:2]:
+            assert refusal.is_error
+            # The refusal names the pending input; its text arrives once, next turn.
+            assert "- 1 follow-up message(s)" in refusal.content, refusal.content
+            assert "also check the macos run" not in refusal.content, refusal.content
+        assert [result.is_error for result in results] == [True, True, False], [
+            result.content for result in results
+        ]
+        assert backend.child_turns == 2
+        report = await asyncio.to_thread(
+            child_store.pending_prompt_queue.explicit_finish_report
+        )
+        assert report is not None
+        if retry_summary:
+            # A new summary uses only its own fields, not the refused draft's.
+            assert report == {"status": "done", "summary": retry_summary}, report
+        else:
+            assert report["summary"] == backend.report.strip()
+            assert report["verdict"] == "pass"
+    finally:
+        await loop.close()
+        if child_store is not None:
+            child_store.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_refusal_preview_lists_prompts_and_notifications(
+    tmp_path: Path,
+) -> None:
+    store = await asyncio.to_thread(ConversationStore, tmp_path)
+    try:
+        await asyncio.to_thread(
+            store.append_agent_notification,
+            "grandchild-1",
+            child_session_path="/tmp/child",
+            description="review",
+            status="completed",
+            text="review says MERGE-READY",
+            display_only=False,
+        )
+        await asyncio.to_thread(
+            store.append_agent_notification,
+            "mirror-1",
+            child_session_path="/tmp/child",
+            description="mirror",
+            status="completed",
+            text="display only mirror",
+            display_only=True,
+        )
+        await asyncio.to_thread(store.pending_prompt_queue.append, "parent says stop")
+        preview = pending_delivery_module.StepDeliveryFlow(store).pending_preview()
+        assert preview.splitlines() == [
+            "- 1 follow-up message(s)",
+            "- agent_completion grandchild-1 completed",
+        ], preview
+    finally:
+        store.close()
+
+
 @pytest.mark.asyncio
 async def test_ask_parent_answer_does_not_block_finish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -23456,6 +23628,32 @@ async def test_done_registered_watcher_cannot_send_or_cancel(
     await loop.close()
     child.close()
     store.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_cancel_on_a_grandchild_names_its_parent(tmp_path: Path) -> None:
+    store = ConversationStore(tmp_path)
+    loop = AgentLoop(
+        FakeBackend([]), store, max_turns=1, skill_catalog=SkillCatalog.empty()
+    )
+    try:
+        lead = f"{store.session_id}:6"
+        grandchild = f"{lead}:34"
+        canceled = await loop.tool_registry.execute(
+            ToolCall("cancel-grandchild", "agent_cancel", {"handle": grandchild})
+        )
+        assert canceled["isError"] is True
+        assert canceled["content"][0]["text"] == (
+            f"agent error: {grandchild} is a child of {lead}, not of you; "
+            f"ask {lead} with agent_send, or cancel {lead}"
+        )
+        unknown = await loop.tool_registry.execute(
+            ToolCall("cancel-unknown", "agent_cancel", {"handle": lead})
+        )
+        assert unknown["content"][0]["text"] == "agent error: unknown child handle"
+    finally:
+        await loop.close()
+        store.close()
 
 
 @pytest.mark.asyncio

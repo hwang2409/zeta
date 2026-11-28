@@ -33,14 +33,14 @@ def catalog_display(value: Mapping[str, Any]) -> list[AccountDisplay]:
 
 
 def list_display(store: AccountStore) -> list[AccountDisplay]:
-    from .store import _read_account_tokens
+    from .store import _listed_tokens
     from .usage import read_usage
 
     result = []
     catalog = store.list_catalog()
     with store._home() as home_fd:
         for item in catalog:
-            tokens = _read_account_tokens(home_fd, item.account)
+            tokens = _listed_tokens(home_fd, item.account)
             details = (
                 tuple(filter(None, (tokens.email, tokens.workspace))) if tokens else ()
             )
