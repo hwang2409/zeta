@@ -1234,8 +1234,21 @@ nanoseconds; missing times are null.
 
 The server captures live status for all resident sessions, including parked
 sessions, before it reads stored metadata. For example, a parked session
-waiting for approval reports `approval`, not the `running` value inferred from
-its on-disk execution lease.
+waiting for approval reports `approval`, not a value inferred from its on-disk
+execution lease.
+
+For a session that this server does not hold, the status comes from the owner
+recorded in the session's runtime lease:
+
+| Lease owner | `status` |
+|---|---|
+| none, or the owner process exited | `idle` |
+| another `serve` or TUI process | `unknown` |
+| a headless run, child agent, or recovery | `running` |
+
+A `serve` or TUI process holds the lease while it is idle, and this server
+cannot see that process's turn, so it reports `unknown`. Headless, child, and
+recovery owners hold the lease only while they work.
 
 Session state uses the same state read errors as the catalog. A missing
 `state_session` target returns `-32602` with `data.code` `session_not_found`.
