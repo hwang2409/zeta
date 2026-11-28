@@ -1095,10 +1095,11 @@ class ConnectionRegistry(ReplayOutput):
             connection, lambda: settings.catalog(runtime), controller, fence=False
         )
 
-    async def read_settings(self, connection: Any, controller: SessionUse) -> object:
+    async def read_settings(
+        self, connection: Any, params: dict[str, Any], controller: SessionUse
+    ) -> object:
         runtime = controller.runtime
-        if runtime.opened is None:
-            raise ProtocolError(ErrorDescriptor.INTERNAL_ERROR, "server has no active session")
+        validation.active(runtime, params)
         telemetry = settings.telemetry(connection)
         return await self.run_read(
             connection, lambda: settings.settings(runtime, telemetry=telemetry), controller, fence=False
