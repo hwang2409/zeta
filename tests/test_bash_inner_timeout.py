@@ -79,6 +79,7 @@ async def test_short_inner_timeout_does_not_lower_the_default(
 ) -> None:
     # test-contract: seam small values keep the test fast; the ratio matches 2 s vs 30 s
     monkeypatch.setattr(bash_tool, "_DEFAULT_TIMEOUT_SECONDS", 1.0)
+    # test-contract: seam the 5 s margin is too slow to wait out here
     monkeypatch.setattr(bash_tool, "_INNER_TIMEOUT_MARGIN_SECONDS", 0.1)
     text, result = await _run(
         tmp_path, {"command": _IGNORE_N + "timeout 0.1 true && sleep 0.5 && echo done"}
