@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,12 +44,22 @@ class ChildTurnControl:
         self.used = 0
         self._reserved = False
         self._warned = False
+        self._settlement_ready = False
+
+    def restore_used(self, used: int) -> None:
+        self.used = used
+        self._warned = used >= math.ceil(0.9 * self.limit)
+
+    def admit_settlement(self) -> None:
+        assert self.exhausted and not self.reserved
+        self._settlement_ready = True
 
     def begin_completion(self) -> Message | None:
         if self._reserved:
             return None
-        if self.used >= self.limit:
+        if self.exhausted and not self._settlement_ready:
             return None
+        self._settlement_ready = False
         self._reserved = True
         number = self.used + 1
         if not self._warned and number == math.ceil(0.9 * self.limit):
@@ -210,6 +220,7 @@ def project_payload(payload: dict[str, object], child_session_path: str) -> dict
 def background_turn_limit_state(
     *,
     result: object,
+    exhausted_control: ChildTurnControl | None,
     child_turns: Callable[[], int],
     child_loop: Any,
     child_instance_id: str,
@@ -220,16 +231,14 @@ def background_turn_limit_state(
     structured = (
         result.get("structuredContent", {}) if isinstance(result, dict) else {}
     )
-    control = getattr(child_loop, "child_turn_control", None)
-    turn_limited = control is not None and control.exhausted
     turns_used = max(child_turns(), int(structured.get("turns_used", 0)))
-    if not turn_limited:
+    if exhausted_control is None:
         return False, turns_used, None
     return (
         True,
         turns_used,
         background_fallback_handoff(
-            control=control,
+            control=exhausted_control,
             child_instance_id=child_instance_id,
             child_session_path=child_session_path,
             final_text=final_text,
@@ -318,31 +327,6 @@ async def finalize_exhausted_child(
     return project_payload(result, child_session_path)
 
 
-def finish_foreground_turn_limit(
-    *,
-    store: ConversationStore,
-    child_session_path: str,
-    readable_text: str,
-    turns_used: int,
-    stats: dict[str, object],
-    build_result: Callable[..., dict[str, object]],
-) -> dict[str, object]:
-    payload = build_result(
-        readable_text,
-        state="completed",
-        stats=stats,
-        persist_receipt=False,
-    )
-    receipt = payload["content"][0]["text"]
-    store.finish_agent_lifecycle(
-        "completed",
-        final_result=build_turn_limit_result(receipt, child_session_path),
-        turns_used=turns_used,
-        canonical_receipt=True,
-    )
-    return payload
-
-
 def make_publish_child_lifecycle(
     *,
     account_context: Any,
@@ -390,38 +374,27 @@ def make_child_progress_callbacks(
     child_store: Any,
     child_marker_key: str,
     child_tool_call_id: str,
-) -> tuple[Callable[[int], None], Callable[[], None]]:
-    def update_turns(turns: int) -> None:
+    recoverable: bool,
+) -> tuple[Callable[[int], Awaitable[None] | None], Callable[[], None]]:
+    from ..core.store._async_writes import _ChildActivityCommand, _ChildTurnsCommand
+
+    async def persist_turns(turns: int) -> None:
+        await child_store._commit_storage_command(_ChildActivityCommand(turns=turns))
+        parent = loop._background_owner.parent_store(child_marker_key, loop.store)
+        await parent._commit_storage_command(_ChildTurnsCommand(run_id=child_marker_key, turns=turns))
+
+    def update_turns(turns: int) -> Awaitable[None] | None:
         loop._agent_child_turns[child_tool_call_id] = turns
+        if recoverable:
+            return persist_turns(turns)
         child_store.update_agent_lifecycle(turns_used=turns)
         loop.store.update_agent_child_turns(child_marker_key, turns)
+        return None
 
     def record_tool_call() -> None:
         child_store.update_agent_lifecycle(tool_calls=1)
 
     return update_turns, record_tool_call
-
-
-def make_finish_limited_child_turn(
-    *,
-    store: ConversationStore,
-    child_session_path: str,
-    turns_used: Callable[[], int],
-    stats: Callable[[int], dict[str, object]],
-    build_result: Callable[..., dict[str, object]],
-) -> Callable[[str], dict[str, object]]:
-    def finish(readable_text: str) -> dict[str, object]:
-        used = turns_used()
-        return finish_foreground_turn_limit(
-            store=store,
-            child_session_path=child_session_path,
-            readable_text=readable_text,
-            turns_used=used,
-            stats=stats(used),
-            build_result=build_result,
-        )
-
-    return finish
 
 
 def fallback_handoff(

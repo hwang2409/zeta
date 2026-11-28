@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 from ...agent.explicit_finish import owned_work_descriptions
-from ...agent.terminal_fence import TerminalTransitionFence
 from ..registry import AbortSignal, ToolExecutionContext, ToolRegistry, text_block
 
 _STATUSES = {"done", "blocked", "failed"}
@@ -17,8 +16,8 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
     if child_loop is None:
         return
 
-    fence = TerminalTransitionFence(
-        registry._session_store,
+    owner = child_loop._child_run_owner
+    owner.bind_finish_checks(
         notification_pending=lambda: bool(
             child_loop.step_delivery
             and child_loop.step_delivery.has_pending_edge
@@ -31,7 +30,6 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
         owned_work=lambda: owned_work_descriptions(child_loop),
         delivering_prompt_id=lambda: getattr(child_loop, "_delivering_prompt_id", None),
     )
-    child_loop._terminal_transition_fence = fence
 
     registry.set_execution_guard(
         lambda _name: (
@@ -71,12 +69,12 @@ def register(registry: ToolRegistry, *, child_loop: Any = None) -> None:
             report["head_sha"] = head_sha
         if verdict is not None:
             report["verdict"] = verdict
-        if refusal := fence.owned_work_refusal():
+        if refusal := owner.owned_work_refusal():
             return _error("finish refused; " + refusal)
         flow = child_loop.step_delivery
         if flow is not None and (await flow.admit_terminal("finish")).pending:
             return _error("finish refused; pending notification must be read first")
-        refusal = await fence.accept_finish(report)
+        refusal = await owner.accept_finish(report)
         if refusal is not None:
             return _error("finish refused; " + refusal)
         child_loop._explicit_finish_report = report

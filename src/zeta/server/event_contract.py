@@ -113,6 +113,8 @@ LEGACY_NOTIFICATION_WIRE_EVENT = EventDescriptor.SUB_AGENT_RECEIPT
 NOTIFICATION_WIRE_EVENTS = {
     "agent_completion": LEGACY_NOTIFICATION_WIRE_EVENT,
     "child_idle": EventDescriptor.CHILD_IDLE,
+    "child_recovered": EventDescriptor.CHILD_RECOVERED,
+    "child_suspended": EventDescriptor.CHILD_SUSPENDED,
     "child_hold": EventDescriptor.CHILD_HOLD,
     "task_exited": EventDescriptor.TASK_EXIT_NOTIFICATION,
     "project_inbox": EventDescriptor.PROJECT_INBOX_NOTIFICATION,
@@ -129,6 +131,8 @@ LIVE_NOTIFICATION_KINDS = frozenset({"project_inbox_health"})
 def notification_wire_event(kind: object, protocol_version: str) -> EventDescriptor:
     """Preserve the legacy notification event until protocol 1.2."""
 
+    if kind == "child_suspended":
+        return EventDescriptor.CHILD_SUSPENDED
     if protocol_version != "1.2":
         return LEGACY_NOTIFICATION_WIRE_EVENT
     return NOTIFICATION_WIRE_EVENTS.get(kind, LEGACY_NOTIFICATION_WIRE_EVENT)

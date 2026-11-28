@@ -234,6 +234,7 @@ class _StageDeliveryRequestCommand(_StoreMutationCommand):
     token_counter: Any
     notification_selector: Any
     notification_context: Any
+    ignore_prompts: bool = False
 
     def apply(self, store: Any) -> Any:
         return store._stage_delivery_request(
@@ -241,6 +242,7 @@ class _StageDeliveryRequestCommand(_StoreMutationCommand):
             self.token_counter,
             self.notification_selector,
             self.notification_context,
+            self.ignore_prompts,
         )
 
 
@@ -280,10 +282,11 @@ class _AcceptExplicitFinishCommand(_StoreMutationCommand):
     report: dict[str, object]
     notification_ids: frozenset[str]
     prompt_id: str | None
+    question_settlement: bool = False
 
     def apply(self, store: Any) -> Any:
         return store._accept_explicit_finish(
-            self.report, self.notification_ids, self.prompt_id
+            self.report, self.notification_ids, self.prompt_id, self.question_settlement
         )
 
 
@@ -326,9 +329,10 @@ class _ResolveApprovalCommand(_StoreMutationCommand):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _MarkAgentCanceledCommand(_StoreMutationCommand):
     tool_call_id: str
+    current_step: str | None = None
 
     def apply(self, store: Any) -> None:
-        store.mark_agent_canceled(self.tool_call_id)
+        store.mark_agent_canceled(self.tool_call_id, current_step=self.current_step)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -342,6 +346,7 @@ class _RegisterAgentChildCommand(_StoreMutationCommand):
     accepts_follow_ups: bool
     explicit_finish: bool
     turns_used: int
+    resume: dict[str, Any] | None = None
 
     def apply(self, store: Any) -> Any:
         return store.register_agent_child(
@@ -354,7 +359,136 @@ class _RegisterAgentChildCommand(_StoreMutationCommand):
             accepts_follow_ups=self.accepts_follow_ups,
             explicit_finish=self.explicit_finish,
             turns_used=self.turns_used,
+            resume=self.resume,
         )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _SelectChildAccountsCommand(_StoreMutationCommand):
+    run_id: str
+    pins: dict[str, str]
+
+    def apply(self, store: Any) -> None:
+        store.select_child_accounts(self.run_id, self.pins)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ChildTurnsCommand(_StoreMutationCommand):
+    run_id: str
+    turns: int
+
+    def apply(self, store: Any) -> None:
+        store.persist_agent_child_turns(self.run_id, self.turns)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ReserveQuestionSettlementCommand(_StoreMutationCommand):
+    question_ids: frozenset[str]
+    turn: int
+
+    def apply(self, store: ConversationStore) -> None:
+        from ...protocol.types import Message, MessageRole, TextContent
+        from ._pending_prompts import PENDING_PROMPT_ID_METADATA
+
+        with store.pending_prompt_queue._lock():
+            fold = store._delivery_fold
+            rows = [
+                ("child_question_state", {**fold.child_questions[q].data, "settlement_turn": self.turn})
+                for q in self.question_ids
+            ]
+            # The single settlement turn must see the entire queued follow-up batch.
+            for prompt in store.pending_prompt_queue._pending_unlocked():
+                text = prompt.data["text"]
+                if prompt.id not in fold.prompt_messages:
+                    message = Message(MessageRole.USER, [TextContent(text)], metadata={
+                        "zeta.origin": prompt.data["origin"], PENDING_PROMPT_ID_METADATA: prompt.id,
+                    })
+                    rows.append(("message", {"message": message.to_dict()}))
+                rows.append(("pending_prompt_ack", {"prompt_id": prompt.id}))
+            store._append_many_unlocked(rows)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ChildQuestionsCommand(_StoreMutationCommand):
+    rows: tuple[dict[str, Any], ...]
+
+    def apply(self, store: ConversationStore) -> None:
+        if not store.child_question_hold_enabled:
+            raise ValueError("child question state requires a newer home epoch")
+        store.append_many(("child_question_state", data) for data in self.rows)
+
+
+@dataclass(frozen=True, slots=True)
+class _ChildActivityCommand(_StoreMutationCommand):
+    state: str | None = None
+    turns: int | None = None
+
+    current_step: str | None = None
+
+    def apply(self, store: Any) -> None:
+        store.persist_child_activity(state=self.state, turns=self.turns, current_step=self.current_step)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _ChildSuspensionCommand(_StoreMutationCommand):
+    reason: str | None = None
+    activate: int | None = None
+    blocked: str | None = None
+
+    provider_retry: dict[str, str | int] | None = None
+    retry_progress: bool = False
+    retry_schedule: tuple[str, int] | None = None
+    activation_stopped: Callable[[], bool] | None = None
+
+    def apply(self, store: Any) -> Any:
+        return store.transition_agent_suspension(
+            reason=self.reason, activate=self.activate, blocked=self.blocked,
+            provider_retry=self.provider_retry, retry_progress=self.retry_progress, retry_schedule=self.retry_schedule,
+            activation_stopped=self.activation_stopped,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _RepairChildInterruptionCommand(_StoreMutationCommand):
+    def apply(self, store: Any) -> None:
+        from ...protocol.types import Message, MessageRole, TextContent, ToolUseContent
+        from ...runtime.approval_recovery import recover_store_approvals
+        from ..approval import canceled_result
+
+        pending = dict.fromkeys(
+            item.tool_call.id
+            for ref in store.branch_refs() if ref.type == "message"
+            for item in Message.from_dict(store.entry(ref).data["message"]).content
+            if isinstance(item, ToolUseContent) and item.tool_call.id not in store._delivery_fold.tool_result_seqs
+        )
+        recover_store_approvals(store, store._storage_lease.observed_epoch)
+        for call_id in pending:
+            if store.tool_result(call_id) is None:
+                result = canceled_result(call_id)
+                store.append_message(Message(
+                    MessageRole.TOOL_RESULT, [TextContent(result.content)], tool_result=result,
+                ))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _CloseChildApprovalHistoryCommand(_StoreMutationCommand):
+    payload: dict[str, object]
+
+    def apply(self, store: Any) -> None:
+        store.append_approval_history_end_if_absent(self.payload)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _AppendChildRecoveredCommand(_StoreMutationCommand):
+    run_id: str
+    episode: int
+    path: str
+    description: str
+
+    suspension: dict | None = None
+
+    def apply(self, store: Any) -> Any:
+        return store.append_child_recovered(self.run_id, self.episode, path=self.path, description=self.description, suspension=self.suspension)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -388,6 +522,7 @@ class _FinishAgentLifecycleCommand(_StoreMutationCommand):
     killed_task_count: int | None
     killed_task_ids_truncated: bool | None
     canonical_receipt: bool
+    current_step: str | None = None
 
     def apply(self, store: Any) -> None:
         store.finish_agent_lifecycle(
@@ -398,6 +533,7 @@ class _FinishAgentLifecycleCommand(_StoreMutationCommand):
             killed_task_count=self.killed_task_count,
             killed_task_ids_truncated=self.killed_task_ids_truncated,
             canonical_receipt=self.canonical_receipt,
+            current_step=self.current_step,
         )
 
 
@@ -1002,6 +1138,8 @@ class AsyncDurableWritesMixin:
         token_counter: Any,
         notification_selector: Any,
         notification_context: Any,
+        *,
+        ignore_prompts: bool = False,
     ) -> Any:
         return await self._commit_storage_command(
             _StageDeliveryRequestCommand(
@@ -1009,6 +1147,7 @@ class AsyncDurableWritesMixin:
                 token_counter=token_counter,
                 notification_selector=notification_selector,
                 notification_context=notification_context,
+                ignore_prompts=ignore_prompts,
             )
         )
 
@@ -1045,12 +1184,15 @@ class AsyncDurableWritesMixin:
         report: dict[str, object],
         notification_ids: frozenset[str],
         prompt_id: str | None,
+        *,
+        question_settlement: bool = False,
     ) -> Any:
         return await self._commit_storage_command(
             _AcceptExplicitFinishCommand(
                 report=report,
                 notification_ids=notification_ids,
                 prompt_id=prompt_id,
+                question_settlement=question_settlement,
             )
         )
 
@@ -1064,10 +1206,10 @@ class AsyncDurableWritesMixin:
         return await self._commit_storage_command(_TerminalTransitionCommand())
 
     async def mark_agent_canceled_async(
-        self: ConversationStore, parent_tool_call_id: str
+        self: ConversationStore, parent_tool_call_id: str, *, current_step: str
     ) -> None:
         await self._commit_storage_command(
-            _MarkAgentCanceledCommand(tool_call_id=parent_tool_call_id)
+            _MarkAgentCanceledCommand(tool_call_id=parent_tool_call_id, current_step=current_step)
         )
 
     async def idle_nudge_eligible(

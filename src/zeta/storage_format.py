@@ -24,8 +24,9 @@ from typing import Any, Final, Self
 
 from .locking import format_lock, open_created, shape_lock
 
-WRITER_EPOCH: Final = 12
+WRITER_EPOCH: Final = 13
 P06_FEATURE_EPOCH: Final = 6
+CHILD_QUESTION_STATES: Final = frozenset({"pending", "answered", "withdrawn"})
 
 
 class StorageFeature(StrEnum):
@@ -40,6 +41,9 @@ class StorageFeature(StrEnum):
     SESSION_RETENTION_ACTIVATION = "session_retention_activation"
     INBOX_DURABLE_INTENT = "inbox_durable_intent"
     TRANSCRIPT_TAIL_EVIDENCE = "transcript_tail_evidence"
+    CHILD_RECOVERY = "child_recovery"
+    PROVIDER_RECOVERY = "provider_recovery"
+    CHILD_QUESTION_HOLD = "child_question_hold"
 
 
 FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
@@ -52,6 +56,10 @@ FEATURE_EPOCHS: Final[dict[StorageFeature, int]] = {
     StorageFeature.SESSION_RETENTION: 8,
     StorageFeature.SESSION_RETENTION_ACTIVATION: 11,
     StorageFeature.TRANSCRIPT_TAIL_EVIDENCE: 12,
+    StorageFeature.CHILD_RECOVERY: 13,
+    # feature-branch epochs 14 and 15 collapse into main's single +1 epoch.
+    StorageFeature.CHILD_QUESTION_HOLD: 13,
+    StorageFeature.PROVIDER_RECOVERY: 13,
     # APPROVAL_RESTART_REASON and INBOX_DURABLE_INTENT must be fixed int literals
     # (test_storage_feature_epochs forbids referencing WRITER_EPOCH here).
     # Recheck main+1 at the final merge.
@@ -120,6 +128,25 @@ GATED_HOME_PATHS: Final[tuple[tuple[str, str], ...]] = (
 # Persisted mappings that reject unknown keys.  Names are wire-shape names, not
 # Python type names, so a conditional variant can be compared independently.
 ACCEPTED_KEY_SETS: Final[dict[str, frozenset[str]]] = {
+    "child_question_state": frozenset({
+        "question_id", "state", "question", "options", "held_at_turn_limit",
+        "ancestor_target_ids", "settlement_turn",
+    }),
+    "child_suspended_notification": frozenset({
+        "kind", "origin", "logical_id", "child_instance_id", "child_session_path", "description", "episode", "text", "display_only", "code", "next_retry_at",
+    }),
+    "child_recovered_notification": frozenset({
+        "kind", "origin", "logical_id", "child_instance_id", "child_session_path", "description", "episode", "text", "display_only",
+    }),
+    "child_resume": frozenset({
+        "preset", "requested_model", "model", "provider", "requested_max_turns",
+        "effective_max_turns", "depth", "cwd", "description", "background",
+        "follow_up", "explicit_finish", "account_pins", "selected_accounts",
+    }),
+    "child_resume_preset": frozenset({
+        "name", "source", "tool_names", "preamble", "prompt_suffix", "allow_delegation",
+        "accepts_follow_ups", "explicit_finish", "max_child_depth", "max_turns",
+    }),
     "hook_config": frozenset({"hook"}),
     "hook_record": frozenset({"event", "command", "timeout_seconds", "tools", "on_error"}),
     "notification_marker": frozenset({"notification_id"}),
@@ -258,6 +285,14 @@ BROAD_OWNED_SUBTREES: Final[dict[str, frozenset[tuple[str, ...]]]] = {
 }
 
 CLOSED_VARIANTS: Final[dict[str, frozenset[object]]] = {
+    "child_question_state.state": CHILD_QUESTION_STATES,
+    "notification.child_suspended": frozenset({"child_suspended"}),
+    "notification.child_recovered": frozenset({"child_recovered"}),
+    "child_lifecycle.state": frozenset({"running", "idle", "finishing", "completed", "canceled", "failed", "suspended"}),
+    "child_lifecycle.resume_mode": frozenset({"idle", "active"}),
+    "child_lifecycle.suspension_reason": frozenset({"normal_exit", "owner_lost", "provider_unavailable"}),
+    "child_lifecycle.retry_state": frozenset({"retrying", "stopped"}),
+    "child_resume.account_pins": frozenset({"pending", "selected"}),
     "approval.resolution_reason": APPROVAL_RESOLUTION_REASONS,
     "attention.kind": frozenset({"decision", "answer", "decided", "deferred"}),
     "account.provider": frozenset({"anthropic", "codex"}),

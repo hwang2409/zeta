@@ -37,6 +37,7 @@ class DeliveryFold:
         "active_prompts",
         "agent_call_ids",
         "agent_receipts",
+        "child_questions",
         "completions_by_child",
         "delivery_message",
         "last_message",
@@ -47,7 +48,9 @@ class DeliveryFold:
         "presented",
         "prompt_ids",
         "prompt_messages",
+        "question_cards",
         "queue_closed",
+        "recoveries_by_id",
         "tool_result_receipts",
         "tool_result_seqs",
     )
@@ -60,9 +63,12 @@ class DeliveryFold:
         self.agent_receipts: list[tuple[str, str]] = []
         self.notification_ids: set[str] = set()
         self.active_notifications: dict[str, ConversationEntry] = {}
+        self.recoveries_by_id: dict[str, ConversationEntry] = {}
         self.completions_by_child: dict[str, ConversationEntry] = {}
         self.presented: set[str] = set()
         self.prompt_ids: set[str] = set()
+        self.child_questions: dict[str, ConversationEntry] = {}
+        self.question_cards: dict[tuple[str, str], ConversationEntry] = {}
         self.active_prompts: dict[str, ConversationEntry] = {}
         self.prompt_messages: dict[str, Message] = {}
         self.queue_closed = False
@@ -106,9 +112,12 @@ class DeliveryFold:
         new.agent_receipts = list(self.agent_receipts)
         new.notification_ids = set(self.notification_ids)
         new.active_notifications = dict(self.active_notifications)
+        new.recoveries_by_id = dict(self.recoveries_by_id)
         new.completions_by_child = dict(self.completions_by_child)
         new.presented = set(self.presented)
         new.prompt_ids = set(self.prompt_ids)
+        new.child_questions = dict(self.child_questions)
+        new.question_cards = dict(self.question_cards)
         new.active_prompts = dict(self.active_prompts)
         new.prompt_messages = dict(self.prompt_messages)
         new.queue_closed = self.queue_closed
@@ -163,6 +172,8 @@ class DeliveryFold:
                     f"duplicate notification TUI presentation: {notification_id}"
                 )
             self.presented.add(notification_id)
+        elif entry_type == "child_question_state":
+            self.child_questions[entry.data["question_id"]] = entry
         elif entry_type == "pending_prompt":
             self.prompt_ids.add(entry.id)
             self.active_prompts[entry.id] = entry
@@ -231,7 +242,14 @@ class DeliveryFold:
     def _apply_notification(self, entry: ConversationEntry) -> None:
         handle = entry.data.get("child_instance_id")
         child_path = entry.data.get("child_session_path")
-        if type(handle) is str and handle and type(child_path) is str and child_path:
+        kind = entry.data.get("kind")
+        if kind == "child_question":
+            self.question_cards[handle, entry.data["question_id"]] = entry
+        elif kind == "child_question_withdrawn":
+            self.question_cards.pop((handle, entry.data["question_id"]), None)
+        if kind in {"child_recovered", "child_suspended"}:
+            self.recoveries_by_id.setdefault(entry.data["logical_id"], entry)
+        elif type(handle) is str and handle and type(child_path) is str and child_path:
             self.agent_receipts.append((handle, child_path))
         self.notification_ids.add(entry.id)
         self.active_notifications[entry.id] = entry

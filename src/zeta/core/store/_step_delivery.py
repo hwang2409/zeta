@@ -103,6 +103,8 @@ TERMINAL_DISPOSITION: Mapping[str, TerminalRoute] = MappingProxyType(
         AGENT_COMPLETION_NOTIFICATION_KIND: TerminalRoute("fold", "reroute"),
         CHILD_QUESTION_NOTIFICATION_KIND: TerminalRoute("keep", "reroute"),
         CHILD_IDLE_NOTIFICATION_KIND: TerminalRoute("keep", "reroute"),
+        "child_recovered": TerminalRoute("keep", "keep"),
+        "child_suspended": TerminalRoute("keep", "keep"),
         CHILD_HOLD_NOTIFICATION_KIND: TerminalRoute("keep", "reroute"),
         PROJECT_INBOX_NOTIFICATION_KIND: TerminalRoute("keep", "keep"),
         TASK_EXITED_NOTIFICATION_KIND: TerminalRoute("ack_moot", "ack_moot"),
@@ -132,6 +134,7 @@ class PromptInput:
     origin: MessageOrigin
     deadline: float | None
     starts_new_episode: bool = False
+    answer_question_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,7 +169,8 @@ class StagedDelivery:
     notification_ids: tuple[str, ...]
     prompt_message: Message | None
     prompt_id: str | None
-    more_pending: bool
+    more_prompts: bool
+    more_notifications: bool
     publications: DeliveryPublications
 
 
@@ -189,6 +193,7 @@ def _commit_delivery_input(
             origin=item.origin,
             deadline=item.deadline,
             starts_new_episode=item.starts_new_episode,
+            answer_question_id=item.answer_question_id,
         )
         return ProducerResult((entry,), True, 1)
 
@@ -357,10 +362,17 @@ def _child_question_mutation_rows(
         for entry in store._delivery_fold.active_notifications.values()
         if entry.data.get("kind") == "child_question"
         and entry.data.get("child_instance_id") == child_id
+        and ("question_id" not in data or entry.data.get("question_id") == data["question_id"])
     ]
     rows: list[tuple[str, dict[str, Any]]] = []
+    if kind == "child_question_close" and "question_id" in data and not entries:
+        # An acknowledgement consumes model input, not the displayed card.
+        historical_card = store._delivery_fold.question_cards.get((child_id, data["question_id"]))
+        if historical_card is not None:
+            entries.append(historical_card)
     for entry in entries:
-        rows.append(("notification_ack", {"notification_id": entry.id}))
+        if entry.id in store._delivery_fold.active_notifications:
+            rows.append(("notification_ack", {"notification_id": entry.id}))
         if kind == "child_question_close":
             rows.append(
                 (
@@ -476,9 +488,10 @@ def _stage_delivery_request(
     token_counter: Callable[[Sequence[Message]], int] | None,
     notification_selector: NotificationSelector,
     notification_context: Message | None = None,
+    ignore_prompts: bool = False,
 ) -> StagedDelivery:
     with store.pending_prompt_queue._lock():
-        pending_prompts = store.pending_prompt_queue._pending_unlocked()
+        pending_prompts = [] if ignore_prompts else store.pending_prompt_queue._pending_unlocked()
         pending_notifications = [
             entry
             for entry in store._delivery_fold.active_notifications.values()
@@ -510,8 +523,8 @@ def _stage_delivery_request(
             represented_ids,
             prompt_message,
             prompt_entry.id if prompt_entry is not None else None,
-            len(pending_prompts) > 1
-            or len(pending_notifications) > len(notification_entries),
+            len(pending_prompts) > 1,
+            len(pending_notifications) > len(notification_entries),
             DeliveryPublications(
                 tuple(store._snapshot_entry(entry) for entry in notification_entries),
                 store._snapshot_entry(prompt_entry) if prompt_entry is not None else None,
@@ -712,6 +725,7 @@ class StepDeliveryStoreMixin:
         token_counter: Callable[[Sequence[Message]], int] | None,
         notification_selector: NotificationSelector,
         notification_context: Message | None = None,
+        ignore_prompts: bool = False,
     ) -> StagedDelivery:
         return _stage_delivery_request(
             self,
@@ -719,6 +733,7 @@ class StepDeliveryStoreMixin:
             token_counter,
             notification_selector,
             notification_context,
+            ignore_prompts,
         )
 
     def _acknowledge_staged_delivery(

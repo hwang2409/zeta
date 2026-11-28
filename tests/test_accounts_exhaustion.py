@@ -38,7 +38,7 @@ from zeta.accounts.usage import (
     UsageWindow,
     format_usage_lines,
     read_usage,
-    record_subscription_limit,
+    record_usage_snapshot,
 )
 from zeta.core.session import SessionError, SessionManager
 from zeta.core.store import ConversationStore
@@ -175,7 +175,7 @@ def test_limit_marks_account_known_exhausted_until_reset(tmp_path: Path) -> None
     limit = SubscriptionLimit(ACCOUNT, NOW + timedelta(hours=1), 10080)
     state = limit.usage_state(NOW)
     assert state.snapshot is not None
-    record_subscription_limit(store, ACCOUNT, state.snapshot, NOW)
+    record_usage_snapshot(store, ACCOUNT, state.snapshot, NOW)
 
     persisted = read_usage(store, ACCOUNT, now=NOW)
     assert persisted.known_exhausted(NOW)

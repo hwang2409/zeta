@@ -350,7 +350,7 @@ async def test_failed_persistence_releases_context_for_exactly_one_retry(
     failed = False
 
     def fail_context_append(
-        self, notification_budget, token_counter, selector, notification_context=None
+        self, notification_budget, token_counter, selector, notification_context=None, ignore_prompts=False
     ):
         nonlocal failed
         if (
@@ -366,6 +366,7 @@ async def test_failed_persistence_releases_context_for_exactly_one_retry(
             token_counter,
             selector,
             notification_context,
+            ignore_prompts,
         )
 
     fail_context_append.__name__ = "_stage_delivery_request"
