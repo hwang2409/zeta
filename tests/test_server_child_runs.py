@@ -563,9 +563,9 @@ async def test_accepts_send_is_false_for_running_profile_without_follow_ups_and_
 async def test_accepts_send_is_true_for_provider_suspended_run_with_live_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from tests.test_child_provider_recovery import _ManualClock, _RecoveryBackend
     from zeta.agent import runner
     from zeta.core.agent_progress import register_child_run_sink
-    from tests.test_child_provider_recovery import _ManualClock, _RecoveryBackend
 
     clock = _ManualClock()
     child_backend = _RecoveryBackend(clock)
