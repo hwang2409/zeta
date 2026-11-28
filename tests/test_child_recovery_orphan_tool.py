@@ -255,7 +255,8 @@ async def test_unstoppable_orphan_blocks_recovery(tmp_path, monkeypatch):
         _seam(monkeypatch, "_holders", lambda fd, path: [])
         recovered, lifecycle = await _resume(tmp_path, monkeypatch, session_id, pids, expect_call=False)
         assert lifecycle["state"] == "suspended"
-        assert f"process group {pids[0]}" in lifecycle.get("recovery_blocked", ""), lifecycle
+        # On Linux /bin/sh forks bash instead of exec-ing it, so the group leader is the shell, not $$.
+        assert f"process group {os.getpgid(pids[0])}" in lifecycle.get("recovery_blocked", ""), lifecycle
         assert recovered.calls == []
         assert _alive(pids[0])
         assert _records(), "the record must stay so the next resume tries again"

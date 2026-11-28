@@ -414,7 +414,7 @@ async def _bash(
         os.close(read_fd)
         if record is not None:
             if process is None or process.returncode is not None:
-                record.unlink()
+                record.remove()
             else:
                 record.close_parent_fd()
 

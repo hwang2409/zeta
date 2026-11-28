@@ -63,7 +63,7 @@ class ToolProcessRecord:
             os.close(self.fd)
             self.fd = -1
 
-    def unlink(self) -> None:
+    def remove(self) -> None:
         """Remove the record once the command was reaped or never spawned."""
         self.close_parent_fd()
         self.path.unlink(missing_ok=True)
