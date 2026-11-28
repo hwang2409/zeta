@@ -24,6 +24,18 @@ def _direct_terminal(registry: ToolRegistry, handle: str) -> bool:
     return len(rows) == 1 and _is_finished_agent_status(rows[0])
 
 
+def _not_own_child(registry: ToolRegistry, handle: str) -> str:
+    store = registry.session_store
+    own = store.agent_handle() or store.session_id
+    parent = handle.rpartition(":")[0]
+    if parent.startswith(own + ":"):
+        return (
+            f"{handle} is a child of {parent}, not of you; "
+            f"ask {parent} with agent_send, or cancel {parent}"
+        )
+    return "unknown child handle"
+
+
 async def agent_cancel(
     registry: ToolRegistry, arguments: dict[str, Any], abort_signal: AbortSignal,
     stream_publisher: object = None,
@@ -45,7 +57,7 @@ async def agent_cancel(
                 outcome_status = "already_finished"
                 outcome_error = None
             else:
-                return _agent_error("unknown child handle", max_bytes)
+                return _agent_error(_not_own_child(registry, handle), max_bytes)
         else:
             outcome = await owner.cancel_and_wait(handle)
             outcome_status = outcome.status

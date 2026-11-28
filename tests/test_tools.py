@@ -198,6 +198,83 @@ async def test_registry_validates_arguments_before_running_handler(tmp_path: Pat
     assert not called
 
 
+@pytest.mark.asyncio
+async def test_registry_size_errors_state_the_limit_and_the_real_size(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    registry.register(
+        "sized",
+        lambda arguments: "ran",
+        parameters={
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "minLength": 2, "maxLength": 5},
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 2,
+                },
+            },
+            "additionalProperties": False,
+        },
+    )
+    try:
+        cases = {
+            "long": (
+                {"summary": "x" * 9},
+                "arguments.summary is too long (9 > 5 characters)",
+            ),
+            "short": (
+                {"summary": "x"},
+                "arguments.summary is too short (1 < 2 characters)",
+            ),
+            "items": (
+                {"options": ["a", "b", "c"]},
+                "arguments.options has too many items (3 > 2)",
+            ),
+        }
+        for call_id, (arguments, message) in cases.items():
+            result = await registry.execute(ToolCall(call_id, "sized", arguments))
+            assert result["isError"] is True
+            assert result["content"][0]["text"] == f"invalid arguments: {message}"
+    finally:
+        await registry.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_rejects_a_copied_context_placeholder_before_schema_checks(
+    tmp_path: Path,
+) -> None:
+    called = False
+
+    def handler(arguments: dict[str, object]) -> str:
+        nonlocal called
+        called = True
+        return "ran"
+
+    registry = ToolRegistry(
+        tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty()
+    )
+    # an open schema: without the early check the placeholder would reach the handler
+    registry.register(
+        "open", handler, parameters={"type": "object"}, requires_approval=False
+    )
+    try:
+        result = await registry.execute(
+            ToolCall("copied", "open", {"eviction_receipt": {"source_seq": 649}})
+        )
+        assert result["content"][0]["text"] == (
+            "invalid arguments: you copied a context placeholder; send the real arguments"
+        )
+        assert result["isError"] is True
+        assert not called
+    finally:
+        await registry.close()
+
+
 def test_registry_rejects_unsupported_schema_constructs(tmp_path: Path) -> None:
     registry = ToolRegistry(tmp_path, register_builtin=False, skill_catalog=SkillCatalog.empty())
 

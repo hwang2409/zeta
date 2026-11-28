@@ -93,9 +93,11 @@ async def _spawn(tmp_path: Path, arguments: dict[str, object], seed):
     return result, loop, opened
 
 
-async def _children(loop: AgentLoop) -> list[object]:
+async def _child_count(loop: AgentLoop) -> int:
+    # finished children leave the no-handle list, so count them too
     status = await loop.tool_registry.execute(ToolCall("status", "agent_status", {}))
-    return list(status["structuredContent"].get("children", []))
+    content = status["structuredContent"]
+    return len(content.get("children", [])) + content.get("finished_omitted", 0)
 
 
 async def _close(loop: AgentLoop, opened) -> None:
@@ -150,7 +152,7 @@ async def test_spawn_on_codex_model_refuses_a_four_day_cached_hold(
         assert "codex:third" not in text, (
             "a stale account must not be named as headroom"
         )
-        assert await _children(loop) == [], (
+        assert await _child_count(loop) == 0, (
             "a refused spawn must not create a child row"
         )
         assert not (opened.store.session_dir / "agents").exists()
@@ -183,6 +185,6 @@ async def test_spawn_without_a_long_hold_on_the_child_account_starts(
     result, loop, opened = await _spawn(tmp_path, {}, seed)
     try:
         assert not result.is_error, result.content
-        assert len(await _children(loop)) == 1
+        assert await _child_count(loop) == 1
     finally:
         await _close(loop, opened)
