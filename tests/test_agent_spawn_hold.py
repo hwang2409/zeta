@@ -8,12 +8,14 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.credentials import named_account_credentials
 from tests.support.fake_backend import PerActorFakeBackend, ScriptedTurn
 from tests.support.owned import await_or_fail
-from tests.test_accounts_exhaustion import _account_context
+from tests.test_accounts_exhaustion import _account_context, _codex_token
 from tests.test_rate_limit_hold import _collect
 from zeta.accounts.store import AccountId
 from zeta.accounts.usage import UsageSnapshot, UsageWindow, record_usage_snapshot
+from zeta.oauth import OAuthTokens
 from zeta.protocol.types import MessageOrigin, StreamEventType, TextContent, ToolCall
 from zeta.runtime.loop import AgentLoop
 from zeta.skills import SkillCatalog
@@ -42,16 +44,23 @@ class SpawnBackend(PerActorFakeBackend):
         )
 
 
-def _seed(context, account: AccountId, *, used: float, resets_in: timedelta) -> None:
+def _seed(
+    context,
+    account: AccountId,
+    *,
+    used: float,
+    resets_in: timedelta,
+    also_resets_in: timedelta | None = None,
+    age: timedelta = timedelta(0),
+) -> None:
     now = datetime.now(UTC)
+    windows = [UsageWindow("primary", used, 10_080, now + resets_in)]
+    if also_resets_in is not None:
+        windows.append(UsageWindow("five_hour", used, 300, now + also_resets_in))
     record_usage_snapshot(
         context.store,
         account,
-        UsageSnapshot(
-            now,
-            "usage_endpoint",
-            (UsageWindow("primary", used, 10_080, now + resets_in),),
-        ),
+        UsageSnapshot(now - age, "usage_endpoint", tuple(windows)),
         now,
     )
 
@@ -104,9 +113,28 @@ async def test_spawn_on_codex_model_refuses_a_four_day_cached_hold(
     hold = timedelta(days=4)
 
     def seed(context, first, second) -> None:
-        # the session pins codex:first; it is held for days, codex:second has room
-        _seed(context, first, used=100.0, resets_in=hold)
+        # the session pins codex:first; it is held for days (its other spent
+        # window resets sooner), codex:second has room, codex:third only has a
+        # stale low reading, so it is not confirmed headroom
+        _seed(
+            context,
+            first,
+            used=100.0,
+            resets_in=hold,
+            also_resets_in=timedelta(hours=2),
+        )
         _seed(context, second, used=10.0, resets_in=timedelta(hours=1))
+        third = AccountId("codex", "third")
+        named_account_credentials(context.store.home, "codex", "third").save(
+            OAuthTokens(_codex_token("third"), "refresh", 4_000_000_000)
+        )
+        _seed(
+            context,
+            third,
+            used=10.0,
+            resets_in=timedelta(hours=1),
+            age=timedelta(hours=1),
+        )
 
     before = datetime.now(UTC)
     result, loop, opened = await _spawn(tmp_path, {"model": "gpt-5.6-luna"}, seed)
@@ -117,8 +145,11 @@ async def test_spawn_on_codex_model_refuses_a_four_day_cached_hold(
         end = datetime.fromisoformat(text.split(" until ", 1)[1].split(" ", 1)[0])
         assert (
             before + hold - timedelta(minutes=1) <= end <= datetime.now(UTC) + hold
-        ), text
+        ), f"the hold must end at the last spent window's reset: {text}"
         assert "codex:second" in text, "the refusal must name the account with headroom"
+        assert "codex:third" not in text, (
+            "a stale account must not be named as headroom"
+        )
         assert await _children(loop) == [], (
             "a refused spawn must not create a child row"
         )

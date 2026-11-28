@@ -635,6 +635,16 @@ async def spawn_child(
     return result
 
 
+async def _spawn_hold_error(loop: AgentLoop, child_backend: object) -> str | None:
+    """Refusal text when the child's account has a long cached hold, read off-loop."""
+    accounts = getattr(loop, "account_context", None)
+    if accounts is None:
+        return None
+    return await asyncio.to_thread(
+        accounts.spawn_hold_refusal, getattr(child_backend, "provider", None)
+    )
+
+
 async def _run_child(
     loop: AgentLoop,
     tool_call: ToolCall | None,
@@ -752,15 +762,7 @@ async def _run_child(
         return failure(
             backend_error, code="state_unavailable",
         )
-    accounts = getattr(loop, "account_context", None)
-    hold_error = (
-        await asyncio.to_thread(
-            accounts.spawn_hold_refusal, getattr(child_backend, "provider", None)
-        )
-        if accounts is not None
-        else None
-    )
-    if hold_error is not None:
+    if (hold_error := await _spawn_hold_error(loop, child_backend)) is not None:
         if child_backend is not loop.backend and is_owned_completion_backend(
             child_backend
         ):

@@ -251,7 +251,9 @@ class SessionAccountContext:
             account = self._pins.get(canonical) or self.store.default(canonical)
             if account is None:
                 return None
-            return spawn_hold_refusal(self.store.list_display(), account)
+            return spawn_hold_refusal(
+                read_usage(self.store, account), account, self.store.list_display
+            )
         except (AccountError, OSError, ValueError):
             return None
 

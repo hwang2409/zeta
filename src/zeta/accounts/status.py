@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 from ..models.catalog import DEFAULT_MODELS
 from .availability import AccountDisplay
 from .registry import AccountId
+
+if TYPE_CHECKING:
+    from .usage import UsageState
 
 # a cached hold that ends sooner than this is left for the child's own hold to wait out
 SPAWN_REFUSE_HOLD_OVER = timedelta(minutes=10)
@@ -48,12 +51,16 @@ def account_status(
 
 
 def spawn_hold_refusal(
-    displays: Sequence[AccountDisplay], account: AccountId
+    usage: UsageState,
+    account: AccountId,
+    displays: Callable[[], Sequence[AccountDisplay]],
 ) -> str | None:
-    """Name a long cached hold on ``account`` and the accounts with cached headroom."""
+    """Name a long cached hold on ``account`` and the accounts with cached headroom.
+
+    ``displays`` reads every account, so it runs only when a refusal is returned.
+    """
     now = datetime.now(UTC)
-    usage = next((item.usage for item in displays if item.account == account), None)
-    end = usage.exhausted_until(now) if usage is not None else None
+    end = usage.exhausted_until(now)
     if end is None or end - now <= SPAWN_REFUSE_HOLD_OVER:
         return None
     local = end.astimezone().strftime("%b %d %H:%M %Z").lower()
@@ -64,7 +71,7 @@ def spawn_hold_refusal(
             if item.account.provider != account.provider
             else "; switch with /accounts)"
         )
-        for item in displays
+        for item in displays()
         if item.account != account and _has_headroom(item, now)
     ]
     return (
@@ -79,7 +86,7 @@ def spawn_hold_refusal(
     )
 
 
-def _live_windows(usage: Any, now: datetime) -> list[float]:
+def _live_windows(usage: UsageState, now: datetime) -> list[float]:
     snapshot = usage.snapshot
     if snapshot is None:
         return []
