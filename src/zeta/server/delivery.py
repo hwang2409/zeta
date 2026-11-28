@@ -440,9 +440,14 @@ class DeliveryRequests:
             if steering is None:
                 control._schedule_background_wake(session_id)
                 return
+            controllers = control.server.controllers
+            registry = control.server.connections
+            shutting_down = registry is not None and registry.frozen
+            controller_present = control.controller_present()
             if (
-                not control.server.controllers.is_closing(control)
-                and control.controller_present()
+                not shutting_down
+                and not controllers.is_closing(control)
+                and controller_present
                 and not control.client_turn_detached()
                 and control.runtime.state is state
             ):
@@ -459,9 +464,16 @@ class DeliveryRequests:
                     allow_assistant_reset=allow_assistant_reset,
                 )
                 return
-        # no client can see this turn: the server closes, the bindings left, or
-        # the controller is gone with no reconnect grace.
-        await self._drop_steering(session_id, state, "disconnect")
+            if not shutting_down and not controller_present:
+                # The finished turn's record need not still own the session.
+                resident = controllers.resident(session_id)
+                controller_present = (
+                    resident is not None and resident.control.controller_present()
+                )
+            reason: DeliveryDropReason = (
+                "turn_end" if controller_present and not shutting_down else "disconnect"
+            )
+        await self._drop_steering(session_id, state, reason)
 
     async def _drop_steering(
         self, session_id: str, state: SessionState, reason: DeliveryDropReason

@@ -132,6 +132,8 @@ The server echoes it in `result.capabilities.features`. Use multi-controller
 mode only after that echo. Controllers that do not negotiate it use the
 exclusive legacy slot. Legacy and multi-controller modes cannot mix; a
 controller `hello` for the other mode returns `-32001` and closes the connection.
+A fresh multi-controller `hello` is admitted during reconnect grace; exact
+session reclaim still requires the matching session id (see issue #1586).
 
 Each controller can attach to at most one session, and each session has at most
 one controller. There is no automatic or forced handoff. Another connection
@@ -178,9 +180,12 @@ and a pending approval of a child is terminated.
 
 The limits are fixed, not settings:
 
-- Four multi controllers: the fifth controller `hello` gets `-32001` and closes.
-- Eight resident records, including unattached, setup, parked, closing, and
-  reconnect-grace records: an operation that would allocate a ninth gets
+- Sixteen multi controllers may hold sessions. A multi controller that has not
+  attached to a session does not count toward this limit. The seventeenth
+  session-holding controller `hello` gets `-32001` and closes.
+- Twenty resident records bound total loaded records for the serve: 16 session
+  holders, one sessionless record, and three records of room for parked, grace,
+  or closing records across all connections; a fifth tab that parks 3 chats hits
   `-32004` with `data.reason: "resident_limit"`.
 - Eight pending or active observer subscriptions per session, including child
   streams for that session: the ninth join gets `-32001` and the connection
@@ -195,8 +200,11 @@ The limits are fixed, not settings:
   legacy role limits and refusal behavior are unchanged. The 33rd connection
   closes without a JSON-RPC response.
 
-In multi-controller mode, an observer's `session_history_and_subscribe` join
-selects the session used by `status`, `content_read`, `model_catalog`,
+In multi-controller mode, a controller may join another controller's session with
+`session_history_and_subscribe`. This gives the joining controller read history
+and live events for that session, but does not attach it or allow it to `send`
+or `steer`; those operations still require the controller's own attached session.
+An observer's `session_history_and_subscribe` join selects the session used by `status`, `content_read`, `model_catalog`,
 `session_settings`, `delivery_status`, `session_grants`, `skill_catalog`,
 `skill_read`, `agent_profile_catalog`, `agent_profile_read`, `mcp_server_list`,
 and `session_history_read`. Without a live view, those methods return
@@ -747,8 +755,9 @@ the swap is the same as without the feature.
   event's `session_id` is the parked session; `data` is its
   `status.parked_sessions` row plus `last_turn_outcome` (`{turn_id, reason}`
   or `null`, the same object as in `status`). A session whose turn ends sends
-  `state: "idle"` with the turn's outcome, then `state: "closed"` once it holds
-  no work. A parked session reports `running` for its whole turn; `tool` is
+  `state: "idle"` with the turn's outcome, then `state: "closed"` after the
+  resident record is removed and no longer counts toward the resident limit.
+  A parked session reports `running` for its whole turn; `tool` is
   not sent while a turn runs. `resume` of a parked session sends no
   `parked_session_changed` event. Observers do not get this event. After a
   reconnect, read `status.parked_sessions`; events only report changes after
@@ -1132,7 +1141,7 @@ requested method. Without feature negotiation the methods return `-32601`.
 | `state_memory_detail` | `project_id`, `memory_id` | `{memory, body, truncated}` | — |
 | `state_inbox` | `project_id`, `status?`, `limit?`, `cursor?` | Page of Inbox | `created_ns`, `message_id` |
 | `state_inbox_detail` | `project_id`, `message_id` | `{message, body, truncated}` | — |
-| `state_attention` | `project_id?`, `status?`, `limit?`, `cursor?` | Page of Attention | `created_ns`, `attention_id` |
+| `state_attention` | `project_id?`, `status?`, `list?`, `limit?`, `cursor?` | Page of Attention | `created_ns`, `attention_id` |
 
 Ids are strings. Use `null` or omit a filter to include all values. Memory
 `kind` is `brief`, `decision`, `state`, `backlog`, `changelog`, or `legacy`; inbox
@@ -1146,7 +1155,7 @@ snapshot and returns the largest prefix that fits the frame.
 Project   {project_id, name, path, session_count, memory_count, inbox: {new, claimed, done}, updated_ns}
 Memory    {memory_id, project_id, kind, automatic, accepted, summary, created_ns, updated_ns, source_session_id, has_body}
 Inbox     {message_id, project_id, kind, status, sender, summary, created_ns, updated_ns, trusted_assignment, has_body}
-Attention {attention_id, project_id, session_id, kind, status, title, created_ns, updated_ns}
+Attention {attention_id, project_id, session_id, kind, requires_action, status, title, created_ns, updated_ns}
 ```
 
 Project `path` is the canonical integration root, or `null` when there is none.
@@ -1191,7 +1200,12 @@ nanoseconds; missing times are null.
 - Session rows contain `session_id`, `project_id`, `title`, `profile`, `model`,
   `created_ns`, `updated_ns`, `status` (`idle`, `running`, `approval`, `failed`,
   or `unknown`), `child_count` (direct child slots), `background_count` (session
-  tasks), `attention_count` (stored attention records), and `bytes` (top-level transcript size, read from file metadata).
+  tasks), `attention_count` (stored attention records, including resolved and FYI records),
+  `attention_open` (open action-required items), and `bytes` (top-level transcript size, read from file metadata).
+  `attention_open` counts only `decision` and `deferred` items owned by that
+  top-level session and matching its project (including null for an unassigned
+  session). It is not a project-wide total. It excludes resolved, FYI (`answer`
+  and `decided`), and broken records, and is zero for non-owner sessions.
 - Agent rows contain `run_id`, `session_id`, `parent_run_id`, `profile`, `status`
   (`running`, `idle`, `waiting`, `finished`, `failed`, `cancelled`, or `unknown`),
   `background` (`true` or `false` or `null`), `started_ns`, and `ended_ns`.
@@ -1299,10 +1313,12 @@ reply streams, is not dropped when that turn completes. After the turn's
 `turn_end` and `agent_end`, the server starts the next turn with no new user
 message, and that turn's first provider request carries the steer, so its
 `delivery_status` becomes `delivered`. This turn emits the usual `agent_start`
-through `agent_end` events. The next turn does not start, and the steer is
-`dropped` with reason `disconnect`, if the server is closing, a `send` would be
-refused because the session is not attached, or the controller is gone with no
-`turn_reconnect` grace running. A `send` that arrives right after
+through `agent_end` events. If the server is closing or the session has no
+controller and no reconnect grace, the steer is `dropped` with reason
+`disconnect`. If the session still has a controller or reconnect grace but the
+finished turn cannot start a successor (for example, required bindings are
+missing or the runtime state was replaced), the reason is `turn_end`.
+A `send` that arrives right after
 `turn_end` either starts the turn that carries the steer, or gets `-32004`
 because that turn has already started; the client should then retry the text as
 a `steer`.
@@ -1578,6 +1594,17 @@ child run, cumulative across its follow-up segments, and never decreases. The
 public `run_id` is the existing child
 instance id. Child-local store ids and the agent tool's `handle` name are not
 exposed.
+
+A live row can also include `account_status` when a snapshot is available. It
+contains `account` (the child's pinned `provider:account` ID), `held` (boolean,
+whether the child is in a provider rate-limit hold), `usable_alternatives`
+(nonnegative integer, the number of other available accounts on that provider
+with fresh cached headroom), and `cached_used_percent` (number from 0 to 100,
+or null if unknown). The percentage is the highest usage among fresh, active
+cached limit windows; a known active exhaustion can still show 100 when the
+cache is stale. The server does not refresh usage to produce this row. A count
+of zero means no alternatives are known from the cache, not that the provider
+is exhausted. Rows without a snapshot and terminal rows omit `account_status`.
 
 `child_run_send` queues one message at the child's existing safe delivery
 point. Params are `session_id`, `run_id`, and nonempty `text`; success returns
@@ -3393,7 +3420,20 @@ The shared slash registry has this order and surface availability:
 | `restart` | no | restart this session from the local checkout (reinstall after `pyproject` changes) |
 | `permissions` | no | show rules; revoke a session grant: `/permissions revoke <grant>`; clear all: `/permissions clear` |
 
-The `/decisions` list includes broken attention records instead of hiding them. A
+`state_attention` accepts `list: "action"` for open decisions and deferred
+items, or `list: "fyi"` for open answers and decided notes. With
+`status: "open"` or a `list` selector, it uses the same project queue as
+`list_attention`, including open items from dead top-level predecessors.
+Supply `project_id` to scope to one project. The rows expose `requires_action`
+and include only valid records. Without `list`, omit `status` for all stored
+records or use `status: "done"` for resolved history.
+
+`/decisions action` and `/decisions fyi` select the corresponding open list
+for the attached session's project. Bare `/decisions` still lists both over
+serve. Reading does not acknowledge an FYI note; `/decisions dismiss <id>`
+resolves it in the owning session.
+
+The `/decisions` action list includes broken attention records instead of hiding them. A
 broken item is additive: it has `id`, `path`, and `reason` fields in attention
 payloads, and contains no request body. `reason` is one of `unreadable`,
 `invalid_name`, `invalid_json`, `invalid_schema`, `id_mismatch`, or `too_large`.
@@ -3482,7 +3522,7 @@ negotiate a feature sees the behavior from before the feature existed.
 | `mcp_refresh_tools` | adds controller-only `mcp_refresh_tools`, which publishes a forced MCP `tools/list` refresh before a later controller request is admitted |
 | `resume_attach` | `resume` of the active session during a busy turn attaches without a swap: it keeps the turn, approvals, and children, re-supplies `mcp_bindings` and `host_commands`, and returns `attached: "live_turn"` |
 | `turn_reconnect` | requires `approval_reconnect`; a controller disconnect keeps a running turn for the reconnect grace instead of cancelling it, a reclaiming controller's `hello` takes it over, and expiry cancels it with reason `disconnect` (see "reconnecting sessions and background completions") |
-| `multi_controller` | enables up to four controllers with exclusive ownership of attached and parked sessions, connection-local parking, and exact-id reclaim of independent per-session reconnect grace; see [`multi_controller`](#multi_controller) for limits and refusals |
+| `multi_controller` | enables up to sixteen session-holding controllers with exclusive ownership of attached and parked sessions, sessionless controllers that do not count toward that cap, connection-local parking, and exact-id reclaim of independent per-session reconnect grace; see [`multi_controller`](#multi_controller) for limits and refusals |
 | `session_park` | requires `resume_attach`; `new_session` and `resume` of another session park a busy attached session instead of returning `-32004`, `resume` attaches a parked session again, a parked session closes once idle, at most 3 per connection are parked or closing (`-32004` with `data.reason: "parked_limit"`), `status` adds `parked_sessions`, and the controller gets `parked_session_changed` events (see "parking a busy session") |
 | `in_flight_replay` | requires `session_replay_seq`; a `session_history_and_subscribe` join during a reply starts its stream with the reply text, thinking, and running-tool output streamed so far, as ordinary `assistant_delta` and `tool_output` events (see "joining during a reply") |
 

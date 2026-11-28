@@ -11,7 +11,7 @@ from typing import Any
 
 from prompt_toolkit.document import Document
 
-from ..core.agent_progress import live_agent_lifecycle
+from ..core.agent_progress import live_agent_lifecycle, overlay_agent_progress
 from ..core.checkpoints import ConversationIntegrityError, load_session_json
 from ..core.session_files import SessionError, open_session_file, session_directory
 from ..core.transcript_recovery.runtime import repair_command_for_child_path
@@ -121,8 +121,12 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 
 def _agent_metadata(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
-    lifecycle_path = path / "agent_lifecycle.json"
-    lifecycle = live_agent_lifecycle(lifecycle_path) or _read_json(lifecycle_path)
+    live = live_agent_lifecycle(path / "agent_lifecycle.json")
+    return overlay_agent_progress(_durable_agent_metadata(path, fallback), live)
+
+
+def _durable_agent_metadata(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
+    lifecycle = _read_json(path / "agent_lifecycle.json")
     if lifecycle:
         return lifecycle
     state = _read_json(path / "session_state.json")

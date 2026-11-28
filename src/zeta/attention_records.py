@@ -7,7 +7,7 @@ import json
 import os
 import stat
 import uuid
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -109,6 +109,10 @@ class AttentionRecord:
     decision: str | None = None
     kind: AttentionKind = "decision"
 
+    @property
+    def requires_action(self) -> bool:
+        return self.kind in {"decision", "deferred"}
+
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> AttentionRecord:
         reject_unknown_keys(value, "attention_record")
@@ -147,7 +151,8 @@ class AttentionRecord:
 
         return {
             "attention_id": self.id, "project_id": self.project_id, "session_id": self.session_id,
-            "kind": self.kind, "status": "open" if self.status == "open" else "done",
+            "kind": self.kind, "requires_action": self.requires_action,
+            "status": "open" if self.status == "open" else "done",
             "title": self.title, "created_ns": timestamp_ns(self.created_at),
             "updated_ns": timestamp_ns(self.resolved_at or self.created_at),
         }
@@ -427,20 +432,15 @@ def _state_attention_files(session_dir: Path) -> tuple[Path, ...]:
     return tuple(sorted(directory.glob("*.json")))
 
 
-def state_attention_counts(sessions_dir: Path, session_ids: Iterable[str]) -> dict[str, int]:
-    """Count regular attention slots without opening any record body."""
-    counts = {}
-    for session_id in session_ids:
-        count = 0
-        for path in _state_attention_files(sessions_dir / session_id):
-            try:
-                _check_id(path.stem)
-                if stat.S_ISREG(path.lstat().st_mode):
-                    count += 1
-            except (ValueError, FileNotFoundError):
-                continue
-        counts[session_id] = count
-    return counts
+def state_attention_slots(session_dir: Path) -> Iterator[str]:
+    """Yield ids of regular attention slots without opening any record body."""
+    for path in _state_attention_files(session_dir):
+        try:
+            _check_id(path.stem)
+            if stat.S_ISREG(path.lstat().st_mode):
+                yield path.stem
+        except (ValueError, FileNotFoundError):
+            continue
 
 
 def state_attention_rows(session_dir: Path, observed_epoch: int) -> list[dict[str, Any]]:
@@ -484,16 +484,21 @@ def _is_attention_id(value: str) -> bool:
     return len(value) == 32 and all(character in "0123456789abcdef" for character in value)
 
 
-def state_attention_home_generation(sessions_dir: Path) -> object:
+def state_attention_home_generation(sessions_dir: Path, *, include_owner: bool = False) -> object:
     from .state_snapshot import stamps
 
-    return stamps([sessions_dir]), tuple(state_attention_generation(path) for path in _attention_sessions(sessions_dir))
+    sessions = _attention_sessions(sessions_dir)
+    owner_paths = (path / "meta.json" for path in sessions) if include_owner else ()
+    return stamps((sessions_dir, *owner_paths)), tuple(state_attention_generation(path) for path in sessions)
 
 
-def state_attention_home_rows(sessions_dir: Path, epoch: int, project_id: str | None, status: str | None):
+def state_attention_home_rows(
+    sessions_dir: Path, epoch: int, project_id: str | None, status: str | None,
+):
     return [
         row for path in _attention_sessions(sessions_dir) for row in state_attention_rows(path, epoch)
-        if (project_id is None or row["project_id"] == project_id) and (status is None or row["status"] == status)
+        if (project_id is None or row["project_id"] == project_id)
+        and (status is None or row["status"] == status)
     ]
 
 

@@ -24,11 +24,11 @@ def _string(params: dict[str, Any], key: str, max_bytes: int) -> str:
     return value
 
 
-def _owner_error(code: str):
+def _owner_error(code: str, *, detail: str | None = None):
     from ...protocol import ErrorDescriptor, invalid_resource_params, resource_error
 
     if code == "invalid_params":
-        return invalid_resource_params()
+        return invalid_resource_params(detail=detail)
     return resource_error({
         "child_run_not_found": ErrorDescriptor.CHILD_RUN_NOT_FOUND,
         "operation_busy": ErrorDescriptor.OPERATION_BUSY,
@@ -69,7 +69,7 @@ async def child_run_spawn(client, request_id, params, controller):
     try:
         run_id = await spawn_child(loop, agent_type=agent_type, task=task, cwd=cwd)
     except ChildControlError as exc:
-        raise _owner_error(exc.code) from None
+        raise _owner_error(exc.code, detail=exc.detail) from None
     return {"data": {"accepted": True, "run_id": run_id}}
 
 

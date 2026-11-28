@@ -9,6 +9,7 @@ from tests.support.fake_backend import FakeBackend, PerActorFakeBackend, Scripte
 from tests.support.owned import await_or_fail
 from tests.support.serve_contract import ServeClient
 from tests.support.sockets import short_socket_path
+from zeta.core.agent_progress import live_agent_lifecycle, publish_live_agent_lifecycle
 from zeta.core.store import ConversationStore
 from zeta.protocol.types import (
     Message,
@@ -291,6 +292,18 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
             what="child model safe point",
         )
         run_id = f"{session_id}:1"
+        root = server.controllers.attached().runtime.opened.store
+        lifecycle_path = root.session_dir / "agents" / "1" / "agent_lifecycle.json"
+        lifecycle = live_agent_lifecycle(lifecycle_path)
+        assert lifecycle is not None
+        account_status = {
+            "account": "codex:first",
+            "held": True,
+            "usable_alternatives": 1,
+            "cached_used_percent": 85.0,
+        }
+        # test-contract: seam seed a held snapshot while the child is gated
+        publish_live_agent_lifecycle(lifecycle_path, {**lifecycle, "account_status": account_status})
 
         listed = await client.request(
             "list-before",
@@ -336,6 +349,7 @@ async def test_child_run_list_and_safe_point_send_over_real_transport(
         assert before["parent_run_id"] is None
         assert before["accepts_follow_ups"] is True
         assert "handle" not in before
+        assert before.get("account_status") == account_status, "child_run_list must expose the held account"
 
         assert sent["result"] == {"accepted": True, "run_id": run_id}
         backend.release_children.set()

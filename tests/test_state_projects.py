@@ -23,7 +23,7 @@ BODY = PREFIX + "界z"
 PROJECT_KEYS = "project_id name path session_count memory_count inbox updated_ns"
 MEMORY_KEYS = "memory_id project_id kind automatic accepted summary created_ns updated_ns source_session_id has_body"
 INBOX_KEYS = "message_id project_id kind status sender summary created_ns updated_ns trusted_assignment has_body"
-ATTENTION_KEYS = "attention_id project_id session_id kind status title created_ns updated_ns"
+ATTENTION_KEYS = "attention_id project_id session_id kind requires_action status title created_ns updated_ns"
 
 
 def seed(home):

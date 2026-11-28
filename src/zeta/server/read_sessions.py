@@ -8,6 +8,7 @@ import time
 from datetime import UTC, datetime
 
 from .. import attention_records
+from ..attention_decisions import session_attention_counts
 from ..core.child_runs import (
     child_run_directories,
     read_child_run_metadata,
@@ -65,14 +66,16 @@ def _session_status(session_id, fd, active):
     return active.get(session_id) or ("running" if session_owner_status(fd)[0] else "idle")
 
 
-def _session_row(metadata, fd, status, updated_ns):
+def _session_row(metadata, fd, status, updated_ns, root, epoch):
     session_id = metadata.session_id
+    stored, action_required = session_attention_counts(root, metadata, epoch)
     return {
         "session_id": session_id, "project_id": metadata.project_id,
         "title": metadata.name or None, "profile": None, "model": metadata.model or None,
         "created_ns": _ns(metadata.created_at) or 0, "updated_ns": updated_ns,
         "status": status, "child_count": len(child_run_directories(fd)),
         "background_count": len(read_background_task_records(fd)), "bytes": _size(fd),
+        "attention_count": stored, "attention_open": action_required,
     }
 
 
@@ -159,16 +162,7 @@ def read_session_page(home, method, params, fits, active, *, collection=None, de
                 result.append((info.st_ino, info.st_ctime_ns, info.st_mtime_ns))
         return result
 
-    def read_sessions(_epoch):
-        rows, more = read_session_candidates()
-        # Count only the limit-selected rows, before fitting exact frame sizes.
-        if rows:
-            counts = attention_records.state_attention_counts(root, [row["session_id"] for row in rows])
-            for row in rows:
-                row["attention_count"] = counts[row["session_id"]]
-        return None, rows, more
-
-    def read_session_candidates():
+    def read_sessions(epoch):
         candidates = []
         for item in list_session_metadata_read_only(root):
             if select is not None and item.project_id != select:
@@ -183,15 +177,15 @@ def read_session_page(home, method, params, fits, active, *, collection=None, de
             with session_root(root) as root_fd:
                 for (updated, sid), item in candidates:
                     if status is None and len(rows) == room:
-                        return rows, True
+                        return None, rows, True
                     with child_directory(root_fd, sid) as fd:
                         item_status = _session_status(sid, fd, active)
                         if status is not None and item_status != status:
                             continue
                         if len(rows) == room:
-                            return rows, True
-                        rows.append(_session_row(item, fd, item_status, updated - 1))
-        return rows, False
+                            return None, rows, True
+                        rows.append(_session_row(item, fd, item_status, updated - 1, root, epoch))
+        return None, rows, False
 
     def detail_shape(session, items, cursor):
         return {"session": session, "collection": collection, "items": items, "next_cursor": cursor}
@@ -215,8 +209,9 @@ def read_session_page(home, method, params, fits, active, *, collection=None, de
                 sid = item.session_id
                 with child_directory(root_fd, sid) as fd:
                     if detail:
-                        session = _session_row(item, fd, _session_status(sid, fd, active), _ns(item.updated_at) or 0)
-                        session["attention_count"] = attention_records.state_attention_counts(root, [sid])[sid]
+                        session = _session_row(
+                            item, fd, _session_status(sid, fd, active), _ns(item.updated_at) or 0, root, epoch,
+                        )
                     if collection == "attention":
                         return attention_records.state_attention_page(
                             root / sid, epoch, start, limit, fits=fits,

@@ -134,6 +134,39 @@ def _press(app: TUIApp, key: str) -> None:
 
 
 @pytest.mark.asyncio
+async def test_fyi_lifecycle_keeps_attention_badge_action_only(tmp_path: Path) -> None:
+    manager = SessionManager(tmp_path)
+    project = await asyncio.to_thread(manager.project_registry.create_project, "alpha", "git")
+    owner = await asyncio.to_thread(_session, tmp_path, project.project_id)
+    try:
+        decision = await asyncio.to_thread(_request, owner, project.project_id, "Choose a database")
+        note = await asyncio.to_thread(_request, owner, project.project_id, "Build completed", kind="answer")
+        app = await _make_app(tmp_path, owner, owner.store.session_id)
+        async with owned_app(app):
+            action = _rendered_text(app)
+            assert "● 1 attention item" in action, action
+            assert decision.title in action and note.title not in action
+            _press(app, "f")
+            fyi = _rendered_text(app)
+            assert note.title in fyi and decision.title not in fyi
+            assert "d dismiss" in fyi and "● 1 attention item" in fyi
+            store = AttentionStore(owner.store.session_dir, writer_epoch=5)
+            assert (await asyncio.to_thread(store.get, note.id)).status == "open"
+            _press(app, "d")
+            await await_or_fail(
+                asyncio.to_thread(_wait_for_records, tmp_path, owner.store.session_id, {note.id}),
+                what="dismiss the selected FYI through the TUI",
+            )
+            await app._decisions_tick()
+            assert "No open FYI items." in _rendered_text(app)
+            _press(app, "f")
+            action = _rendered_text(app)
+            assert decision.title in action and "● 1 attention item" in action
+    finally:
+        owner.store.close()
+
+
+@pytest.mark.asyncio
 async def test_tui_renders_broken_attention_without_request_body(
     tmp_path: Path,
 ) -> None:
@@ -477,14 +510,8 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
     monkeypatch.setattr(AttentionReplies, "stage", gated_stage)
     monkeypatch.setattr(AttentionReplies, "flush", tracked_flush)
     try:
-        # Dismiss the non-decision answer first and let it resolve, so the FIFO
-        # order (dismiss before the gated stage) cannot deadlock.
-        _press(app, "j")
-        await asyncio.sleep(0)
-        _press(app, "j")
-        await asyncio.sleep(0)
-        _press(app, "j")
-        await asyncio.sleep(0)
+        # Dismiss before the gated stage so the FIFO lock cannot deadlock.
+        _press(app, "f")
         _press(app, "d")
         await asyncio.sleep(0)
         await asyncio.wait_for(
@@ -493,12 +520,7 @@ async def test_tui_escape_flushes_two_answers_and_dismisses_non_decision(
             ),
             10,
         )
-        _press(app, "k")
-        await asyncio.sleep(0)
-        _press(app, "k")
-        await asyncio.sleep(0)
-        _press(app, "k")
-        await asyncio.sleep(0)
+        _press(app, "f")
         _press(app, "1")
         await asyncio.sleep(0)
         _press(app, "j")
@@ -724,7 +746,7 @@ async def test_tui_broken_record_with_staged_reply_is_not_counted_as_staged(
             broken.write_bytes(b'{"why":"cut off"')
             await app._decisions_tick()
             text = _rendered_text(app)
-            assert "● 2 open, 1 staged" in text, text
+            assert "● 1 open, 1 staged" in text, text
             broken_rows = [line for line in text.splitlines() if records[0].id in line]
             assert broken_rows, text
     finally:
