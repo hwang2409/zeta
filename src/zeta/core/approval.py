@@ -1233,6 +1233,6 @@ def _resolved_decision(value: str | None) -> ApprovalDecision | None:
     return None
 
 
-def canceled_result(tool_call_id: str) -> ToolResult:
-    return ToolResult(tool_call_id, "tool execution canceled", True, is_canceled=True)
+def canceled_result(tool_call_id: str, text: str | None = None) -> ToolResult:
+    return ToolResult(tool_call_id, text or "tool execution canceled", True, is_canceled=True)
 
