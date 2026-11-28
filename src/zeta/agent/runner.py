@@ -67,6 +67,7 @@ from .child_context import (
     _compose_child_project_context,
     _prepare_child_project_context,
     consume_run,
+    refuse_held_child_backend,
     resolve_child_backend,
 )
 from .child_run_owner import ChildControlError, ChildRunTransitionOwner
@@ -635,16 +636,6 @@ async def spawn_child(
     return result
 
 
-async def _spawn_hold_error(loop: AgentLoop, child_backend: object) -> str | None:
-    """Refusal text when the child's account has a long cached hold, read off-loop."""
-    accounts = getattr(loop, "account_context", None)
-    if accounts is None:
-        return None
-    return await asyncio.to_thread(
-        accounts.spawn_hold_refusal, getattr(child_backend, "provider", None)
-    )
-
-
 async def _run_child(
     loop: AgentLoop,
     tool_call: ToolCall | None,
@@ -762,11 +753,7 @@ async def _run_child(
         return failure(
             backend_error, code="state_unavailable",
         )
-    if (hold_error := await _spawn_hold_error(loop, child_backend)) is not None:
-        if child_backend is not loop.backend and is_owned_completion_backend(
-            child_backend
-        ):
-            await loop.close_backend(child_backend, stage="child_construction")
+    if (hold_error := await refuse_held_child_backend(loop, child_backend)) is not None:
         return failure(hold_error, code="state_unavailable", public_detail=True)
     # The long kinds default to background -- a run on someone else's model, or
     # one sized for a big task. Waiting on either blocks the orchestrator for
