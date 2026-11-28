@@ -740,13 +740,16 @@ class StepDeliveryFlow:
         return TerminalResult(pending, closed)
 
     def pending_preview(self) -> str:
-        """Return one bounded line per durable input that blocks a terminal call."""
+        """Name each durable input that blocks a terminal call, without its text.
 
-        lines = [
-            "follow-up: " + str(entry.data.get("text", ""))[:500]
-            for entry in self.store.delivery_fold.active_prompts.values()
-        ]
-        for entry in self.store.delivery_fold.active_notifications.values():
+        The input itself is delivered on the next turn; repeating its text here
+        would put it into the model context twice.
+        """
+
+        fold = self.store.delivery_fold
+        prompts = len(fold.active_prompts)
+        lines = [f"{prompts} follow-up message(s)"] if prompts else []
+        for entry in fold.active_notifications.values():
             if entry.data.get("display_only") is True:
                 continue
             digest = _notification_digest(entry)
@@ -755,7 +758,7 @@ class StepDeliveryFlow:
                 for key in ("kind", "child_instance_id", "status")
                 if digest[key]
             )
-            lines.append(f"{label}: {digest['summary'] or digest['description']}")
+            lines.append(label)
         shown = "\n".join("- " + line for line in lines[:5])
         if len(lines) > 5:
             shown += f"\n- … (+{len(lines) - 5} more)"
