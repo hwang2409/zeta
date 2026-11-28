@@ -497,7 +497,8 @@ async def test_crash_during_long_tool_call_keeps_saved_progress(tmp_path, monkey
                 lifecycle_file = _child_lifecycle_file(store)
                 clock[0] += 40.0
                 # 30 s model call + 40 s inside the bash call, and the started call counts.
-                assert await _saved_progress(lifecycle_file, 70.0) == (70.0, 1), "progress inside a long step must be saved"
+                # Asserted after recovery, so a run without saves reaches the recovered totals first.
+                saved_mid_call = await _saved_progress(lifecycle_file, 70.0)
                 # A copy taken mid-run is what a killed process leaves on disk.
                 shutil.copytree(root, tmp_path / "crashed")
             finally:
@@ -531,6 +532,7 @@ async def test_crash_during_long_tool_call_keeps_saved_progress(tmp_path, monkey
             assert (lifecycle.value["elapsed"], stats["elapsed"]) == (90.0, 90.0), "elapsed must keep the long step"
             assert (lifecycle.value["tool_calls"], stats["tool_calls"]) == (2, 2), receipt.data
             assert "90.0s · 2 tool calls" in receipt.data["text"], receipt.data["text"]
+            assert saved_mid_call == (70.0, 1), "progress inside a long step must be saved"
         finally:
             await await_or_fail(loop.close(), what="close resumed parent")
 
