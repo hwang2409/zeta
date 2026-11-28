@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import fcntl
 import hashlib
 import json
@@ -34,6 +35,7 @@ from ..core.session_files import (
 from ..oauth import (
     ACCOUNT_LOCK_TURN_WAIT_SECONDS,
     OAUTH_REFRESH_TIMEOUT_SECONDS,
+    CredentialReadError,
     OAuthRefreshFailure,
     OAuthTokens,
     classify_oauth_refresh_failure,
@@ -587,7 +589,17 @@ class AccountStore(_AccountRegistry):
                     if state is _Registry.MISSING and warnings:
                         logger.warning("%s", warnings[-1])
                 for provider in ("anthropic", "codex"):
-                    self._migrate_provider(home_fd, provider, warnings)
+                    try:
+                        self._migrate_provider(home_fd, provider, warnings)
+                    except CredentialReadError as exc:
+                        if exc.errno in (errno.EMFILE, errno.ENFILE):
+                            raise
+                        path = self.credential_path(AccountId(provider, "default"))
+                        warnings.append(
+                            f"kept {path}: {exc.strerror}; "
+                            "fix its permissions, then restart zeta"
+                        )
+                        logger.warning("%s", warnings[-1])
         return tuple(warnings)
 
     def refuse_orphaning_registration(self, account: AccountId) -> None:
@@ -1162,7 +1174,11 @@ def _keep_token(
 
 
 def _read_optional_tokens(directory_fd: int) -> OAuthTokens | None:
-    credential = _read_optional_bytes(directory_fd, "oauth.json")
+    try:
+        credential = _read_optional_bytes(directory_fd, "oauth.json")
+    except OSError as exc:
+        raise_if_unreadable(exc, "OAuth credentials file")
+        raise
     return None if credential is None else _tokens_from_bytes(credential)
 
 

@@ -36,6 +36,14 @@ class CredentialReadError(OSError):
     """A credential or account file exists but could not be read; the login is unknown."""
 
 
+def raise_if_out_of_files(exc: BaseException, what: str) -> None:
+    """Re-raise descriptor exhaustion honestly: the file was not read at all."""
+    if isinstance(exc, OSError) and exc.errno in (errno.EMFILE, errno.ENFILE):
+        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        message = f"too many open files (soft limit {soft}); {what} was not read"
+        raise CredentialReadError(exc.errno, message) from exc
+
+
 def raise_if_unreadable(exc: BaseException, what: str) -> None:
     """Re-raise a failed read honestly: it is not a bad or missing login.
 
@@ -50,10 +58,7 @@ def raise_if_unreadable(exc: BaseException, what: str) -> None:
         or exc.errno == errno.ELOOP
     ):
         return
-    if exc.errno in (errno.EMFILE, errno.ENFILE):
-        soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
-        message = f"too many open files (soft limit {soft}); {what} was not read"
-        raise CredentialReadError(exc.errno, message) from exc
+    raise_if_out_of_files(exc, what)
     name = errno.errorcode.get(exc.errno or 0, "unknown error")
     message = f"{what} could not be read ({name}: {exc.strerror})"
     raise CredentialReadError(exc.errno, message) from exc
